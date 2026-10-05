@@ -25,7 +25,8 @@ acknowledgement semantics are.
 ### 2.1 Meaning
 
 `local-direct` means the workload receives exclusive direct access to a
-physical NVMe device/controller assigned through VFIO.
+PCI-addressable NVMe controller/function assigned through VFIO. Ordinary
+namespaces sharing one controller are not separate VFIO isolation boundaries.
 
 It does **not** mean:
 
