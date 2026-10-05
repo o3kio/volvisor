@@ -117,8 +117,11 @@ No PCI device may have two owners. Ambiguous ownership fails closed.
 
 #### `local-direct`
 
-A whole physical NVMe controller/namespace is exclusively leased to one
-workload and passed to the workload VM through VFIO.
+A whole PCI-addressable NVMe controller/function is exclusively leased to one
+workload and passed to the workload VM through VFIO. Ordinary namespace
+subdivision on a shared controller is not treated as an isolation boundary;
+an individual namespace is eligible only when hardware exposes it through an
+independently assignable PCI function with safe IOMMU isolation.
 
 Data path:
 
@@ -192,9 +195,11 @@ compiles device/Storage Cell plans and activates Volvisor.
 Volvisor must not require a second always-available central service merely to
 keep established volume I/O running.
 
-Storage Cells may maintain an internal replicated metadata/lease service for
-runtime ownership and fencing. That is part of the storage runtime, not a new
-tenant-facing control plane.
+For replicated-async, the Volvisor runtime must maintain enough durable,
+fenced runtime metadata to preserve current writer authority and replica
+progress while the consumer control plane is absent. This may be an embedded
+replicated metadata/lease service inside the Storage Cells; it is part of the
+storage runtime, not a new tenant-facing control plane.
 
 Required outage behavior:
 
