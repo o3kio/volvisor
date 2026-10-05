@@ -49,6 +49,17 @@ NVMe 6..7  -> cluster-durable / Ceph OSD capacity
 This 4/2/2 split is an example only. It is not an API contract and must never
 be assumed by scheduling or provider code.
 
+Prototype terminology maps to the normative class names as follows:
+
+| Prototype term | Normative Volvisor class |
+|---|---|
+| direct NVMe | `local-direct` |
+| fast-async NVMe | `replicated-async` |
+| cluster-slow / Ceph | `cluster-durable` |
+
+The semantic names are intentional: performance changes with hardware, while
+failure and acknowledgement guarantees must remain stable.
+
 The architecture must also fit AI-cloud workloads. AI systems frequently need
 both ends of the storage spectrum: device-local disposable capacity for KV
 cache, scratch and hot datasets; and durable shared storage for customer data,
