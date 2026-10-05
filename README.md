@@ -27,6 +27,7 @@ fencing and host-local presentation.
 | [Replicated-async contract v1](contracts/replicated-async-v1.md) | Engine-independent replication and migration correctness contract |
 | [Engineering design](docs/design.md) | Consolidated explanatory design |
 | [Replicated-async R&D](docs/research/replicated-async-rnd.md) | Gluster/Xen historical pattern and DRBD/Mayastor/SPDK alternatives |
+| [Design review](docs/reviews/storage-cell-v0-review.md) | Adversarial review, corrections, open decisions and prototype verdict |
 
 ## Status
 
