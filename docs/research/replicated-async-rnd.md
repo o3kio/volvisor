@@ -195,15 +195,31 @@ This validates the feasibility of:
 local NVMe + SPDK + NVMe-oF + per-node I/O engine + remote replicas
 ~~~
 
-It is not a drop-in Volvisor implementation because its lifecycle is
+It is not a drop-in Volvisor implementation because the packaged lifecycle is
 Kubernetes/CSI-oriented and replicated foreground writes are synchronous,
 whereas Volvisor's target class is local-first asynchronous.
 
-The project is Apache-2.0 at project level. Volvisor should still default to a
-clean implementation unless source reuse is explicitly reviewed for provenance
-and licensing.
+However, the Mayastor data plane is more separable than the Kubernetes product
+surface suggests. The project documents direct Nexus use from application code,
+a gRPC service and an io-engine client for creating pools and replicas. Volvisor
+must therefore test a second path before committing to a new SPDK engine:
+**run the Mayastor io-engine inside the Storage Cell and drive it from a
+Volvisor-native control adapter without deploying the Kubernetes control
+plane.**
 
-R&D role: **architecture and performance reference**.
+That experiment can answer whether Mayastor already supplies enough of the
+pool, NVMe-oF, Nexus, rebuild and device machinery to reuse safely. The likely
+mismatch remains write semantics: its replicated Nexus sends writes
+synchronously to healthy children. Changing that behavior to Volvisor's
+local-ACK asynchronous contract could require a substantial fork and would
+need the same fencing/migration proof as a clean engine.
+
+The project is Apache-2.0 at project level. Any source reuse still requires
+explicit provenance and license review; architecture study does not authorize
+copy/translation.
+
+R&D role: **serious reusable-data-plane candidate and architecture/performance
+reference; reject or adopt only after a standalone io-engine experiment.**
 
 ## 8. Candidate C — custom SPDK replication bdev
 
@@ -391,7 +407,7 @@ must abort and the source must remain authoritative.
 |---|---:|---:|---:|---:|---:|---|
 | Historical Gluster + NFS | 2 | 3 | 4 | 3 | 2 | rejected reference |
 | DRBD 9 | 3 | 5 | 5 | 2 | 3 | mandatory baseline |
-| Mayastor | 5 | 2 (sync-first) | 4 | 3 | 3 | architecture reference |
+| Mayastor io-engine | 5 | 2 (sync-first) | 4 | 3 | 4 | reuse candidate/reference |
 | O_DIRECT/io_uring custom | 4 | 5 | 5 | 4 | 5 | first clean prototype |
 | SPDK custom bdev | 5 | 5 | 5 | 5 | 5 | long-term candidate |
 | Ceph RBD | 2-4 | different contract | 5 | 1 for Volvisor | 5 | durable/control baseline |
@@ -409,6 +425,17 @@ consume the same canonical volume identity from either host.
 
 Measure 4K/16K/128K latency, sequential bandwidth, async replication lag,
 resync cost, planned migration downtime and source-failure behavior.
+
+### R1.5 — standalone Mayastor io-engine experiment
+
+Run the io-engine inside a Storage Cell without Kubernetes/CSI. Drive pools,
+replicas and Nexus lifecycle through its native management interface. Measure
+the local presentation path, rebuild behavior and the cost/feasibility of
+adapting synchronous Nexus semantics to the Volvisor contract.
+
+If a small, maintainable adapter can satisfy the contract, prefer reuse over a
+new storage engine. If async semantics require invasive permanent divergence,
+record that explicitly before rejecting it.
 
 ### R2 — clean Volvisor semantics prototype
 
@@ -451,11 +478,13 @@ Proceed with a custom engine only if all are true:
 
 ## 16. Recommendation
 
-Prototype the semantics first with a simple block engine. Use DRBD as the
-correctness baseline and Mayastor as the closest NVMe architecture reference.
-Move to a clean SPDK replication bdev only after fencing/migration behavior is
-proven and benchmarks show a meaningful reason to own the extra correctness
-surface.
+Prototype the semantics first, but do not assume a new engine is necessary.
+Use DRBD as the correctness baseline and run a standalone Mayastor io-engine
+reuse experiment before writing a new SPDK data plane. If neither existing path
+can meet Volvisor's local-ACK async contract cleanly, prove the contract with a
+simple O_DIRECT/io_uring engine first. Move to a clean SPDK replication bdev
+only after fencing/migration behavior is proven and benchmarks show a
+meaningful reason to own the extra correctness surface.
 
 This preserves the successful idea from the historical Xen deployment without
 carrying GlusterFS forward.
