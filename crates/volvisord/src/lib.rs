@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod config;
+pub mod runtime;
 
 use std::net::SocketAddr;
 

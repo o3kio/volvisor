@@ -722,6 +722,7 @@ version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
@@ -972,6 +973,7 @@ dependencies = [
 name = "volvisord"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "serde",
  "tempfile",
@@ -980,6 +982,10 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "volvisor-api",
+ "volvisor-journal",
+ "volvisor-lvm",
+ "volvisor-provider",
  "volvisor-types",
 ]
 

@@ -32,6 +32,15 @@ pub struct Config {
     pub provider: ProviderKind,
     /// LVM volume-group prefix used for claimed pools (LVM provider only).
     pub lvm_vg_prefix: Option<String>,
+    /// Scoped destructive-authorization token for device claim/release
+    /// (LVM provider only; required for that provider, never logged).
+    pub device_claim_token: Option<String>,
+    /// Durable LVM provider state path (defaults to
+    /// `<journal_dir>/lvm-state.json`).
+    pub lvm_state_path: Option<std::path::PathBuf>,
+    /// Filesystem root for read-only device discovery (defaults to `/`;
+    /// test isolation only).
+    pub sysfs_root: Option<std::path::PathBuf>,
     /// Static bearer token for privileged admin operations. Empty disables
     /// admin endpoints (fail closed). Never logged.
     #[serde(default)]
@@ -62,10 +71,19 @@ impl Config {
 
     /// Validate cross-field constraints.
     fn validate(&self) -> Result<(), DaemonError> {
-        if self.lvm_vg_prefix.is_none() && self.provider == ProviderKind::Lvm {
-            return Err(DaemonError::Config(
-                "lvm_vg_prefix is required for the lvm provider".to_owned(),
-            ));
+        if self.provider == ProviderKind::Lvm {
+            if self.lvm_vg_prefix.is_none() {
+                return Err(DaemonError::Config(
+                    "lvm_vg_prefix is required for the lvm provider".to_owned(),
+                ));
+            }
+            if self.device_claim_token.as_deref().unwrap_or("").is_empty() {
+                return Err(DaemonError::Config(
+                    "device_claim_token is required for the lvm provider (scoped destructive \
+                     authorization)"
+                        .to_owned(),
+                ));
+            }
         }
         if let Some(prefix) = &self.lvm_vg_prefix {
             if prefix.is_empty() || prefix.len() > 64 {
@@ -96,6 +114,7 @@ listen = \"127.0.0.1:8787\"
 journal_dir = \"/var/lib/volvisor/journal\"
 provider = \"lvm\"
 lvm_vg_prefix = \"volvisor\"
+device_claim_token = \"scoped-destructive-auth\"
 "
         .to_owned()
     }
@@ -109,7 +128,7 @@ lvm_vg_prefix = \"volvisor\"
     }
 
     #[test]
-    fn lvm_provider_requires_prefix() {
+    fn lvm_provider_requires_prefix_and_token() {
         let raw = "\
 listen = \"127.0.0.1:8787\"
 journal_dir = \"/j\"
@@ -117,6 +136,9 @@ provider = \"lvm\"
 ";
         let cfg: Config = toml::from_str(raw).expect("parse");
         assert!(cfg.validate().is_err());
+        let raw = raw.to_owned() + "device_claim_token = \"t\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err(), "still missing lvm_vg_prefix");
     }
 
     #[test]

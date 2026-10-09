@@ -3,19 +3,24 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use volvisord::config::Config;
 use volvisord::DaemonError;
+use volvisord::config::Config;
+use volvisord::runtime;
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
-#[command(name = "volvisord", about = "Volvisor volume virtualization daemon")]
+#[command(
+    name = "volvisord",
+    about = "Volvisor volume virtualization daemon (prototype)"
+)]
 struct Args {
     /// Path to the TOML configuration file.
     #[arg(short, long)]
     config: PathBuf,
 }
 
-fn main() -> Result<(), DaemonError> {
+#[tokio::main]
+async fn main() -> Result<(), DaemonError> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     init_logging();
@@ -24,11 +29,9 @@ fn main() -> Result<(), DaemonError> {
         provider = ?config.provider,
         "volvisord starting (prototype; not production supported)"
     );
-    // Journal open/replay, provider construction and HTTP serving are wired
-    // in by the integration milestone (M6); failing closed until then.
-    Err(DaemonError::Config(
-        "daemon wiring not yet enabled in this milestone".to_owned(),
-    ))
+    // Startup order: journal lock + replay, provider reconcile, then serve.
+    // A second daemon on the same journal directory fails fast here.
+    runtime::serve(config).await
 }
 
 /// Initialize structured JSON logging with a conservative default filter.
