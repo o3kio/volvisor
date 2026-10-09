@@ -40,7 +40,7 @@ Exclusive VFIO of a PCI-addressable NVMe controller grants guest visibility to t
 
 ## State transitions and fail-closed invariants
 
-The cell lifecycle uses the **canonical state vocabulary defined in [ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)** (same names as the migration states of the v2 contracts): `DISCOVERED -> CLAIMED -> VM_PROVISIONED -> BOOTED -> NODE_JOINED -> ATTESTED -> ELIGIBLE_FOR_ROOK -> OSD_PREPARED -> CEPH_READY` with `DRAINING`, `SHUTDOWN`/`UPGRADING`, `RECOVERED` and `QUARANTINED`.
+The cell lifecycle uses the **canonical state vocabulary defined in [ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)** (same SCREAMING_CASE convention as the migration states of the v2 contracts): `DISCOVERED -> CLAIMED -> VM_PROVISIONED -> BOOTED -> NODE_JOINED -> ATTESTED -> ELIGIBLE_FOR_ROOK -> OSD_PREPARED -> CEPH_READY` with `DRAINING`, `SHUTDOWN`/`UPGRADING`, `RECOVERED` and `QUARANTINED`.
 
 - **ATTESTED** includes physical PCI claim versus guest NVMe by-id mapping, expected guest image, node identity and topology. A Kubernetes `Ready` event is not enough.
 - **ELIGIBLE_FOR_ROOK** additionally requires the exact taint/label/admission controls and approved POC CephCluster explicit storage node list.

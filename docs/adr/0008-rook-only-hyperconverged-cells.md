@@ -1,8 +1,8 @@
 # ADR-0008 — Experimental Rook-only Ceph hyperconverged Volvisor Cells
 
 Status: **Proposed / experimental / production NO-GO**
-Date: 2026-10-09
 Decision-accepted: pending (record acceptance date and accepting authority here)
+Date: 2026-10-09
 Builds on: [ADR-0003](0003-tiered-volume-virtualization.md), [ADR-0005](0005-ceph-rbd-and-managed-osds.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md)
 POC: [Rook Cell go/no-go](../poc/rook-cells/README.md)
 Scope: **optional managed Ceph OSD infrastructure provider**; does not replace existing-cluster `ceph-rbd` adapter
