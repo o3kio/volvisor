@@ -291,6 +291,36 @@ pub trait HandoffSurface: Send + Sync {
         migration_id: &MigrationId,
         attach: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError>;
+
+    /// Whether one volume's **local** role is Secondary, from observed
+    /// status (stage B2: the daemon's handoff driver feeds the
+    /// coordinator's `source_secondary` observation, and the
+    /// destination's peer `prepare` verifies the target replica's
+    /// role the same way before the cut).
+    ///
+    /// Read-only: a status observation, no mutation.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// `INTERNAL` for a status observation that cannot be trusted. A
+    /// resource that is verifiably down is a **result** (`false`), not
+    /// an error: "not Secondary" is the observable fact the caller
+    /// reconciles on.
+    async fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError>;
+
+    /// Fail-closed fencing for one participant (stage B2: the daemon
+    /// driver's `fence_source`, the rollback tail whose barrier void
+    /// could not be confirmed): durably self-fence the volume —
+    /// suspend, mark, demote — so it cannot be written again until an
+    /// operator resolves it. Never followed by a resume of anything
+    /// (AGENTS rule 4: fencing is never weakened; rule 5: the fenced
+    /// source is never blindly restarted).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// the fencing act's typed error otherwise (the volume stays
+    /// suspended — never a silent unfenced writer).
+    async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError>;
 }
 
 #[cfg(test)]

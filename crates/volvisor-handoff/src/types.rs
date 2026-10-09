@@ -275,6 +275,18 @@ pub struct MigrationRecord {
     pub barrier_proofs: Vec<BarrierProof>,
     /// The abort policy (v1: `AutoBeforeCut` only).
     pub abort_policy: AbortPolicy,
+    /// The consumer's `BarrierAndTransfer` proof, recorded verbatim as
+    /// **corroboration** (stage B2, plan §6): volvisor performs and
+    /// verifies its own pause (§5) and its own suspension proof (D2), so
+    /// the parameter is recorded, never trusted — a false or absent
+    /// proof changes nothing about the drive. The **first** recorded
+    /// corroboration is kept; later proofs never overwrite it (the
+    /// record is append-only in spirit, like the state history).
+    ///
+    /// Additive stage-B2 field: records written by stage B1 decode with
+    /// `None` (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_proof: Option<serde_json::Value>,
     /// Unix epoch seconds at `prepare`.
     pub created_at: u64,
     /// Unix epoch seconds at the last persisted transition.
@@ -414,6 +426,7 @@ mod tests {
             state_history: vec![],
             barrier_proofs: vec![],
             abort_policy: AbortPolicy::AutoBeforeCut,
+            consumer_proof: None,
             created_at: 1,
             updated_at: 2,
         }

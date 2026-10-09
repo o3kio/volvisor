@@ -411,6 +411,14 @@ impl HandoffSurface for DrbdProvider {
     ) -> Result<AttachVolumeResponse, ApiError> {
         DrbdProvider::promote_target(self, volume_id, migration_id, attach)
     }
+
+    async fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError> {
+        DrbdProvider::role_secondary(self, volume_id)
+    }
+
+    async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
+        DrbdProvider::fail_closed_fence(self, volume_id, reason)
+    }
 }
 
 /// The migration-barrier evidence the classifier found for one
@@ -4931,6 +4939,95 @@ impl DrbdProvider {
             eligible,
             participants,
         })
+    }
+
+    /// The provider-local participant facts for one migration
+    /// participant (stage B2: the daemon's `PrepareNearlineHandoff`
+    /// enrichment — the consumer's engine-neutral mobility request
+    /// names volumes and expected generations; the resource name and
+    /// DRBD minor each volume's writer identity lives in are derived
+    /// here from provider state, never asserted by the consumer).
+    ///
+    /// Verifies existence, the expected generation (fail-closed on a
+    /// stale generation: the consumer has not seen this volume
+    /// lately) and that the volume's current attachment names `vm_id`
+    /// (rule 6: eligibility is VM-wide, so a volume attached to a
+    /// different VM refuses the whole preparation).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// `STALE_GENERATION` when `expected_generation` does not match
+    /// the current generation; `INVALID_REQUEST` when the volume is
+    /// not attached to `vm_id`.
+    pub fn migration_participant_facts(
+        &self,
+        volume_id: &VolumeId,
+        vm_id: &str,
+        expected_generation: u64,
+    ) -> Result<(String, u32), ApiError> {
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        if expected_generation != stored.entry.generation {
+            return Err(ApiError::stale_generation(
+                expected_generation,
+                stored.entry.generation,
+            ));
+        }
+        let attached_to_vm = stored
+            .runtime
+            .attachment
+            .as_ref()
+            .is_some_and(|record| record.vm_id == vm_id);
+        if !attached_to_vm {
+            return Err(ApiError::invalid_request(format!(
+                "volume {volume_id} is not attached to vm {vm_id}"
+            )));
+        }
+        Ok((stored.entry.resource_name.clone(), stored.entry.minor))
+    }
+
+    /// Whether one volume's local role is Secondary, from observed
+    /// status (stage B2, [`HandoffSurface::role_secondary`]). A
+    /// verifiably down resource is `Ok(false)` — "not Secondary" is
+    /// the observable fact, never a guessed error.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` for an unknown volume; `INTERNAL` when the status
+    /// observation fails.
+    pub fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError> {
+        let resource = {
+            let state = self.lock_state()?;
+            let stored = state
+                .volume(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            stored.entry.resource_name.clone()
+        };
+        Ok(self
+            .resource_status(&resource)?
+            .is_some_and(|status| status.role == Role::Secondary))
+    }
+
+    /// Fail-closed fencing for one participant (stage B2,
+    /// [`HandoffSurface::fail_closed_fence`]): the P4a self-fence
+    /// path — suspend, durable marker, demote — under the caller's
+    /// reason. The fenced volume is never resumed by this call; a
+    /// demotion that finds the device still open defers to the
+    /// pending-fence completion path exactly like every other fence.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` for an unknown volume; the fence act's typed error
+    /// otherwise (the volume stays suspended — never a silent
+    /// unfenced writer).
+    pub fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
+        let mut state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        let entry = stored.entry.clone();
+        self.self_fence(&mut state, volume_id, &entry, vec![reason.to_owned()])?;
+        Ok(())
     }
 
     /// Quiesce one participant's source data path for a migration

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use volvisor_handoff::{
     BatchStep, Clock, CutProgress, HandoffDriver, HandoffState, MigrationCoordinator,
     MigrationRecord, MigrationStore, Participant, PrepareHandoffRequest, barrier_operation_id,
-    batch_operation_id,
+    batch_operation_id, void_barrier_operation_id,
 };
 use volvisor_types::authority::{
     AuthorityView, BarrierAttestation, EpochRetirement, LeaseState, RecordedMigrationBarrier,
@@ -1424,6 +1424,157 @@ async fn coordinator_uses_deterministic_op_ids() {
     assert_eq!(
         barrier_operation_id(&migration, &vol_a).expect("derive"),
         barrier_operation_id(&migration, &vol_a).expect("derive")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage B2 substrate: consumer-proof corroboration, retry set, void ids
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn consumer_proof_is_first_recorded_and_durable() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.coordinator();
+    coordinator
+        .prepare(prepare_request())
+        .await
+        .expect("prepare");
+
+    // An unknown migration: typed NOT_FOUND, nothing invented.
+    let missing = MigrationId::new("mig-absent").expect("valid id");
+    let err = coordinator
+        .record_consumer_proof(&missing, serde_json::json!({}))
+        .expect_err("absent migration");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+
+    // The first proof is recorded verbatim and durably (a fresh
+    // coordinator — the crashed daemon — reads it back from disk).
+    let first = serde_json::json!({
+        "kind": "barrier-and-transfer",
+        "vm_paused": true,
+    });
+    let record = coordinator
+        .record_consumer_proof(&migration_id(), first.clone())
+        .expect("record proof");
+    assert_eq!(record.consumer_proof, Some(first.clone()));
+    assert_eq!(fixture.stored_record().consumer_proof, Some(first.clone()));
+
+    // A later proof never overwrites the first: the corroborator of
+    // record is whoever corroborated first.
+    let record = coordinator
+        .record_consumer_proof(&migration_id(), serde_json::json!({"kind": "other"}))
+        .expect("record proof again");
+    assert_eq!(record.consumer_proof, Some(first.clone()));
+    assert_eq!(fixture.stored_record().consumer_proof, Some(first.clone()));
+
+    // The proof is corroboration only: the happy drive is unaffected,
+    // and no history entry was appended for it (it is not a state
+    // transition).
+    let before = record.state_history.len();
+    let record = coordinator
+        .transfer(&migration_id())
+        .await
+        .expect("transfer");
+    assert_eq!(record.consumer_proof, Some(first));
+    assert_eq!(record.state, HandoffState::Complete);
+    assert_eq!(
+        record.state_history.len(),
+        before + expected_happy_history().len() - 1
+    );
+}
+
+#[tokio::test]
+async fn list_ids_owns_every_non_terminal_record() {
+    let fixture = Fixture::new();
+    let coordinator = fixture.coordinator();
+    assert_eq!(
+        coordinator.list_ids().expect("empty store"),
+        Vec::<MigrationId>::new()
+    );
+
+    // A live migration is in the retry set.
+    coordinator
+        .prepare(prepare_request())
+        .await
+        .expect("prepare");
+    assert_eq!(
+        coordinator.list_ids().expect("ids"),
+        vec![migration_id()],
+        "a prepared migration is owned by the retry task"
+    );
+
+    // Complete leaves the set.
+    coordinator
+        .transfer(&migration_id())
+        .await
+        .expect("transfer");
+    assert_eq!(
+        coordinator.list_ids().expect("ids"),
+        Vec::<MigrationId>::new(),
+        "a complete migration is nobody's retry"
+    );
+
+    // A second migration aborted pre-cut also leaves the set.
+    let mut request = prepare_request();
+    request.migration_id = MigrationId::new("mig-2").expect("valid id");
+    let record = coordinator.prepare(request).await.expect("prepare 2");
+    coordinator
+        .abort(&record.migration_id)
+        .await
+        .expect("abort");
+    assert_eq!(
+        coordinator.list_ids().expect("ids"),
+        Vec::<MigrationId>::new(),
+        "an aborted migration is nobody's retry"
+    );
+
+    // A terminal InDoubt record stays in the set: resolve() itself
+    // gates its re-attempt on witness reachability, so the retry task
+    // must keep offering it (never resuming anything itself).
+    let mut request = prepare_request();
+    request.migration_id = MigrationId::new("mig-3").expect("valid id");
+    let record = coordinator.prepare(request).await.expect("prepare 3");
+    fixture.world.lock().expect("world").witness_reachable = false;
+    coordinator
+        .abort(&record.migration_id)
+        .await
+        .expect("fail closed");
+    let observed = coordinator
+        .observe(&record.migration_id)
+        .expect("observe")
+        .expect("record exists");
+    assert!(matches!(observed.state, HandoffState::InDoubt { .. }));
+    assert_eq!(
+        coordinator.list_ids().expect("ids"),
+        vec![record.migration_id],
+        "a terminally in-doubt migration stays owned by the retry task"
+    );
+}
+
+#[test]
+fn void_barrier_operation_ids_are_deterministic_and_volume_scoped() {
+    let migration = migration_id();
+    let vol_a = VolumeId::new("vol-a").expect("valid id");
+    let vol_b = VolumeId::new("vol-b").expect("valid id");
+    assert_eq!(
+        void_barrier_operation_id(&migration, &vol_a).expect("derive"),
+        void_barrier_operation_id(&migration, &vol_a).expect("derive")
+    );
+    assert_ne!(
+        void_barrier_operation_id(&migration, &vol_a).expect("derive"),
+        void_barrier_operation_id(&migration, &vol_b).expect("derive")
+    );
+    // Distinct from the record id of the same volume (a void is a
+    // different mutation, never a replay of the record).
+    assert_ne!(
+        void_barrier_operation_id(&migration, &vol_a).expect("derive"),
+        barrier_operation_id(&migration, &vol_a).expect("derive")
+    );
+    assert!(
+        void_barrier_operation_id(&migration, &vol_a)
+            .expect("derive")
+            .as_str()
+            .starts_with("mig-void-barrier-")
     );
 }
 

@@ -43,12 +43,15 @@
 
 pub mod coordinator;
 pub mod store;
+pub mod surface;
 pub mod types;
 
 pub use coordinator::{
-    BatchStep, Clock, HandoffDriver, MigrationCoordinator, barrier_operation_id, batch_operation_id,
+    BatchStep, Clock, HandoffDriver, MigrationCoordinator, barrier_operation_id,
+    batch_operation_id, void_barrier_operation_id,
 };
 pub use store::MigrationStore;
+pub use surface::{MigrationSurface, MobilityRequest, migration_not_enabled};
 pub use types::{
     AbortPolicy, BarrierProof, CutProgress, HandoffState, MigrationRecord, MigrationSummary,
     Participant, PrepareHandoffRequest, StateHistoryEntry,

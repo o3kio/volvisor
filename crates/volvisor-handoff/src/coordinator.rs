@@ -259,6 +259,27 @@ pub fn barrier_operation_id(
     derived_operation_id(migration_id, "record-barrier", &[volume_id.as_str()])
 }
 
+/// Derive the deterministic per-volume operation id for the
+/// `VoidBarrier` that rolls one participant's recorded barrier back
+/// (the same discipline as [`barrier_operation_id`], tag
+/// `void-barrier`).
+///
+/// A stage-B2 driver that voids through a journaled witness mutation
+/// uses this id so a post-crash re-attempt replays the recorded
+/// outcome byte-identically instead of being refused as a fresh
+/// mutation against an already-voided barrier (the round-1 "confirm by
+/// state, not by fresh-mutation success" contract).
+///
+/// # Errors
+/// `INTERNAL` only if the derived string failed identity validation
+/// (unreachable for the fixed tag and hex alphabet).
+pub fn void_barrier_operation_id(
+    migration_id: &MigrationId,
+    volume_id: &VolumeId,
+) -> Result<OperationId, ApiError> {
+    derived_operation_id(migration_id, "void-barrier", &[volume_id.as_str()])
+}
+
 /// The first `bytes * 2` hex characters of a digest, without `format!`
 /// (the house `resource_name_for` discipline).
 fn hex_prefix(digest: &[u8], bytes: usize) -> String {
@@ -387,6 +408,7 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             }],
             barrier_proofs: Vec::new(),
             abort_policy: AbortPolicy::AutoBeforeCut,
+            consumer_proof: None,
             created_at: now,
             updated_at: now,
         };
@@ -550,6 +572,71 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
     ) -> Result<Option<MigrationSummary>, ApiError> {
         self.with_store(|store| Ok(store.get(migration_id)))
             .map(|record| record.map(|record| record.observe()))
+    }
+
+    /// Record the consumer's `BarrierAndTransfer` proof for one
+    /// migration — **corroboration, never an input** (plan §6: the
+    /// coordinator performs and verifies its own pause (§5) and its
+    /// own post-suspension durability proof (D2), so the parameter is
+    /// stored verbatim and a false or absent proof changes nothing
+    /// about the drive).
+    ///
+    /// The **first** recorded proof is kept: a later call never
+    /// overwrites it (the field is as append-only in spirit as the
+    /// state history — the corroborator of record is whoever
+    /// corroborated first). Recording is idempotent and permitted in
+    /// any state; it is a pure store mutation, persisted before the
+    /// record is returned.
+    ///
+    /// Stage B2's `POST /v2/migrations/{id}/transfer` calls this
+    /// before spawning the drive, so the proof is durable even if the
+    /// drive never starts (crash between the 202 and the task).
+    ///
+    /// # Errors
+    /// `NOT_FOUND` when the record does not exist (the proof is only
+    /// meaningful attached to a real migration); `INTERNAL` when the
+    /// store lock is poisoned or the atomic save fails.
+    pub fn record_consumer_proof(
+        &self,
+        migration_id: &MigrationId,
+        proof: serde_json::Value,
+    ) -> Result<MigrationRecord, ApiError> {
+        let now = (self.clock)();
+        self.with_store(|store| {
+            let mut record = store.get(migration_id).ok_or_else(|| {
+                ApiError::not_found(format!("migration {migration_id} does not exist"))
+            })?;
+            if record.consumer_proof.is_none() {
+                record.consumer_proof = Some(proof);
+                record.updated_at = now;
+                store.upsert(&record)?;
+            }
+            Ok(record)
+        })
+    }
+
+    /// The migration ids the retry task owns: every record that is
+    /// neither `Complete` nor `Aborted` (plan §3's periodic reconcile —
+    /// including terminal `InDoubt`, whose re-attempt is itself gated
+    /// by witness reachability inside [`Self::resolve`]). Ordered by
+    /// identity.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the store lock is poisoned.
+    pub fn list_ids(&self) -> Result<Vec<MigrationId>, ApiError> {
+        self.with_store(|store| {
+            Ok(store
+                .load_all()
+                .into_iter()
+                .filter(|record| {
+                    !matches!(
+                        record.state,
+                        HandoffState::Complete | HandoffState::Aborted { .. }
+                    )
+                })
+                .map(|record| record.migration_id)
+                .collect())
+        })
     }
 
     /// The forward drive (steps 1–7 of the cutover sequence). Every

@@ -162,7 +162,7 @@ where
                     operation_id = %operation_id,
                     "replaying recorded outcome without executing"
                 );
-                replay_response(outcome.success, &outcome.response)
+                replay_response(outcome.success, outcome.http_status, &outcome.response)
             }
             None => operation_in_doubt(state, op_kind, &operation_id),
         };
@@ -178,7 +178,11 @@ where
     }?;
     match append {
         IntentAppend::New => {}
-        IntentAppend::Replayed { success, response } => {
+        IntentAppend::Replayed {
+            success,
+            response,
+            http_status,
+        } => {
             state.metrics.record_operation(op_kind, "replayed");
             tracing::info!(
                 kind = op_kind,
@@ -188,7 +192,7 @@ where
             // Same reconstruction as the first-lookup replay above: a
             // concurrently recorded failure must serve the recorded error
             // status, never a 200 wrapping the error body.
-            return replay_response(success, &response);
+            return replay_response(success, http_status, &response);
         }
         IntentAppend::AlreadyInFlight => {
             return operation_in_doubt(state, op_kind, &operation_id);
@@ -297,12 +301,27 @@ fn operation_in_doubt(
 ///
 /// This is the single status-reconstruction path shared by *every* replay:
 /// the first journal lookup before `append_intent`, and the race branch
-/// that re-resolves idempotency inside `append_intent`. Successes replay
-/// as `200` with the stored body; failures replay with the status
-/// reconstructed from the recorded error code and the stored body, so a
-/// replay is status- and byte-compatible with the first caller's response
-/// regardless of which caller executed the mutation.
-fn replay_response(success: bool, response: &Value) -> Result<Response, ApiError> {
+/// that re-resolves idempotency inside `append_intent`. A recorded
+/// `http_status` (stage B2: the mobility routes answer `201` and `202`)
+/// is served verbatim; otherwise successes replay as `200` with the
+/// stored body and failures replay with the status reconstructed from
+/// the recorded error code, so a replay is status- and byte-compatible
+/// with the first caller's response regardless of which caller executed
+/// the mutation.
+fn replay_response(
+    success: bool,
+    http_status: Option<u16>,
+    response: &Value,
+) -> Result<Response, ApiError> {
+    if let Some(status) = http_status {
+        let status = StatusCode::from_u16(status).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "recorded outcome carries an invalid HTTP status",
+            )
+        })?;
+        return Ok(json_response(status, response));
+    }
     if success {
         return Ok(json_response(StatusCode::OK, response));
     }
