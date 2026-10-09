@@ -333,19 +333,25 @@ fn parse_u64_suffix(detail: &str, key: &str) -> u64 {
 
 /// Compute the idempotency request hash for a witness operation.
 ///
-/// Domain-separated SHA-256 over the operation kind, the operation id and
-/// the canonical JSON of the request body (the same discipline as the
-/// Volume API's request hashes). Retries must send byte-identical request
-/// bodies; a reused `operation_id` with a different body is a typed
-/// conflict.
+/// Domain-separated SHA-256 over the operation kind, the target
+/// volume, the operation id and the canonical JSON of the request
+/// body (the same discipline as the Volume API's request hashes). The
+/// volume is folded in because it travels in the URL path, not the
+/// body — without it, the same `operation_id` and body replayed
+/// against a different volume would collide. Retries must send
+/// byte-identical request bodies (and target the same volume); a
+/// reused `operation_id` with a different body is a typed conflict.
 pub(crate) fn request_hash(
     op: &str,
+    volume_id: &VolumeId,
     operation_id: &OperationId,
     body: &impl Serialize,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"volvisor.witness.v1:");
     hasher.update(op.as_bytes());
+    hasher.update(b":");
+    hasher.update(volume_id.as_str().as_bytes());
     hasher.update(b":");
     hasher.update(operation_id.as_str().as_bytes());
     hasher.update(b":");
@@ -410,20 +416,26 @@ mod tests {
 
     #[test]
     fn request_hash_is_deterministic_and_discriminating() {
+        let vol = VolumeId::new("vol-1").expect("valid id");
         let op = OperationId::new("op-1").expect("valid id");
         let req = GrantRequest {
             protocol_version: WITNESS_PROTOCOL_VERSION,
             operation_id: op.clone(),
             host_id: HostId::new("node-a").expect("valid host"),
         };
-        let first = request_hash("grant", &op, &req);
-        assert_eq!(first, request_hash("grant", &op, &req));
+        let first = request_hash("grant", &vol, &op, &req);
+        assert_eq!(first, request_hash("grant", &vol, &op, &req));
         let other_host = GrantRequest {
             protocol_version: WITNESS_PROTOCOL_VERSION,
             operation_id: op.clone(),
             host_id: HostId::new("node-b").expect("valid host"),
         };
-        assert_ne!(first, request_hash("grant", &op, &other_host));
+        assert_ne!(first, request_hash("grant", &vol, &op, &other_host));
+        // The volume travels in the URL path, not the body: the same
+        // operation id and body against a DIFFERENT volume must not
+        // collide (cross-volume replay would return the wrong lease).
+        let other_vol = VolumeId::new("vol-2").expect("valid id");
+        assert_ne!(first, request_hash("grant", &other_vol, &op, &req));
     }
 
     #[test]

@@ -223,7 +223,9 @@ The adopt-and-promote flow (unplanned failover to the surviving host):
      a recorded operator barrier (the only evidence that closes the
      acknowledged-tail question; protocol alone never does);
    - `possible_loss` — the acknowledged tail is not provably present
-     (`boundary: "unknown"` unless a recorded barrier names it);
+     (`boundary` is always `"unknown"` in this stage: a recorded barrier
+     gates `safe_current`, it never names a provable loss boundary for a
+     volume that kept serving past it);
    - `unsafe` — integrity unprovable or a live lease still held.
 4. **Promotion** — only `safe_current`, or a `possible_loss` with the
    request's explicit `allow_loss`, promotes; under a fresh witness epoch

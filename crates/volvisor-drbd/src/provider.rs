@@ -84,7 +84,7 @@ use crate::resgen::{
 use crate::state::{
     AttachmentRecord, ClearedAttachment, ClearedAttachmentReason, DeferredRenewal, DrbdState,
     FencedVolume, PendingFence, ReconcileReport, RenewalReport, ReplicationMode, StoredVolume,
-    UnverifiableVolume, VolumeEntry, VolumeRuntime, unix_now,
+    UnverifiableVolume, VolumeAuthorityBlock, VolumeEntry, VolumeRuntime, unix_now,
 };
 use crate::{CommandOutput, CommandRunner};
 use volvisor_witness::proto::{RegisterResponse, RegistrationContent, WitnessError};
@@ -694,9 +694,13 @@ impl DrbdProvider {
     }
 
     /// Self-fence a witness-managed volume (plan §4): suspend I/O, then
-    /// attempt the demotion. A busy device (the kernel refuses demotion
+    /// attempt the demotion. The pending-fence marker is durably
+    /// recorded **before** the demotion is attempted, so a crash
+    /// between the two routes the restart through reconcile's
+    /// fence-completion path instead of leaving a suspended Secondary
+    /// nothing resumes. A busy device (the kernel refuses demotion
     /// while open — the P3 rule) stays suspended with the attachment
-    /// record cleared, a [`PendingFence`] marker recorded and the
+    /// record cleared, the [`PendingFence`] marker recorded and the
     /// lifecycle `Failed`; reconcile completes the demotion once the
     /// device closes. A clean demotion returns the volume to `Ready`.
     /// Never a silent resume.
@@ -716,6 +720,32 @@ impl DrbdProvider {
         reasons: Vec<String>,
     ) -> Result<FencedVolume, ApiError> {
         self.suspend_io(entry.minor)?;
+        // The fence marker is durable BEFORE the demotion is attempted
+        // (the plan's crash-window discipline): a crash anywhere past
+        // this point leaves the marker that routes the restart through
+        // reconcile's fence-completion path (which demotes, resumes and
+        // clears it) — never a suspended Secondary that nothing resumes
+        // while the state claims it is healthy.
+        let fenced = FencedVolume {
+            volume_id: volume_id.clone(),
+            reasons,
+            demoted: false,
+        };
+        if let Some(volume) = state.volume_mut(volume_id) {
+            volume.runtime.attachment = None;
+            volume.runtime.authority = None;
+            volume.runtime.fence = Some(PendingFence {
+                reason: fenced
+                    .reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "writer authority lost".to_owned()),
+                fenced_at: unix_now(),
+            });
+            volume.runtime.state = VolumeLifecycle::Failed;
+            volume.entry.generation += 1;
+            state.save(&self.state_path)?;
+        }
         let demoted = match self.resource_status(&entry.resource_name)? {
             Some(status) if status.role == Role::Primary => {
                 let output = self.run_drbdadm("secondary", &entry.resource_name)?;
@@ -743,31 +773,17 @@ impl DrbdProvider {
             }
         }
         let complete = demoted && resume_error.is_none();
-        let fenced = FencedVolume {
-            volume_id: volume_id.clone(),
-            reasons,
-            demoted,
-        };
-        if let Some(volume) = state.volume_mut(volume_id) {
-            volume.runtime.attachment = None;
-            volume.runtime.authority = None;
-            if complete {
+        if complete {
+            // The fence finished: clear the durable marker. (A crash
+            // before this save leaves the marker set — reconcile
+            // re-runs the idempotent completion.)
+            if let Some(volume) = state.volume_mut(volume_id) {
                 volume.runtime.fence = None;
                 volume.runtime.state = VolumeLifecycle::Ready;
-            } else {
-                volume.runtime.fence = Some(PendingFence {
-                    reason: fenced
-                        .reasons
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "writer authority lost".to_owned()),
-                    fenced_at: unix_now(),
-                });
-                volume.runtime.state = VolumeLifecycle::Failed;
+                state.save(&self.state_path)?;
             }
-            volume.entry.generation += 1;
-            state.save(&self.state_path)?;
         }
+        let fenced = FencedVolume { demoted, ..fenced };
         if let Some(error) = resume_error {
             return Err(error);
         }
@@ -2175,7 +2191,12 @@ impl DrbdProvider {
     /// `SAFE_CURRENT` is evidence-gated, never protocol-gated: the
     /// only P4a evidence is a recorded barrier whose attestation
     /// covers the last-acknowledged-boundary property (over protocol
-    /// C's synchronous completion).
+    /// C's synchronous completion). Every non-`SAFE_CURRENT` row
+    /// reports `POSSIBLE_LOSS` with an **unknown** boundary — a
+    /// recorded barrier names no provable boundary for a volume that
+    /// kept serving past it (the plan's table mandates `Unknown` for
+    /// all four cells; `Known` boundaries arrive only with P4b's
+    /// `BARRIER_DURABLE`, never from a registration-time attestation).
     fn classify_adoption(
         local_disk: DiskState,
         replication_mode: ReplicationMode,
@@ -2188,9 +2209,7 @@ impl DrbdProvider {
             }
             DiskState::UpToDate | DiskState::Consistent | DiskState::Outdated => {
                 PromotionClassification::PossibleLoss {
-                    boundary: barrier.map_or(LossBoundary::Unknown, |recorded| {
-                        LossBoundary::Known(recorded.boundary.clone())
-                    }),
+                    boundary: LossBoundary::Unknown,
                     authorized: allow_loss,
                 }
             }
@@ -2262,6 +2281,11 @@ impl DrbdProvider {
     /// `FOREIGN_DEVICE_STATE`), `UNKNOWN_FENCING_AUTHORITY` when the
     /// witness is unreachable, `FENCE_PENDING` while the witness is
     /// still inside the W7 fence-wait window for the retired lease.
+    // Adopt is a fail-closed promotion sequence like attach
+    // (verification → authority check → classification gate → grant →
+    // durable record → promote → verify → unwind); splitting it would
+    // scatter the crash-window invariants.
+    #[allow(clippy::too_many_lines)]
     pub fn adopt_and_promote(
         &self,
         volume_id: &VolumeId,
@@ -2331,13 +2355,13 @@ impl DrbdProvider {
         // Promotion: a fresh epoch from the witness (the grant record
         // is the durable FencingProof that retired the old epoch — W2;
         // W7 has already waited out the fence window or the grant
-        // itself refuses with FENCE_PENDING), then `primary --force`
-        // (see the method docs), then verification.
-        let block = authority.acquire(volume_id, None)?;
-        let output = self.run_drbdadm_seed(&facts.resource)?;
-        if !output.success {
-            return Err(command_failed("drbdadm primary --force", &output));
-        }
+        // itself refuses with FENCE_PENDING), then the durable
+        // adoption record, then `primary --force` (see the method
+        // docs), then verification. The record is persisted BEFORE the
+        // promotion — the same crash-window discipline as attach: a
+        // crash between the two leaves a TRACKED volume the
+        // reconciler validates or fences, never an untracked Primary
+        // holding a live lease outside every fence path.
         let size = self.device_size(facts.minor)?;
         if size == 0 {
             return Err(ApiError::new(
@@ -2348,28 +2372,90 @@ impl DrbdProvider {
                 ),
             ));
         }
+        let entry = Self::adopted_volume_entry(&facts, &classification, allow_loss, size)?;
+        let block = authority.acquire(volume_id, None)?;
         let stored = StoredVolume {
-            entry: Self::adopted_volume_entry(&facts, &classification, allow_loss, size)?,
+            entry,
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
                 seeded: true,
-                authority: Some(block),
+                authority: Some(block.clone()),
                 fence: None,
             },
         };
-        self.verify_promotion(&stored.entry)?;
-        let response = self.verified_inspect_response(volume_id, &stored)?;
+        let entry = stored.entry.clone();
         state.insert_volume(volume_id.clone(), stored);
         // Keep the monotonic allocators ahead of the adopted resource
         // so a later allocation can never collide with it.
         state.observe_minor(facts.minor);
         state.observe_port(facts.port);
-        state.save(&self.state_path)?;
+        if let Err(error) = state.save(&self.state_path) {
+            // No durable record: release the just-granted lease
+            // best-effort so a failed save does not hold authority
+            // hostage until the lease lapses.
+            let _ = authority.release(volume_id, &block);
+            return Err(error);
+        }
+        let promoted = self
+            .run_drbdadm_seed(&facts.resource)
+            .and_then(|output| {
+                if output.success {
+                    Ok(())
+                } else {
+                    Err(command_failed("drbdadm primary --force", &output))
+                }
+            })
+            .and_then(|()| self.verify_promotion(&entry));
+        if let Err(error) = promoted {
+            self.unwind_failed_adoption(&mut state, volume_id, &block)?;
+            return Err(error);
+        }
+        let stored = state.volume(volume_id).ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("the adoption record for {volume_id} vanished mid-operation"),
+            )
+        })?;
+        let response = self.verified_inspect_response(volume_id, stored)?;
         Ok(AdoptVolumeResponse {
             classification,
             volume: Some(response),
         })
+    }
+
+    /// Unwind an adoption whose promotion failed after the durable
+    /// record: the volume stays **tracked and `Failed`** (reconcile
+    /// owns any suspended or Primary residue — the entry is never
+    /// silently removed, because a Primary residue with no record is
+    /// exactly the untracked-writer hole the pre-promotion save exists
+    /// to prevent), and the just-granted lease is released best-effort
+    /// so a failed adopt does not hold authority hostage until the
+    /// lease lapses.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the state save fails (the witness lease is
+    /// already released or lapses on its own; the operator sees the
+    /// error and the tracked `Failed` entry).
+    fn unwind_failed_adoption(
+        &self,
+        state: &mut DrbdState,
+        volume_id: &VolumeId,
+        block: &VolumeAuthorityBlock,
+    ) -> Result<(), ApiError> {
+        if let Some(authority) = &self.authority {
+            // Best-effort: the witness may be unreachable and the
+            // lease may already be superseded — both leave the lease
+            // to lapse at the witness, which only delays the next
+            // adopt past the fence window.
+            let _ = authority.release(volume_id, block);
+        }
+        if let Some(volume) = state.volume_mut(volume_id) {
+            volume.runtime.state = VolumeLifecycle::Failed;
+            volume.runtime.authority = None;
+            volume.entry.generation += 1;
+        }
+        state.save(&self.state_path)
     }
 
     /// Build the inspect response for one stored volume, verifying the

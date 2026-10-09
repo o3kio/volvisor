@@ -182,6 +182,10 @@ struct VolumeAuthority {
     /// The fencing proof of the latest retirement (grant or revoke) —
     /// kept for state-idempotent self-release retries.
     last_proof: Option<FencingProof>,
+    /// The registry commit index of the last mutation that touched
+    /// THIS authority (what `inspect` reports as the authority's
+    /// commit index — the global watermark stays internal).
+    last_commit: u64,
 }
 
 /// The durable writer-authority registry.
@@ -287,7 +291,7 @@ impl WitnessCore {
         // Operation-id idempotency first: a journaled retry replays the
         // recorded response even if the registry state has since moved on
         // (strict replay before content comparison).
-        let hash = request_hash("register", &request.operation_id, request);
+        let hash = request_hash("register", volume_id, &request.operation_id, request);
         if let Some(replayed) = self.replay(&request.operation_id, hash)? {
             return Ok(replayed);
         }
@@ -344,7 +348,7 @@ impl WitnessCore {
         request: &GrantRequest,
         now_secs: u64,
     ) -> Result<GrantResponse, WitnessError> {
-        let hash = request_hash("grant", &request.operation_id, request);
+        let hash = request_hash("grant", volume_id, &request.operation_id, request);
         if let Some(replayed) = self.replay(&request.operation_id, hash)? {
             return Ok(replayed);
         }
@@ -422,7 +426,7 @@ impl WitnessCore {
         request: &RenewRequest,
         now_secs: u64,
     ) -> Result<RenewResponse, WitnessError> {
-        let hash = request_hash("renew", &request.operation_id, request);
+        let hash = request_hash("renew", volume_id, &request.operation_id, request);
         if let Some(replayed) = self.replay(&request.operation_id, hash)? {
             return Ok(replayed);
         }
@@ -478,6 +482,14 @@ impl WitnessCore {
     /// attestation shortens a forced revocation's wait to zero; a bare
     /// authorization never shortens it.
     ///
+    /// Trust model (recorded, plan §7): the self-release shortcut keys
+    /// on the holder identity the client asserts under the shared
+    /// bearer token. A token holder impersonating the current holder
+    /// could suppress the next grant's fence window — the same total
+    /// compromise as a leaked token granting itself leases. The token
+    /// is the authentication boundary; per-client identities are P4b
+    /// hardening, not a P4a claim.
+    ///
     /// # Errors
     /// [`WitnessError::StaleEpoch`] on epoch/lease mismatch,
     /// [`WitnessError::InvalidRequest`] when a required authorization or
@@ -488,7 +500,7 @@ impl WitnessCore {
         request: &RevokeRequest,
         now_secs: u64,
     ) -> Result<RevokeResponse, WitnessError> {
-        let hash = request_hash("revoke", &request.operation_id, request);
+        let hash = request_hash("revoke", volume_id, &request.operation_id, request);
         if let Some(replayed) = self.replay(&request.operation_id, hash)? {
             return Ok(replayed);
         }
@@ -611,7 +623,7 @@ impl WitnessCore {
             holder: vol.holder.clone(),
             lease_state,
             lease_remaining_secs,
-            commit_index: self.commit_index,
+            commit_index: vol.last_commit,
             registration: Some(vol.registration.clone()),
         })
     }
@@ -727,6 +739,7 @@ impl WitnessCore {
                         holder: None,
                         lease: None,
                         last_proof: None,
+                        last_commit: 0,
                     },
                 );
             }
@@ -785,6 +798,22 @@ impl WitnessCore {
             }
         }
         self.commit_index += 1;
+        if let Some(vol) = self.volumes.get_mut(mutation.volume_id()) {
+            vol.last_commit = self.commit_index;
+        }
+    }
+}
+
+impl Mutation {
+    /// The volume this mutation touches (every variant is
+    /// volume-scoped).
+    fn volume_id(&self) -> &VolumeId {
+        match self {
+            Mutation::Register { volume_id, .. }
+            | Mutation::Grant { volume_id, .. }
+            | Mutation::Renew { volume_id, .. }
+            | Mutation::Revoke { volume_id, .. } => volume_id,
+        }
     }
 }
 
@@ -1014,7 +1043,7 @@ mod tests {
         // retry with the same operation id computes, or the replay
         // prelude would (correctly) report a conflict instead of
         // completing it.
-        let orphan_hash = request_hash("grant", &op(91), &grant_request(91, 1));
+        let orphan_hash = request_hash("grant", &volume(1), &op(91), &grant_request(91, 1));
         // Build an orphaned intent directly in the journal: a grant whose
         // outcome was never appended (crash between append and response).
         {
@@ -1471,5 +1500,52 @@ mod tests {
         ] {
             assert!(config.validate().is_err(), "{config:?}");
         }
+    }
+
+    #[test]
+    fn the_same_operation_id_across_volumes_never_replays_the_wrong_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = open_core(dir.path());
+        core.register(&volume(1), &register_request(1), 1_000)
+            .expect("register vol-1");
+        core.register(&volume(2), &register_request(2), 1_000)
+            .expect("register vol-2");
+        // The same operation id and a byte-identical body, targeting a
+        // different volume: the volume is folded into the request hash
+        // (it travels in the URL path, not the body), so this is a
+        // typed idempotency conflict — never volume 1's grant response
+        // served for volume 2.
+        core.grant(&volume(1), &grant_request(7, 1), 1_000)
+            .expect("grant vol-1");
+        let error = core
+            .grant(&volume(2), &grant_request(7, 1), 1_000)
+            .expect_err("cross-volume reuse of an operation id");
+        assert!(
+            matches!(error, WitnessError::IdempotencyConflict),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn inspect_reports_the_authoritys_own_commit_index_not_the_global_watermark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = open_core(dir.path());
+        core.register(&volume(1), &register_request(1), 1_000)
+            .expect("register vol-1");
+        core.register(&volume(2), &register_request(2), 1_000)
+            .expect("register vol-2");
+        core.grant(&volume(1), &grant_request(3, 1), 1_000)
+            .expect("grant vol-1");
+        // vol-2's authority last changed at its own registration: the
+        // global watermark (bumped by vol-1's grant) must not leak into
+        // its view.
+        let view_1 = core.inspect(&volume(1), 1_000).expect("inspect vol-1");
+        let view_2 = core.inspect(&volume(2), 1_000).expect("inspect vol-2");
+        assert_eq!(view_1.commit_index, 3, "vol-1's own grant index");
+        assert_eq!(view_2.commit_index, 2, "vol-2's own registration index");
+        // The global watermark equals vol-1's index only because its
+        // grant was the last mutation; vol-2 proves the per-volume
+        // tracking.
+        assert_eq!(core.commit_index(), 3);
     }
 }

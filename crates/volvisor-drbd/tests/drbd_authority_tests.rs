@@ -42,7 +42,7 @@ use common::{
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
 use volvisor_drbd::report::Role;
-use volvisor_drbd::state::{DrbdState, ReplicationMode};
+use volvisor_drbd::state::{DrbdState, PendingFence, ReplicationMode};
 use volvisor_provider::VolumeProvider;
 use volvisor_types::request::{AccessModeRequest, AttachVolumeRequest, DetachVolumeRequest};
 use volvisor_types::{
@@ -1108,4 +1108,120 @@ async fn adopt_refuses_a_stripped_ownership_tag_on_own_backing() {
         role_of(&f.world, &resource_of("vol-stripped")),
         Role::Secondary
     );
+}
+
+// --------------------------------------------- review-round-1 additions
+
+/// The adoption record is durable BEFORE the promotion (the same
+/// crash-window discipline as attach): a failed `primary --force`
+/// after the grant leaves a TRACKED `Failed` volume — never an
+/// untracked Primary holding a live lease outside every fence path —
+/// and the just-granted lease is released, not stranded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_promotion_after_the_grant_unwinds_tracked_and_released() {
+    let kit = witness_kit().await;
+    let state = adopt_fixture(&kit, "vol-unwind", ReplicationMode::A, None);
+    {
+        let mut world = state.world.lock().expect("world");
+        world.fail_primary = true;
+    }
+    let error = state
+        .peer
+        .adopt_and_promote(&state.volume, true)
+        .expect_err("the promotion fails");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    // The record is durable and tracked as Failed.
+    let inspect = state.peer.inspect_volume(&state.volume).await;
+    assert!(
+        inspect.is_ok(),
+        "the adopted volume must stay tracked: {inspect:?}"
+    );
+    if let Ok(inspect) = inspect {
+        assert_eq!(inspect.state, volvisor_types::VolumeLifecycle::Failed);
+    }
+    // The just-granted lease was released (not stranded until lapse):
+    // the witness shows it revoked by the holder's own unwind.
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Revoked);
+    // A retry after the fault clears is the typed already-exists
+    // refusal: the tracked Failed entry is resolved through volume
+    // management, never by a silent second adoption.
+    {
+        let mut world = state.world.lock().expect("world");
+        world.fail_primary = false;
+    }
+    let error = state
+        .peer
+        .adopt_and_promote(&state.volume, true)
+        .expect_err("already tracked");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+}
+
+/// Outside `SAFE_CURRENT` the loss boundary is always `Unknown` (the
+/// plan §5 table): a recorded barrier gates the safe row, it never
+/// names a provable boundary for a volume that kept serving past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_reports_an_unknown_boundary_outside_safe_current() {
+    let kit = witness_kit().await;
+    // Protocol A with a recorded barrier: the previously over-claiming
+    // row — the boundary must still be reported unknown.
+    let state = adopt_fixture(&kit, "vol-boundary", ReplicationMode::A, Some(barrier()));
+    let response = state
+        .peer
+        .adopt_and_promote(&state.volume, false)
+        .expect("classified");
+    assert!(matches!(
+        response.classification,
+        PromotionClassification::PossibleLoss {
+            boundary: LossBoundary::Unknown,
+            authorized: false,
+        }
+    ));
+    assert!(response.volume.is_none());
+}
+
+/// A crash mid-self-fence (after the suspend and demote, before the
+/// completion save) leaves exactly the durable marker the fence
+/// writes BEFORE demoting — and the reconciler completes it: resumed,
+/// marker cleared, `Ready`. Never a silently frozen Secondary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_mid_fence_is_completed_by_the_reconciler() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-midfence").await;
+    // Simulate the crash point: the device suspended, the resource
+    // demoted, the durable state exactly the pre-demotion marker.
+    {
+        let mut world = state.world.lock().expect("world");
+        let resource = world.resources.get_mut(&state.resource).expect("resource");
+        resource.role = Role::Secondary;
+        world.suspended_minors.insert(SEED_MINOR);
+    }
+    {
+        let mut disk = DrbdState::load(&state.state_path).expect("load state");
+        let volume = disk.volume_mut(&state.volume).expect("volume");
+        volume.runtime.attachment = None;
+        volume.runtime.authority = None;
+        volume.runtime.fence = Some(PendingFence {
+            reason: "writer authority lost".to_owned(),
+            fenced_at: START,
+        });
+        volume.runtime.state = volvisor_types::VolumeLifecycle::Failed;
+        disk.save(&state.state_path).expect("save state");
+    }
+    let provider = authority_provider(&kit, &state.state_path, &state.world);
+    let report = provider
+        .last_reconcile_report()
+        .expect("report lock")
+        .expect("startup report");
+    assert_eq!(report.completed_fences, vec![state.volume.clone()]);
+    assert!(
+        !suspended(&state.world, SEED_MINOR),
+        "the fence completion lifts the suspension"
+    );
+    let inspect = provider
+        .inspect_volume(&state.volume)
+        .await
+        .expect("inspect");
+    assert_eq!(inspect.state, volvisor_types::VolumeLifecycle::Ready);
 }
