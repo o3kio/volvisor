@@ -945,3 +945,167 @@ async fn registration_is_content_idempotent_and_refuses_divergence() {
         .expect_err("diverging re-register is refused");
     assert_eq!(error.code, ApiErrorCode::InvalidState);
 }
+
+// ------------------------------------------------- matrix completions
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_suspends_a_live_but_nearly_expired_lease() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-margin").await;
+    // The lease is still live at the witness but its remaining duration
+    // is under the renewal margin: a resumed writer would hold no
+    // W5-conformant deadline until its first renewal — the resume gate
+    // refuses exactly that.
+    kit.witness_clock
+        .store(START + TTL - (INTERVAL - 5), Ordering::SeqCst);
+    let provider = authority_provider(&kit, &state.state_path, &state.world);
+    // The fence completes on the spot here (no device is open in the
+    // fixture): demoted, resumed, and recorded — never left serving.
+    assert_eq!(
+        role_of(&state.world, &state.resource),
+        Role::Secondary,
+        "a nearly-expired lease is not a safe resume"
+    );
+    assert!(
+        !suspended(&state.world, SEED_MINOR),
+        "the fence resumed after the clean demotion"
+    );
+    let report = provider
+        .last_reconcile_report()
+        .expect("report lock")
+        .expect("startup report");
+    assert_eq!(report.fenced_volumes.len(), 1);
+    let inspect = provider
+        .inspect_volume(&state.volume)
+        .await
+        .expect("inspect");
+    // The fence completed cleanly: the attachment is gone and the
+    // volume is Ready (reattachable under a fresh lease), not Failed.
+    assert_eq!(inspect.state, volvisor_types::VolumeLifecycle::Ready);
+    assert_eq!(
+        inspect.attachment_ids,
+        Vec::<volvisor_types::AttachmentId>::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reattach_after_detach_is_not_fence_pending_blocked() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-reattach").await;
+    state
+        .provider
+        .detach_volume(
+            &state.volume,
+            &AttachmentId::new("att-vol-reattach").expect("valid id"),
+            &detach_req("att-vol-reattach", 1),
+        )
+        .await
+        .expect("detach");
+    // W7's self-release exclusion: the holder that demoted and released
+    // itself waits no fence window on the next grant.
+    state
+        .provider
+        .attach_volume(&state.volume, &attach_req("vol-reattach", 3))
+        .await
+        .expect("reattach after a clean release");
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_inside_the_fence_window_is_typed_then_succeeds_after_it() {
+    let kit = witness_kit().await;
+    let state = adopt_fixture(&kit, "vol-adoptwindow", ReplicationMode::A, None);
+    // The dead primary's lease lapsed but the W7 window has not passed:
+    // the adopt caller sees the typed wait, never a promotion.
+    grant_to_peer(&kit, &state.volume).await;
+    kit.witness_clock.store(START + TTL + 5, Ordering::SeqCst);
+    let error = state
+        .peer
+        .adopt_and_promote(&state.volume, true)
+        .expect_err("inside the fence window");
+    assert_eq!(error.code, ApiErrorCode::FencePending);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    // The window passes: the same request succeeds.
+    kit.witness_clock
+        .store(START + TTL + 5 + 5 + 1, Ordering::SeqCst);
+    let response = state
+        .peer
+        .adopt_and_promote(&state.volume, true)
+        .expect("adopt after the window");
+    assert!(response.volume.is_some());
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+}
+
+/// The volvisor-created branch of the ownership check: the ORIGINAL
+/// host, having lost its state file, re-adopts its own volume — its
+/// endpoint is registered as volvisor-created, so the backing LV must
+/// carry the matching `volvisor.owner` tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_of_own_volvisor_created_backing_requires_the_ownership_tag() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume(&f.base, &f.world, "vol-own", GIB);
+    let primary = authority_provider(&kit, &f.state_path, &f.world);
+    let vol = volume("vol-own");
+    primary.register_volume(&vol, None).expect("register");
+    // The host lost its state file (and nothing else): a fresh state
+    // over the same world and authority identity.
+    let lost = f.base.join("state-lost.json");
+    let survivor = DrbdProvider::with_authority(
+        FakeDrbd::runner(&f.world),
+        common::config_for(&f.base),
+        lost,
+        authority_for(&kit, NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("fresh provider");
+    let response = survivor
+        .adopt_and_promote(&vol, true)
+        .expect("the tagged own backing adopts");
+    assert!(
+        response.volume.is_some(),
+        "protocol A + allow_loss promotes"
+    );
+    assert_eq!(role_of(&f.world, &resource_of("vol-own")), Role::Primary);
+}
+
+/// The same flow with the ownership tag stripped from the LV: the
+/// volvisor-created branch refuses — foreign backing is never adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_refuses_a_stripped_ownership_tag_on_own_backing() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume(&f.base, &f.world, "vol-stripped", GIB);
+    let primary = authority_provider(&kit, &f.state_path, &f.world);
+    let vol = volume("vol-stripped");
+    primary.register_volume(&vol, None).expect("register");
+    // Strip the volvisor.owner tag from the backing LV (the
+    // reconstructed-disk case): only the lineage match remains, and it
+    // does not carry the ownership proof this branch requires.
+    {
+        let mut world = f.world.lock().expect("world");
+        let lv = world
+            .lvs
+            .get_mut(&format!("{}/{}", common::VG, resource_of("vol-stripped")))
+            .expect("backing lv");
+        lv.tags.retain(|tag| !tag.starts_with("volvisor.owner="));
+    }
+    let lost = f.base.join("state-lost.json");
+    let survivor = DrbdProvider::with_authority(
+        FakeDrbd::runner(&f.world),
+        common::config_for(&f.base),
+        lost,
+        authority_for(&kit, NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("fresh provider");
+    let error = survivor
+        .adopt_and_promote(&vol, true)
+        .expect_err("untagged own backing is foreign");
+    assert_eq!(error.code, ApiErrorCode::ForeignDeviceState);
+    assert!(error.detail.contains("volvisor.owner"));
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-stripped")),
+        Role::Secondary
+    );
+}
