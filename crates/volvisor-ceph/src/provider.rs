@@ -1783,8 +1783,11 @@ impl CephRbdProvider {
                 // pre-delete lifecycle with the image already in the
                 // recoverable trash, which is Retain's terminal state.
                 // Image names are injective in the pool, so a trash hit
-                // is a replay of our delete, never an adoption; the
-                // replay completes by dropping the state entry.
+                // is indistinguishable from — and operationally
+                // equivalent to — our own replay (even an out-of-band
+                // trash move of our image by a foreign actor lands in
+                // the same terminal state); only the state entry is
+                // dropped, never the trashed image.
                 if !self.list_trash()?.contains(&image_name) {
                     return Err(ApiError::new(
                         ApiErrorCode::Internal,

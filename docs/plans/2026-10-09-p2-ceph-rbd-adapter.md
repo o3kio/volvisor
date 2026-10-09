@@ -125,7 +125,9 @@ Out (recorded follow-ups):
   the remedy is the operator's manual `rbd unmap`. A delete replay that
   finds the image already in the trash (our own half-finished move)
   completes instead of wedging; image names are injective in the pool,
-  so a trash hit is never an adoption.
+  so a trash hit is indistinguishable from — and operationally
+  equivalent to — our own replay: only the state entry is dropped,
+  never the trashed image.
 - Shared-backend note: a `ceph-rbd` volume does not pin the volume to one
   host the way a local LV does — placement constraints reflect that the
   cluster (not a host) backs the volume — but migration eligibility is still
