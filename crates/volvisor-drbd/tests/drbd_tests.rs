@@ -1354,16 +1354,23 @@ async fn reconcile_fails_a_foreign_peer_on_an_unseeded_volume() {
 
 #[tokio::test]
 async fn reconcile_adopts_a_crashed_seed_while_the_resync_is_in_flight() {
-    // The round-2 grammar defect, end to end: a predecessor crashed in
+    // The round-2 grammar fix, end to end: a predecessor crashed in
     // the window between `primary --force` and the state save. Its
     // resource is up MID-RESYNC — local UpToDate, peer Inconsistent —
     // so `drbdsetup status` answers with the real replication-first
     // peer-device line (`replication:SyncSource peer-disk:Inconsistent
-    // done:37.50`). The parser must read that line (the pre-fix
-    // order-reversed parser silently dropped peer_disk from it), the
-    // startup/reconcile pass must adopt the seed from the data-holding
-    // local disk, and health must tell the truth: Degraded overall
-    // while the replica is still catching up, Healthy once it did.
+    // done:37.50`). This test pins that the real-order line drives the
+    // full crashed-seed lifecycle: adoption, a quiet steady-state
+    // pass, honest Degraded-while-resyncing health, Healthy once
+    // caught up. It deliberately does NOT claim to pin the peer-disk
+    // capture itself: the pre-fix order-reversed parser silently
+    // DROPPED peer_disk from this line (no parse error), and the seed
+    // adoption here flows from the data-holding LOCAL disk — peer
+    // observability must not gate crash recovery. The capture fact is
+    // pinned by the report.rs unit tests
+    // (`parses_resync_progress_on_the_peer_disk_line` and the
+    // verbatim 9.29.0 fixtures), which fail under exactly that old
+    // parser.
     let fixture = fixture();
     let volume_id = VolumeId::new("crash-seed").expect("id");
     seed_volume(&fixture.base, &fixture.world, "crash-seed", GIB);

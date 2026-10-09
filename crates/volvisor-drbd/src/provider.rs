@@ -2662,11 +2662,19 @@ fn extent_rounded(size: u64, extent: u64) -> u64 {
 /// NOT the LVM/Ceph providers' 113-character budget: those backends
 /// have no status-line width constraint, DRBD does.
 ///
-/// The remaining wrap exposure is operator-intervention-only (e.g. an
-/// out-of-band `drbdsetup suspend-io` appending `suspended:<reasons>`
-/// to a near-max-length resource line); if that wraps, the status
-/// parse fails closed (`INTERNAL`, the volume is left untouched and
-/// reported unverifiable) — never mis-parsed.
+/// The remaining wrap exposure: resource-line qualifiers that appear
+/// only while the resource is degraded — the operator's out-of-band
+/// `drbdsetup suspend-io` (`suspended:user`), and, importantly NOT an
+/// operator action, the kernel's automatic no-data-access suspension
+/// (`suspended:no-data`) after local data-access loss, i.e. the very
+/// disk-failure observation path. ` name(48..63) + role:Secondary +
+/// " suspended:no-data"` exceeds 80 columns, so on a genuine
+/// failed-disk event with a longer name the qualifier wraps onto a
+/// continuation line and the status parse fails closed (`INTERNAL`,
+/// the volume is left untouched and reported unverifiable) instead of
+/// reporting the documented `Unhealthy` verdict. That is safe (never
+/// mis-parsed) but lossy for names >= 48; a future parser that merges
+/// wrap continuations would close it.
 const RESOURCE_NAME_SANITIZED_MAX_CHARS: usize = 50;
 
 /// The maximum length of a node name (`on <host>` in the generated
