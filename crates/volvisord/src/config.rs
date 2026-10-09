@@ -22,6 +22,10 @@ pub enum ProviderKind {
     /// RBD images in one pool of a Ceph cluster operated outside
     /// volvisor, verified fail-closed at startup.
     Ceph,
+    /// DRBD 9 nearline baseline (P3 prototype): the local end of a
+    /// single-primary replicated resource over an operator-designated
+    /// volume group, verified fail-closed at startup (ADR-0007).
+    Drbd,
 }
 
 /// Default Ceph entity name (`--name`) when `ceph_user` is unset.
@@ -68,6 +72,52 @@ pub struct Config {
     /// Durable ceph provider state path (defaults to
     /// `<journal_dir>/ceph-state.json`).
     pub ceph_state_path: Option<std::path::PathBuf>,
+    /// Operator-designated volume group holding the nearline backing
+    /// LVs (drbd provider only; must exist and be distinct from any
+    /// `native-local` VG — foreign LVs in it are never touched).
+    pub drbd_vg_name: Option<String>,
+    /// Directory the generated `volvisor-<resource>.res` files live in
+    /// (drbd provider only; defaults to `/etc/drbd.d`).
+    pub drbd_config_dir: Option<std::path::PathBuf>,
+    /// The local DRBD `on` node name (drbd provider only; validated
+    /// against `uname -n` at startup — a wrong-host daemon must never
+    /// adopt a peer's resources).
+    pub drbd_node_name: Option<String>,
+    /// The local replication address, an IPv4 dotted quad without port
+    /// (drbd provider only).
+    pub drbd_local_address: Option<String>,
+    /// The peer's `on` node name (drbd provider only).
+    pub drbd_peer_name: Option<String>,
+    /// The peer's replication address as `<ipv4>:<port>` (drbd provider
+    /// only; the peer end is operator-provisioned out of band in P3).
+    pub drbd_peer_address: Option<String>,
+    /// Path of the peer shared secret, an owner-only file (drbd
+    /// provider only; required — peer authentication is a binding v1
+    /// invariant). The secret is read at resource-generation time and
+    /// never configured inline or logged.
+    pub drbd_shared_secret_file: Option<std::path::PathBuf>,
+    /// Inclusive lower bound of the local replication port range (drbd
+    /// provider only; defaults to 7100).
+    #[serde(default = "default_drbd_port_min")]
+    pub drbd_port_min: u16,
+    /// Inclusive upper bound of the local replication port range (drbd
+    /// provider only; defaults to 7199).
+    #[serde(default = "default_drbd_port_max")]
+    pub drbd_port_max: u16,
+    /// Inclusive lower bound of the DRBD minor range (drbd provider
+    /// only; defaults to 100).
+    #[serde(default = "default_drbd_minor_min")]
+    pub drbd_minor_min: u32,
+    /// Inclusive upper bound of the DRBD minor range (drbd provider
+    /// only; defaults to 999).
+    #[serde(default = "default_drbd_minor_max")]
+    pub drbd_minor_max: u32,
+    /// Root of the procfs mount used for the DRBD module check (drbd
+    /// provider only; defaults to `/proc` — test isolation only).
+    pub drbd_proc_root: Option<std::path::PathBuf>,
+    /// Durable drbd provider state path (defaults to
+    /// `<journal_dir>/drbd-state.json`).
+    pub drbd_state_path: Option<std::path::PathBuf>,
     /// Filesystem root for read-only device discovery (defaults to `/`;
     /// test isolation only).
     pub sysfs_root: Option<std::path::PathBuf>,
@@ -85,6 +135,22 @@ pub struct Config {
 
 fn default_max_body_bytes() -> usize {
     1 << 20
+}
+
+fn default_drbd_port_min() -> u16 {
+    7100
+}
+
+fn default_drbd_port_max() -> u16 {
+    7199
+}
+
+fn default_drbd_minor_min() -> u32 {
+    100
+}
+
+fn default_drbd_minor_max() -> u32 {
+    999
 }
 
 impl Config {
@@ -105,36 +171,82 @@ impl Config {
     /// Validate cross-field constraints.
     fn validate(&self) -> Result<(), DaemonError> {
         if self.provider == ProviderKind::Lvm {
-            if self.lvm_vg_prefix.is_none() {
-                return Err(DaemonError::Config(
-                    "lvm_vg_prefix is required for the lvm provider".to_owned(),
-                ));
-            }
-            if self.device_claim_token.as_deref().unwrap_or("").is_empty() {
-                return Err(DaemonError::Config(
-                    "device_claim_token is required for the lvm provider (scoped destructive \
-                     authorization)"
-                        .to_owned(),
-                ));
-            }
+            self.validate_lvm_fields()?;
         }
         if self.provider == ProviderKind::Ceph {
-            if self.ceph_cluster_fsid.is_none() {
-                return Err(DaemonError::Config(
-                    "ceph_cluster_fsid is required for the ceph provider".to_owned(),
-                ));
-            }
-            if self.ceph_mon_hosts.is_none() {
-                return Err(DaemonError::Config(
-                    "ceph_mon_hosts is required for the ceph provider".to_owned(),
-                ));
-            }
-            if self.ceph_pool.is_none() {
-                return Err(DaemonError::Config(
-                    "ceph_pool is required for the ceph provider".to_owned(),
-                ));
+            self.validate_ceph_fields()?;
+        }
+        if self.provider == ProviderKind::Drbd {
+            self.validate_drbd_fields()?;
+        }
+        self.validate_field_shapes()
+    }
+
+    /// Fields required only when the lvm provider is selected.
+    fn validate_lvm_fields(&self) -> Result<(), DaemonError> {
+        if self.lvm_vg_prefix.is_none() {
+            return Err(DaemonError::Config(
+                "lvm_vg_prefix is required for the lvm provider".to_owned(),
+            ));
+        }
+        if self.device_claim_token.as_deref().unwrap_or("").is_empty() {
+            return Err(DaemonError::Config(
+                "device_claim_token is required for the lvm provider (scoped destructive \
+                 authorization)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fields required only when the ceph provider is selected.
+    fn validate_ceph_fields(&self) -> Result<(), DaemonError> {
+        if self.ceph_cluster_fsid.is_none() {
+            return Err(DaemonError::Config(
+                "ceph_cluster_fsid is required for the ceph provider".to_owned(),
+            ));
+        }
+        if self.ceph_mon_hosts.is_none() {
+            return Err(DaemonError::Config(
+                "ceph_mon_hosts is required for the ceph provider".to_owned(),
+            ));
+        }
+        if self.ceph_pool.is_none() {
+            return Err(DaemonError::Config(
+                "ceph_pool is required for the ceph provider".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fields required only when the drbd provider is selected.
+    fn validate_drbd_fields(&self) -> Result<(), DaemonError> {
+        // drbd_config_dir is NOT required: it defaults to the DRBD
+        // convention /etc/drbd.d (see drbd_config_dir_or_default).
+        for (missing, field) in [
+            (self.drbd_vg_name.is_none(), "drbd_vg_name"),
+            (self.drbd_node_name.is_none(), "drbd_node_name"),
+            (self.drbd_local_address.is_none(), "drbd_local_address"),
+            (self.drbd_peer_name.is_none(), "drbd_peer_name"),
+            (self.drbd_peer_address.is_none(), "drbd_peer_address"),
+            (
+                self.drbd_shared_secret_file.is_none(),
+                "drbd_shared_secret_file",
+            ),
+        ] {
+            if missing {
+                return Err(DaemonError::Config(format!(
+                    "{field} is required for the drbd provider"
+                )));
             }
         }
+        Ok(())
+    }
+
+    /// Shape checks for individually-optional fields, independent of the
+    /// selected provider (a wrong shape is a configuration mistake even
+    /// when the field is currently ignored).
+    fn validate_field_shapes(&self) -> Result<(), DaemonError> {
         if let Some(prefix) = &self.lvm_vg_prefix {
             if !is_simple_name(prefix, 64) {
                 return Err(DaemonError::Config(
@@ -169,6 +281,28 @@ impl Config {
                     "ceph_pool must be 1..=64 characters of alnum, '-' and '_'".to_owned(),
                 ));
             }
+        }
+        if let Some(vg) = &self.drbd_vg_name {
+            if !is_simple_name(vg, 64) {
+                return Err(DaemonError::Config(
+                    "drbd_vg_name must be 1..=64 characters of alnum, '-' and '_'".to_owned(),
+                ));
+            }
+        }
+        if self.drbd_port_min > self.drbd_port_max {
+            return Err(DaemonError::Config(
+                "drbd_port_min must not exceed drbd_port_max".to_owned(),
+            ));
+        }
+        if self.drbd_minor_min > self.drbd_minor_max {
+            return Err(DaemonError::Config(
+                "drbd_minor_min must not exceed drbd_minor_max".to_owned(),
+            ));
+        }
+        if self.drbd_minor_max > 4095 {
+            return Err(DaemonError::Config(
+                "drbd_minor_max must not exceed 4095 (the DRBD kernel minor space)".to_owned(),
+            ));
         }
         if let Some(user) = &self.ceph_user {
             // `--name` takes the FULL entity name; a bare id (or a non-client
@@ -212,6 +346,26 @@ impl Config {
     #[must_use]
     pub fn ceph_user_or_default(&self) -> &str {
         self.ceph_user.as_deref().unwrap_or(DEFAULT_CEPH_USER)
+    }
+
+    /// The effective DRBD config directory: the configured value, or
+    /// the DRBD convention `/etc/drbd.d`.
+    #[must_use]
+    pub fn drbd_config_dir_or_default(&self) -> &std::path::PathBuf {
+        static DEFAULT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        self.drbd_config_dir
+            .as_ref()
+            .unwrap_or_else(|| DEFAULT.get_or_init(|| PathBuf::from("/etc/drbd.d")))
+    }
+
+    /// The effective procfs root for the DRBD module check: the
+    /// configured value, or `/proc`.
+    #[must_use]
+    pub fn drbd_proc_root_or_default(&self) -> &std::path::PathBuf {
+        static DEFAULT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        self.drbd_proc_root
+            .as_ref()
+            .unwrap_or_else(|| DEFAULT.get_or_init(|| PathBuf::from("/proc")))
     }
 }
 
@@ -570,6 +724,110 @@ provider = \"ceph\"
         // Mirroring how the lvm provider ignores fake-provider fields:
         // extraneous (but well-formed) lvm_* settings are not an error.
         let raw = minimal_ceph_toml() + "lvm_state_path = \"/j/lvm-state.json\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn minimal_drbd_toml() -> String {
+        "\
+listen = \"127.0.0.1:8787\"
+journal_dir = \"/var/lib/volvisor/journal\"
+provider = \"drbd\"
+drbd_vg_name = \"volvisor-nearline\"
+drbd_node_name = \"host-a\"
+drbd_local_address = \"10.0.0.1\"
+drbd_peer_name = \"host-b\"
+drbd_peer_address = \"10.0.0.2:7100\"
+drbd_shared_secret_file = \"/etc/volvisor/drbd-peer-secret\"
+"
+        .to_owned()
+    }
+
+    #[test]
+    fn parses_minimal_drbd_config() {
+        let cfg: Config = toml::from_str(&minimal_drbd_toml()).expect("parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.provider, ProviderKind::Drbd);
+        // The documented defaults apply when unset.
+        assert_eq!(
+            cfg.drbd_config_dir_or_default(),
+            &std::path::PathBuf::from("/etc/drbd.d")
+        );
+        assert_eq!(
+            cfg.drbd_proc_root_or_default(),
+            &std::path::PathBuf::from("/proc")
+        );
+        assert_eq!(cfg.drbd_port_min, 7100);
+        assert_eq!(cfg.drbd_port_max, 7199);
+        assert_eq!(cfg.drbd_minor_min, 100);
+        assert_eq!(cfg.drbd_minor_max, 999);
+    }
+
+    #[test]
+    fn drbd_provider_requires_every_end_field() {
+        let raw = "\
+listen = \"127.0.0.1:8787\"
+journal_dir = \"/j\"
+provider = \"drbd\"
+";
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        assert!(cfg.validate().is_err());
+        // Each required field, added one at a time, keeps the config
+        // invalid until the last one lands (drbd_config_dir is absent
+        // on purpose: it defaults to /etc/drbd.d).
+        let mut raw = raw.to_owned();
+        for line in [
+            "drbd_vg_name = \"vg\"\n",
+            "drbd_node_name = \"host-a\"\n",
+            "drbd_local_address = \"10.0.0.1\"\n",
+            "drbd_peer_name = \"host-b\"\n",
+            "drbd_peer_address = \"10.0.0.2:7100\"\n",
+        ] {
+            raw.push_str(line);
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            assert!(cfg.validate().is_err(), "still missing a required field");
+        }
+        raw.push_str("drbd_shared_secret_file = \"/etc/volvisor/secret\"\n");
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn drbd_vg_uses_the_lvm_name_rule() {
+        let raw = minimal_drbd_toml().replace(
+            "drbd_vg_name = \"volvisor-nearline\"",
+            "drbd_vg_name = \"has space\"",
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err());
+        let raw = minimal_drbd_toml().replace(
+            "drbd_vg_name = \"volvisor-nearline\"",
+            "drbd_vg_name = \"ok-vg\"",
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn drbd_ranges_must_be_ordered_and_bounded() {
+        let raw = minimal_drbd_toml() + "drbd_port_min = 7200\ndrbd_port_max = 7199\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err(), "inverted port range");
+        let raw = minimal_drbd_toml() + "drbd_minor_min = 200\ndrbd_minor_max = 100\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err(), "inverted minor range");
+        let raw = minimal_drbd_toml() + "drbd_minor_max = 9999\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "minor space beyond the DRBD kernel limit"
+        );
+    }
+
+    #[test]
+    fn ceph_and_lvm_fields_are_simply_ignored_for_drbd() {
+        let raw = minimal_drbd_toml()
+            + "ceph_pool = \"volvisor\"\nlvm_state_path = \"/j/lvm-state.json\"\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert!(cfg.validate().is_ok());
     }

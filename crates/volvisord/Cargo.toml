@@ -24,6 +24,7 @@ volvisor-journal = { workspace = true }
 volvisor-provider = { workspace = true }
 volvisor-lvm = { workspace = true }
 volvisor-ceph = { workspace = true }
+volvisor-drbd = { workspace = true }
 volvisor-api = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

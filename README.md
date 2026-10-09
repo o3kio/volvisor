@@ -49,7 +49,8 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 
 A Rust workspace implements the P0 control plane (stable IDs, device claiming,
 single-volume API/attachments, provider conformance — SPEC-0002 section 12)
-plus the native-local LVM slice and the external Ceph RBD adapter slice:
+plus the native-local LVM slice, the external Ceph RBD adapter slice and the
+DRBD 9 nearline baseline slice:
 
 ```text
 crates/volvisor-types      typed domain vocabulary (Volume API v2 mirror)
@@ -59,6 +60,9 @@ crates/volvisor-provider   engine-neutral provider trait, command runner,
 crates/volvisor-lvm        native-local LVM provider (thick LV, P1 slice)
 crates/volvisor-ceph       ceph-rbd adapter for an existing external Ceph
                            cluster (P2 slice, ADR-0005 Phase A)
+crates/volvisor-drbd       DRBD 9 nearline baseline: the local end of a
+                           single-primary replicated resource over an
+                           operator-designated VG (P3 slice, ADR-0007)
 crates/volvisor-api        HTTP/JSON Volume API v2 server
 crates/volvisord           daemon binary
 ```
@@ -67,8 +71,11 @@ Build and test: `cargo build`, `cargo test --workspace`,
 `cargo clippy --all-targets` (CI denies warnings). Real-LVM integration tests
 run only when `VOLVISOR_TEST_LVM=1` and root are available; real-Ceph
 integration tests run only when `VOLVISOR_TEST_CEPH=1` plus
-`VOLVISOR_CEPH_*` cluster configuration are present. This is prototype
-software: no production-support claim is made or implied (AGENTS rule 12).
+`VOLVISOR_CEPH_*` cluster configuration are present; real-DRBD integration
+tests run only when `VOLVISOR_TEST_DRBD=1` plus `VOLVISOR_DRBD_*` host/peer
+configuration are present (they need the drbd-utils toolchain, the DRBD
+kernel module and a provisioned peer). This is prototype software: no
+production-support claim is made or implied (AGENTS rule 12).
 
 ## Historical draft v1 (superseded proposals)
 
