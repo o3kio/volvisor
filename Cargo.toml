@@ -37,7 +37,7 @@ futures = "0.3"
 
 [profile.release]
 lto = "thin"
-debug = "1"
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -50,3 +50,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 dbg_macro = "deny"
+# Doc-formatting lints produce churn disproportionate to value for a
+# contract-mirror crate; correctness lints stay at full strictness.
+missing_errors_doc = "allow"
+doc_markdown = "allow"
