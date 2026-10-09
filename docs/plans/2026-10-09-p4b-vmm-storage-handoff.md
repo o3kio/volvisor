@@ -2,7 +2,7 @@
 
 Status: normative for the P4b phase (this document is the plan of record;
 implementation PRs cite it)
-Date: 2026-10-09
+Date: 2026-10-09 (rev 2 — round-1 design review findings folded in)
 Builds on: [P4a plan](2026-10-09-p4-witness-fencing-authority.md) (merged as PR #7),
 ADR-0004 Decision 3/4, ADR-0007 "Planned Cloud Hypervisor live migration is a
 separate hard gate", [nearline contract v2](../../contracts/nearline-replication-v2.md)
@@ -25,12 +25,13 @@ records that unlock `SAFE_CURRENT` without operator attestation.
    canonical state machine, its durable per-migration store, startup
    reconcile and `IN_DOUBT` resolution.
 2. **Witness extensions** (new journaled mutations + hardening):
-   per-client host identities, `RecordBarrier`, and batch
+   per-client host identities, `RecordBarrier`/`VoidBarrier`, and batch
    (all-writable-volume) authority mutations.
 3. A **provider handoff surface** (`HandoffSurface`, the
    `AdoptionSurface` pattern applied to migration): source-side
-   quiesce/barrier/transfer primitives and the target-side
-   promote-with-proof, on the DRBD provider.
+   quiesce/barrier/transfer primitives, the durable **migration-cut
+   marker** in `DrbdState`, and the target-side
+   promote-under-granted-lease, on the DRBD provider.
 4. **VMM coordination** (`VmmController` trait): a Cloud Hypervisor
    adapter over `ch-remote` — CLI-honest, verified against the
    upstream command surface (see §5) — and a fake VMM for the test
@@ -60,6 +61,9 @@ records that unlock `SAFE_CURRENT` without operator attestation.
   O3K/CellHV consumer layer) owns VMM process lifecycle. Volvisor
   drives an *already-running* destination VMM through its API socket
   (§5). Starting VMMs would duplicate the consumer's responsibility.
+  Consequence, handled honestly in §3: a dead destination VMM process
+  stalls the forward path in `IN_DOUBT` with a typed detail until the
+  operator restarts the receiver — volvisor never launches it.
 - **Ceph RBD / native-local migration.** `CheckVmStorageMobility`
   reports them ineligible with typed reasons (contract §5); no
   implementation.
@@ -67,8 +71,9 @@ records that unlock `SAFE_CURRENT` without operator attestation.
   memory snapshot to a configured directory that the destination host
   can read (shared filesystem, operator-provided). Volvisor does not
   copy multi-GB snapshots itself; without a shared path the migration
-  is refused at `PREPARED` with a typed reason. Honest availability
-  boundary, recorded in the contract text.
+  is refused — at `PREPARED`, when the destination daemon verifies it
+  can read the directory (not merely at config time), with a typed
+  reason. Honest availability boundary, recorded in the contract text.
 - **Witness garbage collection, multi-peer (>2 data ends) topologies,
   rate-control policy (CONVERGE heuristics).** The state vocabulary and
   the barrier proofs are delivered; dirty-rate-driven scheduling is a
@@ -78,12 +83,12 @@ records that unlock `SAFE_CURRENT` without operator attestation.
 ### Staging (review-surface split, like P4a's two-PR shape)
 
 - **Stage B1 (one PR): the authority substrate.** Witness extensions
-  (identities, `RecordBarrier`, batch mutations, inspect exposure),
-  the `volvisor-handoff` state machine + store + reconcile, the
-  `HandoffSurface` on the DRBD provider, and the
-  `SAFE_CURRENT` adoption unlock. Fully testable without a VMM (the
-  state machine is driven by a fake driver; the provider surface by
-  the existing fake world).
+  (identities, `RecordBarrier`/`VoidBarrier`, batch mutations, inspect
+  exposure), the `volvisor-handoff` state machine + store + reconcile,
+  the `HandoffSurface` on the DRBD provider including the migration-cut
+  marker, and the `SAFE_CURRENT` adoption unlock. Fully testable
+  without a VMM (the state machine is driven by a fake driver; the
+  provider surface by the existing fake world).
 - **Stage B2 (one PR): the cutover.** `VmmController` + the Cloud
   Hypervisor adapter + the fake VMM, the internal peer-daemon surface,
   the consumer-facing mobility endpoints, the coordinator's full
@@ -106,37 +111,49 @@ source host                                destination host
 PREPARED: eligibility (VM-wide),           target replica verified
   migration record created                   (resource present, Secondary,
                                               connected, no fence marker)
+  + snapshot dir readability
+    verified by the destination
 PRECOPY: DRBD replica catch-up observed
   (TrackSync); no memory pre-copy (out of scope, above)
 QUIESCED: ch-remote pause
   + vm.info state == Paused (verified)
-  + provider suspend_io on every
-    participating volume (enforcement point)
+  + provider suspend_io + durable
+    migration-cut marker on every
+    participating volume
 BARRIER_DURABLE: TrackSync proof
   (peer UpToDate, no resync, after the
   suspension fixed the boundary)
   + witness RecordBarrier (authenticated)
-SOURCE_REVOKED: ch-remote snapshot          (memory+state to the shared
-  + ch-remote delete (VM destroyed —          snapshot dir)
-    the source device closes)
-  + drbdadm secondary (demote, device
-    now closed; verified Secondary)
-  + witness batch revoke (self-release,
-    after proven demotion — the P4a
-    release-after-proof discipline)
-  + migration store: SOURCE_REVOKED       [IN_DOUBT window begins]
-DESTINATION_AUTHORIZED:                    witness batch grant (new epochs,
+CUT (point of no return — the store is      [everything from here is
+ written BEFORE each irreversible act]):     forward-only; observed
+  store: cut=snapshotting                  as IN_DOUBT until
+  ch-remote snapshot                        DESTINATION_AUTHORIZED]
+  store: cut=destroying-vm
+  ch-remote delete (the source device
+    closes; the VM is gone — there is
+    no rollback past this line)
+  store: cut=demoting
+  drbdadm secondary (device closed;
+    role re-verified Secondary)
+  store: cut=revoking
+  witness RevokeSet (self-release,
+    after EVERY participant proven
+    Secondary — never a subset)
+SOURCE_REVOKED: store records it
+DESTINATION_AUTHORIZED:                    witness GrantSet (new epochs,
                                              retires leftovers — W2)
-                                           migration store records it
+                                           store records it
                                            [IN_DOUBT window ends]
 VM_RESUMED:                                ch-remote restore (pre-started
-                                             destination VMM, snapshot dir,
-                                             disk paths checked against the
-                                             promoted devices)
+                                             destination VMM; a non-empty
+                                             or half-restored VMM is
+                                             destroyed first — idempotent
+                                             re-drive)
                                            + ch-remote resume
                                            + attachment identity verified
 COMPLETE: source reconciled Secondary,
-  migration record closed
+  migration record closed, cut markers
+  cleared
 ```
 
 Design decisions, each with its rule citation:
@@ -151,14 +168,25 @@ Design decisions, each with its rule citation:
   (`ch-remote restore source_url=file://…`), landing paused, then
   `ch-remote resume`. Every command is in the verified upstream
   surface (§5).
+- **D1a — the cut is a durable, forward-only progress record.** Before
+  the first irreversible act (the snapshot begins the window; the
+  `delete` ends all rollback possibility), the migration store gains a
+  `cut` progress field, updated durably **before** each external side
+  effect (write-ahead, the P4a marker-before-demote discipline). Every
+  state at or past `cut=snapshotting` is forward-only in reconcile and
+  is observed as `IN_DOUBT` (with a per-step detail) until
+  `DESTINATION_AUTHORIZED` — never as a rollback-eligible state, never
+  as a generic `ABORTED`. There is no abort handler for cut-or-later
+  states, by construction (§8 item 4).
 - **D2 — the barrier is fixed by suspension, then proven by
   observation.** `QUIESCED` freezes the source data path at the kernel
   enforcement point (`drbdsetup suspend-io`) after the VMM pause is
-  verified. Only then is replication catch-up observed (`TrackSync`:
-  peer disk `UpToDate`, no resync in progress, connection
-  established). This ordering makes the recorded boundary exact rather
-  than estimated; a catch-up observation taken before the freeze
-  proves nothing about the boundary (ADR-0004 Decision 2's
+  verified, and stamps the durable migration-cut marker into
+  `DrbdState` (D6a). Only then is replication catch-up observed
+  (`TrackSync`: peer disk `UpToDate`, no resync in progress,
+  connection established). This ordering makes the recorded boundary
+  exact rather than estimated; a catch-up observation taken before the
+  freeze proves nothing about the boundary (ADR-0004 Decision 2's
   exact-prefix rule).
 - **D3 — authority transfer stays two observable steps with a real
   `IN_DOUBT` window.** The witness gains batch mutations
@@ -170,20 +198,21 @@ Design decisions, each with its rule citation:
   a crash in between resolves **forward only** (retry the grant) or
   holds `IN_DOUBT` for the operator — the source never resumes
   (AGENTS rule 5, ADR-0004 Decision 4).
-- **D4 — the source self-release is the P4a discipline.** The batch
-  revoke happens only after a **proven** demotion (device closed by
-  VM deletion, `drbdadm secondary` succeeded, role re-verified from
-  `drbdsetup status`). A self-release waives the next grant's W7 wait;
-  it is earned exactly as in detach/adopt: never while a writer might
-  still be serving.
+- **D4 — the source self-release is the P4a discipline, set-wide.**
+  The batch revoke happens only after **every** participant is proven
+  demoted (device closed by VM deletion, `drbdadm secondary`
+  succeeded, role re-verified from `drbdsetup status`). A single
+  participant's refusal holds the whole cut at `cut=demoting` and
+  retries — a subset release is never issued. A self-release waives
+  the next grant's W7 wait; it is earned exactly as in
+  detach/adopt: never while a writer might still be serving.
 - **D5 — dead-source `IN_DOUBT` converges to the P4a adoption path.**
-  If the source host dies inside the window (or after
-  `SOURCE_REVOKED`), the destination does not need the source's
-  migration record: the surviving host resolves through
-  `adopt-and-promote`, and the migration-recorded barrier upgrades the
-  classification to `SAFE_CURRENT` (§7). One recovery vocabulary, two
-  entry points (coordinator-driven roll-forward and adoption), no
-  special cases.
+  If the source host dies inside the window (or after the cut began),
+  the destination does not need the source's migration record: the
+  surviving host resolves through `adopt-and-promote`, and the
+  migration-recorded barrier upgrades the classification to
+  `SAFE_CURRENT` (§7). One recovery vocabulary, two entry points
+  (coordinator-driven roll-forward and adoption), no special cases.
 - **D6 — the coordinator runs on the source host's daemon.** It hosts
   the consumer-facing mobility API, drives the destination host's
   daemon through an internal authenticated peer API (the destination
@@ -192,6 +221,23 @@ Design decisions, each with its rule citation:
   directly. The destination's actions are idempotent provider
   operations driven over the peer API; its own startup reconcile (the
   P4a adoption-record pattern) covers half-done promotes.
+- **D6a — the migration-cut marker makes the suspension durable
+  against the provider's own reconcile.** The provider's startup
+  reconcile auto-resumes a Primary whose lease it can validate; a
+  mid-migration suspended Primary is exactly that shape. The cut
+  marker (`runtime.migration: Option<MigrationCut>` in `DrbdState`,
+  carrying the migration id and the suspension timestamp) changes
+  three behaviors while set: (1) the startup reconcile reports the
+  volume as migration-suspended and does **not** resume it — only the
+  coordinator clears the marker; (2) the renewal pass keeps renewing
+  the lease (the cut needs a live lease; the lease deadline remains
+  the bound — a cut that outlives its lease fails closed through the
+  existing deadline fence and lands in the adoption recovery path);
+  (3) attach/detach of a migration-suspended volume is refused typed.
+  A marker whose migration record no longer exists (corrupt or
+  operator-removed store) is reported and left in place — fail-closed,
+  operator resolution; the provider never invents a migration
+  decision.
 
 ## 3. The migration state machine (`volvisor-handoff`)
 
@@ -203,17 +249,19 @@ Design decisions, each with its rule citation:
   `Prepared`, `Precopy`, `Quiesced`, `BarrierDurable`,
   `SourceRevoked`, `DestinationAuthorized`, `VmResumed`, `Complete`,
   plus the terminal observations `InDoubt { since, detail }` and
-  `Aborted { reason, at }`. Serde-tagged, forward-compatible
-  (`deny_unknown_fields` per the house schema rules; new fields go
-  through schema bumps, not silent rewrites).
+  `Aborted { reason, at }`. The internal cut progress (`cut:
+  Option<CutProgress>` — `Snapshotting | DestroyingVm | Demoting |
+  Revoking`) is a sub-field of the record, not a canonical state;
+  externally, any record with an active cut is observed as `IN_DOUBT`
+  with the step as detail (D1a).
 - `MigrationRecord` — one per `MigrationId`:
   `migration_id, vm_id, source_host, target_host, participants[]`
   (each: `volume_id, expected_generation, resource, minor`),
-  `state`, `state_history[]` (append-only, monotonic — the observable
-  trace `ObserveHandoff` reports), `barrier_proofs[]` (per-volume:
-  boundary commit index, attestation, recorded_at),
-  `abort_policy` (`AutoBeforeSourceRevoked` — the only v1 policy),
-  `created_at/updated_at`.
+  `state`, `cut`, `state_history[]` (append-only, monotonic — the
+  observable trace `ObserveHandoff` reports), `barrier_proofs[]`
+  (per-volume: boundary commit index, attestation, recorded_at),
+  `abort_policy` (`AutoBeforeCut` — the only v1 policy; there is no
+  abort after the cut begins), `created_at/updated_at`.
 - `MigrationStore` — atomic-save JSON (write-temp + fsync + rename,
   the `DrbdState` discipline) at a configured path, keyed by
   `MigrationId`; `load`, `upsert`, `remove` (terminal records are
@@ -222,62 +270,92 @@ Design decisions, each with its rule citation:
   `Arc<dyn HandoffSurface>`, a witness client, a destination peer
   client (§6), a `VmmController`, the store, and a clock. Every
   transition is: perform the side effects → persist the store → only
-  then report the new state. Transitions are idempotent (replay of a
-  recorded step is a no-op check, never a re-execution with different
-  effects).
+  then report the new state; every irreversible act is preceded by its
+  durable write-ahead (D1a). Transitions are idempotent: a re-drive of
+  a recorded step first reconciles the external world (witness view,
+  VMM state, provider state) and skips what is already true — never a
+  blind re-execution with different effects.
 
 ### Reconcile (startup + retry task)
 
 A background task (the renewal-task pattern) and a startup pass drive
-`resolve(record)`:
+`resolve(record)`. **Order matters: the reconcile first queries the
+external facts — the witness view (lease state, current epoch, barrier
+log) and the VMM state (VM present? paused?) — and folds them into the
+store; only then does it choose abort or forward.** The stored state
+alone is never trusted to classify a crash window, because every
+side-effect/persist boundary can leave it stale.
 
-- `Prepared|Precopy|Quiesced|BarrierDurable` → **abort path**: source
-  authority is intact, so rollback is allowed — unsuspend every
-  participating volume, `ch-remote resume` the source VM (if paused),
-  discard the target-side preparation, record `Aborted`. If the
-  rollback itself fails, the volume is left suspended with the
-  migration record `InDoubt`-annotated — fail-closed, never a silent
-  resume.
-- `SourceRevoked` → **forward only**: retry the destination grant
-  batch until it succeeds or the operator intervenes; the state stays
-  `InDoubt`-observable (`SourceRevoked` with an in-flight flag; the
-  API surfaces it as `IN_DOUBT` per the contract's terminal
-  observation). The source VM is already destroyed; there is no
-  rollback and the code must not grow one.
+- `Prepared|Precopy|Quiesced|BarrierDurable` **with no cut** →
+  **abort path**: source authority is intact, so rollback is allowed
+  — void the recorded barriers (W9), unsuspend every participating
+  volume, clear the cut markers, `ch-remote resume` the source VM (if
+  paused), discard the target-side preparation, record `Aborted`. If
+  the rollback itself fails, the volume is routed through `self_fence`
+  (the durable `PendingFence` path) with the migration record
+  `InDoubt`-annotated — fail-closed, never a silent resume, never an
+  unmarked suspension.
+- Any record **with a cut** (`cut=snapshotting` … `revoking`) →
+  **forward only**: re-drive the cut from the reconciled external
+  facts (a VM already destroyed, a demotion already done, a revoke
+  already journaled are each detected, not repeated). The retry
+  reuses the **same witness operation ids** for `RevokeSet`/`GrantSet`
+  (the journal replays the recorded outcome byte-identically; a fresh
+  id would mint a redundant epoch — safe but noisy, and pinned here to
+  keep audit trails one-mutation-per-intent). The state stays
+  `IN_DOUBT`-observable until `DESTINATION_AUTHORIZED`. If forward
+  progress is impossible (destination daemon unreachable, destination
+  VMM dead — §1), the record stays `IN_DOUBT` with a typed detail;
+  the code has no rollback for these states and must not grow one.
+- `SourceRevoked` → forward only (the same re-drive; the revoke
+  already happened or the retry performs it).
 - `DestinationAuthorized|VmResumed` → **forward completion**: drive
-  restore/resume/reconcile to `Complete`.
+  restore (destroying any half-restored destination VM first — the
+  re-drive is idempotent), resume, reconcile the source Secondary,
+  clear the cut markers, `Complete`.
 - `Complete|Aborted` → nothing.
 
 The reconcile is the only writer of `state_history` besides the live
-drive — both go through the same transition function.
+drive — both go through the same transition function, which is
+append-only by construction (a transition appends, never edits).
 
 ## 4. Witness extensions (W8–W10)
 
 New invariants, unit-tested like W1–W7:
 
-- **W8 (caller identity binding).** The witness configuration grows a
-  per-host credential map (`HostId → token`; the existing single
-  shared token remains valid as a legacy *unbound* credential, and
-  every mutation it performs is journaled with
-  `identity: unbound-legacy` and logged — deployment hardening, not a
-  silent trust change). A mutation that asserts a holder (`grant`'s
-  `host_id`, `renew`'s, a self-`revoke`, `RecordBarrier`'s recorder)
-  is accepted only from that holder's credential. This closes the
-  P4a-recorded residual ("per-client identities are P4b hardening")
-  and is the trust root for W9.
-- **W9 (recorded barrier).** New journaled mutation
+- **W8 (caller identity binding).** The witness configuration gains a
+  per-host credential map (`HostId → token`). The legacy single shared
+  token remains valid **for reads only** (inspect/health); every
+  holder-asserting or state-mutating call (`grant`, `renew`,
+  self-`revoke`, `RecordBarrier`, `VoidBarrier`, the batch mutations)
+  requires the credential bound to the asserted holder and is refused
+  typed otherwise. This is a witness protocol version 2 breaking
+  change, deployed with the migration feature (which cannot function
+  without it); it closes the P4a-recorded residual ("per-client
+  identities are P4b hardening") without leaving a shared-token path
+  that could forge holder assertions. Every journaled mutation records
+  the bound identity.
+- **W9 (recorded barrier).** New journaled mutations:
   `RecordBarrier { volume_id, holder, boundary_commit_index,
   attestation { vm_paused_and_drained, data_path_suspended,
-  peer_up_to_date }, migration_id?, recorded_at }`. Enforced: only the
-  current epoch's holder (W8) may record; the boundary must be ≤ that
-  epoch's last commit index; records are immutable once journaled
-  (a re-record for the same epoch is an `IDEMPOTENCY_CONFLICT` unless
-  byte-identical). `inspect` exposes the per-volume barrier log (the
-  latest barrier + the epoch/boundary it attests), replacing
-  registration-time operator attestation as the machine-checkable
-  evidence source. The registration barrier (P4a) remains valid
-  evidence; a migration-recorded barrier at the retired epoch's final
-  commit index is strictly stronger.
+  peer_up_to_date }, migration_id?, recorded_at }` and
+  `VoidBarrier { volume_id, migration_id, holder }`. Enforced:
+  `RecordBarrier` only from the current epoch's holder (W8), while the
+  epoch is current; the boundary is an **ordering token** — the
+  witness's commit index at recording time, placing the barrier in the
+  journal's total order — and carries no claim of being the epoch's
+  final mutation (renewals after the barrier write no data and do not
+  invalidate it; §7 states what the classifier actually checks).
+  `VoidBarrier` only from the recording holder (W8), only before the
+  epoch retires — the abort path's evidence-hygiene step so an
+  aborted migration's barrier can never surface as `SAFE_CURRENT`
+  evidence for a later retirement. Records are immutable once
+  journaled (byte-identical replay aside, a differing re-record is an
+  `IDEMPOTENCY_CONFLICT`). `inspect` exposes the per-volume barrier
+  log: each barrier's attestation, migration id, recorder identity,
+  commit index, and voided flag — plus, per retired epoch, the
+  retirement record's commit index (already in the journal fold; no
+  new mechanism).
 - **W10 (batch atomicity).** `RevokeSet { releases[], migration_id }`
   and `GrantSet { requests[], migration_id }` are single journaled
   mutations: the fold applies all-or-nothing, one commit-index bump
@@ -285,12 +363,12 @@ New invariants, unit-tested like W1–W7:
   existing `MutationEnvelope` discipline). A partial failure rejects
   the whole batch typed. `GrantSet` mints new epochs per volume and
   retires any lingering epochs (W2 semantics, set-wide); `RevokeSet`
-  from the source is a set of self-releases (W8-bound) that waive W7
-  legitimately — every member was proven demoted before the call.
+  from the source is a set of self-releases (W8-bound, every member
+  proven demoted before the call — D4) that waive W7 legitimately.
 
-The witness protocol version bumps to 2 (new routes/mutations; the
-client negotiates). `inspect` gains the barrier log; the `AuthorityView`
-shape change is additive.
+The witness protocol version bumps to 2 (new routes/mutations, the W8
+authn change; the client negotiates). `inspect` gains the barrier log;
+the `AuthorityView` shape change is additive.
 
 ## 5. VMM coordination (`VmmController`)
 
@@ -330,7 +408,7 @@ trait VmmController: Send + Sync {
     fn destroy(&self, vm_id: &str) -> Result<(), ApiError>;            // delete; device release
     fn restore(&self, vm_id: &str, dir: &Path, disks: &[DiskMapping]) -> Result<(), ApiError>;
     fn resume(&self, vm_id: &str) -> Result<(), ApiError>;
-    fn state(&self, vm_id: &str) -> Result<VmState, ApiError>;
+    fn state(&self, vm_id: &str) -> Result<VmState, ApiError>;         // Absent | Created | Running | Paused
 }
 ```
 
@@ -340,18 +418,23 @@ host's promoted device path; the adapter rewrites the copied
 replication pair in the common case, so the rewrite is usually a
 no-op — but it is verified, never assumed). `PauseProof` is the
 observed `Paused` state from `vm.info` — volvisor's own verification,
-not the consumer's attestation.
+not the consumer's attestation. `destroy` and `restore` are
+re-drive-safe: destroying an absent VM succeeds as a no-op when
+`state()` confirms `Absent` (the crash-reconcile dependency), and
+`restore` refuses a non-empty VMM typed (the coordinator destroys the
+half-restored VM first, §3).
 
 ### The fake VMM (test harness)
 
 `FakeVmm` models what the cutover actually depends on: it holds the
 VM's devices open (integrating with `FakeDrbd.open_devices` — the
 minor is inserted while the VM "runs" and removed on `destroy`), tracks
-`Running|Paused|Destroyed` and snapshot directories (real files in a
-tempdir, so a restore genuinely reads what the snapshot wrote). This
-makes rule 17 *provable in tests*: any coordinator bug that demotes
-before `destroy` fails against the fake's busy refusal, exactly as it
-would on a real host.
+`Absent|Created|Running|Paused` and snapshot directories (real files
+in a tempdir, so a restore genuinely reads what the snapshot wrote,
+and an unreadable directory genuinely fails). This makes rule 17
+*provable in tests*: any coordinator bug that demotes before `destroy`
+fails against the fake's busy refusal, exactly as it would on a real
+host.
 
 ## 6. Daemon and API surface
 
@@ -370,10 +453,17 @@ api_socket_dir = "/run/volvisor/vms"
 ```
 
 Validation (the `config.rs` discipline): `migration.enabled` requires
-the drbd provider + a witness; `peer_api_url` must not share a failure
-domain with the local replication end or the witness (the existing
-`ensure_witness_failure_domain` checks extended); `snapshot_dir` must
-exist; refuse `enabled` when `vmm` is unconfigured.
+the drbd provider + a witness; the **witness** must remain in a
+failure domain distinct from both replication ends (the existing
+`ensure_witness_failure_domain` check — the peer API is *expected* to
+be colocated with the peer replication end, since the destination
+daemon is the destination VMM's proxy (D6); only the witness is a
+third domain in this topology); `snapshot_dir` must exist locally
+(its cross-host readability is verified at `PREPARED` by the
+destination daemon, with a typed refusal); refuse `enabled` when
+`vmm` is unconfigured. The new credentials (`peer_api_token`,
+`witness_host_token`) join the API journal's redaction set (the
+`REDACTED_KEYS` discipline) and are never logged or echoed.
 
 ### Consumer-facing routes (source host; journaled, admin-token)
 
@@ -389,7 +479,7 @@ POST /v2/migrations/{migration_id}/transfer BarrierAndTransfer
 GET  /v2/migrations/{migration_id}          ObserveHandoff
   -> {state, state_history[], participants[], in_doubt_detail?}
 POST /v2/migrations/{migration_id}/abort
-  -> {state}                                        # typed refusal after SOURCE_REVOKED
+  -> {state}                                        # typed refusal once the cut began
 ```
 
 `BarrierAndTransfer`'s consumer proof is **recorded, not trusted**:
@@ -401,13 +491,17 @@ without depending on the consumer's honesty.
 
 ```text
 POST /v2/internal/peer/prepare      {migration_id, volume_ids[], expected_generations[]}
-POST /v2/internal/peer/grant        {migration_id}        # the GrantSet + promote-with-proof
+POST /v2/internal/peer/grant        {migration_id}        # the GrantSet + promote-under-granted-lease
 POST /v2/internal/peer/restore-vm   {migration_id, snapshot_dir, disks[]}
-GET  /v2/internal/peer/health
+GET  /v2/internal/peer/health       -> {snapshot_dir_readable: bool, ...}
 ```
 
 Each is idempotent (driven by the coordinator's retry task) and
-refuses volumes not matching the migration's participant set.
+refuses volumes not matching the migration's participant set. They are
+journaled with their own operation ids (the ops.rs pipeline); an
+intent-without-outcome replay resolves by inspecting the witness and
+the provider state — never a blind re-execution (the same
+`OPERATION_IN_DOUBT` discipline as every privileged mutation).
 
 ### Provider surface (`HandoffSurface`, the `AdoptionSurface` pattern)
 
@@ -417,40 +511,75 @@ trait HandoffSurface: Send + Sync {
     async fn quiesce_for_barrier(&self, volume_id: &VolumeId, migration_id: &MigrationId) -> Result<QuiesceProof, ApiError>;
     async fn track_sync(&self, volume_id: &VolumeId) -> Result<SyncProof, ApiError>;
     async fn release_source(&self, volume_id: &VolumeId, migration_id: &MigrationId) -> Result<(), ApiError>;
-    async fn promote_target(&self, volume_id: &VolumeId, migration_id: &MigrationId) -> Result<AttachVolumeResponse, ApiError>;
+    async fn promote_target(&self, volume_id: &VolumeId, migration_id: &MigrationId, attach: &AttachVolumeRequest) -> Result<AttachVolumeResponse, ApiError>;
     async fn abort_prepare(&self, volume_id: &VolumeId, migration_id: &MigrationId) -> Result<(), ApiError>;
 }
 ```
 
 DRBD implementation notes: `quiesce_for_barrier` = suspend-io +
-observed-suspended; `track_sync` = `drbdsetup status` peer disk state
-`UpToDate` + no resync + connection up, **taken after** the suspension
-(D2); `release_source` = the demote-verify-release-clear path (the
-detach tail, minus the consumer request shape — and the demote must
-observe the device closed, refusing typed otherwise, never forcing);
-`promote_target` = the adopt-and-promote core with the migration
-context (no `allow_loss`: the recorded barrier is the proof, §7).
+observed-suspended + the durable cut marker (D6a); `track_sync` =
+`drbdsetup status` peer disk state `UpToDate` + no resync +
+connection up, **taken after** the suspension (D2); `release_source` =
+the demote-verify-release-clear path (the detach tail, minus the
+consumer request shape — the demote observes the device closed,
+refusing typed otherwise, never forcing); `abort_prepare` = void the
+barriers, unsuspend, clear the marker.
+
+`promote_target` is **not** a reuse of `adopt_and_promote` — it is a
+sibling path, **promote-under-granted-lease**, sharing the P4a
+verification core (`verify_adoption`: lineage, Secondary role, the
+definition naming this host, ownership tag) and the entry-creation
+tail, with three named deviations:
+
+1. *Authority gate inverted*: adoption refuses any live lease; the
+   migration path requires the live lease to be **ours at the epoch
+   `GrantSet` minted** (holder = this host, epoch = the granted one,
+   lease live), plus the `FencingProof` of the retired source epoch.
+   A foreign live lease is still `Unsafe`.
+2. *Classification branch*: the P4a classifier's `SafeCurrent`
+   requires Protocol C + the registration barrier; the migration path
+   adds the migration-barrier evidence class (§7) — protocol-independent,
+   because the suspension + `TrackSync` attestation is the claim, not
+   the steady-state protocol.
+3. *Entry provenance*: the tracked entry is created with migration
+   provenance (migration id, granted epoch) and the **attachment
+   record** the restore's disk-path verification needs (vm id, host,
+   device), not adoption's `"adopted"`-project/`Ready` stamp.
 
 ## 7. The `SAFE_CURRENT` unlock
 
 P4a's classifier treats the registration's `RecordedBarrier` as the
 only `SAFE_CURRENT` evidence (operator attestation). P4b adds the
-machine-checked source: when adoption inspects the witness and finds a
-migration-recorded barrier for the retired epoch whose
-`boundary_commit_index` equals that epoch's last commit index, with
-`peer_up_to_date` attested and the recorder W8-bound to the retired
-holder, the classification is `SafeCurrent` — no `allow_loss`
-authorization needed. Anything less keeps the P4a boundaries
-(`PossibleLoss` with the recorded boundary; `Unsafe` for unproven
-fencing). The classifier prefers the strongest evidence present and
-records which evidence class justified the decision in the response.
+machine-checked source. When adoption inspects the witness and finds,
+for the retired source epoch, a **non-voided** `RecordBarrier` whose
+recorder is W8-bound to that epoch's holder with all three
+attestations true (`vm_paused_and_drained`, `data_path_suspended`,
+`peer_up_to_date`), recorded while the epoch was current (the
+barrier's commit index precedes the retirement record's commit index —
+both in the journal fold, both exposed by `inspect`), the
+classification is `SafeCurrent` — no `allow_loss` authorization
+needed.
+
+The comparison is **ordering, not terminality**: the barrier's
+boundary commit index is checked to precede the retirement (the
+barrier was recorded before the epoch ended), never to equal the
+epoch's final mutation — renewals between barrier and retirement
+write no data and are explicitly compatible (a renewal is an authority
+lease extension, not a guest write; the data claim lives entirely in
+the attestations). A voided barrier is never evidence. Anything less
+keeps the P4a boundaries (`PossibleLoss` with the recorded boundary;
+`Unsafe` for unproven fencing). The classifier prefers the strongest
+evidence present and records which evidence class justified the
+decision in the response.
 
 Residual, stated in code docs and the contract: the attestation's
 truth lives on the source host (a compromised or buggy source can
-still lie); W8 makes the recorder accountable, the journal makes the
-record immutable, and the barrier's claims (paused/suspended/UpToDate)
-are each independently re-checkable by an operator from the surviving
-host. This is the same trust class as the P4a self-release.
+still lie); W8 makes the recorder accountable (and removes the
+shared-token forge path entirely — legacy tokens cannot record), the
+journal makes the record immutable, and the barrier's claims
+(paused/suspended/UpToDate) are each independently re-checkable by an
+operator from the surviving host. This is the same trust class as the
+P4a self-release.
 
 ## 8. Honesty and verification rules
 
@@ -473,14 +602,14 @@ host. This is the same trust class as the P4a self-release.
    real-host evidence campaign (the out-of-band R4 gate) must confirm
    with the write-trace oracle. The fake models asynchronous peer
    apply so tests prove the coordinator *waits* rather than assumes.
-4. No path resumes source writes after `SOURCE_REVOKED` (rule 5). The
-   rollback code only exists for pre-revocation states and lives
-   behind a type-level state guard (`SourceRevoked` and later states
-   have no `abort` handler at all).
+4. No path resumes source writes after the cut begins (rule 5). The
+   rollback code exists only for pre-cut states; cut-or-later states
+   have no abort handler at all — the type-level guard is that the
+   abort function's match arms end at `BarrierDurable`-without-cut.
 5. Every consumer-facing and peer-facing mutation is journaled
    (operation id + request hash, the ops.rs pipeline); the migration
-   store's transitions are separately durable and the state history is
-   append-only.
+   store's transitions are separately durable, write-ahead before
+   irreversible acts, and the state history is append-only.
 6. Conformance: the shared provider kit stays green — the mobility
    surface is additive (`HandoffSurface` is optional, like
    `AdoptionSurface`).
@@ -491,31 +620,35 @@ Stage B1 (no VMM):
 
 | # | Row |
 |---|---|
-| 1 | W8: a holder-bound mutation (self-revoke, RecordBarrier) from the wrong host's credential is refused typed; the legacy shared token still works and journals `unbound-legacy` |
-| 2 | W9: RecordBarrier accepted from the epoch holder, boundary ≤ last commit index; over-boundary and stale-epoch recordings refused; re-record byte-identical replays, different content conflicts |
-| 3 | W10: RevokeSet/GrantSet apply all-or-nothing (one member failing rejects the batch); GrantSet retires lingering epochs set-wide; one commit-index bump |
-| 4 | The state machine: every legal transition persists before reporting; replayed steps are no-ops; illegal transitions refused |
-| 5 | Reconcile: each pre-revocation state rolls back (unsuspend + resume + discard); rollback failure → suspended + InDoubt-annotated, never a silent resume |
-| 6 | Reconcile: SourceRevoked rolls forward only; the grant retry eventually completes; no code path re-grants the source |
-| 7 | `quiesce_for_barrier`/`track_sync` on the DRBD provider: suspension observed; peer lag (fake async apply) makes the barrier wait; no convergence → typed timeout, abort before revocation |
-| 8 | `release_source` refuses typed while the (fake) device is open — rule 17 — and completes after `destroy` |
-| 9 | The classifier: a migration-recorded barrier at the final commit index → `SAFE_CURRENT` without `allow_loss`; a short-boundary barrier → `PossibleLoss` with the recorded boundary; no barrier → P4a behavior unchanged |
-| 10 | Multi-volume: one unprepared participant refuses the whole migration (VM-wide eligibility) |
+| 1 | W8: a holder-bound mutation (self-revoke, RecordBarrier, batches) from the wrong host's credential is refused typed; the legacy shared token can inspect but every mutation is refused with the v2 typed error |
+| 2 | W9: RecordBarrier accepted from the epoch holder while current; stale-epoch recording refused; byte-identical re-record replays, differing content conflicts; VoidBarrier from the holder before retirement voids it, after retirement refused |
+| 3 | W10: RevokeSet/GrantSet apply all-or-nothing (one member failing rejects the batch); GrantSet retires lingering epochs set-wide; one commit-index bump; batch retries with the same operation id replay the recorded outcome |
+| 4 | The state machine: every legal transition persists before reporting; replayed steps reconcile external facts and skip what is true; illegal transitions refused; `state_history` is append-only under concurrent observe + crash-replay (no duplication, no edits) |
+| 5 | Reconcile: each pre-cut state rolls back (void barriers, unsuspend, resume, discard); rollback failure routes through `self_fence` (durable marker), never a silent resume |
+| 6 | Reconcile with a cut: forward-only from every cut step, detecting already-done external facts (VM absent, role Secondary, lease revoked, epoch granted) instead of repeating them; no abort path exists for these states |
+| 7 | The cut write-ahead: the store records each cut step BEFORE its external act (crash between write-ahead and act lands in the correct forward re-drive) |
+| 8 | `quiesce_for_barrier`/`track_sync`: suspension observed + cut marker durable; the provider's startup reconcile does NOT resume a migration-suspended Primary (D6a); attach/detach of a cut-marked volume refused typed |
+| 9 | Peer lag (fake async apply) makes the barrier wait; no convergence → typed timeout, abort before the cut |
+| 10 | `release_source` refuses typed while the device is open (rule 17) and completes after `destroy`; one-of-N participants refusing holds the whole RevokeSet — never a subset release |
+| 11 | The classifier: a non-voided migration barrier (all attestations, recorder-bound, pre-retirement ordering) → `SAFE_CURRENT` without `allow_loss`, protocol-independent; a barrier followed by renewals then retirement → still `SAFE_CURRENT` (ordering, not terminality); a voided barrier → never evidence; a short-boundary or partial-attestation barrier → `PossibleLoss` with the recorded boundary; no barrier → P4a behavior unchanged |
+| 12 | Multi-volume: one unprepared participant refuses the whole migration (VM-wide eligibility) |
 
 Stage B2 (fake VMM, end-to-end):
 
 | # | Row |
 |---|---|
-| 11 | Happy path, two-volume VM: PREPARED→COMPLETE; VM resumed on the target (fake VMM state Running, devices open on the target minors, closed on the source); witness epochs retired; barriers recorded; source Secondary |
-| 12 | Rule-17 ordering proof: the demote is attempted only after the VM destroy (a coordinator regression that demotes early fails against the fake's busy device) |
-| 13 | Crash injection between every pair of states (the store is dropped mid-drive): reconcile lands in the correct resolution per §3; specifically crash between revoke and grant → IN_DOUBT observable, forward-only |
-| 14 | Abort before barrier: source VM resumed, volumes unsuspended, target discarded, record `Aborted` |
-| 15 | Abort after SOURCE_REVOKED: typed refusal |
-| 16 | Dead source inside the window: the destination adopts (P4a path) and the recorded barrier yields `SAFE_CURRENT` — D5 convergence |
-| 17 | Eligibility: a VM with one native-local or ceph volume → ineligible with typed reasons; a fenced/failed volume → ineligible |
-| 18 | API: journaling and idempotency for prepare/transfer/abort (replay byte-identical, hash conflict typed); ObserveHandoff reports the exact canonical states and never collapses the revoke/grant pair |
-| 19 | Peer API: wrong token refused; non-participant volume refused; idempotent re-drive |
-| 20 | Config validation: the failure-domain and provider guards of §6 |
+| 13 | Happy path, two-volume VM: PREPARED→COMPLETE; VM resumed on the target (fake VMM Running, devices open on the target minors, closed on the source); witness epochs retired; barriers recorded; source Secondary |
+| 14 | Rule-17 ordering proof: the demote is attempted only after the VM destroy (a coordinator regression that demotes early fails against the fake's busy device) |
+| 15 | Crash injection between every pair of cut steps (the store dropped mid-drive): reconcile lands forward-only in the correct resolution; specifically crash between delete and demote, and between demote and revoke — the states the round-1 review identified — resolve forward, never to the abort path |
+| 16 | Abort before the cut: source VM resumed, barriers voided, volumes unsuspended, target discarded, record `Aborted`; abort after the cut began: typed refusal |
+| 17 | Dead source inside the window: the destination adopts (P4a path) and the recorded barrier yields `SAFE_CURRENT` — D5 convergence |
+| 18 | Half-restored destination: a crashed restore is re-driven by destroying the partial VM first; a dead destination VMM stalls in `IN_DOUBT` with a typed detail |
+| 19 | Snapshot-dir unreadable at the destination: `PREPARED` refuses typed (peer health check) |
+| 20 | Eligibility: a VM with one native-local or ceph volume → ineligible with typed reasons; a fenced/failed volume → ineligible |
+| 21 | API: journaling and idempotency for prepare/transfer/abort (replay byte-identical, hash conflict typed); ObserveHandoff reports the exact canonical states, maps cut-progress to `IN_DOUBT` with step detail, and never collapses the revoke/grant pair; the peer routes resolve intent-without-outcome by inspecting witness/provider state, never a blind re-execution |
+| 22 | One-of-two target promotes failing blocks the VM restore (forward-retried; the VM is never resumed half-migrated) |
+| 23 | The restore's `config.json` disk-path rewrite: matching minors (no-op) and divergent paths (rewrite verified) |
+| 24 | Config validation: witness-third-domain guard, provider requirement, snapshot-dir existence, vmm requirement, credential redaction in journaled payloads |
 
 Real-host items (env-gated, like the P4a `VOLVISOR_TEST_DRBD` gate;
 no CI claim): `VOLVISOR_TEST_CH=1` runs the adapter against a real
@@ -546,6 +679,26 @@ Both stages merged with clean adversarial review verdicts; the §9
 matrix green in CI; the conformance kit green; fmt/clippy(-D
 warnings, both feature sets)/doc clean; the contracts updated; and
 every claim in this plan either implemented or explicitly listed in
-§1's out-of-scope table with its reason. Production support is **not**
-claimed: the real-host evidence campaign (nearline contract §10) is
-the next implementation-order item's prerequisite, not this phase's.
+§1's out-of-scope table with its reason.
+
+Additionally, these normative invariants are completion gates in
+their own right (the round-1 review's findings — an implementation
+that deviates from any of them has not delivered this plan):
+
+- **G1 (D1a)**: no crash window between the VM destroy and the
+  store's revocation record can reach a rollback path; cut-or-later
+  is forward-only and `IN_DOUBT`-observable.
+- **G2 (§7)**: the classifier's comparison is ordering-before-
+  retirement with full attestations and a bound recorder — never an
+  equality against an epoch's final commit index; renewals after the
+  barrier do not downgrade the classification.
+- **G3 (§6)**: `promote_target` is promote-under-granted-lease with
+  the three named deviations from `adopt_and_promote`; it never runs
+  adoption's no-live-lease gate against the granted lease.
+- **G4 (D6a)**: the migration-cut marker is durable, honored by the
+  provider's startup reconcile (no auto-resume), and cleared only by
+  the coordinator.
+
+Production support is **not** claimed: the real-host evidence
+campaign (nearline contract §10) is the next implementation-order
+item's prerequisite, not this phase's.
