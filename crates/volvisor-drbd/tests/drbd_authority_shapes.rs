@@ -404,8 +404,13 @@ async fn lineage_uuids_are_deterministic_across_world_reseeds() {
     }
     assert_eq!(outputs[0], outputs[1], "re-seeded worlds agree");
 
-    // The provider create path (create-md assigns the set) produces
-    // the same bytes as the seeded fixture for the same volume id.
+    // The provider create path (create-md assigns the set) mints a
+    // FRESH identity set: real create-md generates a new random
+    // current UUID per initialization (v08_md_initialize,
+    // drbdmeta.c:2679-2686), so a created volume never shares the
+    // seeded fixture's lineage — and a recreated same-named volume
+    // never inherits the old one. This is exactly the property the
+    // adopt flow's lineage comparison exists to close.
     let created = {
         let fixture = fixture();
         fixture
@@ -418,7 +423,7 @@ async fn lineage_uuids_are_deterministic_across_world_reseeds() {
         assert!(out.success);
         out.stdout
     };
-    assert_eq!(created, outputs[0], "create-md and seed agree");
+    assert_ne!(created, outputs[0], "create-md mints a fresh lineage");
 
     // A different volume is a different lineage.
     let other = {

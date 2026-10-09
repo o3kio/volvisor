@@ -1108,6 +1108,7 @@ name = "volvisor-drbd"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "serde",
  "serde_json",
  "sha2",
@@ -1115,6 +1116,7 @@ dependencies = [
  "tokio",
  "volvisor-provider",
  "volvisor-types",
+ "volvisor-witness",
 ]
 
 [[package]]

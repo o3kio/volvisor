@@ -44,6 +44,9 @@
 //! - [`client`]: the engine-neutral [`client::WitnessConnection`] trait
 //!   with an HTTP implementation, which storage daemons and tests use to
 //!   talk to a witness;
+//! - [`blocking`]: the synchronous mirror boundary
+//!   ([`blocking::BlockingWitnessConnection`]) for engine code whose
+//!   control paths are synchronous;
 //! - [`config`]: the witness daemon's [`config::WitnessConfig`].
 //!
 //! ## Honesty
@@ -58,12 +61,14 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod blocking;
 pub mod client;
 pub mod config;
 pub mod proto;
 pub mod registry;
 pub mod server;
 
+pub use blocking::{BlockingWitness, BlockingWitnessConnection};
 pub use config::WitnessConfig;
 pub use proto::WITNESS_PROTOCOL_VERSION;
 pub use registry::{WitnessCore, WitnessCoreConfig};

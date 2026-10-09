@@ -50,9 +50,9 @@ pub use id::{
     VolumeId,
 };
 pub use request::{
-    AccessModeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
-    ErasurePolicy, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
-    ListVolumesResponse, PROVIDER_API_VERSION,
+    AccessModeRequest, AdoptVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
+    DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest, GrowVolumeResponse,
+    InspectVolumeResponse, ListVolumesResponse, PROVIDER_API_VERSION,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 

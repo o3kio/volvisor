@@ -51,13 +51,18 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod authority;
 pub mod provider;
 pub mod report;
 pub mod resgen;
 pub mod state;
 
+pub use authority::AuthorityContext;
 pub use provider::{DrbdProvider, DrbdProviderConfig, PROVIDER_NAME, resource_name_for};
-pub use state::{ClearedAttachment, ClearedAttachmentReason, ReconcileReport, ReplicationMode};
+pub use state::{
+    ClearedAttachment, ClearedAttachmentReason, ReconcileReport, ReplicationMode,
+    VolumeAuthorityBlock,
+};
 // The command-execution abstraction is shared with the LVM and Ceph
 // adapters and lives in volvisor-provider; re-exported here for API
 // stability.

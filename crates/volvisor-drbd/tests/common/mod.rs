@@ -66,7 +66,7 @@ use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_fo
 use volvisor_drbd::report::{DiskState, Role};
 use volvisor_drbd::resgen::{ResourceDefinition, parse_resource_file};
 use volvisor_drbd::state::{DrbdState, ReplicationMode, StoredVolume, VolumeEntry, VolumeRuntime};
-use volvisor_drbd::{CommandOutput, CommandRunner, FakeRunner};
+use volvisor_drbd::{AuthorityContext, CommandOutput, CommandRunner, FakeRunner};
 use volvisor_provider::VolumeProvider;
 use volvisor_types::domain::{Health, VolumeClass};
 use volvisor_types::request::{
@@ -204,8 +204,30 @@ impl GiSet {
     /// drbdmeta.c:2683-2685).
     #[must_use]
     pub fn for_resource(resource: &str) -> Self {
+        Self::from_current(fnv1a64(resource.as_bytes()))
+    }
+
+    /// A freshly minted identity set for the `generation`-th creation
+    /// of `resource` (`generation >= 1`). Real `create-md` generates a
+    /// NEW random current UUID every time it initializes metadata
+    /// (v08_md_initialize, drbdmeta.c:2679-2686): a recreated
+    /// same-named volume must NOT inherit the old lineage — this is
+    /// exactly the recreated-volume hole the adopt flow's lineage
+    /// comparison exists to close, so the fake models it (the salted
+    /// derivation stands in for the kernel's randomness).
+    #[must_use]
+    pub fn for_resource_generation(resource: &str, generation: u64) -> Self {
+        let mut data = resource.as_bytes().to_vec();
+        data.extend_from_slice(&generation.to_le_bytes());
+        Self::from_current(fnv1a64(&data))
+    }
+
+    /// Build a set from the derived current UUID (zero maps to
+    /// `UUID_JUST_CREATED`), over create-md-initialized bitmap and
+    /// history.
+    fn from_current(current: u64) -> Self {
         Self {
-            current_uuid: match fnv1a64(resource.as_bytes()) {
+            current_uuid: match current {
                 0 => UUID_JUST_CREATED,
                 value => value,
             },
@@ -331,6 +353,12 @@ pub struct FakeDrbd {
     /// reports): on-LV metadata content, assigned at create-md,
     /// surviving `down`, dying with `lvremove`.
     pub lineage: BTreeMap<String, GiSet>,
+    /// Monotonic counter of lineage sets minted in this world (see
+    /// [`GiSet::for_resource_generation`]): every `create-md` (and
+    /// first materialization of a seeded resource) mints a fresh
+    /// generation, so a recreated same-named volume never inherits the
+    /// old identity set.
+    pub lineage_salt: u64,
     // -- Fault-injection matrix (one bool per scripted failure) --
     /// `lvcreate` fails.
     pub fail_lvcreate: bool,
@@ -387,6 +415,7 @@ impl Default for FakeDrbd {
             suspended_minors: BTreeSet::new(),
             peer_node_id: 1,
             lineage: BTreeMap::new(),
+            lineage_salt: 0,
             fail_lvcreate: false,
             fail_lvextend: false,
             fail_primary: false,
@@ -633,13 +662,15 @@ fn script_drbdadm(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> 
             // create-md (re-)initializes the on-LV metadata, which
             // includes the data-generation identity set: fresh
             // metadata carries only the current UUID
-            // (v08_md_initialize — drbdmeta.c:2679-2686; the kernel
-            // then generates the real random UUID on first use). The
-            // fake assigns the resource's deterministic set (see
-            // [`GiSet`]).
-            world
-                .lineage
-                .insert(resource.to_owned(), GiSet::for_resource(resource));
+            // (v08_md_initialize — drbdmeta.c:2679-2686) and a NEW
+            // random current UUID is generated per initialization —
+            // the fake models that with a fresh generation salt (see
+            // [`GiSet::for_resource_generation`]).
+            world.lineage_salt += 1;
+            world.lineage.insert(
+                resource.to_owned(),
+                GiSet::for_resource_generation(resource, world.lineage_salt),
+            );
             Some(CommandOutput::success(format!(
                 "initial metadata created for {resource}\n"
             )))
@@ -721,12 +752,14 @@ fn script_drbdadm_up(
         .map_or_else(|| PEER_NODE.to_owned(), |node| node.name.clone());
     let device_size = lv.size.min(world.peer_backing(lv.size));
     // Materialize the on-LV identity set for resources whose metadata
-    // was seeded straight into the world (same deterministic set
-    // create-md assigns, so both paths agree byte for byte).
+    // was seeded straight into the world: a fresh generation salt, as
+    // create-md would mint (the stored set is the single source of
+    // truth for the resource from here on).
+    world.lineage_salt += 1;
     world
         .lineage
         .entry(resource.to_owned())
-        .or_insert_with(|| GiSet::for_resource(resource));
+        .or_insert_with(|| GiSet::for_resource_generation(resource, world.lineage_salt));
     world.resources.insert(
         resource.to_owned(),
         FakeResource {
@@ -995,7 +1028,10 @@ fn script_drbdsetup_show_gi(world: &mut FakeDrbd, args: &[&str]) -> CommandOutpu
     let gi = world
         .lineage
         .entry(resource.to_owned())
-        .or_insert_with(|| GiSet::for_resource(resource))
+        .or_insert_with(|| {
+            world.lineage_salt += 1;
+            GiSet::for_resource_generation(resource, world.lineage_salt)
+        })
         .clone();
     CommandOutput::success(gi.show_gi_text())
 }
@@ -1269,6 +1305,128 @@ pub fn provider_from(state_path: &Path, world: &Arc<Mutex<FakeDrbd>>) -> Arc<Drb
         .expect("provider construction")
 }
 
+/// Like [`provider_from`], but witness-managed (P4a): the provider
+/// takes the writer-authority context and its startup reconciliation
+/// fail-closes on primaries it cannot prove.
+pub fn provider_from_with_authority(
+    state_path: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    authority: AuthorityContext,
+) -> Arc<DrbdProvider> {
+    let runner = FakeDrbd::runner(world);
+    let base = state_path
+        .parent()
+        .expect("state path has a parent directory");
+    DrbdProvider::with_authority(
+        runner,
+        config_for(base),
+        state_path.to_path_buf(),
+        authority,
+    )
+    .map(Arc::new)
+    .expect("provider construction")
+}
+
+/// The fixture configuration seen from the OTHER host (the P3 peer):
+/// node, peer and addresses swapped (the seeded definitions pin the
+/// original node's replication port to `SEED_PORT`). Adoption tests
+/// run on this view after flipping the world's node name (see
+/// [`flip_world_to_peer`]).
+#[must_use]
+pub fn config_for_peer(base: &Path) -> DrbdProviderConfig {
+    let (peer_ip, _peer_port) = peer_endpoint();
+    DrbdProviderConfig {
+        node_name: PEER_NODE.to_owned(),
+        peer_name: NODE.to_owned(),
+        local_address: peer_ip,
+        peer_address: format!("{LOCAL_ADDR}:{SEED_PORT}"),
+        ..config_for(base)
+    }
+}
+
+/// Flip the simulated world to the peer host's view: `uname -n`
+/// answers the peer name and the res-file peer device of a resource
+/// is the original node (node-id 0 — the generated definitions pin
+/// the local node to 0 and the peer to 1).
+pub fn flip_world_to_peer(world: &Arc<Mutex<FakeDrbd>>) {
+    let mut world = world.lock().expect("world");
+    world.node_name.clear();
+    world.node_name.push_str(PEER_NODE);
+    world.peer_node_id = 0;
+}
+
+/// Seed a running resource, its res file and its backing LV into the
+/// host directory and world WITHOUT any state entry — the shape the
+/// surviving (peer) host sees for a volume whose primary died (the
+/// P4a plan §5 adopt-and-promote fixture). `tagged` selects the
+/// volvisor-created branch (a `volvisor.owner`-tagged LV) versus the
+/// operator-provisioned peer side (no tag).
+pub fn seed_foreign_volume(
+    base: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    volume_id: &str,
+    size_bytes: u64,
+    protocol: ReplicationMode,
+    tagged: bool,
+) -> String {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let resource = resource_name_for(&volume_id);
+    let (peer_ip, peer_port) = peer_endpoint();
+    ResourceDefinition {
+        resource_name: resource.clone(),
+        minor: SEED_MINOR,
+        protocol,
+        local_node: NODE.to_owned(),
+        local_address: LOCAL_ADDR.to_owned(),
+        local_port: SEED_PORT,
+        peer_node: PEER_NODE.to_owned(),
+        peer_address: peer_ip,
+        peer_port,
+        disk_path: format!("/dev/{VG}/{resource}"),
+        shared_secret: SECRET.to_owned(),
+    }
+    .write(&base.join("drbd.d"))
+    .expect("write fixture res file");
+    let mut world = world.lock().expect("world");
+    let key = format!("{VG}/{resource}");
+    let extent = world.vg_extent_size;
+    let mut tags = vec!["volvisor.generation=1".to_owned()];
+    if tagged {
+        tags.insert(0, format!("volvisor.owner={}", volume_id.as_str()));
+    }
+    world.lvs.insert(
+        key.clone(),
+        FakeLv {
+            size: extent_round_up(size_bytes, extent),
+            tags,
+            has_data: true,
+        },
+    );
+    world.metadata.insert(resource.clone());
+    world.lineage_salt += 1;
+    let generation = world.lineage_salt;
+    world.lineage.insert(
+        resource.clone(),
+        GiSet::for_resource_generation(&resource, generation),
+    );
+    let local = world.lvs.get(&key).map_or(size_bytes, |lv| lv.size);
+    let device = local.min(world.peer_backing(local));
+    world.resources.insert(
+        resource.clone(),
+        FakeResource {
+            minor: SEED_MINOR,
+            role: Role::Secondary,
+            local_disk: DiskState::UpToDate,
+            peer_disk: DiskState::UpToDate,
+            peer_role: Role::Secondary,
+            resyncing: false,
+            device_size: device,
+            peer_node: NODE.to_owned(),
+        },
+    );
+    resource
+}
+
 /// The peer's `(ip, port)` the fixture definitions carry.
 fn peer_endpoint() -> (String, u16) {
     let (ip, port) = PEER_ADDR
@@ -1279,11 +1437,23 @@ fn peer_endpoint() -> (String, u16) {
 
 /// The resource definition matching a [`seed_volume`] state entry.
 pub fn seed_definition(resource: &str, minor: u32, port: u16) -> ResourceDefinition {
+    seed_definition_with_protocol(resource, minor, port, ReplicationMode::A)
+}
+
+/// Like [`seed_definition`], with the replication protocol chosen (the
+/// adopt-flow classification branches on it — protocol C with a
+/// recorded barrier is the `SAFE_CURRENT` evidence row).
+pub fn seed_definition_with_protocol(
+    resource: &str,
+    minor: u32,
+    port: u16,
+    protocol: ReplicationMode,
+) -> ResourceDefinition {
     let (peer_ip, peer_port) = peer_endpoint();
     ResourceDefinition {
         resource_name: resource.to_owned(),
         minor,
-        protocol: ReplicationMode::A,
+        protocol,
         local_node: NODE.to_owned(),
         local_address: LOCAL_ADDR.to_owned(),
         local_port: port,
@@ -1308,6 +1478,18 @@ pub fn write_seed_res_file(base: &Path, resource: &str, minor: u32, port: u16) {
 /// `UpToDate`, Secondary) into the simulated world (reconciliation /
 /// foreign-state / lifecycle tests).
 pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, size_bytes: u64) {
+    seed_volume_with_protocol(base, world, volume_id, size_bytes, ReplicationMode::A);
+}
+
+/// Like [`seed_volume`], with the resource definition's replication
+/// protocol chosen (the adopt-flow classification branches on it).
+pub fn seed_volume_with_protocol(
+    base: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    volume_id: &str,
+    size_bytes: u64,
+    protocol: ReplicationMode,
+) {
     let volume_id = VolumeId::new(volume_id).expect("valid volume id");
     let resource = resource_name_for(&volume_id);
     let state_path = base.join("state.json");
@@ -1326,7 +1508,7 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
                 generation: 1,
                 project_id: ProjectId::new("seed-project").expect("valid project id"),
                 block_size: 4096,
-                replication_mode: ReplicationMode::A,
+                replication_mode: protocol,
                 creation_payload: "seed".to_owned(),
                 created_at: 0,
             },
@@ -1334,6 +1516,8 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
                 state: VolumeLifecycle::Ready,
                 attachment: None,
                 seeded: true,
+                authority: None,
+                fence: None,
             },
         },
     );
@@ -1342,7 +1526,9 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
     state.observe_minor(SEED_MINOR);
     state.observe_port(SEED_PORT);
     state.save(&state_path).expect("seed volume state");
-    write_seed_res_file(base, &resource, SEED_MINOR, SEED_PORT);
+    seed_definition_with_protocol(&resource, SEED_MINOR, SEED_PORT, protocol)
+        .write(&base.join("drbd.d"))
+        .expect("write fixture res file");
     let mut world = world.lock().expect("world");
     let key = format!("{VG}/{resource}");
     let extent = world.vg_extent_size;

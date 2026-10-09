@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::authority::AuthoritySummary;
+use crate::authority::{AuthoritySummary, PromotionClassification};
 use crate::domain::{
     EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning, VolumeClass,
 };
@@ -474,6 +474,24 @@ pub struct InspectVolumeResponse {
 pub struct ListVolumesResponse {
     /// Volumes visible in the request scope.
     pub volumes: Vec<InspectVolumeResponse>,
+}
+
+/// Adopt-and-promote response (P4a plan §5/§6): the honest promotion
+/// classification — including a refused one (`unsafe`, or
+/// `possible_loss` without the recorded `allow_loss` authorization) —
+/// and the resulting volume state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptVolumeResponse {
+    /// The classification computed from observed facts only.
+    pub classification: PromotionClassification,
+    /// The recorded volume state after a **successful** adoption;
+    /// `None` on refusal — nothing was adopted and this host's state
+    /// is unchanged (the resource keeps whatever out-of-band state it
+    /// had; nothing is fabricated for a volume this host does not
+    /// hold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<InspectVolumeResponse>,
 }
 
 /// AttachVolume response: a host-scoped, ephemeral backend handle, never raw
