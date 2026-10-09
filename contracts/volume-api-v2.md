@@ -100,7 +100,7 @@ MoveVolumeBackingOnline(volume_id, target_pool_id, expected_generation,
 - `MoveVolumeBackingOnline` does not change compute host or guest disk identity. Backends advertise `same_vg_extent_move` and `same_host_live_backing_move` separately, bound to actual LV layout/VMM/frontend/QSD qualification.
 - Native LVM `pvmove` is restricted to supported physical extent migrations within the same VG, and should not be presented as arbitrary per-thin-LV cross-pool movement.
 - General online same-host move via QEMU Storage Daemon vhost-user-blk is an **experimental** capability until mirror, pivot, reattach/restart, writer fencing, guest flush/FUA, idempotency and in-doubt recovery pass fault injection.
-- Source deletion must only occur after the target pivot and persistent ownership reconciliation; an unknown result is not a safe reason to revert authority or delete either copy.
+- Source deletion must only occur after the target pivot and persistent ownership reconciliation; an unknown result is not a safe reason to revert authority or delete either copy. Never report a generic `FAILED` after the pivot: the outcome is `IN_DOUBT` or rolls forward under reconciled authority, mirroring the cross-host handoff rules in section 5.
 
 ## 5. MigrateVolume / MigrateVM
 
@@ -151,6 +151,7 @@ Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse
 Versioned provider capabilities:
 `create`, `attach`, `resize`, `snapshot`, `clone`, `local_mirror`,
 `encryption`, `replicate`, `live_migrate`, `offline_copy`,
+`same_vg_extent_move`, `same_host_live_backing_move`,
 `rbd_cluster_adapter`, `managed_ceph_osd`, `pci_passthrough`.
 
 Capabilities must be tied to implementation/VMM version and **evidence**, not inferred from a backend product name. No class is production-supported before its exact-SHA conformance and real-host failure evidence gates.

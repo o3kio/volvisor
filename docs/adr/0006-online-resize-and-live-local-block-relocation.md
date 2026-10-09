@@ -1,6 +1,7 @@
 # ADR-0006 — Online block-volume growth and live backing-store relocation
 
 Status: Proposed (R&D-gated)
+Decision-accepted: pending (record acceptance date and accepting authority here)
 Date: 2026-10-09
 Related: [ADR-0003](0003-tiered-volume-virtualization.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [Volume API v2](../../contracts/volume-api-v2.md)
 
@@ -48,7 +49,7 @@ QSD brings extra process, packaging, failure domain and potential latency/CPU co
 
 ## Online capacity growth for native logical LV
 
-1. Consumer requests `ResizeVolume` with `expected_generation` and new size. Grow-only in v0, and ensure quota, reserve, layout and thin metadata headroom.
+1. Consumer requests `GrowVolume` with `expected_generation` and new size. Grow-only in v0, and ensure quota, reserve, layout and thin metadata headroom.
 2. Volvisor journal intent and grows backing LV using LVM/dm (e.g. `lvextend -L +50G vg/vol` for a qualified thick LV; thin virtual-size changes use their specific LVM operations).
 3. Verify actual mapped block size with `blockdev --getsize64`. Do not infer from command exit code alone.
 4. Call Cloud Hypervisor `PUT /api/v1/vm.resize-disk` using its configured disk ID and actual desired bytes, *on a pinned version proven to support host block devices*.

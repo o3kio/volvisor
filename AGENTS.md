@@ -28,12 +28,11 @@ ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented propos
 11. Strong guest flush/FUA, crash consistency, media failure and thin pool exhaustion must be tested explicitly.
 12. Match every production-support claim to exact implementation source, hardware, VMM/backend versions and real-host failure evidence.
 13. Do not reuse or translate third-party source without explicit provenance/license review; prefer existing DRBD/Ceph components before new engines.
+14. Keep *online capacity growth*, *same-host backing relocation* and *cross-host VM live migration* separate. Native LV online growth does not require a block-copy job; no generic live cross-pool copy is implied by LVM pvmove.
+15. Do not put an additional QSD/userspace proxy on all native foreground I/O solely to make it movable. Treat QSD/vhost-user-blk mirror/pivot as an optional, version-pinned, crash-tested backend.
 
 ## Implementation order
 
 Stable identity/volume contract -> native logical volumes -> external Ceph RBD adapter -> DRBD nearline baseline -> witness/fencing and full VMM/storage handoff -> aggressive failure campaign -> consider standalone Mayastor/clean io_uring/SPDK only with measured justification -> separately designed managed OSD infrastructure.
 
 A benchmark is not a durability proof. A happy-path migration is not a split-brain proof. No class is called production-supported until its exact implementation passes the failure and evidence requirements in SPEC-0002 and the relevant v2 contract.
-
-14. Keep *online capacity growth*, *same-host backing relocation* and *cross-host VM live migration* separate. Native LV online growth does not require a block-copy job; no generic live cross-pool copy is implied by LVM pvmove.
-15. Do not put an additional QSD/userspace proxy on all native foreground I/O solely to make it movable. Treat QSD/vhost-user-blk mirror/pivot as an optional, version-pinned, crash-tested backend.
