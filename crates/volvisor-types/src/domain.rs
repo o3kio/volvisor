@@ -73,6 +73,12 @@ pub enum RemoteProtectionAxis {
     None,
     /// Asynchronous peer replication (possible-RPO; not RPO=0).
     AsynchronousPeer,
+    /// Synchronous peer replication: remote durable completion is
+    /// acknowledged before the write is acknowledged (DRBD Protocol C;
+    /// RPO=0 only under the protocol's own conditions — both durable
+    /// media, correct connection state — and never a claim about
+    /// simultaneous-failure loss).
+    SynchronousPeer,
     /// Ceph placement/replica or EC policy.
     CephPolicy,
 }
@@ -386,6 +392,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RemoteProtectionAxis::AsynchronousPeer).expect("s"),
             "\"asynchronous_peer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteProtectionAxis::SynchronousPeer).expect("s"),
+            "\"synchronous_peer\""
         );
         assert_eq!(
             serde_json::to_string(&RemoteProtectionAxis::CephPolicy).expect("s"),

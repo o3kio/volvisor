@@ -18,7 +18,7 @@ use volvisor_types::domain::{
 use volvisor_types::request::{
     AccessModeRequest, AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest,
     DeleteVolumeRequest, DetachVolumeRequest, GrowGuestNotification, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
+    GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest, ReplicationModeRequest,
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, Attachment, AttachmentId, AttachmentState, Capability, CapabilitySet,
@@ -319,9 +319,19 @@ fn apply_create(
         Some(LocalProtectionModeRequest::ProviderSpecific) => LocalProtectionAxis::ProviderSpecific,
     };
     let effective_remote = if req.volume_class == VolumeClass::NearlineReplicated {
-        // Policy modes async/semi-sync/sync all sit on the asynchronous-peer
-        // axis (a possible-RPO remote copy; never conflated with local legs).
-        RemoteProtectionAxis::AsynchronousPeer
+        // async and semi-sync sit on the asynchronous-peer axis (a
+        // possible-RPO remote copy); sync is the synchronous axis.
+        match req
+            .replication
+            .as_ref()
+            .map(|policy| policy.mode)
+            .unwrap_or_default()
+        {
+            ReplicationModeRequest::Sync => RemoteProtectionAxis::SynchronousPeer,
+            ReplicationModeRequest::Async | ReplicationModeRequest::SemiSync => {
+                RemoteProtectionAxis::AsynchronousPeer
+            }
+        }
     } else {
         RemoteProtectionAxis::None
     };

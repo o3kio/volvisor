@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use volvisor_api::{AppState, SharedState, router};
 use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
+use volvisor_drbd::{DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
 use volvisor_lvm::{LvmProvider, RealRunner};
 use volvisor_provider::AdminSurface;
@@ -54,6 +55,10 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
         }
         ProviderKind::Ceph => {
             let provider = Arc::new(ceph_provider(config)?);
+            AppState::new(provider, None, journal, config.admin_token.clone())
+        }
+        ProviderKind::Drbd => {
+            let provider = Arc::new(drbd_provider(config)?);
             AppState::new(provider, None, journal, config.admin_token.clone())
         }
     };
@@ -130,6 +135,60 @@ fn ceph_provider(config: &Config) -> Result<CephRbdProvider, DaemonError> {
         ceph_state_path(config),
     )
     .map_err(|e| DaemonError::Config(format!("ceph provider construction failed: {e}")))
+}
+
+/// Construct the DRBD nearline provider from validated configuration.
+///
+/// The provider's constructor performs the fail-closed startup
+/// verification (toolchain answers, kernel module present, VG exists,
+/// host identity matches, secret readable, config dir usable) and
+/// reconciles observed resource state; any failure refuses the daemon.
+/// No `AdminSurface`: the nearline VG is operator-designated (like the
+/// ceph pool), so admin routes keep their typed 404.
+fn drbd_provider(config: &Config) -> Result<DrbdProvider, DaemonError> {
+    let provider_config = DrbdProviderConfig {
+        vg_name: config.drbd_vg_name.clone().ok_or_else(|| {
+            DaemonError::Config("drbd_vg_name is required for the drbd provider".to_owned())
+        })?,
+        config_dir: config.drbd_config_dir_or_default().clone(),
+        node_name: config.drbd_node_name.clone().ok_or_else(|| {
+            DaemonError::Config("drbd_node_name is required for the drbd provider".to_owned())
+        })?,
+        local_address: config.drbd_local_address.clone().ok_or_else(|| {
+            DaemonError::Config("drbd_local_address is required for the drbd provider".to_owned())
+        })?,
+        peer_name: config.drbd_peer_name.clone().ok_or_else(|| {
+            DaemonError::Config("drbd_peer_name is required for the drbd provider".to_owned())
+        })?,
+        peer_address: config.drbd_peer_address.clone().ok_or_else(|| {
+            DaemonError::Config("drbd_peer_address is required for the drbd provider".to_owned())
+        })?,
+        shared_secret_file: config.drbd_shared_secret_file.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "drbd_shared_secret_file is required for the drbd provider".to_owned(),
+            )
+        })?,
+        port_min: config.drbd_port_min,
+        port_max: config.drbd_port_max,
+        minor_min: config.drbd_minor_min,
+        minor_max: config.drbd_minor_max,
+        proc_root: config.drbd_proc_root_or_default().clone(),
+    };
+    DrbdProvider::new(
+        Arc::new(RealRunner::default()),
+        provider_config,
+        drbd_state_path(config),
+    )
+    .map_err(|e| DaemonError::Config(format!("drbd provider construction failed: {e}")))
+}
+
+/// The durable drbd provider state path: configured, or
+/// `<journal_dir>/drbd-state.json`.
+fn drbd_state_path(config: &Config) -> std::path::PathBuf {
+    config
+        .drbd_state_path
+        .clone()
+        .unwrap_or_else(|| config.journal_dir.join("drbd-state.json"))
 }
 
 /// Serve the Volume API v2 surface until a shutdown signal arrives, then
@@ -219,6 +278,19 @@ mod tests {
             ceph_state_path: None,
             sysfs_root: None,
             admin_token: admin_token.map(str::to_owned),
+            drbd_vg_name: None,
+            drbd_config_dir: None,
+            drbd_node_name: None,
+            drbd_local_address: None,
+            drbd_peer_name: None,
+            drbd_peer_address: None,
+            drbd_shared_secret_file: None,
+            drbd_port_min: 7100,
+            drbd_port_max: 7199,
+            drbd_minor_min: 100,
+            drbd_minor_max: 999,
+            drbd_proc_root: None,
+            drbd_state_path: None,
             max_body_bytes: 1 << 20,
         }
     }
@@ -241,6 +313,19 @@ mod tests {
             ceph_state_path: None,
             sysfs_root: None,
             admin_token: None,
+            drbd_vg_name: None,
+            drbd_config_dir: None,
+            drbd_node_name: None,
+            drbd_local_address: None,
+            drbd_peer_name: None,
+            drbd_peer_address: None,
+            drbd_shared_secret_file: None,
+            drbd_port_min: 7100,
+            drbd_port_max: 7199,
+            drbd_minor_min: 100,
+            drbd_minor_max: 999,
+            drbd_proc_root: None,
+            drbd_state_path: None,
             max_body_bytes: 1 << 20,
         }
     }
@@ -343,6 +428,117 @@ mod tests {
                 || message.contains("ceph fsid")
                 || message.contains("CEPH_CLUSTER_UNHEALTHY"),
             "error must preserve the verification failure detail: {message}"
+        );
+    }
+
+    fn drbd_config(journal_dir: std::path::PathBuf) -> Config {
+        Config {
+            drbd_vg_name: Some("volvisor-nearline".to_owned()),
+            drbd_node_name: Some("host-a".to_owned()),
+            drbd_local_address: Some("10.0.0.1".to_owned()),
+            drbd_peer_name: Some("host-b".to_owned()),
+            drbd_peer_address: Some("10.0.0.2:7100".to_owned()),
+            drbd_shared_secret_file: Some(std::path::PathBuf::from("/nonexistent/secret")),
+            ..drbd_base_config(journal_dir)
+        }
+    }
+
+    fn drbd_base_config(journal_dir: std::path::PathBuf) -> Config {
+        Config {
+            listen: "127.0.0.1:8787".parse().expect("valid listen address"),
+            journal_dir,
+            provider: ProviderKind::Drbd,
+            lvm_vg_prefix: None,
+            device_claim_token: None,
+            lvm_state_path: None,
+            ceph_cluster_fsid: None,
+            ceph_mon_hosts: None,
+            ceph_pool: None,
+            ceph_user: None,
+            ceph_state_path: None,
+            sysfs_root: None,
+            admin_token: None,
+            max_body_bytes: 1 << 20,
+            drbd_vg_name: None,
+            drbd_config_dir: None,
+            drbd_node_name: None,
+            drbd_local_address: None,
+            drbd_peer_name: None,
+            drbd_peer_address: None,
+            drbd_shared_secret_file: None,
+            drbd_port_min: 7100,
+            drbd_port_max: 7199,
+            drbd_minor_min: 100,
+            drbd_minor_max: 999,
+            drbd_proc_root: None,
+            drbd_state_path: None,
+        }
+    }
+
+    #[test]
+    fn drbd_state_path_defaults_into_the_journal_dir() {
+        let config = drbd_config(std::path::PathBuf::from("/j"));
+        assert_eq!(
+            drbd_state_path(&config),
+            std::path::PathBuf::from("/j/drbd-state.json"),
+            "unset drbd_state_path defaults to <journal_dir>/drbd-state.json"
+        );
+        let config = Config {
+            drbd_state_path: Some(std::path::PathBuf::from("/custom/drbd-state.json")),
+            ..config
+        };
+        assert_eq!(
+            drbd_state_path(&config),
+            std::path::PathBuf::from("/custom/drbd-state.json")
+        );
+    }
+
+    #[test]
+    fn drbd_provider_missing_required_field_maps_to_a_config_error() {
+        // Config::validate would reject this earlier in a real load; the
+        // runtime must still map a missing field to a typed error rather
+        // than panic or silently default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            drbd_vg_name: None,
+            ..drbd_config(dir.path().join("journal"))
+        };
+        let error = build_state(&config)
+            .err()
+            .expect("missing drbd_vg_name must refuse daemon startup");
+        assert!(matches!(error, DaemonError::Config(_)), "error: {error}");
+        assert!(
+            error.to_string().contains("drbd_vg_name is required"),
+            "error names the missing field: {error}"
+        );
+    }
+
+    #[test]
+    fn drbd_provider_construction_fails_closed_without_drbd() {
+        // No DRBD toolchain, kernel module or nearline VG exists in this
+        // environment, which is the honest test condition: the provider's
+        // fail-closed startup verification must refuse construction and
+        // the daemon must surface a typed DaemonError. The drbdadm binary
+        // is absent here, so the toolchain probe fails to execute; on a
+        // host with the toolchain the missing module/VG/secret produces
+        // the corresponding typed error instead. Either way: no start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            // A missing secret file alone must also refuse startup, even
+            // before any toolchain probe could matter.
+            drbd_shared_secret_file: Some(std::path::PathBuf::from(
+                "/nonexistent/drbd-peer-secret",
+            )),
+            ..drbd_config(dir.path().join("journal"))
+        };
+        let error = build_state(&config)
+            .err()
+            .expect("unverified DRBD host must refuse daemon startup");
+        assert!(matches!(error, DaemonError::Config(_)), "error: {error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("drbd provider construction failed"),
+            "error must surface the provider construction failure: {message}"
         );
     }
 }

@@ -129,10 +129,12 @@ Every volume exposes two independent axes:
 
 ```text
 local_protection: none | mirror | provider_specific
-remote_protection: none | asynchronous_peer | ceph_policy
+remote_protection: none | asynchronous_peer | synchronous_peer | ceph_policy
 ```
 
 `native-local` can be locally mirrored but still unavailable after host failure. `nearline-replicated` can be unmirrored locally yet have a stale remote copy. `ceph-rbd` uses Ceph's placement/replica or EC policy, not a Volvisor local mirror unless separately approved. Protection choice and current effective health must never be collapsed to a single boolean.
+
+`synchronous_peer` is reported only for an observed synchronous replica (DRBD Protocol C read back from the resource's own definition, the replica observed `UpToDate`, no resync in progress). It states that writes are acknowledged after both durable media completed — RPO=0 under the protocol's own conditions (both nodes up, connection healthy) — and is never a claim about simultaneous-failure loss (AGENTS rule 16). `asynchronous_peer` remains possible-RPO and must never be presented as zero-RPO.
 
 These axes are reporting dimensions of `effective_protection` (section 2), not additional request fields; the request-side fields are `local_protection` and `replication` (section 1).
 
