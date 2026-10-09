@@ -7,7 +7,7 @@
 //! ## Durability model
 //!
 //! - Records live in `<dir>/journal.log` as length-prefixed, CRC-checked
-//!   frames with a monotonic sequence number (see the [`frame`] module
+//!   frames with a monotonic sequence number (see the private `frame` module
 //!   docs for the exact layout).
 //! - Every acknowledged append writes the frame bytes and calls
 //!   `fsync` on the log file before returning; the journal directory is

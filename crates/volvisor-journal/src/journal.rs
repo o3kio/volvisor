@@ -163,7 +163,7 @@ impl Journal {
     ///
     /// Returns `None` for unknown operations and for operations known only
     /// through an outcome record (no intent, hence no request hash to
-    /// compare — see [`OperationState`]).
+    /// compare — see the private `OperationState` docs).
     #[must_use]
     pub fn lookup(&self, operation_id: &OperationId) -> Option<RegistryEntry> {
         let state = self.operations.get(operation_id)?;
