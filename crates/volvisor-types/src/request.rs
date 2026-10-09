@@ -312,7 +312,30 @@ pub struct GrowVolumeRequest {
 }
 
 impl GrowVolumeRequest {
-    /// Validate the envelope against the current size.
+    /// Validate the state-independent envelope (api version and sector
+    /// alignment).
+    ///
+    /// This is the part of validation that can run BEFORE the journal's
+    /// idempotency lookup: rejections leave no journal record and the
+    /// `operation_id` stays reusable for a corrected retry. The
+    /// state-dependent grow-only check needs the current size and lives in
+    /// the provider (under its lock) — see [`Self::validate`].
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] when `api_version` is unsupported or
+    /// `new_size_bytes` is not 512-aligned.
+    pub fn validate_envelope(&self) -> Result<(), ApiError> {
+        crate::validate_api_version(&self.api_version)?;
+        if self.new_size_bytes % 512 != 0 {
+            return Err(ApiError::invalid_request(
+                "new_size_bytes must be a multiple of 512",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the envelope against the current size (grow-only check
+    /// included; run under the provider's lock on real executions only).
     pub fn validate(&self, current_size_bytes: u64) -> Result<(), ApiError> {
         crate::validate_api_version(&self.api_version)?;
         if self.new_size_bytes <= current_size_bytes {
@@ -324,11 +347,7 @@ impl GrowVolumeRequest {
                 ),
             ));
         }
-        if self.new_size_bytes % 512 != 0 {
-            return Err(ApiError::invalid_request(
-                "new_size_bytes must be a multiple of 512",
-            ));
-        }
+        self.validate_envelope()?;
         Ok(())
     }
 

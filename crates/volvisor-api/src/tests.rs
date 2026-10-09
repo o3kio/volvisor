@@ -1412,3 +1412,54 @@ async fn metrics_serve_prometheus_text() {
     assert!(body.contains("http_requests_total{code=\"200\",route=\"/v2/volumes/{volume_id}\"} 1"));
     assert!(body.contains("operations_total{kind=\"create_volume\",outcome=\"success\"} 1"));
 }
+
+/// An invalid grow ENVELOPE (bad api_version, non-aligned size) is
+/// rejected before anything is journaled — the operation_id stays
+/// reusable for a corrected retry. Only state-dependent rejections
+/// (grow-only, stale generation, missing volume) are journaled, because
+/// only those can differ between the first attempt and a replay.
+#[tokio::test]
+async fn invalid_grow_envelope_is_rejected_without_journaling() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-grow-envelope", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let records_before = journal_record_count(&state);
+
+    let grow_uri = "/v2/volumes/vol-grow-envelope/grow";
+
+    // Bad api_version: envelope rejection, nothing journaled.
+    let bad_version = serde_json::json!({
+        "api_version": "volvisor.volume.v1",
+        "operation_id": "op-grow-envelope",
+        "new_size_bytes": 2 * GIB,
+        "expected_generation": 1,
+    });
+    let (status, body) = send(&app, json_request(Method::POST, grow_uri, &bad_version)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(journal_record_count(&state), records_before);
+
+    // Non-512-aligned size: same.
+    let unaligned = serde_json::json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": "op-grow-envelope",
+        "new_size_bytes": 2 * GIB + 1,
+        "expected_generation": 1,
+    });
+    let (status, body) = send(&app, json_request(Method::POST, grow_uri, &unaligned)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(journal_record_count(&state), records_before);
+
+    // The SAME operation_id now executes the corrected request.
+    let corrected = serde_json::json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": "op-grow-envelope",
+        "new_size_bytes": 2 * GIB,
+        "expected_generation": 1,
+    });
+    let (status, body) = send(&app, json_request(Method::POST, grow_uri, &corrected)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
