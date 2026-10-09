@@ -36,6 +36,9 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 - [ADR-0005 — Ceph RBD versus OSD lifecycle](docs/adr/0005-ceph-rbd-and-managed-osds.md)
 - [ADR-0006 — online resize and live local block relocation](docs/adr/0006-online-resize-and-live-local-block-relocation.md)
 - [ADR-0007 — DRBD 9 nearline replication backend](docs/adr/0007-drbd9-nearline-replication-provider.md)
+- [ADR-0008 — Rook-only hyperconverged Volvisor Cells](docs/adr/0008-rook-only-hyperconverged-cells.md)
+- [Experimental Rook Cell contract](contracts/rook-cell-experimental-v0.md)
+- [Three-host Rook Cell GO/NO-GO POC](docs/poc/rook-cells/README.md)
 - [ADR-0008 — experimental Rook-only hyperconverged cells](docs/adr/0008-rook-only-hyperconverged-cells.md)
 - [SPEC-0002 — v2 implementation specification](docs/specs/SPEC-0002-volvisor-volume-virtualization.md)
 - [Volume API contract v2](contracts/volume-api-v2.md)
@@ -55,3 +58,5 @@ The v1 drafts remain available for traceability and historical design research. 
 Online growth of a local LV is distinct from **same-host live relocation** of its backing storage, which is itself distinct from cross-host live VM migration. See ADR-0006 for native Cloud Hypervisor resize, same-VG LVM pvmove, and optional QEMU Storage Daemon + vhost-user-blk block mirroring.
 
 For nearline, **DRBD 9 is the first replication-engine prototype candidate**, operating directly above LVM logical volumes (host-kernel path) or from an isolated Storage Cell (via qualified host-to-cell block frontend). Protocol A provides local-first asynchronous replication; Protocol C is an explicit optional synchronous-protection profile. The difficult cross-host Cloud Hypervisor migration handoff is **not** considered solved merely by using DRBD; see ADR-0007.
+
+Optional **experimental managed-Ceph mode**: Volvisor boots fixed-resource Cloud Hypervisor `volvisor-cell` infrastructure VMs with exclusively VFIO-assigned NVMe, joins them as dedicated Kubernetes worker Nodes and permits only Rook/Ceph plus essential node-system workloads. Rook operator/control plane remain independent. This mode is *disabled by default and NOT production supported*; three **physical** host Rook/Ceph failure and performance tests are required. No Rook fork is presumed.

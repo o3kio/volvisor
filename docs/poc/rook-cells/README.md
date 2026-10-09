@@ -24,6 +24,8 @@ RBD CephBlockPool -> failureDomain=host, replicated.size=3
 client -> non-cell compute node or O3K RBD host adapter
 ```
 
+**Capacity caveat:** with VFIO the assigned NVMe **whole controller** is available to the guest. A requirement such as "allow only 500Gi from a 2Ti NVMe" cannot be enforced by this raw device passthrough. Use an explicitly different fixed-size virtio-blk LV backend for a capped-disk experiment; that is functional evidence only, not VFIO evidence.
+
 First (optional) nested three-cell smoke test on a **single physical host** may validate Kubernetes/Rook API wiring, but not distinct host failure domains, PCI passthrough or HA, and never counts as the GO/NO-GO hardware gate.
 
 Reference conservative cell budget: 6 vCPUs pinned/charged to physical host allocation, 16 GiB fixed RAM with ballooning disabled, local 40 GiB persistent root/system disk **not on Ceph**, persist guest `/var/lib/rook` across cell restarts, 1 entire IOMMU-safe PCI NVMe controller dedicated to Ceph, separate VM storage data-path network. Adapt after measuring actual per-OSD and MON/MGR requirements. A guest disk's size is not restricted by Rook pod limits; Volvisor claims physical device capacity by stable identity and explicitly passes the whole controller. Reserve real host resources before tenants receive compute capacity.

@@ -8,6 +8,7 @@
 4. docs/adr/0006-online-resize-and-live-local-block-relocation.md
 5. docs/adr/0007-drbd9-nearline-replication-provider.md
 6. docs/adr/0008-rook-only-hyperconverged-cells.md
+6. docs/adr/0008-rook-only-hyperconverged-cells.md
 7. docs/specs/SPEC-0002-volvisor-volume-virtualization.md
 8. contracts/volume-api-v2.md
 9. contracts/nearline-replication-v2.md
@@ -40,3 +41,8 @@ ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented propos
 Stable identity/volume contract -> native logical volumes -> external Ceph RBD adapter -> DRBD nearline baseline -> witness/fencing and full VMM/storage handoff -> aggressive failure campaign -> consider standalone Mayastor/clean io_uring/SPDK only with measured justification -> separately designed managed OSD infrastructure.
 
 A benchmark is not a durability proof. A happy-path migration is not a split-brain proof. No class is called production-supported until its exact implementation passes the failure and evidence requirements in SPEC-0002 and the relevant v2 contract.
+
+18. In `rook-cell-experimental` the cell is a **Kubernetes worker VM**, not a general-purpose tenant-pod runtime. Rook operator and Kubernetes API must remain independently bootable. Allow essential kube-system pods, but refuse arbitrary tenant pods with admission beyond taints.
+19. Volvisor owns PCI/VFIO claims, vCPU/RAM fixed reservation, guest root/state and Node↔Host mapping; Rook owns the Ceph OSD/MON/MGR workloads. No device is implicitly adopted or reformatted.
+20. Three storage microVMs on one physical host are not three Ceph failure domains. Real VFIO, CRUSH physical-host placement, memory pressure and host loss require three-physical-host evidence.
+21. Do not patch or fork Rook unless the unmodified upstream POC demonstrates a reproducible missing capability and a separate accepted decision authorizes it.

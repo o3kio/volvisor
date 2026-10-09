@@ -97,6 +97,14 @@ Phase B (separate acceptance): Volvisor-managed OSD placement in Storage Cells, 
 
 Never double-replicate under an OSD by default. Existing Ceph clusters do not require OSDs to move into Storage Cell VMs. RBD snapshots, clones and resize are conditional on safe backend-validated workflows, not automatically shared API guarantees.
 
+## 6C. Experimental Rook-managed hyperconverged Ceph Cells
+
+The optional `rook-cell-experimental` service model is separately specified in [ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md), [Rook Cell contract](../../contracts/rook-cell-experimental-v0.md) and the [three-host POC](../poc/rook-cells/README.md). It is **disabled by default**, supports only preauthorized Rook/Ceph and minimum required Kubernetes node-system workloads inside dedicated cells, and uses an independently bootable Kubernetes control plane and Rook operator outside cell nodes.
+
+Volvisor explicitly reserves microVM vCPU/RAM/root state and owns exclusive IOMMU-safe NVMe VFIO claims; each cell guest registers as a kubelet Node and hosts Rook's OSD/MON/MGR daemons. Fixed microVM capacity is enforced on the physical hypervisor; kubelet reservation and Rook Pod limits are separate nested constraints. Rook selects explicit Nodes and guest stable disk paths; it **does not** create a Ceph OSD per tenant RBD volume. Three cell guests on one physical server do not satisfy three host failure domains.
+
+The Rook Cell mode remains POC-only until exact-SHA three-physical-host tests prove all lifecycle, quorum/CRUSH topology, disk/VFIO isolation, cleanup, CPU/memory budget, node scheduling/admission, fail/restart and benchmark gates. No Rook patch or local fork is authorized without a specific upstream-mismatch ADR after the unmodified-operator proof.
+
 ## 7. Consumer API and operation states
 
 Operations are specified in [Volume API v2](../../contracts/volume-api-v2.md). Every mutation must carry idempotency key, expected generation and authorization scope. A provider must not return `Ready` while an attachment is merely declared.

@@ -42,6 +42,12 @@ Phase B may deploy OSDs on disks assigned to Storage Cell VMs, but only through 
 
 An external Ceph cluster needs none of this managed-OSD work. An OSD may run in a dedicated service VM or directly on infrastructure where evidence proves that is more reliable than a consolidated Storage Cell. The 'exactly one Storage Cell per host' proposal is **not** an inflexible requirement for managed Ceph in v2.
 
+## Experimental Rook-only Cell deployment (separate GO/NO-GO decision)
+
+[ADR-0008](0008-rook-only-hyperconverged-cells.md) defines a distinct **optional experimental** managed-OSD mode in which each hyperconverged physical host launches a fixed-resource Cloud Hypervisor storage-worker microVM with exclusively passed NVMe controller(s). Each guest joins an *independent existing Kubernetes cluster* as a labeled/tainted Node; **unpatched upstream Rook** initially selects explicit cell Nodes, devices and resources. The Rook operator/Kubernetes API stay outside these cells. A cell may run necessary kubelet/containerd/CNI agents in addition to Ceph pods, but no general tenant workloads.
+
+This is not a new storage class: workloads still consume `ceph-rbd` images. It is an alternative to external Ceph infrastructure for running the **OSD/MON/MGR service**, and must never be assumed production-ready based on Rook's ordinary host-storage support. [POC gate](../poc/rook-cells/README.md) requires real PCI/VFIO isolation, 3 physical host CRUSH domains, resource reservation, pod scheduling policy, failure recovery and baseline performance. No Rook fork before evidence.
+
 ## Failure claims and migration
 
 Ceph durability is defined by actual cluster policy, configured placement and healthy state. The backend may be unavailable or unsafe under loss of too many OSDs, MON quorum, full pool, or violated failure-domain topology. Never claim every `ceph-rbd` image is generically RPO=0 without describing the Ceph committed-write and client cache/flush contract.
