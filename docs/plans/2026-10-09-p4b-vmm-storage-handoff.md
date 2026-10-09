@@ -2,7 +2,8 @@
 
 Status: normative for the P4b phase (this document is the plan of record;
 implementation PRs cite it)
-Date: 2026-10-09 (rev 2 — round-1 design review findings folded in)
+Date: 2026-10-09 (rev 3 — round-1 and round-2 design review findings
+folded in)
 Builds on: [P4a plan](2026-10-09-p4-witness-fencing-authority.md) (merged as PR #7),
 ADR-0004 Decision 3/4, ADR-0007 "Planned Cloud Hypervisor live migration is a
 separate hard gate", [nearline contract v2](../../contracts/nearline-replication-v2.md)
@@ -237,7 +238,15 @@ Design decisions, each with its rule citation:
   A marker whose migration record no longer exists (corrupt or
   operator-removed store) is reported and left in place — fail-closed,
   operator resolution; the provider never invents a migration
-  decision.
+  decision. The operator's resolution mechanism is defined, not
+  hand-waved: a **clear-cut-marker admin operation** on the provider
+  (journaled, admin-token) that requires the volume to be provably
+  not-writer first — Secondary role *or* a fencing proof the operator
+  supplies — and then clears the marker and reconciles the volume
+  normally; the same operation covers the source-side `Failed` +
+  cut-marked residue left after the destination adopts a dead
+  source's volume (the adoption demoted the peer; this host's device
+  must be verified closed/Secondary before the marker clears).
 
 ## 3. The migration state machine (`volvisor-handoff`)
 
@@ -290,23 +299,41 @@ side-effect/persist boundary can leave it stale.
   **abort path**: source authority is intact, so rollback is allowed
   — void the recorded barriers (W9), unsuspend every participating
   volume, clear the cut markers, `ch-remote resume` the source VM (if
-  paused), discard the target-side preparation, record `Aborted`. If
-  the rollback itself fails, the volume is routed through `self_fence`
+  paused), discard the target-side preparation, record `Aborted`.
+  Ordering is normative (B-round-2): **an unvoided recorded barrier is
+  a hard gate on any source resume** — the void step must succeed (or
+  the witness must be unreachable in a way that provably could not
+  have journaled anything) before the VM is resumed. A `VoidBarrier`
+  that cannot be journaled fails the whole rollback into `self_fence`
   (the durable `PendingFence` path) with the migration record
-  `InDoubt`-annotated — fail-closed, never a silent resume, never an
-  unmarked suspension.
+  `InDoubt`-annotated — the source stays paused/suspended, never
+  resumed with a live barrier that could later certify a false
+  `SAFE_CURRENT` (writes acknowledged after the barrier's boundary
+  would fall inside its attested window). Fail-closed, never a silent
+  resume, never an unmarked suspension.
 - Any record **with a cut** (`cut=snapshotting` … `revoking`) →
   **forward only**: re-drive the cut from the reconciled external
   facts (a VM already destroyed, a demotion already done, a revoke
-  already journaled are each detected, not repeated). The retry
-  reuses the **same witness operation ids** for `RevokeSet`/`GrantSet`
-  (the journal replays the recorded outcome byte-identically; a fresh
-  id would mint a redundant epoch — safe but noisy, and pinned here to
-  keep audit trails one-mutation-per-intent). The state stays
-  `IN_DOUBT`-observable until `DESTINATION_AUTHORIZED`. If forward
-  progress is impossible (destination daemon unreachable, destination
-  VMM dead — §1), the record stays `IN_DOUBT` with a typed detail;
-  the code has no rollback for these states and must not grow one.
+  already journaled are each detected, not repeated). Re-drive
+  semantics are explicit: a still-present VM at `cut=destroying-vm`
+  is **destroyed as its forward step** (it is paused, barrier-recorded
+  and cut-marked — no writer; the destroy is the committed
+  direction); a re-run snapshot of the same paused VM overwrites into
+  the same directory (the intended, safe semantics — the memory is
+  identical until the VM resumes, which it never will on the source).
+  The retry reuses the **same witness operation ids** for
+  `RevokeSet`/`GrantSet`, **derived deterministically** — the id is a
+  function of `migration_id` + the step (`revoke-set`/`grant-set`) +
+  the ordered participant volume set, so a post-restart retry
+  reconstructs it without having remembered the prior call (the
+  journal replays the recorded outcome byte-identically; a fresh
+  random id would mint a redundant epoch — safe but noisy, and
+  excluded here to keep audit trails one-mutation-per-intent). The
+  state stays `IN_DOUBT`-observable until `DESTINATION_AUTHORIZED`.
+  If forward progress is impossible (destination daemon unreachable,
+  destination VMM dead — §1), the record stays `IN_DOUBT` with a
+  typed detail; the code has no rollback for these states and must
+  not grow one.
 - `SourceRevoked` → forward only (the same re-drive; the revoke
   already happened or the retry performs it).
 - `DestinationAuthorized|VmResumed` → **forward completion**: drive
@@ -349,13 +376,24 @@ New invariants, unit-tested like W1–W7:
   `VoidBarrier` only from the recording holder (W8), only before the
   epoch retires — the abort path's evidence-hygiene step so an
   aborted migration's barrier can never surface as `SAFE_CURRENT`
-  evidence for a later retirement. Records are immutable once
+  evidence for a later retirement. **An unvoided barrier is a hard
+  gate on any source resume** (§3 abort path): the void must be
+  journaled before the source VM is resumed, and a void that cannot
+  be journaled fails the rollback into `self_fence` — a resumed
+  writer with a live barrier is exactly the false-`SAFE_CURRENT`
+  shape W9 exists to exclude. (The malicious direction is safe: a
+  holder voiding a *good* barrier merely degrades a later adoption to
+  `PossibleLoss` — it loses an unlock, it cannot promote anything
+  falsely.) Records are immutable once
   journaled (byte-identical replay aside, a differing re-record is an
   `IDEMPOTENCY_CONFLICT`). `inspect` exposes the per-volume barrier
   log: each barrier's attestation, migration id, recorder identity,
   commit index, and voided flag — plus, per retired epoch, the
-  retirement record's commit index (already in the journal fold; no
-  new mechanism).
+  retirement record's commit index. That exposure is a small derived
+  state/inspect addition over the journal fold (the fold sees every
+  record; the registry today keeps only `last_proof`/`last_commit`,
+  so per-retired-epoch indices are computed and cached at inspect
+  time — new code, not a new mechanism, and called out as such).
 - **W10 (batch atomicity).** `RevokeSet { releases[], migration_id }`
   and `GrantSet { requests[], migration_id }` are single journaled
   mutations: the fold applies all-or-nothing, one commit-index bump
@@ -418,7 +456,12 @@ host's promoted device path; the adapter rewrites the copied
 replication pair in the common case, so the rewrite is usually a
 no-op — but it is verified, never assumed). `PauseProof` is the
 observed `Paused` state from `vm.info` — volvisor's own verification,
-not the consumer's attestation. `destroy` and `restore` are
+not the consumer's attestation. The adapter maps the real
+`vm.info` states (`Created|Running|Paused|Shutoff`, plus the
+API-not-found error) onto `VmState`, with `Absent` meaning the
+not-found error on the socket; the mapping and the verified-against
+CH version are recorded in the adapter's module docs. `destroy` and
+`restore` are
 re-drive-safe: destroying an absent VM succeeds as a no-op when
 `state()` confirms `Absent` (the crash-reconcile dependency), and
 `restore` refuses a non-empty VMM typed (the coordinator destroys the
@@ -441,19 +484,32 @@ host.
 ### Config additions (`volvisord`)
 
 ```toml
+[witness]                                  # existing table
+url = "…"
+host_token = "…"                           # NEW, REQUIRED with url on a v2 witness
+                                           # (this host's W8 credential — the base
+                                           # P4a AuthorityContext uses it for
+                                           # grant/renew/self-revoke/register;
+                                           # the legacy shared token is read-only)
 [migration]
 enabled = true                       # false until the deployment opts in
 snapshot_dir = "/var/lib/volvisor/migrations"   # must be shared with the peer for cross-host cutover
 peer_api_url = "http://peer-host:7780"
 peer_api_token = "…"                 # daemon-to-daemon credential (distinct from the witness and consumer tokens)
-witness_host_token = "…"             # this host's W8 credential
 [vmm]
 ch_remote_bin = "/usr/bin/ch-remote"
 api_socket_dir = "/run/volvisor/vms"
 ```
 
-Validation (the `config.rs` discipline): `migration.enabled` requires
-the drbd provider + a witness; the **witness** must remain in a
+Validation (the `config.rs` discipline): **`witness.host_token` is
+required whenever `witness.url` is set** — the witness protocol is v2
+as of this phase and every state-mutating call from this daemon
+(including the P4a attach/renew/release path, not only the migration
+surface) authenticates as this host; a v2 witness without the
+credential would break attach/detach/renewal at runtime, so config
+refuses it up front rather than failing mid-operation.
+`migration.enabled` requires the drbd provider + a witness + a set
+`host_token`; the **witness** must remain in a
 failure domain distinct from both replication ends (the existing
 `ensure_witness_failure_domain` check — the peer API is *expected* to
 be colocated with the peer replication end, since the destination
@@ -461,8 +517,8 @@ daemon is the destination VMM's proxy (D6); only the witness is a
 third domain in this topology); `snapshot_dir` must exist locally
 (its cross-host readability is verified at `PREPARED` by the
 destination daemon, with a typed refusal); refuse `enabled` when
-`vmm` is unconfigured. The new credentials (`peer_api_token`,
-`witness_host_token`) join the API journal's redaction set (the
+`vmm` is unconfigured. The new credentials (`witness.host_token`,
+`peer_api_token`) join the API journal's redaction set (the
 `REDACTED_KEYS` discipline) and are never logged or echoed.
 
 ### Consumer-facing routes (source host; journaled, admin-token)
@@ -566,7 +622,14 @@ barrier was recorded before the epoch ended), never to equal the
 epoch's final mutation — renewals between barrier and retirement
 write no data and are explicitly compatible (a renewal is an authority
 lease extension, not a guest write; the data claim lives entirely in
-the attestations). A voided barrier is never evidence. Anything less
+the attestations). When the epoch is **still current at
+classification time** (the dead-source mid-cut path, D5 — no
+`RevokeSet` ever landed, so no retirement record exists yet), the
+comparison target is vacuous: the check reduces to "a non-voided
+barrier recorded during this same current epoch, holder-bound, all
+attestations true". The retirement-index comparison applies only when
+the epoch is already retired (the revoke/grant proof's commit index
+is the target). A voided barrier is never evidence. Anything less
 keeps the P4a boundaries (`PossibleLoss` with the recorded boundary;
 `Unsafe` for unproven fencing). The classifier prefers the strongest
 evidence present and records which evidence class justified the
@@ -640,7 +703,8 @@ Stage B2 (fake VMM, end-to-end):
 | 13 | Happy path, two-volume VM: PREPARED→COMPLETE; VM resumed on the target (fake VMM Running, devices open on the target minors, closed on the source); witness epochs retired; barriers recorded; source Secondary |
 | 14 | Rule-17 ordering proof: the demote is attempted only after the VM destroy (a coordinator regression that demotes early fails against the fake's busy device) |
 | 15 | Crash injection between every pair of cut steps (the store dropped mid-drive): reconcile lands forward-only in the correct resolution; specifically crash between delete and demote, and between demote and revoke — the states the round-1 review identified — resolve forward, never to the abort path |
-| 16 | Abort before the cut: source VM resumed, barriers voided, volumes unsuspended, target discarded, record `Aborted`; abort after the cut began: typed refusal |
+| 16 | Abort before the cut: source VM resumed, barriers voided, volumes unsuspended, target discarded, record `Aborted`; abort after the cut began: typed refusal. The void-failure path specifically: a rollback whose `VoidBarrier` cannot be journaled (witness unreachable) leaves the source **not resumed** and routes through `self_fence` — the unvoided barrier is a hard gate on resume |
+| 16a | The clear-cut-marker admin operation: refuses while the volume is Primary/writer; clears + reconciles when Secondary or fencing-proven; journaled |
 | 17 | Dead source inside the window: the destination adopts (P4a path) and the recorded barrier yields `SAFE_CURRENT` — D5 convergence |
 | 18 | Half-restored destination: a crashed restore is re-driven by destroying the partial VM first; a dead destination VMM stalls in `IN_DOUBT` with a typed detail |
 | 19 | Snapshot-dir unreadable at the destination: `PREPARED` refuses typed (peer health check) |
@@ -648,7 +712,7 @@ Stage B2 (fake VMM, end-to-end):
 | 21 | API: journaling and idempotency for prepare/transfer/abort (replay byte-identical, hash conflict typed); ObserveHandoff reports the exact canonical states, maps cut-progress to `IN_DOUBT` with step detail, and never collapses the revoke/grant pair; the peer routes resolve intent-without-outcome by inspecting witness/provider state, never a blind re-execution |
 | 22 | One-of-two target promotes failing blocks the VM restore (forward-retried; the VM is never resumed half-migrated) |
 | 23 | The restore's `config.json` disk-path rewrite: matching minors (no-op) and divergent paths (rewrite verified) |
-| 24 | Config validation: witness-third-domain guard, provider requirement, snapshot-dir existence, vmm requirement, credential redaction in journaled payloads |
+| 24 | Config validation: witness-third-domain guard, provider requirement, snapshot-dir existence, vmm requirement, `witness.host_token` required whenever `witness.url` is set (v2 witness — the base P4a surface depends on it), credential redaction in journaled payloads |
 
 Real-host items (env-gated, like the P4a `VOLVISOR_TEST_DRBD` gate;
 no CI claim): `VOLVISOR_TEST_CH=1` runs the adapter against a real
@@ -662,8 +726,17 @@ is explicitly **not** claimed by this plan.
 
 - `contracts/volume-api-v2.md` §5: the concrete routes, the
   snapshot-dir sharing requirement, the downtime statement, and the
-  `BarrierAndTransfer` proof-as-corroboration semantics.
-- `contracts/nearline-replication-v2.md` §6: an implementation-status
+  `BarrierAndTransfer` proof-as-corroboration semantics. **Reachability
+  amendment**: the `IN_DOUBT` wording ("between `SOURCE_REVOKED` and
+  `DESTINATION_AUTHORIZED`") is amended to "`IN_DOUBT` is reachable
+  once the cut is entered (the durable point of no return, at or
+  after the source-side barrier) and until `DESTINATION_AUTHORIZED`;
+  it must never be reported as a generic `ABORTED`" — the plan's
+  cut-progress states observe `IN_DOUBT` strictly before
+  `SOURCE_REVOKED`, which is the fail-closed direction the contract's
+  spirit intends, and the letter is amended to say so.
+- `contracts/nearline-replication-v2.md` §6: the same `IN_DOUBT`
+  reachability amendment, plus an implementation-status
   note (the canonical states are now served by volvisor's coordinator;
   memory pre-copy and dual-primary remain out of scope with the §1
   reasons); §1's durable-state sketch gains the migration record
