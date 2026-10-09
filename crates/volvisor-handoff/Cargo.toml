@@ -1,0 +1,22 @@
+[package]
+name = "volvisor-handoff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Coordinated VMM/storage handoff state machine: durable migration records, the forward-only cut, and IN_DOUBT reconcile (P4b plan section 3)"
+
+[lints]
+workspace = true
+
+[dependencies]
+volvisor-types = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
