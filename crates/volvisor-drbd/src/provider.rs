@@ -3359,19 +3359,28 @@ impl DrbdProvider {
                 volume.runtime.authority = Some(block);
             }
             if let Err(error) = state.save(&self.state_path) {
-                // A failed save leaves no durable record of a FRESH
-                // grant: release it best-effort so a retry is not
-                // refused with LEASE_HELD against our own orphan lease
-                // (the adopt path's discipline). Only the
-                // provably-not-writing case releases: a renewed lease
-                // still matches the durable record (same epoch,
-                // extended end) and self-heals on the next renewal
-                // save, and a suspended Primary must never have its
-                // lease released from under it — the next grant's W7
-                // wait would be waived while the device is only
-                // kernel-suspended.
-                if prior_authority.is_none() && !suspended {
+                // A failed save leaves no durable record of a
+                // NEW-EPOCH grant (a fresh grant, or a grant that
+                // superseded a stale recorded block): release it
+                // best-effort so a retry is not refused with
+                // LEASE_HELD against our own orphan lease (the adopt
+                // path's discipline), and restore the in-memory record
+                // to the durable state's value (the save never
+                // landed). Only the provably-not-writing case
+                // releases: a plain renewal still matches the durable
+                // record (same epoch, extended end) and self-heals on
+                // the next renewal save, and a suspended Primary must
+                // never have its lease released from under it — the
+                // next grant's W7 wait would be waived while the
+                // device is only kernel-suspended.
+                let new_epoch = prior_authority
+                    .as_ref()
+                    .is_none_or(|prior| prior.epoch != acquired.epoch);
+                if new_epoch && !suspended {
                     let _ = authority.release(volume_id, &acquired);
+                    if let Some(volume) = state.volume_mut(volume_id) {
+                        volume.runtime.authority = prior_authority;
+                    }
                 }
                 return Err(error);
             }

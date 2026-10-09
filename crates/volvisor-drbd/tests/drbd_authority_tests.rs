@@ -1729,3 +1729,117 @@ async fn one_failed_fence_does_not_abort_the_renewal_pass() {
     let view = kit.client.inspect(&vol_a).await.expect("view");
     assert_eq!(view.lease_state, LeaseState::Live);
 }
+
+// --------------------------------------------- review-round-5 additions
+
+/// Break the state save: the state file's path becomes a directory, so
+/// the atomic write-then-rename fails (the rename onto a directory is
+/// refused). Returns the backup copy for [`restore_state_save`].
+fn break_state_save(state_path: &Path) -> std::path::PathBuf {
+    let backup = state_path.with_extension("json.backup");
+    std::fs::copy(state_path, &backup).expect("back the state file up");
+    std::fs::remove_file(state_path).expect("remove the state file");
+    std::fs::create_dir(state_path).expect("the state path is now a directory");
+    backup
+}
+
+/// Undo [`break_state_save`].
+fn restore_state_save(state_path: &Path, backup: &Path) {
+    std::fs::remove_dir(state_path).expect("remove the directory placeholder");
+    std::fs::copy(backup, state_path).expect("restore the state file");
+    std::fs::remove_file(backup).expect("drop the backup");
+}
+
+/// A failed authority-block save on a FRESH grant releases the
+/// just-acquired lease: a retry is not refused LEASE_HELD against our
+/// own orphan until TTL + fence window (the adopt path's discipline,
+/// now symmetric), and the in-memory record is restored to the
+/// durable state's value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_save_failure_releases_a_fresh_grant() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume(&f.base, &f.world, "vol-savefail", GIB);
+    let vol = volume("vol-savefail");
+    let provider = authority_provider(&kit, &f.state_path, &f.world);
+    provider.register_volume(&vol, None).expect("register");
+    let backup = break_state_save(&f.state_path);
+    let error = provider
+        .attach_volume(&vol, &attach_req("vol-savefail", 1))
+        .await
+        .expect_err("the authority-block save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    // The resource was never promoted (the save precedes the
+    // promotion) and the fresh grant was released.
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-savefail")),
+        Role::Secondary
+    );
+    let view = kit.client.inspect(&vol).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Revoked);
+    // The retry, with the save healthy again, attaches immediately —
+    // no LEASE_HELD against our own orphan, no fence-window wait.
+    restore_state_save(&f.state_path, &backup);
+    provider
+        .attach_volume(&vol, &attach_req("vol-savefail", 1))
+        .await
+        .expect("the retry attaches without an orphan lease");
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-savefail")),
+        Role::Primary
+    );
+}
+
+/// A failed authority-block save on a PLAIN RENEWAL (the recorded
+/// block still matches the live lease) releases nothing: the lease
+/// self-heals on the next renewal save, and releasing an attached
+/// writer's lease would waive the next grant's W7 wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_save_failure_keeps_a_renewed_lease() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume(&f.base, &f.world, "vol-savekeep", GIB);
+    let vol = volume("vol-savekeep");
+    let provider = authority_provider(&kit, &f.state_path, &f.world);
+    provider.register_volume(&vol, None).expect("register");
+    provider
+        .attach_volume(&vol, &attach_req("vol-savekeep", 1))
+        .await
+        .expect("attach");
+    // The interrupted-attach shape: the resource demoted back out of
+    // band, the record rolled to detached-with-authority — a re-attach
+    // renews the recorded lease rather than granting.
+    {
+        let mut world = f.world.lock().expect("world");
+        world
+            .resources
+            .get_mut(&resource_of("vol-savekeep"))
+            .expect("resource")
+            .role = Role::Secondary;
+    }
+    {
+        let mut disk = DrbdState::load(&f.state_path).expect("load state");
+        let entry = disk.volume_mut(&vol).expect("volume");
+        entry.runtime.attachment = None;
+        entry.runtime.state = volvisor_types::VolumeLifecycle::Ready;
+        disk.save(&f.state_path).expect("save state");
+    }
+    let reattacher = authority_provider(&kit, &f.state_path, &f.world);
+    let backup = break_state_save(&f.state_path);
+    let error = reattacher
+        .attach_volume(&vol, &attach_req("vol-savekeep", 2))
+        .await
+        .expect_err("the authority-block save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    // The renewed lease was NOT released: it still matches the
+    // durable record and self-heals on the next save.
+    let view = kit.client.inspect(&vol).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+    restore_state_save(&f.state_path, &backup);
+    reattacher
+        .attach_volume(&vol, &attach_req("vol-savekeep", 2))
+        .await
+        .expect("the retry renews the same lease");
+    let view = kit.client.inspect(&vol).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+}
