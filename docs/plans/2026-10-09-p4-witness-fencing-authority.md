@@ -111,8 +111,11 @@ Out (recorded follow-ups; each maps to P4b or later):
 - `LeaseId(u64)`: opaque, unique per grant.
 - `AuthorityView` (what inspect and the promotion authority check surface):
   current epoch, current holder (`host_id`), lease state (`live` /
-  `expired` / `revoked` / `none`), and the witness commit index that last
-  changed it.
+  `expired` / `revoked` / `none`), the witness commit index that last
+  changed it, the **full registration record** (lineage UUID set, both
+  endpoints' backing identities, any recorded barrier — §3), and, for a
+  live lease, its **remaining duration as a duration-from-response**
+  (W5).
 - `FencingProof`: the witness's **durable statement** that epoch `e` of
   volume `v` was retired at commit index `c`. It is produced by the grant
   of a strictly newer epoch (the grant record retires all older epochs) or
@@ -302,7 +305,10 @@ runs `primary --force` outside the two justified paths in §5.
   before the API surface starts, the lease is validated via
   `inspect`, and the device is resumed only on a live lease for our
   epoch **whose remaining duration (returned per W5) covers the renewal
-  margin** — a live-but-nearly-expired lease is not a safe resume, since
+  margin** — the margin is the daemon's next scheduled renewal period
+  (`renewal_interval_secs`, §6): anything shorter means the lease could
+  lapse before the next renewal lands. A live-but-nearly-expired lease
+  is not a safe resume, since
   the writer would hold no W5-conformant local deadline until its first
   renewal response. An unreachable witness leaves it suspended — a
   restarted daemon
@@ -414,7 +420,12 @@ model), so failover is an **adopt-and-promote** admin operation:
    **availability guard, not a fence**: fencing correctness never
    depends on it (the W7 wait is computed from the lease's recorded end
    at the witness regardless); it only prevents a writer from renewing
-   so rarely that its lease lapses between renewals. Token is required
+   so rarely that its lease lapses between renewals. On the renewal path
+   specifically (the shrink-after-grant case is first observable there,
+   on an already-attached volume), a violating renew response refuses
+   the renewal — the volume then follows the §4 local-deadline
+   self-fence path, with the same evented handling as other renewal
+   failures. Token is required
    for non-loopback witness URLs, plus the §3 two-sided
    failure-domain guard. A background tokio task runs `renew_leases`
    every renewal interval; failures surface as events, not crashes.
@@ -461,7 +472,9 @@ model), so failover is an **adopt-and-promote** admin operation:
   with retry-after both after expiry and after forced revocation of a
   partitioned writer's live lease — the exact case a
   renewal-interval-based wait would get wrong); a power-off STONITH
-  attestation shortening the wait;
+  attestation **with** positive confirmation shortens the wait, and one
+  **without** it (a bare authorization record) is refused — no
+  shortening;
   duration-from-response deadline shape; `inspect` returning the full
   registration record (lineage UUIDs, both endpoints' backing identities,
   barrier) for the adopt flow to compare against.
@@ -479,7 +492,13 @@ model), so failover is an **adopt-and-promote** admin operation:
   fail-closed** (Primary witness-managed volume + unreachable witness →
   stays suspended; a Primary with **no attachment record** — the
   crash-between-promote-and-save and zombie cases — is suspended the
-  same way, keyed on role + lease rather than the record); epoch-0
+  same way, keyed on role + lease rather than the record; a **live but
+  nearly-expired lease** — remaining below the renewal margin — is
+  suspended too, per the resume gate); **renewal-path guards** (a renew
+  response whose TTL violates `renewal_interval < ttl/2` refuses the
+  renewal and follows the §4 local-deadline self-fence path; detach →
+  reattach on the same host is **not** `FENCE_PENDING`-blocked — W7's
+  self-release exclusion); epoch-0
   volumes behave exactly as P3.
 - **Promotion**: every row of the §5 table, including the two `UpToDate`/
   Protocol-C rows (with and without recorded barrier evidence); adoption
