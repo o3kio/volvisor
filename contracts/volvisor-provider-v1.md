@@ -5,7 +5,7 @@
 Status: Proposed  
 Version: 1  
 Applies to: Volvisor Storage Cell v0
-Superseded-by: SPEC-0002 (pool/device ownership and lifecycle) and [Volume API v2](volume-api-v2.md); v1 operational invariants not restated there remain binding per SPEC-0002 section 13
+Superseded-by: [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md) (pool/device ownership and lifecycle) and [Volume API v2](volume-api-v2.md); v1 operational invariants not restated there remain binding per SPEC-0002 section 13
 
 Related:
 

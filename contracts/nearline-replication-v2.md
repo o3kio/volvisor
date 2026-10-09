@@ -51,7 +51,7 @@ For every guest write/zero/discard/barrier:
 2. Establish a recoverable ordering/record of the affected logical bytes.
 3. Commit data and metadata necessary to recover that operation locally, honoring cache mode, FUA and flush ordering.
 4. Advance crash-recoverable local committed/ACK prefix.
-5. ACK without requiring remote durable media for `replication_mode=async`.
+5. ACK without requiring remote durable media for `replication.mode=async`.
 6. Send ordered changes to peer(s) and persist confirmed peer durable progress.
 
 An implementation may pipeline the steps but cannot acknowledge before its own local-durable contract is satisfied. Never replay a discard out of order or silently interpret it as a zero write. Dirty-range metadata must be updated/committed atomically enough to avoid declaring unsynchronized bytes clean after a crash.

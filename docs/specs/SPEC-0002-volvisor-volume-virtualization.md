@@ -120,7 +120,7 @@ Rollback semantics distinguish **before** and **after** authority commit. Never 
 - consistent tenant quotas, RBAC on volume and destructive device actions;
 - no secret/key material in plan, journal, endpoint path, or normal logs;
 - VolumeId and Ceph/RBD image ID are not authorization tokens;
-- cryptographic erasure/key rotation requirements are a separate provider capability;
+- cryptographic erasure and key rotation are sub-capabilities of the versioned `encryption` capability (section 8 of Volume API v2), each with its own evidence gate;
 - `encryption` is a separately versioned capability, not a base-contract guarantee. `provider-managed` keys live in provider key management behind a `key_ref`, never in plans, journals, endpoint paths or logs. Key scope (per-volume/per-replica), rotation, and treating key destruction as sanitization each require their own evidence gate; until such a gate passes, cross-tenant reuse follows the explicit zeroing/discard policy in section 4, not cryptographic erasure;
 - legacy backend disk signatures cannot be implicitly adopted.
 

@@ -132,6 +132,8 @@ remote_protection: none | asynchronous_peer | ceph_policy
 
 `native-local` can be locally mirrored but still unavailable after host failure. `nearline-replicated` can be unmirrored locally yet have a stale remote copy. `ceph-rbd` uses Ceph's placement/replica or EC policy, not a Volvisor local mirror unless separately approved. Protection choice and current effective health must never be collapsed to a single boolean.
 
+These axes are reporting dimensions of `effective_protection` (section 2), not additional request fields; the request-side fields are `local_protection` and `replication` (section 1).
+
 ## 7. Admission, state and failures
 
 Common states: `Requested`, `Provisioning`, `Ready`, `Degraded`, `Attaching`, `Attached`, `Detaching`, `Deleting`, `Failed`, `Quarantined`.
