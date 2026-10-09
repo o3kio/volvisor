@@ -1,0 +1,13 @@
+[package]
+name = "volvisor-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor volvisor-journal"
+
+[lints]
+workspace = true
+
+[dependencies]

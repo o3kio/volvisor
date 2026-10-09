@@ -1,0 +1,17 @@
+[package]
+name = "volvisord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor volume virtualization daemon"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "volvisord"
+path = "src/main.rs"
+
+[dependencies]
