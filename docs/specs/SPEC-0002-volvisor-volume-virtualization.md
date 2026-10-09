@@ -87,6 +87,16 @@ Phase B (separate acceptance): Volvisor-managed OSD placement in Storage Cells, 
 
 Never double-replicate under an OSD by default. Existing Ceph clusters do not require OSDs to move into Storage Cell VMs. RBD snapshots, clones and resize are conditional on safe backend-validated workflows, not automatically shared API guarantees.
 
+## 6B. DRBD nearline reference provider and synchronous option
+
+[ADR-0007](../adr/0007-drbd9-nearline-replication-provider.md) selects DRBD 9 as **first prototype backend**, with an engine-neutral ReplicationProvider adapter. Initial host-kernel DRBD can export /dev/drbdN backed by a local LV straight to Cloud Hypervisor (no extra Storage Cell/QSD hop). A Storage-Cell-contained DRBD instance with private host-local frontend is an alternate topology that must be measured and tested separately.
+
+Per-volume policy shall distinguish `replication.engine=drbd9` and `replication.mode=async|semi-sync|sync`, with implementation capability checks. For DRBD these map to protocols A/B/C respectively. The v2 default remains `async`, with peer ACK not required; a `sync` request is a stronger explicit contract, **not** a retroactive change to the async class. Asynchronous nearline may lose an acknowledged tail on unplanned primary loss even with a healthy quorum witness. Protocol C depends on actual durable host and peer media, correct cache/flush and fencing.
+
+DRBD provides bitmap resync, peer state, role and quorum; Volvisor owns storage allocation, policy, VM attachments, same-host local protection and **the coordinated VM/storage migration transaction**. A DRBD diskless witness is a quorum voter, not another durable copy. The production topology must specify no-quorum I/O behavior, enforcement/fencing, degraded write admission and promotion permission.
+
+**Cross-host live migration hard gate:** a single-primary DRBD resource usually cannot demote while Cloud Hypervisor still holds its block device open. Prove safe CHV release at the VM pause/cutover and new-primary activation **before** claiming migration. DRBD/KVM setups sometimes use temporary dual-primary with protocol C; Volvisor must not enable that under the default single-writer contract without a separate accepted design and crash/partition proof. Verify multi-volume atomic cutover.
+
 ## 7. Consumer API and operation states
 
 Operations are specified in [Volume API v2](../../contracts/volume-api-v2.md). Every mutation must carry idempotency key, expected generation and authorization scope. A provider must not return `Ready` while an attachment is merely declared.

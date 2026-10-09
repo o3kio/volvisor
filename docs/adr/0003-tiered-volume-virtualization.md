@@ -108,7 +108,7 @@ Host agent remains small and privileged (inventory, claim, lifecycle, host nativ
 
 - Choose reference logical-volume engine (LVM-thin vs thick LVM; capacity and crash behavior).
 - Validate Cloud Hypervisor device frontend, backing block-device FD, disk hotplug and migration compatibility **against a pinned release**.
-- Select nearline replication engine only after DRBD baseline, standalone Mayastor evaluation and semantics-first experiments.
+- Prototype DRBD 9 as first nearline replication provider, with selectable Protocol A/B/C for explicit async/semi-sync/sync policies. Keep other engines as alternatives and qualify Cloud Hypervisor write-fd handoff before claiming planned live migration. See [ADR-0007](0007-drbd9-nearline-replication-provider.md).
 - Decide witness/quorum placement and exactly how stale writers are physically fenced.
 - Ceph existing-cluster adapter before any managed-OSD lifecycle claim.
 - Test failure modes independently: physical SSD loss, mirror leg loss, primary/peer host loss, cell crash, stale primary after partition, storage-network loss, control-plane loss, interrupted copy and migration failure.

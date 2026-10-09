@@ -32,13 +32,15 @@ Illustrative interface, not a wire-protocol declaration:
   "provisioning": "thin",
   "placement": {"preferred_host_id": "host-a", "failure_domain": "host"},
   "local_protection": {"mode": "mirror", "min_healthy_legs": 2},
-  "replication": {"mode": "async", "remote_replicas": 1, "allow_degraded_create": false},
+  "replication": {"engine": "drbd9", "mode": "async", "remote_replicas": 1, "allow_degraded_create": false},
   "migration_policy": {"live": "require_verified"},
   "encryption": {"mode": "provider-managed", "key_ref": "external-secret-reference"}
 }
 ```
 
 Accepted fields are schema-versioned. Unsupported policies/field combinations fail closed, rather than being silently ignored. A nearline volume with `local_protection=mirror` requests two *local media legs* on the primary, while `remote_replicas=1` requests another copy on a different host: these are separate resource demands. Do not infer that every sample host has sufficient devices to meet this request.
+
+Valid nearline `replication.mode` values are `async` (DRBD A), `semi-sync` (DRBD B), and `sync` (DRBD C), subject to advertised provider capabilities; `async` remains default. `replication.engine` selects a qualified backend, initially `drbd9`; the engine choice must never alter volume protection silently. See [ADR-0007](../docs/adr/0007-drbd9-nearline-replication-provider.md). Quorum witness nodes do not count toward `remote_replicas`.
 
 Field spellings in this contract are canonical (`replication.mode`, `replication.remote_replicas`, `local_protection.mode`). Prose in the ADRs may abbreviate them (for example `replication_mode=async`); the abbreviated and canonical forms denote the same field and must not diverge.
 

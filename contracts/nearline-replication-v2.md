@@ -134,6 +134,18 @@ A successful planned migration is lossless **only for source writes accepted bef
 
 The serving workload host consumes the active local replica via an isolated frontend mapped to a stable canonical `VolumeId`. Inactive endpoints must be read-only or closed. When source placement changes, destination endpoint activation must be tied to new writer epoch, not mere control-plane creation. Endpoints must not be tenant-network reachable.
 
+## 9A. Replication provider and modes (ADR-0007)
+
+The first qualified implementation candidate is DRBD 9. Define engine-neutral provider methods for create, attach, status, resync, configure policy, fence, promote/demote, migrate preparation and recover. The actual provider must expose **effective**, not merely requested, mode/replica/quorum state. LINSTOR is a management/control plane for DRBD resources, not an independent replication protocol.
+
+`replication.mode=async` maps to DRBD Protocol A (local disk and TCP send-buffer ACK) and remains the v2 nearline default. `semi-sync` maps to Protocol B (remote memory arrival) and `sync` to Protocol C (local and remote disk completion), **only when supported and validated on the pinned driver/frontends**. Section 4 describes required local ACK minimum for the default async mode; stronger remote completion is required for the corresponding configured mode. Synchronous protection must fail closed or explicitly enter a user-authorized degraded policy when remote media is unavailable; never keep advertising the former guaranteed profile while serving locally.
+
+The following are distinct and MUST NOT be conflated: data-replica durability, DRBD quorum/witness membership, local disk RAID1, distributed fencing, and the final target migration barrier. A diskless witness counts for DRBD voting, not data protection. Protocol A remains possible-RPO even if a third witness grants quorum.
+
+The canonical mode values are `async`, `semi-sync`, and `sync`; labels such as `async-local` and `sync-durable` are descriptive, not extra API enum values. `replication.engine=drbd9` identifies this backend, while `remote_replicas` counts remote **data copies**, not a diskless witness.
+
+For DRBD single-primary migration, source block device closure before `drbdadm secondary` is a hard VMM integration requirement. DRBD single-primary demotion can fail while Cloud Hypervisor holds the source /dev/drbd device open. Conventional temporary dual-primary migration requires an explicit Protocol C/fenced exception; **current v2 default forbids it**, and the feature remains disabled absent a separately approved, tested handoff policy. Never mask it with forceful demotion, stale-writer access or data-loss-tolerant promotion. Details: [ADR-0007](../docs/adr/0007-drbd9-nearline-replication-provider.md).
+
 ## 10. Required evidence
 
 - Continuous write-trace oracle with acknowledged-write verification across planned migration; same under power loss to quantify tail.
