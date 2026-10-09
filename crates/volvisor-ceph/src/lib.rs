@@ -27,7 +27,11 @@
 //!   attach maps the image (`rbd map`) and returns the `/dev/rbd*` device
 //!   as the host-scoped ephemeral handle; a pre-existing (crash-leftover)
 //!   mapping is detected through `rbd showmapped` and rejected
-//!   fail-closed, never silently adopted;
+//!   fail-closed, never silently adopted. A `read-only` (shared-reader)
+//!   request is a typed `UNSUPPORTED_CLASS_OR_POLICY` rejection before
+//!   any mutation — the only mapping this prototype makes is writable
+//!   and lock-owning, so granting it would be a fail-open lie; only
+//!   read-write single-writer attachments are supported;
 //! - **honest capacity** (`ceph df` pool statistics against a documented
 //!   headroom; advisory — over-commit surfaces as Ceph's own ENOSPC at
 //!   write time) and **honest health reflection** (`ceph health`:
@@ -47,7 +51,11 @@
 //! - **durable JSON state** (owner-only `0600`, atomic tmp-write + fsync +
 //!   rename) holding the volume-to-image cross-references and attachment
 //!   records; **startup reconciliation** marks volumes whose image
-//!   vanished or whose ownership metadata mismatched as `Failed`, heals
+//!   vanished or whose ownership metadata mismatched as `Failed` and
+//!   clears their stale attachment records (the backing those records
+//!   referenced is gone or no longer provably ours — only the RECORD is
+//!   dropped, mappings are never auto-unmapped, so detach/delete are not
+//!   wedged forever), heals
 //!   the one benign crash window (a completed-but-unrecorded grow:
 //!   recorded size raised to the image's actual report), counts
 //!   transiently-unverifiable volumes honestly instead of guessing, and

@@ -207,7 +207,8 @@ impl Config {
     /// documented default [`DEFAULT_CEPH_USER`].
     ///
     /// The keyring is resolved by the ceph CLI itself (volvisor only
-    /// passes `--id`; no credential material is ever read or logged).
+    /// passes `--name` (full entity); no credential material is ever read or
+    /// logged).
     #[must_use]
     pub fn ceph_user_or_default(&self) -> &str {
         self.ceph_user.as_deref().unwrap_or(DEFAULT_CEPH_USER)

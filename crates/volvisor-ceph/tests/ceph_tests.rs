@@ -28,7 +28,9 @@ use volvisor_provider::conformance::{
     fixture_grow_request,
 };
 use volvisor_types::domain::VolumeClass;
-use volvisor_types::request::{CreateVolumeRequest, ErasurePolicy, GrowGuestNotification};
+use volvisor_types::request::{
+    AccessModeRequest, CreateVolumeRequest, ErasurePolicy, GrowGuestNotification,
+};
 use volvisor_types::{ApiErrorCode, AttachmentState, Frontend, VolumeId, VolumeLifecycle};
 
 const GIB: u64 = 1 << 30;
@@ -780,6 +782,64 @@ async fn grow_proceeds_from_the_actual_size_without_a_reconcile_first() {
 }
 
 #[tokio::test]
+async fn grow_to_an_already_met_target_reports_no_backing_resize() {
+    let fixture = fixture();
+    let id = volume_id("met-target");
+    let created = fixture
+        .provider
+        .create_volume(&create_request("met-target", GIB))
+        .await
+        .expect("create");
+
+    // Crash window after `rbd resize`: the image is already at the 2
+    // GiB the operator will ask for, while state still records 1 GiB.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name_for(&id))
+        .expect("image")
+        .size = 2 * GIB;
+
+    // Growing to the already-met target runs NO resize, so the response
+    // must not claim one (`backing_resized` is true only when a resize
+    // actually ran).
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("met-target", 2 * GIB, created.generation),
+        )
+        .await
+        .expect("grow to the already-met target");
+    assert!(!grown.backing_resized, "no rbd resize ran: {grown:?}");
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    assert_eq!(
+        grown.guest_notification_status,
+        GrowGuestNotification::NotApplicable
+    );
+
+    // The record is still healed to the honest effective size.
+    let state = CephState::load(&fixture.state_path).expect("state");
+    let stored = state.volume(&id).expect("entry");
+    assert_eq!(stored.entry.size_bytes, 2 * GIB);
+    assert_eq!(stored.entry.generation, created.generation + 1);
+
+    // A grow beyond the target still reports a real resize.
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("met-target", 3 * GIB, created.generation + 1),
+        )
+        .await
+        .expect("grow beyond the target");
+    assert!(grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 3 * GIB);
+}
+
+#[tokio::test]
 async fn a_shrunk_image_is_failed_and_never_healed_downward() {
     let fixture = fixture();
     let id = volume_id("shrink-vol");
@@ -798,6 +858,16 @@ async fn a_shrunk_image_is_failed_and_never_healed_downward() {
         .get_mut(&image_name_for(&id))
         .expect("image")
         .size = GIB / 2;
+
+    // Inspect (before reconcile owns the transition) reports Failed
+    // while carrying the RECORDED size: the recorded size is the last
+    // volvisor-provisioned truth, and the shrunk actual is a violation
+    // being surfaced — not a new size to adopt.
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.allocated_bytes, GIB);
+
     let report = fixture.provider.reconcile().expect("reconcile");
     assert_eq!(report.shrunk_volumes, vec![id.clone()]);
     assert_eq!(report.healed_grown, [], "a shrink is never healed");
@@ -1019,6 +1089,57 @@ async fn map_failure_records_no_attachment() {
     assert_eq!(inspected.state, VolumeLifecycle::Ready);
     assert_eq!(inspected.generation, 1);
     assert!(fixture.world.lock().expect("world").mappings.is_empty());
+}
+
+#[tokio::test]
+async fn read_only_attach_is_a_typed_rejection_before_any_mutation() {
+    let fixture = fixture();
+    let id = volume_id("ro-att");
+    let created = fixture
+        .provider
+        .create_volume(&create_request("ro-att", MIB))
+        .await
+        .expect("create");
+
+    // ReadOnly (shared-reader) is not a contract this prototype has
+    // qualified, and the only mapping it could make is writable and
+    // exclusive-lock-owning: typed rejection BEFORE any mutation.
+    let mut read_only = fixture_attach_request("ro-att", "ro-att-1", created.generation);
+    read_only.access_mode = AccessModeRequest::ReadOnly;
+    let err = fixture
+        .provider
+        .attach_volume(&id, &read_only)
+        .await
+        .expect_err("read-only attach is not qualified");
+    assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy, "{err}");
+    assert!(err.detail.contains("read-only"), "{err}");
+    assert!(err.detail.contains("multi-reader"), "{err}");
+
+    // No mapping was created, no attachment recorded, no state moved.
+    assert!(fixture.world.lock().expect("world").mappings.is_empty());
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(inspected.state, VolumeLifecycle::Ready);
+    assert_eq!(inspected.attachment_ids, []);
+    assert_eq!(inspected.current_writer, None);
+    assert_eq!(inspected.generation, created.generation);
+
+    // Read-write single-writer attach still works on the same volume.
+    let attached = fixture
+        .provider
+        .attach_volume(
+            &id,
+            &fixture_attach_request("ro-att", "rw-att-1", created.generation),
+        )
+        .await
+        .expect("read-write attach still works");
+    assert_eq!(
+        attached.frontend,
+        Frontend::VirtioBlk {
+            host_device_path: "/dev/rbd0".to_owned()
+        }
+    );
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(inspected.current_writer, Some(attached.attachment_id));
 }
 
 #[tokio::test]
@@ -1539,6 +1660,184 @@ async fn startup_reconcile_clears_an_interrupted_detach() {
             host_device_path: "/dev/rbd1".to_owned()
         }
     );
+}
+
+#[tokio::test]
+async fn a_vanished_image_with_a_live_attachment_is_unwedged_by_reconcile() {
+    let fixture = fixture();
+    let id = volume_id("wedge-gone");
+    let image_name = image_name_for(&id);
+    fixture
+        .provider
+        .create_volume(&create_request("wedge-gone", MIB))
+        .await
+        .expect("create");
+    fixture
+        .provider
+        .attach_volume(
+            &id,
+            &fixture_attach_request("wedge-gone", "wedge-gone-att", 1),
+        )
+        .await
+        .expect("attach");
+
+    // The image vanishes behind the provider's back while the
+    // attachment record (and its device mapping) is still live.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .remove(&image_name);
+
+    // Restart (the remedy the detach error message documents): reconcile
+    // marks the volume Failed and drops the stale attachment record —
+    // the backing it referenced no longer exists.
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    let report = restarted.reconcile().expect("reconcile report");
+    assert_eq!(
+        report.missing_volumes,
+        vec![id.clone()],
+        "the volume without an image is reported missing"
+    );
+
+    // Failed, detached, no writer — in the response AND in state.
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+    assert_eq!(inspected.attachment_ids, []);
+    assert_eq!(inspected.current_writer, None);
+    let state = CephState::load(&fixture.state_path).expect("state");
+    assert!(
+        state
+            .volume(&id)
+            .expect("entry kept")
+            .runtime
+            .attachment
+            .is_none(),
+        "the stale attachment record is cleared and persisted"
+    );
+
+    // The zombie mapping itself is never auto-unmapped (destructive):
+    // only the RECORD was dropped, the device is left to an operator.
+    assert_eq!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .mappings
+            .get("/dev/rbd0")
+            .map(String::as_str),
+        Some(image_name.as_str())
+    );
+
+    // Delete now succeeds (Failed + detached) instead of refusing
+    // forever on "must be fully detached".
+    restarted
+        .delete_volume(
+            &id,
+            &fixture_delete_request("wedge-gone", inspected.generation),
+        )
+        .await
+        .expect("delete after the restart remedy");
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("volume is gone");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn a_mismatched_image_with_a_live_attachment_is_unwedged_by_reconcile() {
+    let fixture = fixture();
+    let id = volume_id("wedge-mismatch");
+    let image_name = image_name_for(&id);
+    fixture
+        .provider
+        .create_volume(&create_request("wedge-mismatch", MIB))
+        .await
+        .expect("create");
+    fixture
+        .provider
+        .attach_volume(
+            &id,
+            &fixture_attach_request("wedge-mismatch", "wedge-mismatch-att", 1),
+        )
+        .await
+        .expect("attach");
+
+    // The image's ownership record is rewritten to name a foreign
+    // owner: the backing is no longer provably ours.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name)
+        .expect("image")
+        .meta
+        .insert(
+            common::OWNER_META_KEY.to_owned(),
+            "someone-elses-volume".to_owned(),
+        );
+
+    // Restart: reconcile marks the volume Failed, clears the attachment
+    // record (its authority claim is void) and never adopts the image.
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    let report = restarted.reconcile().expect("reconcile report");
+    assert_eq!(
+        report.mismatched_volumes,
+        vec![id.clone()],
+        "the volume whose image is not owned by it is reported mismatched"
+    );
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+    assert_eq!(inspected.attachment_ids, []);
+    assert_eq!(inspected.current_writer, None);
+    let state = CephState::load(&fixture.state_path).expect("state");
+    assert!(
+        state
+            .volume(&id)
+            .expect("entry kept")
+            .runtime
+            .attachment
+            .is_none(),
+        "the stale attachment record is cleared and persisted"
+    );
+
+    // The image survives untouched under its foreign owner record.
+    {
+        let world = fixture.world.lock().expect("world");
+        assert_eq!(
+            world
+                .images
+                .get(&image_name)
+                .expect("image kept")
+                .meta
+                .get(common::OWNER_META_KEY),
+            Some(&"someone-elses-volume".to_owned())
+        );
+        assert_eq!(world.trash, Vec::<String>::new());
+    }
+
+    // The volume is no longer wedged on the stale attachment record:
+    // delete now reaches the honest ownership refusal (a foreign image
+    // is never destroyed, AGENTS rule 7) instead of "must be fully
+    // detached".
+    let err = restarted
+        .delete_volume(
+            &id,
+            &fixture_delete_request("wedge-mismatch", inspected.generation),
+        )
+        .await
+        .expect_err("a foreign image is never destroyed");
+    assert_eq!(err.code, ApiErrorCode::ForeignDeviceState);
+    assert!(err.detail.contains("never destroyed"), "{err}");
 }
 
 #[test]

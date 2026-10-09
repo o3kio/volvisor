@@ -106,7 +106,7 @@ fn ceph_state_path(config: &Config) -> std::path::PathBuf {
 /// succeed); any failure refuses daemon startup. The provider's typed
 /// error detail (fsid mismatch, missing pool, unqueryable health) is
 /// preserved verbatim in the [`DaemonError`] message. Credential
-/// resolution stays entirely with the ceph CLI (`--id` only); nothing
+/// resolution stays entirely with the ceph CLI (`--name` only); nothing
 /// beyond field names is logged.
 fn ceph_provider(config: &Config) -> Result<CephRbdProvider, DaemonError> {
     let cluster_fsid = config.ceph_cluster_fsid.clone().ok_or_else(|| {

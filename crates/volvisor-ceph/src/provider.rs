@@ -208,8 +208,9 @@ impl CephProviderConfig {
 /// the in-memory `Mutex` only serializes access within this daemon. The
 /// constructor runs the fail-closed startup verification (FSID match,
 /// pool existence, health query) and then a reconciliation pass that
-/// marks vanished/mismatched volumes `Failed` and reports foreign images
-/// without touching them.
+/// marks vanished/mismatched volumes `Failed` (clearing their stale
+/// attachment records so detach/delete are not wedged forever) and
+/// reports foreign images without touching them.
 pub struct CephRbdProvider {
     /// Shell-free command executor for the ceph/rbd toolchain.
     runner: Arc<dyn CommandRunner>,
@@ -522,6 +523,34 @@ impl CephRbdProvider {
         }
     }
 
+    /// Mark a volume `Failed` and clear its attachment record.
+    ///
+    /// Used when the backing is verifiably absent or no longer provably
+    /// ours: the attachment record's authority claim is void, and
+    /// keeping it would wedge the volume forever (detach refuses on the
+    /// absent device, delete refuses on "must be fully detached"; the
+    /// documented restart remedy relies on this clear). Only the RECORD
+    /// is dropped — the mapping itself is never auto-unmapped, an
+    /// actual zombie device is left to an operator. The caller persists
+    /// when `changed` says something moved.
+    fn fail_and_clear_attachment(
+        state: &mut CephState,
+        id: &VolumeId,
+        snapshot: &StoredVolume,
+        changed: &mut bool,
+    ) {
+        if let Some(volume) = state.volume_mut(id) {
+            if snapshot.runtime.state != VolumeLifecycle::Failed {
+                volume.runtime.state = VolumeLifecycle::Failed;
+                *changed = true;
+            }
+            if snapshot.runtime.attachment.is_some() {
+                volume.runtime.attachment = None;
+                *changed = true;
+            }
+        }
+    }
+
     /// Reconcile provider state against the observed cluster.
     ///
     /// Non-destructive by construction (nothing is unmapped, adopted or
@@ -529,9 +558,17 @@ impl CephRbdProvider {
     ///
     /// - a state entry whose image is verifiably absent (from a
     ///   successful `rbd ls`) is marked `Failed` and persisted — never
-    ///   silently recreated or dropped;
+    ///   silently recreated or dropped — and its attachment record is
+    ///   cleared: the backing that record referenced no longer exists,
+    ///   so keeping it would wedge the volume forever (detach refuses
+    ///   on the absent device, delete refuses on "must be fully
+    ///   detached"; the documented restart remedy now actually works).
+    ///   The mapping itself is never auto-unmapped — an actual zombie
+    ///   device, if any, is left to an operator;
     /// - a state entry whose `volvisor.owner` metadata is missing or
-    ///   names a different volume is marked `Failed` (never adopted);
+    ///   names a different volume is marked `Failed` with its
+    ///   attachment record cleared for the same reason (the backing is
+    ///   no longer provably ours) — never adopted;
     /// - a state entry whose image reports LESS than the recorded size
     ///   (a shrink outside volvisor) is marked `Failed`; MORE is a
     ///   completed-but-unrecorded grow and the recorded size is healed
@@ -571,12 +608,10 @@ impl CephRbdProvider {
             };
             let image_name = snapshot.entry.image_name.as_str();
             if !listed.iter().any(|name| name == image_name) {
-                if snapshot.runtime.state != VolumeLifecycle::Failed {
-                    if let Some(volume) = state.volume_mut(&id) {
-                        volume.runtime.state = VolumeLifecycle::Failed;
-                        changed = true;
-                    }
-                }
+                // Verifiably absent image: Failed, and the attachment
+                // record (whose backing no longer exists) is cleared so
+                // the volume is not wedged forever.
+                Self::fail_and_clear_attachment(&mut state, &id, &snapshot, &mut changed);
                 report.missing_volumes.push(id);
                 continue;
             }
@@ -649,13 +684,12 @@ impl CephRbdProvider {
                     }
                 }
                 Ok(_) => {
-                    // Missing or foreign owner metadata: never adopt.
-                    if snapshot.runtime.state != VolumeLifecycle::Failed {
-                        if let Some(volume) = state.volume_mut(&id) {
-                            volume.runtime.state = VolumeLifecycle::Failed;
-                            changed = true;
-                        }
-                    }
+                    // Missing or foreign owner metadata: never adopted.
+                    // Failed, and the attachment record (whose backing
+                    // is no longer provably ours) is cleared so the
+                    // volume is not wedged forever; the image itself is
+                    // never touched.
+                    Self::fail_and_clear_attachment(&mut state, &id, &snapshot, &mut changed);
                     report.mismatched_volumes.push(id);
                 }
                 Err(error) => {
@@ -1056,6 +1090,13 @@ impl CephRbdProvider {
     /// `rbd resize`), so the observed size is reported while reconcile
     /// heals the record; an image SMALLER than recorded changed outside
     /// volvisor and is reported `Failed`.
+    ///
+    /// The remote protection axis of the response is
+    /// [`RemoteProtectionAxis::None`]: on this cheap per-volume path
+    /// that means "remote protection not established **by this path**"
+    /// (no policy query runs here) — it does NOT assert the absence of
+    /// remote copies. Query [`CephRbdProvider::discover_pools`] for the
+    /// pool's actual replication policy.
     fn verified_inspect_response(
         &self,
         volume_id: &VolumeId,
@@ -1073,6 +1114,11 @@ impl CephRbdProvider {
                     response.provisioned_bytes = size_bytes;
                     response.allocated_bytes = size_bytes;
                 } else if size_bytes < stored.entry.size_bytes {
+                    // The response keeps the RECORDED size fields: the
+                    // recorded size is the last volvisor-provisioned
+                    // truth, and the shrunk actual is a violation being
+                    // surfaced as `Failed` — not a new size to adopt
+                    // (a shrink is never healed downward).
                     response.state = VolumeLifecycle::Failed;
                 }
                 Ok(response)
@@ -1211,6 +1257,23 @@ impl CephRbdProvider {
                     "requested frontend {frontend:?}: only virtio-blk exists in this provider"
                 )));
             }
+        }
+        // Contract §3 honesty: the only mapping this prototype makes is a
+        // writable, exclusive-lock-owning `rbd map` — granting a ReadOnly
+        // request would hand out a writable device under a read-only
+        // record (fail-open), and two ReadOnly attaches would collide on
+        // the lock. Reject typed BEFORE any mutation (no rbd map, no
+        // state change): a shared-reader attachment requires an explicit
+        // multi-reader contract this prototype has not qualified.
+        if matches!(
+            req.access_mode,
+            volvisor_types::request::AccessModeRequest::ReadOnly
+        ) {
+            return Err(unsupported(
+                "read-only (shared-reader) attachments require an explicit multi-reader \
+                 contract that the ceph-rbd prototype has not qualified; only read-write \
+                 single-writer attachments are supported",
+            ));
         }
         let mode = requested_mode(req.access_mode);
         let mut state = self.lock_state()?;
@@ -1452,7 +1515,11 @@ impl CephRbdProvider {
         // was at least this large) needs no resize: the target is met,
         // the actual size is what gets recorded.
         let mut effective = actual_size;
-        if actual_size < req.new_size_bytes {
+        // Honest resize accounting: `backing_resized` is true only when
+        // an `rbd resize` actually ran, never when the unrecorded-grown
+        // size already met the target and the resize was skipped.
+        let backing_resized = actual_size < req.new_size_bytes;
+        if backing_resized {
             let output = self.run_rbd(&[
                 "resize",
                 "--allow-shrink=false",
@@ -1490,7 +1557,7 @@ impl CephRbdProvider {
         stored.entry.generation += 1;
         state.save(&self.state_path)?;
         Ok(GrowVolumeResponse {
-            backing_resized: true,
+            backing_resized,
             // No VMM integration exists: an attached frontend still needs
             // a (retried) notification; a detached volume has nobody to
             // notify. Never `Notified`.
@@ -1784,6 +1851,11 @@ fn hex_prefix(digest: &[u8], bytes: usize) -> String {
 }
 
 /// The access mode granted for a requested mode.
+///
+/// `ReadOnly` never reaches this mapping on the attach path (it is
+/// rejected typed in [`CephRbdProvider::attach_volume_inner`] before any
+/// mutation); the mapping is kept total so a recorded mode always
+/// round-trips.
 fn requested_mode(mode: volvisor_types::request::AccessModeRequest) -> AccessMode {
     match mode {
         volvisor_types::request::AccessModeRequest::SingleWriter => AccessMode::SingleWriter,
@@ -1871,10 +1943,15 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         // path must stay cheap, so it makes no policy queries; asserting
         // `ceph_policy` unconditionally would claim replication from a
         // heuristic (a size-1 pool has no remote copy at all), and the
-        // axis type has no `unknown` variant. The authoritative policy
-        // facts are reported on the read-only pool discovery surface
-        // (`discover_pools`); per-volume health stays `Unknown` until
-        // proven, and `evidence_status` says `PrototypeOnly`.
+        // axis type has no `unknown` variant. `None` on this path
+        // therefore means "remote protection not established by this
+        // (cheap, per-volume) path — query discover_pools for the pool's
+        // actual replication policy"; it does NOT assert the absence of
+        // remote copies (which would be a conservative falsehood on a
+        // replicated pool). The authoritative policy facts are reported
+        // on the read-only pool discovery surface (`discover_pools`);
+        // per-volume health stays `Unknown` until proven, and
+        // `evidence_status` says `PrototypeOnly`.
         effective_protection: EffectiveProtection {
             local: LocalProtectionAxis::None,
             remote: RemoteProtectionAxis::None,

@@ -23,7 +23,7 @@ validation"):
   the image (`rbd map`) and returns the `/dev/rbd/...` device as the ephemeral
   host-scoped handle; detach unmaps after verifying the mapping.
 - Honest capacity (`ceph df` pool statistics), honest health reflection
-  (`ceph health`: OK→Healthy, WARN→Degraded, ERR→Failed, query
+  (`ceph health`: OK→Healthy, WARN→Degraded, ERR→Unhealthy, query
   failure→Unknown — never fabricated), grow-only resize (`rbd resize`).
 - Erasure policy: `Retain` → `rbd trash move` (recoverable), `ZeroDiscard` →
   typed `UNSUPPORTED_CLASS_OR_POLICY` (Ceph reclaim does not guarantee
@@ -82,9 +82,12 @@ Out (recorded follow-ups):
   (best-effort `rbd rm`) and the create fails honestly.
 - Before every mutation: `rbd info` + `rbd image-meta get volvisor.owner` must
   match the state entry. Mismatch or missing metadata on an image we have
-  state for → volume marked `Failed`, never auto-adopted or silently removed.
-  Images in our pool **without** our metadata are foreign: listed by discovery
-  as foreign, never touched (rule 7).
+  state for → volume marked `Failed`, never auto-adopted or silently removed;
+  reconcile also clears the stale attachment record such a volume may carry
+  (the backing it referenced is gone or no longer provably ours — a lingering
+  record would wedge detach/delete forever) while never touching an actual
+  device. Images in our pool **without** our metadata are foreign: listed by
+  discovery as foreign, never touched (rule 7).
 - Volume state keeps `requested_size_bytes` + effective `size_bytes` (RBD
   sizes are byte-granular — no extent rounding — but the requested size is
   still recorded for idempotent-create replay comparison, mirroring LVM).
@@ -98,9 +101,13 @@ Out (recorded follow-ups):
   host-scoped ephemeral handle with `prepared` state (no VMM integration in
   P2; advertised/active honestly not implemented).
 - Detach: verify the mapping exists and belongs to us → `rbd unmap` → verify
-  gone. A second attach while mapped is a typed `INVALID_STATE` single-writer
-  rejection; crash-recovered stale mappings are detected via `showmapped` at
-  reconcile and reported honestly.
+  gone. A second attach with a recorded attachment is the contract's typed
+  `WRITER_ALREADY_ACTIVE` rejection; a stale unrecorded mapping is a typed
+  `INVALID_STATE` rejection; crash-recovered stale mappings are detected via
+  `showmapped` at reconcile and reported honestly. Read-only (shared-reader)
+  attachments are rejected with a typed `UNSUPPORTED_CLASS_OR_POLICY`: the
+  prototype has no qualified multi-reader contract, and a `--read-only`-less
+  mapping recorded as read-only would be a fail-open lie.
 - Shared-backend note: a `ceph-rbd` volume does not pin the volume to one
   host the way a local LV does — placement constraints reflect that the
   cluster (not a host) backs the volume — but migration eligibility is still
@@ -123,8 +130,9 @@ Out (recorded follow-ups):
   entries), `ceph_pool`, `ceph_user` (default `client.volvisor`),
   `ceph_state_path` (durable state, default `<journal_dir>/ceph-state.json`).
   Credentials are resolved entirely by the `ceph`/`rbd` CLIs from the host's
-  standard keyring/configuration conventions — volvisor passes only `--id` and
-  `-m` and never reads, stores or logs key material.
+  standard keyring/configuration conventions — volvisor passes only `--name`
+  (the full entity, e.g. `client.volvisor`) and `-m` and never reads, stores or
+  logs key material.
 - Startup: FSID must match configuration exactly; pool must exist; a health
   query must succeed. Any mismatch → refuse to start (fail-closed; a
   mis-pointed cluster must never be adopted).

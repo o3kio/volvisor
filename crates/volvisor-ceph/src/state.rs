@@ -124,11 +124,14 @@ pub struct UnverifiableImage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// State entries whose image is absent from a successful `rbd ls`
-    /// (marked `Failed`).
+    /// (marked `Failed`; any attachment record is cleared because the
+    /// backing it referenced no longer exists — the mapping itself is
+    /// never auto-unmapped).
     pub missing_volumes: Vec<VolumeId>,
     /// State entries whose image exists but whose `volvisor.owner`
-    /// metadata is missing or names a different volume (marked `Failed`;
-    /// never adopted).
+    /// metadata is missing or names a different volume (marked `Failed`
+    /// with the attachment record cleared — the backing is no longer
+    /// provably ours; never adopted).
     pub mismatched_volumes: Vec<VolumeId>,
     /// State entries whose image reports LESS than the recorded size —
     /// the image changed outside volvisor (marked `Failed`; the recorded
