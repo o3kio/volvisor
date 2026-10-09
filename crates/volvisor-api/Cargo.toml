@@ -25,3 +25,8 @@ tempfile = { workspace = true }
 # `oneshot` for driving the router in tests without a TCP listener; test-only,
 # never linked into the library.
 tower = { version = "0.5", features = ["util"] }
+# Journal fault injection (`Journal::inject_append_failures_after`) for the
+# journal-before-mutate fault tests; the feature is never enabled for the
+# library itself or for downstream consumers (resolver v3 keeps dev-dep
+# features out of normal builds).
+volvisor-journal = { workspace = true, features = ["test-faults"] }

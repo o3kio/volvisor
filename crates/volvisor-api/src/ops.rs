@@ -44,7 +44,9 @@ use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
     GrowVolumeRequest,
 };
-use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, OperationId, VolumeId};
+use volvisor_types::{
+    ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, DeviceId, OperationId, VolumeId,
+};
 
 use crate::error::{json_response, status_for_wire_code, to_json_value};
 use crate::state::SharedState;
@@ -59,6 +61,53 @@ pub(crate) const OP_DETACH_VOLUME: &str = "detach_volume";
 pub(crate) const OP_GROW_VOLUME: &str = "grow_volume";
 /// Operation kind: delete volume.
 pub(crate) const OP_DELETE_VOLUME: &str = "delete_volume";
+/// Operation kind: claim a device for a pool (admin surface).
+pub(crate) const OP_CLAIM_DEVICE: &str = "claim_device";
+/// Operation kind: release a claimed device (admin surface).
+pub(crate) const OP_RELEASE_DEVICE: &str = "release_device";
+
+// ---------------------------------------------------------------------------
+// Payload redaction (SPEC-0002 section 9: no secret material at rest in the
+// journal beyond what the operator already owns)
+// ---------------------------------------------------------------------------
+
+/// Object keys whose *string* values are credential references and are
+/// replaced with [`REDACTED`] before any payload is journaled.
+const REDACTED_KEYS: [&str; 2] = ["key_ref", "authorization_token"];
+
+/// Replacement value written in place of credential material.
+const REDACTED: &str = "[redacted]";
+
+/// Recursively redact credential material from a journal payload.
+///
+/// Walks the payload and replaces the string value of any object key named
+/// `key_ref` (external secret references) or `authorization_token` (scoped
+/// destructive-authorization tokens) with `[redacted]`, at any nesting
+/// depth and inside arrays. Volume/attachment/device identities, sizes and
+/// policies are not credentials and remain intact for forensics.
+///
+/// The *request hash* is computed from the typed request before redaction
+/// (the hashes in `volvisor-types` deliberately exclude token material), so
+/// redaction never changes idempotency behavior.
+pub(crate) fn redact(payload: &mut Value) {
+    match payload {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if REDACTED_KEYS.contains(&key.as_str()) && value.is_string() {
+                    *value = Value::String(REDACTED.to_owned());
+                } else {
+                    redact(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact(item);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Execute one mutating operation through the journal pipeline.
 ///
@@ -66,12 +115,17 @@ pub(crate) const OP_DELETE_VOLUME: &str = "delete_volume";
 /// is durable, and its result is journaled before the response is returned.
 /// The guard returned by the journal lock is never held while `run`'s future
 /// is polled.
+///
+/// `payload` is the full wire request; it is redacted
+/// ([`redact`]) before anything is journaled, so no credential material
+/// (`encryption.key_ref`, `authorization_token`) ever reaches the journal
+/// file.
 pub(crate) async fn execute<R, F, Fut>(
     state: &SharedState,
     op_kind: &'static str,
     operation_id: OperationId,
     request_hash: [u8; 32],
-    payload: Value,
+    mut payload: Value,
     run: F,
 ) -> Result<Response, ApiError>
 where
@@ -79,6 +133,11 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<R, ApiError>>,
 {
+    // Redact credential material before the payload is used anywhere: the
+    // journaled intent (and any forensic read of the log) must never contain
+    // secret references.
+    redact(&mut payload);
+
     // (2) Resolve idempotency from the replay-derived registry.
     let recorded = {
         let journal = lock_journal(state)?;
@@ -327,7 +386,8 @@ pub(crate) fn delete_hash(req: &DeleteVolumeRequest, volume_id: &VolumeId) -> [u
 }
 
 // ---------------------------------------------------------------------------
-// Journal payloads (full wire request, preserved verbatim for forensics)
+// Journal payloads (full wire request, credential material redacted by
+// `execute` before anything is written; preserved otherwise for forensics)
 // ---------------------------------------------------------------------------
 
 /// Journal payload for CreateVolume.
@@ -356,4 +416,19 @@ pub(crate) fn detach_payload(
         "attachment_id": attachment,
         "request": request,
     }))
+}
+
+/// Journal payload for an admin-surface operation (claim/release): the
+/// target device identity plus the request body. The request hash is taken
+/// from the typed request's `request_hash(&device_id)` (which excludes the
+/// token), so the redaction performed by [`execute`] on this payload never
+/// changes idempotency behavior — and a replay after token rotation still
+/// resolves to the recorded outcome, by design.
+pub(crate) fn admin_payload(
+    device_id: &DeviceId,
+    body: &impl Serialize,
+) -> Result<Value, ApiError> {
+    let device = to_json_value(device_id)?;
+    let request = to_json_value(body)?;
+    Ok(serde_json::json!({ "device_id": device, "request": request }))
 }

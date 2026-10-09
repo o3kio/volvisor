@@ -7,7 +7,8 @@
 //!
 //! Logging follows SPEC-0002 section 9: operation kind, `operation_id` and
 //! target identities only — never payloads (which may carry secret
-//! references) and never the admin token.
+//! references), never the admin token and never the admin-surface
+//! authorization token.
 
 // axum handlers consume their extractors by value; clippy's pass-by-value
 // heuristics do not apply to the handler boundary.
@@ -22,7 +23,10 @@ use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
     GrowVolumeRequest, ListVolumesResponse,
 };
-use volvisor_types::{ApiError, CapabilitySet, ProjectId, VolumeId};
+use volvisor_types::{
+    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, ProjectId, ReleaseDeviceRequest,
+    VolumeId,
+};
 
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
 use crate::extract::{RequireAdmin, ValidJson};
@@ -238,6 +242,115 @@ pub(crate) async fn capabilities(
     Ok(json_response(StatusCode::OK, &body))
 }
 
+// ---------------------------------------------------------------------------
+// Admin surface (device enrollment) — SPEC-0002 section 3
+// ---------------------------------------------------------------------------
+
+/// The typed `NOT_FOUND` rejection served when the configured provider does
+/// not implement an admin surface.
+fn admin_surface_unavailable() -> ApiError {
+    ApiError::not_found("admin surface not available for this provider")
+}
+
+/// `GET /v2/admin/devices` — read-only device discovery.
+///
+/// Privileged (admin token required even though it is a read): the device
+/// inventory is host-level information. No journaling: the operation is
+/// read-only and never mutates anything.
+pub(crate) async fn admin_list_devices(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+) -> Result<Response, ApiErrorReply> {
+    let admin = state
+        .admin
+        .clone()
+        .ok_or_else(|| ApiErrorReply(admin_surface_unavailable()))?;
+    let devices = admin.discover_devices().await?;
+    let body = to_json_value(&devices)?;
+    Ok(json_response(StatusCode::OK, &body))
+}
+
+/// `POST /v2/admin/devices/{device_id}/claim` — claim a device for a pool.
+///
+/// Routed through the same journal pipeline as every other mutation: the
+/// (redacted) intent is durable *before* the destructive provider action.
+/// The request hash comes from [`ClaimDeviceRequest::request_hash`] (device
+/// id folded in, token excluded), so a replay after token rotation still
+/// returns the recorded outcome — by design.
+pub(crate) async fn claim_device(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+    ValidJson(req): ValidJson<ClaimDeviceRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first: a provider without an admin
+    // surface answers 404 for any request shape.
+    let admin = state
+        .admin
+        .clone()
+        .ok_or_else(|| ApiErrorReply(admin_surface_unavailable()))?;
+    req.validate()?;
+    let device_id = parse_device_id(&device_id)?;
+    tracing::info!(
+        kind = ops::OP_CLAIM_DEVICE,
+        operation_id = %req.operation_id,
+        device_id = %device_id,
+        "accepting claim_device"
+    );
+    let payload = ops::admin_payload(&device_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_CLAIM_DEVICE,
+        req.operation_id.clone(),
+        req.request_hash(&device_id),
+        payload,
+        move || async move { admin.claim_device(&device_id, &req).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/admin/devices/{device_id}/release` — release a claimed device.
+///
+/// Journaled exactly like claim (see [`claim_device`]); refuses while
+/// volumes still reside on the device's pool.
+pub(crate) async fn release_device(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(device_id): Path<String>,
+    ValidJson(req): ValidJson<ReleaseDeviceRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first (see `claim_device`).
+    let admin = state
+        .admin
+        .clone()
+        .ok_or_else(|| ApiErrorReply(admin_surface_unavailable()))?;
+    req.validate()?;
+    let device_id = parse_device_id(&device_id)?;
+    tracing::info!(
+        kind = ops::OP_RELEASE_DEVICE,
+        operation_id = %req.operation_id,
+        device_id = %device_id,
+        "accepting release_device"
+    );
+    let payload = ops::admin_payload(&device_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_RELEASE_DEVICE,
+        req.operation_id.clone(),
+        req.request_hash(&device_id),
+        payload,
+        move || async move {
+            admin.release_device(&device_id, &req).await?;
+            Ok(ReleaseDeviceAck {
+                released: device_id.clone(),
+            })
+        },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
 /// `GET /healthz` — daemon liveness only.
 ///
 /// This says nothing about volume health: a volume's health lives on its
@@ -261,6 +374,12 @@ pub(crate) async fn not_found() -> Response {
 fn parse_volume_id(raw: &str) -> Result<VolumeId, ApiError> {
     VolumeId::try_from(raw)
         .map_err(|err| ApiError::invalid_request(format!("invalid volume_id in path: {err}")))
+}
+
+/// Parse and validate the `{device_id}` path segment into a [`DeviceId`].
+fn parse_device_id(raw: &str) -> Result<DeviceId, ApiError> {
+    DeviceId::try_from(raw)
+        .map_err(|err| ApiError::invalid_request(format!("invalid device_id in path: {err}")))
 }
 
 /// Query parameters of `GET /v2/volumes`.
@@ -306,6 +425,15 @@ impl DetachRequestWire {
 struct DeleteVolumeAck {
     /// The deleted volume identity.
     deleted: VolumeId,
+}
+
+/// Admin release response body: an explicit acknowledgment naming the
+/// released device (the provider returns `()`; the journal stores exactly
+/// these bytes so replays are byte-compatible).
+#[derive(Debug, Serialize)]
+struct ReleaseDeviceAck {
+    /// The released device identity.
+    released: DeviceId,
 }
 
 /// `GET /v2/capabilities` response body.

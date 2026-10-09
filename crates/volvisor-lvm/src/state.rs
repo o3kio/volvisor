@@ -24,17 +24,24 @@ use volvisor_types::{
 
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
-/// `lv_name` is the sanitized `volume_id`; `vg_name` identifies the claimed
-/// pool the volume lives in (a provider-internal reference, never exposed
-/// to tenants).
+/// `lv_name` is derived from the `volume_id` (sanitized plus a hash
+/// suffix, so distinct identities can never collide on one LV name);
+/// `vg_name` identifies the claimed pool the volume lives in (a
+/// provider-internal reference, never exposed to tenants).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeEntry {
     /// Volume group holding the logical volume.
     pub vg_name: String,
     /// Logical volume name (the sanitized volume identity).
     pub lv_name: String,
-    /// Provisioned (logical) size in bytes.
+    /// Effective (provisioned) size in bytes: what `lvs` reported after
+    /// LVM rounded the request up to whole physical extents.
     pub size_bytes: u64,
+    /// The size the caller originally requested, in bytes. Thick LVM
+    /// rounds sizes up to the physical extent, so this can be smaller
+    /// than `size_bytes`; idempotent-create replay compares *this*
+    /// value (never the rounded one) against a replayed request.
+    pub requested_size_bytes: u64,
     /// Volume generation (optimistic concurrency fencing).
     pub generation: u64,
     /// Writer epoch / data epoch for authority reasoning.
@@ -128,9 +135,11 @@ impl LvmState {
     /// Persist the state atomically.
     ///
     /// Takes `&mut self` to mark the intent to persist a mutation: write
-    /// `<path>.tmp`, fsync, rename over `path`, fsync the directory. If any
-    /// step fails, the temporary file is removed and an `INTERNAL` error is
-    /// returned; the previous state file remains intact.
+    /// `<path>.tmp` (mode `0600` on unix — the state names devices and
+    /// volume placements, so it is owner-only), fsync, rename over
+    /// `path`, fsync the directory. If any step fails, the temporary
+    /// file is removed and an `INTERNAL` error is returned; the previous
+    /// state file remains intact.
     pub fn save(&mut self, path: &Path) -> Result<(), ApiError> {
         let tmp_path = sibling_tmp_path(path);
         let result = self.save_to(&tmp_path, path);
@@ -147,7 +156,7 @@ impl LvmState {
         let path_display = path.display();
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
-        let mut file = fs::File::create(tmp_path)
+        let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         file.write_all(&data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
@@ -233,6 +242,27 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(os_name)
 }
 
+/// Create (or truncate) `path` for writing with owner-only permissions.
+///
+/// On unix the file is created with mode `0600`; other platforms fall
+/// back to the platform default for [`fs::File::create`].
+fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +279,7 @@ mod tests {
                     vg_name: "vg-1".to_owned(),
                     lv_name: "vol-1".to_owned(),
                     size_bytes: 1024,
+                    requested_size_bytes: 512,
                     generation: 3,
                     data_epoch: 1,
                     project_id,
@@ -321,5 +352,23 @@ mod tests {
         std::fs::write(&path, b"{ not json").expect("write corrupt state");
         let err = LvmState::load(&path).expect_err("corrupt state must fail");
         assert_eq!(err.code, ApiErrorCode::Internal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let mut state = sample_state();
+        state.save(&path).expect("save");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "state file must be owner-only");
+        // An overwritten state keeps the restrictive mode as well.
+        state.save(&path).expect("save again");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A failed save never leaves a .tmp residue behind.
+        assert!(!sibling_tmp_path(&path).exists());
     }
 }

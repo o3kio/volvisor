@@ -36,18 +36,31 @@ where
     }
 }
 
-/// Extractor enforcing admin bearer authentication on mutating endpoints.
+/// Extractor enforcing admin bearer authentication on privileged endpoints.
 ///
-/// When [`crate::AppState`] carries an `admin_token`, the request must present
-/// `Authorization: Bearer <token>`; a missing or mismatching token fails with
-/// `401` and body `{"code":"UNAUTHORIZED", ...}`. `UNAUTHORIZED` is a
-/// transport-level code: it is deliberately not part of the volume error
-/// taxonomy in `volvisor-types` (which models *storage* failures).
+/// Requests must present `Authorization: Bearer <token>` matching the
+/// configured [`crate::AppState`] `admin_token`; a missing or mismatching
+/// token fails with `401` and body `{"code":"UNAUTHORIZED", ...}`.
+/// `UNAUTHORIZED` is a transport-level code: it is deliberately not part of
+/// the volume error taxonomy in `volvisor-types` (which models *storage*
+/// failures).
 ///
-/// Read-only `GET` routes do not use this extractor: in P0 they are open
-/// because the daemon binds host-local and reads expose nothing a local
-/// process could not already observe. **This changes with multi-tenant
-/// exposure** — every route will require authorization then.
+/// **Fail closed**: when no `admin_token` is configured, privileged requests
+/// are *rejected*, never permitted. Mutating endpoints cannot be exposed
+/// without authentication; the tokenless mode is a loopback-only dev/test
+/// convenience (the daemon refuses non-loopback binds without a token).
+///
+/// Two route groups use this extractor:
+///
+/// - every mutating volume endpoint (`POST`/`DELETE` under `/v2/volumes`);
+/// - the whole `/v2/admin` surface, `GET` included, since device inventory
+///   is host-privileged information.
+///
+/// The remaining read-only `GET` routes (`/v2/volumes`, `/v2/capabilities`,
+/// `/healthz`, `/metrics`) stay open in P0 because the daemon binds
+/// host-local and they expose nothing a local process could not already
+/// observe. **This changes with multi-tenant exposure** — every route will
+/// require authorization then.
 ///
 /// The token comparison walks all bytes without an early exit (length is
 /// compared separately), avoiding the obvious timing oracle without pulling
@@ -65,13 +78,19 @@ impl FromRequestParts<SharedState> for RequireAdmin {
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
         let Some(expected) = state.admin_token.as_deref() else {
-            return Ok(Self);
+            // Fail closed: without a configured token there is nothing to
+            // authenticate against, so privileged requests are disabled.
+            return Err(unauthorized_response(
+                "admin_token is not configured; mutating endpoints are disabled (fail closed)",
+            ));
         };
         let presented = bearer_token(&parts.headers);
         if presented.is_some_and(|token| fixed_time_eq(token, expected)) {
             Ok(Self)
         } else {
-            Err(unauthorized_response())
+            Err(unauthorized_response(
+                "mutating operations require a valid admin bearer token",
+            ))
         }
     }
 }
@@ -96,10 +115,10 @@ fn fixed_time_eq(presented: &str, expected: &str) -> bool {
 }
 
 /// The `401 UNAUTHORIZED` reply (transport-level code, contract error shape).
-fn unauthorized_response() -> Response {
+fn unauthorized_response(message: &str) -> Response {
     let body = serde_json::json!({
         "code": "UNAUTHORIZED",
-        "message": "mutating operations require a valid admin bearer token",
+        "message": message,
     });
     json_response(StatusCode::UNAUTHORIZED, &body)
 }

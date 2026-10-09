@@ -3,9 +3,11 @@
 //! All routes share one [`crate::AppState`]. A metrics middleware records
 //! `http_requests_total` (route pattern + status code) for every matched
 //! route; a request body limit from [`crate::ApiConfig`] guards every
-//! endpoint. Mutating endpoints enforce admin bearer auth through the
-//! [`crate::extract::RequireAdmin`] extractor (see its documentation for why
-//! `GET` routes are open in P0).
+//! endpoint. Mutating endpoints and the whole `/v2/admin` surface (device
+//! inventory is privileged, `GET` included) enforce admin bearer auth
+//! through the [`crate::extract::RequireAdmin`] extractor (see its
+//! documentation for the fail-closed tokenless behavior and why the
+//! remaining `GET` routes are open in P0).
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
@@ -41,6 +43,18 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
         )
         .route("/v2/volumes/{volume_id}/grow", post(handlers::grow_volume))
         .route("/v2/capabilities", get(handlers::capabilities))
+        // Admin surface (device enrollment): every route requires the admin
+        // token, GET included — device inventory is privileged. Providers
+        // without an admin surface serve a typed 404 on these routes.
+        .route("/v2/admin/devices", get(handlers::admin_list_devices))
+        .route(
+            "/v2/admin/devices/{device_id}/claim",
+            post(handlers::claim_device),
+        )
+        .route(
+            "/v2/admin/devices/{device_id}/release",
+            post(handlers::release_device),
+        )
         // Liveness is exposed on /healthz (task requirement); the
         // implementation plan section 5.5 also lists /v2/healthz, so both
         // spellings serve the same liveness-only response.

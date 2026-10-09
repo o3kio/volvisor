@@ -6,20 +6,29 @@
 //! `vgs`/`pvs` report it — so the provider's verification steps (sizes
 //! read back from `lvs`) exercise real round-trips instead of echoes.
 //!
+//! The simulation mirrors real LVM semantics that matter to the provider:
+//! `lvcreate`/`lvextend` round sizes **up** to the configured physical
+//! extent size ([`FakeLvm::extent_size`], 4 MiB by default), `lvcreate`
+//! fails on an LV name that already exists, and `lvremove` on a missing
+//! LV fails.
+//!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention (see
 //! the crate-level `cfg_attr(test)` in the library).
 
 #![allow(dead_code)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// The simulated world is a fault-injection matrix; one bool per scripted
+// failure is the clearest shape for test code.
+#![allow(clippy::struct_excessive_bools)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use volvisor_lvm::provider::LvmProvider;
+use volvisor_lvm::provider::{LvmProvider, lv_name_for};
 use volvisor_lvm::runner::{CommandOutput, CommandRunner, FakeRunner, RealRunner};
 use volvisor_lvm::state::{DeviceEntry, LvmState};
-use volvisor_types::{ApiError, DeviceId, DeviceRole, VolumeLifecycle};
+use volvisor_types::{ApiError, DeviceId, DeviceRole, VolumeId, VolumeLifecycle};
 
 /// VG prefix used by the fixtures.
 pub const VG_PREFIX: &str = "vvtest";
@@ -31,9 +40,10 @@ pub const CLAIMED_DEVICE: &str = "dev-0123456789abcdef0123456789abcdef";
 pub const CLAIMED_VG: &str = "vvtest-abcdef01";
 /// Simulated pool capacity (1 TiB).
 pub const POOL_BYTES: u64 = 1 << 40;
+/// Default simulated physical extent size (4 MiB), as in real LVM.
+pub const EXTENT_BYTES: u64 = 4 << 20;
 
 /// The simulated LVM world shared between the provider and assertions.
-#[derive(Default)]
 pub struct FakeLvm {
     /// LV full path (`vg/lv`) to size in bytes.
     pub lvs: BTreeMap<String, u64>,
@@ -53,6 +63,30 @@ pub struct FakeLvm {
     /// When true, `lvextend` claims success but never updates `lvs`
     /// (verification-failure injection).
     pub lvextend_silent: bool,
+    /// Physical extent size `lvcreate`/`lvextend` round up to.
+    pub extent_size: u64,
+    /// When true, `vgcreate` fails (claim crash-window injection).
+    pub fail_vgcreate: bool,
+    /// When true, `pvremove` fails (release crash-window injection).
+    pub fail_pvremove: bool,
+}
+
+impl Default for FakeLvm {
+    fn default() -> Self {
+        Self {
+            lvs: BTreeMap::new(),
+            pvs: Vec::new(),
+            vg_free: BTreeMap::new(),
+            vg_size: BTreeMap::new(),
+            fail_lvremove_for: Vec::new(),
+            fail_blkdiscard: false,
+            lvcreate_silent: false,
+            lvextend_silent: false,
+            extent_size: EXTENT_BYTES,
+            fail_vgcreate: false,
+            fail_pvremove: false,
+        }
+    }
 }
 
 impl FakeLvm {
@@ -137,8 +171,17 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             let size: u64 = size.trim_end_matches('B').parse().ok()?;
             let lv = arg_after(args, "-n")?;
             let vg = *args.last()?;
+            let path = format!("{vg}/{lv}");
+            // Real LVM refuses to create an LV whose name already exists.
+            if world.lvs.contains_key(&path) {
+                return Some(CommandOutput::failure(format!(
+                    "lvcreate: {path} already exists"
+                )));
+            }
             if !world.lvcreate_silent {
-                world.lvs.insert(format!("{vg}/{lv}"), size);
+                // Real LVM rounds the requested size up to whole extents.
+                let effective = round_up_to_extent(size, world.extent_size);
+                world.lvs.insert(path, effective);
             }
             Some(CommandOutput::success(String::new()))
         }
@@ -148,7 +191,8 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             let size: u64 = size.trim_end_matches('B').parse().ok()?;
             let path = *args.last()?;
             if !world.lvextend_silent {
-                world.lvs.insert(path.to_owned(), size);
+                let effective = round_up_to_extent(size, world.extent_size);
+                world.lvs.insert(path.to_owned(), effective);
             }
             Some(CommandOutput::success(String::new()))
         }
@@ -158,7 +202,12 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             if world.fail_lvremove_for.iter().any(|p| p == path) {
                 return Some(CommandOutput::failure("lvremove: device is busy"));
             }
-            world.lvs.remove(path);
+            // Real lvremove of a missing LV fails loudly.
+            if world.lvs.remove(path).is_none() {
+                return Some(CommandOutput::failure(format!(
+                    "lvremove: {path} not found"
+                )));
+            }
             Some(CommandOutput::success(String::new()))
         }
         "blkdiscard" => {
@@ -175,15 +224,41 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             Some(CommandOutput::success(String::new()))
         }
         "vgcreate" => {
+            if world.fail_vgcreate {
+                return Some(CommandOutput::failure("vgcreate: simulated failure"));
+            }
             // vgcreate --yes <vg> <path>
             let vg = (*args.get(1)?).to_owned();
             world.vg_free.insert(vg.clone(), POOL_BYTES);
             world.vg_size.insert(vg, POOL_BYTES);
             Some(CommandOutput::success(String::new()))
         }
-        "vgremove" | "pvremove" => Some(CommandOutput::success(String::new())),
+        "vgremove" => {
+            // vgremove --yes <vg>
+            let vg = *args.last()?;
+            world.vg_free.remove(vg);
+            world.vg_size.remove(vg);
+            Some(CommandOutput::success(String::new()))
+        }
+        "pvremove" => {
+            if world.fail_pvremove {
+                return Some(CommandOutput::failure("pvremove: simulated failure"));
+            }
+            // pvremove --yes <path>
+            let path = *args.last()?;
+            world.pvs.retain(|pv| pv != path);
+            Some(CommandOutput::success(String::new()))
+        }
         _ => None,
     }
+}
+
+/// Round `size` up to a whole multiple of `extent` (real LVM behavior).
+fn round_up_to_extent(size: u64, extent: u64) -> u64 {
+    if extent == 0 {
+        return size;
+    }
+    size.div_ceil(extent) * extent
 }
 
 /// The `lsblk` JSON describing the fake host's disks.
@@ -236,6 +311,27 @@ pub fn seed_claimed_state(state_path: &std::path::Path) {
     state.save(state_path).expect("seed state");
 }
 
+/// A claim request carrying `token` (the destructive-authorization
+/// credential under test).
+pub fn claim_request(token: &str) -> volvisor_types::ClaimDeviceRequest {
+    volvisor_types::ClaimDeviceRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: volvisor_types::OperationId::new("op-claim-fixture")
+            .expect("valid fixture operation id"),
+        authorization_token: token.to_owned(),
+    }
+}
+
+/// A release request carrying `token`.
+pub fn release_request(token: &str) -> volvisor_types::ReleaseDeviceRequest {
+    volvisor_types::ReleaseDeviceRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: volvisor_types::OperationId::new("op-release-fixture")
+            .expect("valid fixture operation id"),
+        authorization_token: token.to_owned(),
+    }
+}
+
 /// A provider over the simulated LVM with a pre-claimed pool.
 ///
 /// Each call yields an isolated provider (own state file, own simulated
@@ -264,6 +360,8 @@ pub struct Fixture {
     pub provider: Arc<LvmProvider>,
     /// The simulated LVM world.
     pub world: Arc<Mutex<FakeLvm>>,
+    /// The scripted runner (for invocation assertions).
+    pub runner: Arc<FakeRunner>,
     /// The state file path.
     pub state_path: PathBuf,
 }
@@ -288,14 +386,16 @@ pub fn provider_from(
 
 /// Seed a volume entry directly into a state file (reconciliation tests).
 pub fn seed_volume(state_path: &std::path::Path, volume_id: &str, vg_name: &str, size_bytes: u64) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
     let mut state = LvmState::load(state_path).expect("load state");
     state.insert_volume(
-        volvisor_types::VolumeId::new(volume_id).expect("valid volume id"),
+        volume_id.clone(),
         volvisor_lvm::state::StoredVolume {
             entry: volvisor_lvm::state::VolumeEntry {
                 vg_name: vg_name.to_owned(),
-                lv_name: volume_id.to_owned(),
+                lv_name: lv_name_for(&volume_id),
                 size_bytes,
+                requested_size_bytes: size_bytes,
                 generation: 1,
                 data_epoch: 0,
                 project_id: volvisor_types::ProjectId::new("seed-project")
@@ -333,7 +433,7 @@ fn fixture_at(state_path: PathBuf, claimed: bool) -> Fixture {
     let runner = FakeLvm::runner(&world);
     let sysfs_root = leak_tempdir();
     let provider = LvmProvider::new(
-        runner,
+        Arc::clone(&runner) as Arc<dyn CommandRunner>,
         state_path.clone(),
         sysfs_root,
         VG_PREFIX.to_owned(),
@@ -344,13 +444,14 @@ fn fixture_at(state_path: PathBuf, claimed: bool) -> Fixture {
     Fixture {
         provider,
         world,
+        runner,
         state_path,
     }
 }
 
 /// A real-command provider over an empty state (integration tests).
 pub fn real_provider(state_path: PathBuf) -> Result<Arc<LvmProvider>, ApiError> {
-    let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner);
+    let runner: Arc<dyn CommandRunner> = Arc::new(RealRunner::default());
     LvmProvider::new(
         runner,
         state_path,

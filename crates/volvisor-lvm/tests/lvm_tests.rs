@@ -12,6 +12,8 @@
 mod common;
 
 use common::{fixture, unclaimed_fixture};
+use volvisor_lvm::provider::lv_name_for;
+use volvisor_lvm::state::LvmState;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
@@ -21,6 +23,7 @@ use volvisor_types::request::ErasurePolicy;
 use volvisor_types::{ApiErrorCode, DeviceId, VolumeId, VolumeLifecycle};
 
 const GIB: u64 = 1 << 30;
+const MIB: u64 = 1 << 20;
 
 fn volume_id(raw: &str) -> VolumeId {
     VolumeId::new(raw).expect("valid fixture volume id")
@@ -33,11 +36,11 @@ fn volume_id(raw: &str) -> VolumeId {
 #[test]
 fn claim_requires_the_destructive_authorization_token() {
     let fixture = unclaimed_fixture();
-    let devices = fixture.provider.discover().expect("discover");
+    let devices = fixture.provider.discover().expect("discover").devices;
     let device = devices.first().expect("a discovered disk");
     let err = fixture
         .provider
-        .claim_device(&device.id, "wrong-token")
+        .claim_device(&device.id, &common::claim_request("wrong-token"))
         .expect_err("claim with a bad token");
     assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy);
     // The token value never appears in the error detail.
@@ -52,7 +55,7 @@ fn claim_requires_the_destructive_authorization_token() {
 #[test]
 fn claim_rejects_a_device_hosting_a_foreign_pv() {
     let fixture = unclaimed_fixture();
-    let devices = fixture.provider.discover().expect("discover");
+    let devices = fixture.provider.discover().expect("discover").devices;
     let device = devices.first().expect("a discovered disk").clone();
 
     // Foreign LVM state already sits on the discovered path.
@@ -65,10 +68,12 @@ fn claim_rejects_a_device_hosting_a_foreign_pv() {
 
     let err = fixture
         .provider
-        .claim_device(&device.id, common::AUTH_TOKEN)
+        .claim_device(&device.id, &common::claim_request(common::AUTH_TOKEN))
         .expect_err("claim over a foreign PV");
     assert_eq!(err.code, ApiErrorCode::ForeignDeviceState);
     assert!(!err.detail.contains("adopted-quietly"));
+    // The detail points at interrupted-claim recovery.
+    assert!(err.detail.contains("pvremove"), "{err}");
 
     // No pvcreate/vgcreate was ever attempted.
     assert!(
@@ -85,12 +90,12 @@ fn claim_rejects_a_device_hosting_a_foreign_pv() {
 #[tokio::test]
 async fn claim_creates_pool_and_release_requires_empty_vg() {
     let fixture = unclaimed_fixture();
-    let devices = fixture.provider.discover().expect("discover");
+    let devices = fixture.provider.discover().expect("discover").devices;
     let device = devices.first().expect("a discovered disk").clone();
 
     let pool = fixture
         .provider
-        .claim_device(&device.id, common::AUTH_TOKEN)
+        .claim_device(&device.id, &common::claim_request(common::AUTH_TOKEN))
         .expect("claim");
     assert!(pool.id.as_str().starts_with("pool-"));
     assert_eq!(
@@ -114,7 +119,7 @@ async fn claim_creates_pool_and_release_requires_empty_vg() {
     // Re-claiming an already-claimed device is rejected.
     let err = fixture
         .provider
-        .claim_device(&device.id, common::AUTH_TOKEN)
+        .claim_device(&device.id, &common::claim_request(common::AUTH_TOKEN))
         .expect_err("double claim");
     assert_eq!(err.code, ApiErrorCode::InvalidState);
 
@@ -126,7 +131,7 @@ async fn claim_creates_pool_and_release_requires_empty_vg() {
         .expect("create");
     let err = fixture
         .provider
-        .release_device(&device.id, common::AUTH_TOKEN)
+        .release_device(&device.id, &common::release_request(common::AUTH_TOKEN))
         .expect_err("release with volumes present");
     assert_eq!(err.code, ApiErrorCode::InvalidState);
 
@@ -141,7 +146,7 @@ async fn claim_creates_pool_and_release_requires_empty_vg() {
         .expect("delete");
     fixture
         .provider
-        .release_device(&device.id, common::AUTH_TOKEN)
+        .release_device(&device.id, &common::release_request(common::AUTH_TOKEN))
         .expect("release");
 }
 
@@ -151,7 +156,7 @@ fn release_requires_the_destructive_authorization_token() {
     let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
     let err = fixture
         .provider
-        .release_device(&device, "wrong-token")
+        .release_device(&device, &common::release_request("wrong-token"))
         .expect_err("release with a bad token");
     assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy);
     assert!(!err.detail.contains("wrong-token"));
@@ -164,7 +169,7 @@ fn claim_of_an_undiscovered_device_is_not_found() {
     let unknown = DeviceId::new("dev-ffffffffffffffffffffffffffffffff").expect("valid id shape");
     let err = fixture
         .provider
-        .claim_device(&unknown, common::AUTH_TOKEN)
+        .claim_device(&unknown, &common::claim_request(common::AUTH_TOKEN))
         .expect_err("claim of unknown device");
     assert_eq!(err.code, ApiErrorCode::NotFound);
 }
@@ -317,7 +322,11 @@ async fn delete_with_an_attachment_is_invalid_state() {
             .lock()
             .expect("world")
             .lvs
-            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "del-attached"))
+            .contains_key(&format!(
+                "{}/{}",
+                common::CLAIMED_VG,
+                lv_name_for(&volume_id("del-attached"))
+            ))
     );
 }
 
@@ -350,7 +359,11 @@ async fn delete_with_zero_discard_stops_before_lvremove_on_failure() {
             .lock()
             .expect("world")
             .lvs
-            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "discard-vol"))
+            .contains_key(&format!(
+                "{}/{}",
+                common::CLAIMED_VG,
+                lv_name_for(&volume_id("discard-vol"))
+            ))
     );
     fixture
         .provider
@@ -382,7 +395,11 @@ async fn delete_with_zero_discard_discards_then_removes() {
             .lock()
             .expect("world")
             .lvs
-            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "discard-ok"))
+            .contains_key(&format!(
+                "{}/{}",
+                common::CLAIMED_VG,
+                lv_name_for(&volume_id("discard-ok"))
+            ))
     );
 }
 
@@ -556,7 +573,7 @@ async fn failed_volume_cannot_attach_but_can_be_deleted() {
     fixture.world.lock().expect("world").lvs.remove(&format!(
         "{}/{}",
         common::CLAIMED_VG,
-        "failed-vol"
+        lv_name_for(&volume_id("failed-vol"))
     ));
     let restarted = common::provider_from(&fixture.state_path, &fixture.world);
     let inspected = restarted
@@ -582,4 +599,287 @@ async fn failed_volume_cannot_attach_but_can_be_deleted() {
         )
         .await
         .expect("delete failed volume");
+}
+
+#[tokio::test]
+async fn delete_of_a_failed_volume_without_an_lv_skips_lvm_entirely() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("ghost-del", GIB))
+        .await
+        .expect("create");
+
+    // The LV vanishes; the restart reconciles the volume to Failed.
+    fixture.world.lock().expect("world").lvs.remove(&format!(
+        "{}/{}",
+        common::CLAIMED_VG,
+        lv_name_for(&volume_id("ghost-del"))
+    ));
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+
+    // blkdiscard is scripted to fail AND lvremove of a missing LV fails
+    // in the realistic fake: the delete must skip both (there is nothing
+    // to discard or remove) and still succeed.
+    fixture.world.lock().expect("world").fail_blkdiscard = true;
+    restarted
+        .delete_volume(&created.volume_id, &{
+            let mut request = fixture_delete_request("ghost-del", inspected.generation);
+            request.data_erasure_policy = ErasurePolicy::ZeroDiscard;
+            request
+        })
+        .await
+        .expect("delete of a Failed volume whose LV is absent");
+
+    let err = restarted
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect_err("volume is gone");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// Extent rounding (thick LVM rounds sizes up to whole physical extents)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_rounds_up_to_the_extent_and_reports_the_effective_size() {
+    let fixture = fixture();
+    // 1 MiB is not extent-aligned (the simulated extent is 4 MiB).
+    let requested = MIB;
+    let effective = 4 * MIB;
+
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("unaligned-vol", requested))
+        .await
+        .expect("non-aligned create succeeds");
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    // The response reports the effective size honestly, not the request.
+    assert_eq!(created.provisioned_bytes, effective);
+    assert_eq!(created.allocated_bytes, effective);
+
+    // The simulated LVM holds the extent-rounded LV.
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&format!(
+            "{}/{}",
+            common::CLAIMED_VG,
+            lv_name_for(&volume_id("unaligned-vol"))
+        )),
+        Some(&effective)
+    );
+
+    // State stores both the requested and the effective size.
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    let entry = &state
+        .volume(&volume_id("unaligned-vol"))
+        .expect("stored volume")
+        .entry;
+    assert_eq!(entry.requested_size_bytes, requested);
+    assert_eq!(entry.size_bytes, effective);
+
+    // Idempotent replay of the same request returns the stored volume.
+    let replayed = fixture
+        .provider
+        .create_volume(&fixture_create_request("unaligned-vol", requested))
+        .await
+        .expect("idempotent replay");
+    assert_eq!(replayed.provisioned_bytes, effective);
+    assert_eq!(replayed.generation, created.generation);
+
+    // A different requested size for the same identity conflicts.
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("unaligned-vol", 2 * MIB))
+        .await
+        .expect_err("conflicting replay");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
+async fn grow_rounds_up_to_the_extent_and_reports_the_effective_size() {
+    let fixture = fixture();
+    // Start at an extent-aligned size, then grow to a non-aligned one.
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("grow-unaligned", 4 * MIB))
+        .await
+        .expect("create");
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &created.volume_id,
+            &fixture_grow_request("grow-unaligned", 5 * MIB, created.generation),
+        )
+        .await
+        .expect("non-aligned grow succeeds");
+    assert!(grown.backing_resized);
+    // 5 MiB rounds up to 8 MiB (two 4-MiB extents).
+    assert_eq!(grown.effective_size_bytes, 8 * MIB);
+
+    // The effective size is persisted and reported.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.provisioned_bytes, 8 * MIB);
+    assert_eq!(inspected.allocated_bytes, 8 * MIB);
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    let entry = &state
+        .volume(&volume_id("grow-unaligned"))
+        .expect("stored volume")
+        .entry;
+    assert_eq!(entry.size_bytes, 8 * MIB);
+}
+
+// ---------------------------------------------------------------------------
+// Injective LV naming
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lv_names_are_injective_across_the_id_charset() {
+    // `vol.a`, `vol:a` and `vol-a` all sanitized to `vol-a` under the old
+    // scheme; the hash suffix keeps them distinct.
+    let names = [
+        lv_name_for(&volume_id("vol.a")),
+        lv_name_for(&volume_id("vol:a")),
+        lv_name_for(&volume_id("vol-a")),
+    ];
+    assert_ne!(names[0], names[1]);
+    assert_ne!(names[0], names[2]);
+    assert_ne!(names[1], names[2]);
+    for name in &names {
+        assert!(name.starts_with("vol-"), "{name}: stable prefix");
+        assert!(!name.starts_with('-'), "{name}: never dash-leading");
+    }
+    // Deterministic for the same identity.
+    assert_eq!(names[0], lv_name_for(&volume_id("vol.a")));
+}
+
+#[tokio::test]
+async fn volumes_with_legacy_colliding_ids_coexist() {
+    let fixture = fixture();
+    // Under the old sanitization both ids mapped to the LV name
+    // `collide-a`; the realistic fake now refuses duplicate LV names, so
+    // this only succeeds because the derived names differ.
+    let first = fixture
+        .provider
+        .create_volume(&fixture_create_request("collide.a", MIB))
+        .await
+        .expect("first create");
+    let second = fixture
+        .provider
+        .create_volume(&fixture_create_request("collide:a", MIB))
+        .await
+        .expect("second create with a legacy-colliding id");
+    assert_ne!(first.volume_id, second.volume_id);
+    let listed = fixture.provider.list_volumes(None).await.expect("list");
+    assert_eq!(listed.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Claim/release crash windows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_vgcreate_failure_undoes_the_pvcreate() {
+    let fixture = unclaimed_fixture();
+    let devices = fixture.provider.discover().expect("discover").devices;
+    let device = devices.first().expect("a discovered disk").clone();
+    fixture.world.lock().expect("world").fail_vgcreate = true;
+
+    let err = fixture
+        .provider
+        .claim_device(&device.id, &common::claim_request(common::AUTH_TOKEN))
+        .expect_err("claim with a failing vgcreate");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("vgcreate"), "{err}");
+    // No manual remediation is demanded: the undo succeeded.
+    assert!(!err.detail.contains("manual pvremove"), "{err}");
+
+    // The pvcreate was undone: no PV remains on the device path (the
+    // fixture's discovery resolves the disk to its kernel path).
+    assert!(fixture.world.lock().expect("world").pvs.is_empty());
+    // The undo ran as a real pvremove invocation.
+    assert!(
+        fixture
+            .runner
+            .invocations()
+            .into_iter()
+            .any(|invocation| invocation.program == "pvremove"),
+        "the claim failure must trigger a pvremove undo"
+    );
+    // State does not claim a device whose VG was not created.
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device.id).is_none());
+}
+
+#[test]
+fn claim_vgcreate_failure_with_a_failing_undo_names_the_remediation() {
+    let fixture = unclaimed_fixture();
+    let devices = fixture.provider.discover().expect("discover").devices;
+    let device = devices.first().expect("a discovered disk").clone();
+    let mut world = fixture.world.lock().expect("world");
+    world.fail_vgcreate = true;
+    world.fail_pvremove = true;
+    drop(world);
+
+    let err = fixture
+        .provider
+        .claim_device(&device.id, &common::claim_request(common::AUTH_TOKEN))
+        .expect_err("claim with a failing vgcreate and undo");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("vgcreate"), "{err}");
+    // The remediation hint names the exact manual pvremove required (the
+    // fixture's discovery resolves the disk to its kernel path).
+    assert!(err.detail.contains("manual pvremove"), "{err}");
+    assert!(err.detail.contains("/dev/sda"), "{err}");
+
+    // The leftover PV is still on the device (observed reality) and the
+    // device is not claimed.
+    assert_eq!(
+        fixture.world.lock().expect("world").pvs,
+        vec!["/dev/sda".to_owned()]
+    );
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device.id).is_none());
+}
+
+#[test]
+fn release_pvremove_failure_keeps_the_claim_removed_with_a_remediation() {
+    let fixture = fixture();
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    fixture.world.lock().expect("world").fail_pvremove = true;
+
+    let err = fixture
+        .provider
+        .release_device(&device, &common::release_request(common::AUTH_TOKEN))
+        .expect_err("release with a failing pvremove");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    // The exact remediation is named.
+    assert!(err.detail.contains("VG removed; manual pvremove"), "{err}");
+    assert!(
+        err.detail
+            .contains("/dev/disk/by-id/wwn-0x5000c500fixt0001"),
+        "{err}"
+    );
+
+    // The claim is NOT restored: the VG really is gone, so state matches
+    // observed reality.
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device).is_none());
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .vg_free
+            .contains_key(common::CLAIMED_VG)
+    );
 }

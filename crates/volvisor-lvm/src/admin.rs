@@ -1,18 +1,32 @@
 //! Administrative (operator-facing) operations on the LVM provider.
 //!
-//! These are *inherent* methods on [`LvmProvider`], deliberately not part
-//! of the [`VolumeProvider`](volvisor_provider::VolumeProvider) trait: they
-//! are host-administration concerns (discovery, device claiming, release,
-//! reconciliation reporting) rather than tenant-facing volume operations.
+//! The inherent methods on [`LvmProvider`] implement the privileged
+//! enrollment concerns (discovery, device claiming, release,
+//! reconciliation reporting); [`AdminSurface`] is implemented on top of
+//! them so the API layer can treat the provider polymorphically. They are
+//! deliberately not part of the [`VolumeProvider`](volvisor_provider::VolumeProvider)
+//! trait: these are host-administration concerns rather than tenant-facing
+//! volume operations.
 //!
 //! Claiming and releasing a device are privileged, destructive operations:
-//! both require the scoped destructive-authorization token configured at
-//! construction. A mismatch fails with `UNSUPPORTED_CLASS_OR_POLICY` and
-//! the token itself is never included in any error or log line.
+//! both require the scoped destructive-authorization token carried by the
+//! request (compared against the token configured at construction, never
+//! logged). A mismatch fails with `UNSUPPORTED_CLASS_OR_POLICY`.
+//!
+//! Crash windows are handled so state always matches observed reality:
+//! a claim whose `vgcreate` fails undoes its `pvcreate` (best effort, with
+//! a manual-remediation hint when the undo fails); a release whose
+//! `pvremove` fails keeps the claim *removed* (the VG is already gone) and
+//! reports the exact manual remediation instead of silently diverging.
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use volvisor_provider::AdminSurface;
 use volvisor_types::domain::{DeviceRole, Health, Pool, PoolProtection, VolumeClass};
-use volvisor_types::{ApiError, ApiErrorCode, DeviceId, PoolId};
+use volvisor_types::{
+    ApiError, ApiErrorCode, ClaimDeviceRequest, DeviceId, DeviceListResponse, PoolId,
+    ReleaseDeviceRequest,
+};
 
 use crate::discover;
 use crate::provider::{LvmProvider, VG_HEADROOM_BYTES, command_failed};
@@ -33,25 +47,34 @@ impl LvmProvider {
     ///
     /// Health is `Unknown` and ownership fields are empty: claim state
     /// lives in the provider state file, not in discovery output.
-    pub fn discover(&self) -> Result<Vec<volvisor_types::domain::PhysicalDevice>, ApiError> {
-        discover::discover_devices(self.runner.as_ref(), &self.sysfs_root)
+    pub fn discover(&self) -> Result<DeviceListResponse, ApiError> {
+        Ok(DeviceListResponse {
+            devices: discover::discover_devices(self.runner.as_ref(), &self.sysfs_root)?,
+        })
     }
 
     /// Claim a discovered device as a native-local pool.
     ///
-    /// Requires the destructive-authorization token. The device must be
-    /// discoverable with a stable identity, must not already be claimed,
-    /// and `pvs` must show **no existing physical volume** on its path —
-    /// foreign LVM state is never adopted (`FOREIGN_DEVICE_STATE`).
-    /// On success the device holds a fresh `pvcreate` + `vgcreate` volume
-    /// group named `<vg_prefix>-<8 hex of sha256(device_id)>`, the claim is
-    /// persisted, and the resulting [`Pool`] is returned.
+    /// Requires the destructive-authorization token carried by `request`.
+    /// The device must be discoverable with a stable identity, must not
+    /// already be claimed, and `pvs` must show **no existing physical
+    /// volume** on its path — foreign LVM state is never adopted
+    /// (`FOREIGN_DEVICE_STATE`). On success the device holds a fresh
+    /// `pvcreate` + `vgcreate` volume group named
+    /// `<vg_prefix>-<8 hex of sha256(device_id)>`, the claim is persisted,
+    /// and the resulting [`Pool`] is returned.
+    ///
+    /// If `vgcreate` fails after `pvcreate` succeeded, the `pvcreate` is
+    /// undone with a best-effort `pvremove` (and a failing undo surfaces a
+    /// manual-remediation hint): state never claims a device whose volume
+    /// group was not created.
     pub fn claim_device(
         &self,
         device_id: &DeviceId,
-        authorization_token: &str,
+        request: &ClaimDeviceRequest,
     ) -> Result<Pool, ApiError> {
-        self.require_token(authorization_token)?;
+        request.validate()?;
+        self.require_token(&request.authorization_token)?;
         let mut state = self.lock_state()?;
 
         if state.device(device_id).is_some() {
@@ -82,7 +105,8 @@ impl LvmProvider {
                     ApiErrorCode::ForeignDeviceState,
                     format!(
                         "device path {} already hosts a physical volume; foreign state is \
-                         never adopted",
+                         never adopted (if this is a leftover from an interrupted volvisor \
+                         claim, remove it manually with pvremove)",
                         device.path
                     ),
                 ));
@@ -98,7 +122,19 @@ impl LvmProvider {
             .runner
             .run("vgcreate", &["--yes", &vg_name, &device.path])?;
         if !output.success {
-            return Err(command_failed("vgcreate", &output));
+            // The pvcreate above left a PV on the device: undo it so no
+            // half-claimed device remains. State has not been touched yet.
+            let mut detail = format!("vgcreate failed: {}", output.stderr_excerpt());
+            let undone = self
+                .runner
+                .run("pvremove", &["--yes", &device.path])
+                .is_ok_and(|undo| undo.success);
+            if !undone {
+                detail.push_str("; pvcreate undo failed: manual pvremove ");
+                detail.push_str(&device.path);
+                detail.push_str(" required");
+            }
+            return Err(ApiError::new(ApiErrorCode::Internal, detail));
         }
         let capacity = self
             .list_vgs()?
@@ -146,18 +182,21 @@ impl LvmProvider {
 
     /// Release a claimed device back to unclaimed state.
     ///
-    /// Requires the destructive-authorization token. The device's volume
-    /// group must hold zero volumes in provider state (`INVALID_STATE`
-    /// otherwise); then the claim is durably removed (intent before
-    /// mutate) and `vgremove` + `pvremove` are executed. If the LVM
-    /// commands fail, the claim is restored to state and the honest
-    /// `INTERNAL` error is returned — success is never pretended.
+    /// Requires the destructive-authorization token carried by `request`.
+    /// The device's volume group must hold zero volumes in provider state
+    /// (`INVALID_STATE` otherwise). `vgremove` runs first; if it fails the
+    /// VG still exists and the claim stays put (state matches reality).
+    /// Once the VG is gone the claim removal is persisted **immediately**,
+    /// then `pvremove` runs: if it fails, the claim is *not* restored —
+    /// the VG really is gone — and the error names the exact manual
+    /// remediation. Success is never pretended.
     pub fn release_device(
         &self,
         device_id: &DeviceId,
-        authorization_token: &str,
+        request: &ReleaseDeviceRequest,
     ) -> Result<(), ApiError> {
-        self.require_token(authorization_token)?;
+        request.validate()?;
+        self.require_token(&request.authorization_token)?;
         let mut state = self.lock_state()?;
 
         let entry = state
@@ -178,33 +217,30 @@ impl LvmProvider {
             ));
         }
 
-        // Intent before mutate: durably drop the claim, then destroy the
-        // LVM objects. On failure the claim is restored below.
+        let vgremove = self.runner.run("vgremove", &["--yes", &entry.vg_name])?;
+        if !vgremove.success {
+            // The VG still exists: keep the claim so state matches the
+            // observed reality (an honest error, never a silent diverge).
+            return Err(command_failed("vgremove", &vgremove));
+        }
+
+        // The VG is gone: durably drop the claim *now*, before pvremove.
+        // If pvremove fails below, the claim is not restored (that would
+        // re-claim a device whose VG no longer exists); the operator gets
+        // the exact manual remediation instead.
         state.remove_device(device_id);
         state.save(&self.state_path)?;
 
-        let vgremove = self.runner.run("vgremove", &["--yes", &entry.vg_name]);
-        let pvremove = vgremove
-            .and_then(|output| {
-                if output.success {
-                    Ok(output)
-                } else {
-                    Err(command_failed("vgremove", &output))
-                }
-            })
-            .and_then(|_| self.runner.run("pvremove", &["--yes", &entry.path]));
-        if let Err(error) = pvremove.and_then(|output| {
-            if output.success {
-                Ok(())
-            } else {
-                Err(command_failed("pvremove", &output))
-            }
-        }) {
-            // Best-effort restore so the claim is not lost to a failed
-            // release; the error still reports the truth.
-            state.insert_device(device_id.clone(), entry);
-            drop(state.save(&self.state_path));
-            return Err(error);
+        let pvremove = self.runner.run("pvremove", &["--yes", &entry.path])?;
+        if !pvremove.success {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "VG removed; manual pvremove {} required (pvremove failed: {})",
+                    entry.path,
+                    pvremove.stderr_excerpt()
+                ),
+            ));
         }
         Ok(())
     }
@@ -287,4 +323,29 @@ fn pool_id_for(device_id: &DeviceId) -> Result<PoolId, ApiError> {
 fn short_hash(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     crate::discover::hex_prefix(&digest, 4)
+}
+
+#[async_trait]
+impl AdminSurface for LvmProvider {
+    async fn discover_devices(&self) -> Result<DeviceListResponse, ApiError> {
+        // Fully qualified: an inherent `discover` method with the same
+        // shape exists on LvmProvider.
+        LvmProvider::discover(self)
+    }
+
+    async fn claim_device(
+        &self,
+        device_id: &DeviceId,
+        request: &ClaimDeviceRequest,
+    ) -> Result<Pool, ApiError> {
+        LvmProvider::claim_device(self, device_id, request)
+    }
+
+    async fn release_device(
+        &self,
+        device_id: &DeviceId,
+        request: &ReleaseDeviceRequest,
+    ) -> Result<(), ApiError> {
+        LvmProvider::release_device(self, device_id, request)
+    }
 }

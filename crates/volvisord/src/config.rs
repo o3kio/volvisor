@@ -41,8 +41,11 @@ pub struct Config {
     /// Filesystem root for read-only device discovery (defaults to `/`;
     /// test isolation only).
     pub sysfs_root: Option<std::path::PathBuf>,
-    /// Static bearer token for privileged admin operations. Empty disables
-    /// admin endpoints (fail closed). Never logged.
+    /// Static bearer token guarding the API's privileged surface (every
+    /// mutating endpoint and the whole `/v2/admin` route group, `GET`
+    /// included). When unset, those endpoints reject every request with
+    /// `401` (fail closed) and the daemon refuses to bind a non-loopback
+    /// address: the tokenless mode is loopback-only dev/test. Never logged.
     #[serde(default)]
     pub admin_token: Option<String>,
     /// Maximum request body size in bytes.
@@ -100,6 +103,16 @@ impl Config {
                 ));
             }
         }
+        // An explicitly empty token is a configuration mistake: unset means
+        // "fail closed, loopback only", while "" would authenticate an empty
+        // bearer. Reject it at startup instead.
+        if self.admin_token.as_deref().is_some_and(str::is_empty) {
+            return Err(DaemonError::Config(
+                "admin_token must not be empty when set (leave it unset for the loopback-only \
+                 fail-closed mode)"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -152,5 +165,27 @@ provider = \"lvm\"
         let raw = minimal_toml().replace("volvisor", "bad prefix!");
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_explicitly_empty_admin_token() {
+        let raw = minimal_toml() + "admin_token = \"\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "empty admin_token is a config mistake"
+        );
+    }
+
+    #[test]
+    fn accepts_unset_or_real_admin_token() {
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        assert!(
+            cfg.validate().is_ok(),
+            "unset admin_token is the loopback-only mode"
+        );
+        let raw = minimal_toml() + "admin_token = \"real-token\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
     }
 }

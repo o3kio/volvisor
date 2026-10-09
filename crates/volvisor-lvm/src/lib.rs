@@ -12,8 +12,10 @@
 //!   token; foreign physical-volume state is never adopted
 //!   (`FOREIGN_DEVICE_STATE`);
 //! - **thick LV volumes** driven through the `lvm2` CLI via a shell-free
-//!   [`CommandRunner`], with sizes verified against `lvs` after every
-//!   resize (honest reporting, never pretended success);
+//!   [`CommandRunner`], with effective sizes verified against `lvs` after
+//!   every create/grow (thick LVM rounds up to physical extents; the
+//!   effective size is persisted and reported honestly, never a pretended
+//!   success);
 //! - **durable JSON state** (atomic tmp-write + fsync + rename) holding the
 //!   volume-to-LV cross-references, attachment records and device claims;
 //! - **startup reconciliation**: state entries whose LV vanished are marked

@@ -6,9 +6,15 @@
 //! [`claim_device`](crate::admin) under a destructive-authorization token.
 //! Every LVM interaction goes through the shell-free
 //! [`CommandRunner`](crate::runner); every mutation is persisted to the
-//! durable JSON state after the backend confirmed it, and sizes are always
-//! verified against `lvs` output — a successful exit status alone is never
-//! trusted as evidence (honest reporting).
+//! durable JSON state after the backend confirmed it, and effective sizes
+//! are always verified against `lvs` output — a successful exit status
+//! alone is never trusted as evidence (honest reporting).
+//!
+//! Thick LVM rounds logical-volume sizes **up** to whole physical extents
+//! (4 MiB by default). The provider therefore treats
+//! `actual_lvm_size >= requested_size` as success, persists and reports
+//! the *effective* (rounded) size, and keeps the *requested* size for
+//! idempotent-create replay comparison.
 //!
 //! P0 honesty constraints: attach returns a `Prepared` (never `Active`)
 //! frontend handle because no VMM integration exists; health and backend
@@ -20,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use volvisor_provider::VolumeProvider;
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning,
@@ -176,6 +183,54 @@ impl LvmProvider {
             .and_then(|row| row.size_bytes()))
     }
 
+    /// Verify a freshly created LV and return its effective size.
+    ///
+    /// Success is `actual >= requested`: thick LVM rounds sizes up to
+    /// whole physical extents, so a non-extent-aligned request legitimately
+    /// yields a larger LV. If the LV is missing or smaller than requested
+    /// (which should be impossible), a best-effort `lvremove` cleans the
+    /// orphaned LV up before the honest `INTERNAL` error is returned, so
+    /// no half-created volume is left behind.
+    fn verify_created_size(
+        &self,
+        vg_name: &str,
+        lv_name: &str,
+        requested: u64,
+    ) -> Result<u64, ApiError> {
+        match self.lv_size(vg_name, lv_name)? {
+            Some(actual) if actual >= requested => Ok(actual),
+            None => {
+                self.remove_lv_best_effort(vg_name, lv_name);
+                Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("lvcreate reported success but lvs does not list {vg_name}/{lv_name}"),
+                ))
+            }
+            Some(actual) => {
+                self.remove_lv_best_effort(vg_name, lv_name);
+                Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "LV size mismatch after lvcreate of {vg_name}/{lv_name}: requested \
+                         {requested} bytes, LVM reports {actual} bytes"
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Best-effort `lvremove` used to clean up a failed create.
+    ///
+    /// The outcome is deliberately swallowed: the caller is already on an
+    /// error path, and a failing cleanup must not mask the original
+    /// failure.
+    fn remove_lv_best_effort(&self, vg_name: &str, lv_name: &str) {
+        drop(
+            self.runner
+                .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")]),
+        );
+    }
+
     /// Pick the first claimed native-pool volume group with enough free
     /// space (headroom included); `NO_SAFE_CAPACITY` when none qualifies.
     fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<String, ApiError> {
@@ -245,9 +300,14 @@ impl LvmProvider {
         let payload = canonical_create_payload(req)?;
         let mut state = self.lock_state()?;
         // Idempotent replay: same volume_id + same payload returns the
-        // current state; a different payload is a typed conflict.
+        // current state; a different payload is a typed conflict. The
+        // comparison uses the *requested* size (stored in
+        // `requested_size_bytes` and embedded in the canonical payload),
+        // never the extent-rounded effective size.
         if let Some(existing) = state.volume(&req.volume_id) {
-            if existing.entry.creation_payload == payload {
+            if existing.entry.creation_payload == payload
+                && existing.entry.requested_size_bytes == req.size_bytes
+            {
                 return Ok(inspect_response(&req.volume_id, existing));
             }
             return Err(ApiError::idempotency_conflict(&req.volume_id));
@@ -270,29 +330,18 @@ impl LvmProvider {
             return Err(command_failed("lvcreate", &output));
         }
         // Verify against LVM's own report: a successful exit status is not
-        // evidence of the requested geometry.
-        let actual = self.lv_size(&vg_name, &lv_name)?.ok_or_else(|| {
-            ApiError::new(
-                ApiErrorCode::Internal,
-                format!("lvcreate reported success but lvs does not list {vg_name}/{lv_name}"),
-            )
-        })?;
-        if actual != req.size_bytes {
-            return Err(ApiError::new(
-                ApiErrorCode::Internal,
-                format!(
-                    "LV size mismatch after lvcreate of {vg_name}/{lv_name}: requested {} \
-                     bytes, LVM reports {actual} bytes",
-                    req.size_bytes
-                ),
-            ));
-        }
+        // evidence of the requested geometry. Thick LVM rounds the size up
+        // to whole physical extents, so anything at or above the request
+        // is a success — the effective size is what gets persisted and
+        // reported.
+        let effective = self.verify_created_size(&vg_name, &lv_name, req.size_bytes)?;
 
         let stored = StoredVolume {
             entry: VolumeEntry {
                 vg_name,
                 lv_name,
-                size_bytes: req.size_bytes,
+                size_bytes: effective,
+                requested_size_bytes: req.size_bytes,
                 generation: 1,
                 data_epoch: 0,
                 project_id: req.project_id.clone(),
@@ -486,14 +535,17 @@ impl LvmProvider {
         if !output.success {
             return Err(command_failed("lvextend", &output));
         }
-        // Verify the effective size from LVM's own report.
+        // Verify the effective size from LVM's own report. Like create,
+        // grow rounds up to whole extents: anything at or above the
+        // requested size is a success, and the effective size is what
+        // gets persisted and reported.
         let actual = self.lv_size(&vg_name, &lv_name)?.ok_or_else(|| {
             ApiError::new(
                 ApiErrorCode::Internal,
                 format!("lvs no longer reports {vg_name}/{lv_name} after lvextend"),
             )
         })?;
-        if actual != req.new_size_bytes {
+        if actual < req.new_size_bytes {
             return Err(ApiError::new(
                 ApiErrorCode::Internal,
                 format!(
@@ -507,7 +559,7 @@ impl LvmProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
-        stored.entry.size_bytes = req.new_size_bytes;
+        stored.entry.size_bytes = actual;
         stored.entry.generation += 1;
         state.save(&self.state_path)?;
         Ok(GrowVolumeResponse {
@@ -573,20 +625,27 @@ impl LvmProvider {
             (stored.entry.vg_name.clone(), stored.entry.lv_name.clone())
         };
 
-        if matches!(req.data_erasure_policy, ErasurePolicy::ZeroDiscard) {
-            let device = format!("/dev/{vg_name}/{lv_name}");
-            let output = self.runner.run("blkdiscard", &["-f", &device])?;
-            if !output.success {
-                // Never proceed to lvremove after a failed discard: the
-                // caller asked for erased data and must learn the truth.
-                return Err(command_failed("blkdiscard", &output));
+        // A Failed volume whose LV is already absent has nothing to remove:
+        // check LVM's own report first so a vanished LV does not pin the
+        // pool forever (lvremove on a missing LV always fails). LVs that
+        // exist but fail to remove keep their typed-error path below.
+        let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
+        if lv_exists {
+            if matches!(req.data_erasure_policy, ErasurePolicy::ZeroDiscard) {
+                let device = format!("/dev/{vg_name}/{lv_name}");
+                let output = self.runner.run("blkdiscard", &["-f", &device])?;
+                if !output.success {
+                    // Never proceed to lvremove after a failed discard: the
+                    // caller asked for erased data and must learn the truth.
+                    return Err(command_failed("blkdiscard", &output));
+                }
             }
-        }
-        let output = self
-            .runner
-            .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])?;
-        if !output.success {
-            return Err(command_failed("lvremove", &output));
+            let output = self
+                .runner
+                .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])?;
+            if !output.success {
+                return Err(command_failed("lvremove", &output));
+            }
         }
         state.remove_volume(volume_id);
         state.save(&self.state_path)?;
@@ -697,15 +756,27 @@ fn not_found(volume_id: &VolumeId) -> ApiError {
     ApiError::not_found(format!("volume {volume_id} not found"))
 }
 
-/// The LV name for a volume identity: `.` and `:` are not safe in all LVM
-/// tooling contexts, so they are replaced with `-` (the ID charset
-/// otherwise consists of `[A-Za-z0-9_.:-]`).
-fn lv_name_for(volume_id: &VolumeId) -> String {
-    volume_id
+/// The LV name for a volume identity.
+///
+/// `.` and `:` are not safe in all LVM tooling contexts, so they are
+/// replaced with `-` (the ID charset otherwise consists of
+/// `[A-Za-z0-9_.:-]`). Sanitization alone is **not injective** (`vol.a`,
+/// `vol:a` and `vol-a` would all map to `vol-a`), so the first 8 hex
+/// characters of SHA-256(volume_id) are appended: distinct volume
+/// identities can never collide on one LV name, and the `vol-` prefix
+/// guarantees the name is never dash-leading.
+#[must_use]
+pub fn lv_name_for(volume_id: &VolumeId) -> String {
+    let sanitized: String = volume_id
         .as_str()
         .chars()
         .map(|c| if matches!(c, '.' | ':') { '-' } else { c })
-        .collect()
+        .collect();
+    let digest = Sha256::digest(volume_id.as_str().as_bytes());
+    format!(
+        "vol-{sanitized}-{}",
+        crate::discover::hex_prefix(&digest, 4)
+    )
 }
 
 /// The access mode granted for a requested mode.
@@ -792,8 +863,9 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         project_id: stored.entry.project_id.clone(),
         generation: stored.entry.generation,
         state: stored.runtime.state,
+        // Thick LVs: provisioning equals allocation, both at the effective
+        // (extent-rounded) size LVM actually created.
         provisioned_bytes: stored.entry.size_bytes,
-        // Thick LVs: allocation equals provisioning.
         allocated_bytes: stored.entry.size_bytes,
         effective_protection: EffectiveProtection::default(),
         failure_domain: FailureDomain::Host,
