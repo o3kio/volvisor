@@ -40,11 +40,11 @@ Exclusive VFIO of a PCI-addressable NVMe controller grants guest visibility to t
 
 ## State transitions and fail-closed invariants
 
-`Discovered -> Claimed -> VMReady -> NodeJoined -> Attested -> RookEligible -> CephServing` with `Draining`, `Upgrading`, `Recovering`, `Quarantined`.
+The cell lifecycle uses the **canonical state vocabulary defined in [ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)** (same names as the migration states of the v2 contracts): `DISCOVERED -> CLAIMED -> VM_PROVISIONED -> BOOTED -> NODE_JOINED -> ATTESTED -> ELIGIBLE_FOR_ROOK -> OSD_PREPARED -> CEPH_READY` with `DRAINING`, `SHUTDOWN`/`UPGRADING`, `RECOVERED` and `QUARANTINED`.
 
-- **Attested** includes physical PCI claim versus guest NVMe by-id mapping, expected guest image, node identity and topology. A Kubernetes `Ready` event is not enough.
-- **RookEligible** additionally requires the exact taint/label/admission controls and approved POC CephCluster explicit storage node list.
-- **CephServing** requires healthy expected OSD set and Ceph MON/quorum state, not just running pod processes.
+- **ATTESTED** includes physical PCI claim versus guest NVMe by-id mapping, expected guest image, node identity and topology. A Kubernetes `Ready` event is not enough.
+- **ELIGIBLE_FOR_ROOK** additionally requires the exact taint/label/admission controls and approved POC CephCluster explicit storage node list.
+- **CEPH_READY** requires healthy expected OSD set and Ceph MON/quorum state, not just running pod processes.
 - A cell may not relocate to another host while its VFIO device stays on the original physical host.
 - Crash recovery reinstantiates the same claimed controller and persistent `/var/lib/rook` metadata; never wipe or allocate a new OSD merely because a pod is missing.
 - Destructive disk role changes require separate explicit scoped user authorization and stable hardware identity proof.

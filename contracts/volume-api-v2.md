@@ -158,7 +158,7 @@ Versioned provider capabilities:
 `same_vg_extent_move`, `same_host_live_backing_move`,
 `rbd_cluster_adapter`, `managed_ceph_osd`, `pci_passthrough`.
 `managed_ceph_osd` includes the separately gated, disabled-by-default
-experimental `rook-cell` deployment mode ([ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)); it is not a fourth volume class.
+experimental `rook-cell-experimental` deployment mode ([ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)); it is not a fourth volume class.
 
 Capabilities must be tied to implementation/VMM version and **evidence**, not inferred from a backend product name. No class is production-supported before its exact-SHA conformance and real-host failure evidence gates.
 

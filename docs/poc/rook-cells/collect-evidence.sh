@@ -15,9 +15,11 @@ kubectl get nodes -o wide > "$out/nodes-wide.txt"
 kubectl get nodes -o yaml > "$out/nodes.yaml"
 kubectl get pods -A -o wide > "$out/pods-wide.txt"
 kubectl get pods -A -o yaml > "$out/pods.yaml"
-kubectl -n rook-ceph get cephcluster rook-ceph -o yaml > "$out/cephcluster.yaml"
-kubectl -n rook-ceph get cephblockpool volvisor-poc-rbd -o yaml > "$out/cephblockpool.yaml"
-kubectl -n rook-ceph get pods -o wide > "$out/rook-pods-wide.txt"
+kubectl -n rook-ceph get cephcluster rook-ceph -o yaml > "$out/cephcluster.yaml" 2>&1 \
+  || echo "MISSING CephCluster rook-ceph (pre-bring-up snapshot?)" >&2
+kubectl -n rook-ceph get cephblockpool volvisor-poc-rbd -o yaml > "$out/cephblockpool.yaml" 2>&1 \
+  || echo "MISSING CephBlockPool volvisor-poc-rbd (pre-bring-up snapshot?)" >&2
+kubectl -n rook-ceph get pods -o wide > "$out/rook-pods-wide.txt" 2>&1 || echo "MISSING namespace rook-ceph (operator not installed yet?)" >&2
 kubectl -n rook-ceph get events --sort-by=.lastTimestamp > "$out/rook-events.txt" 2>&1 || true
 fail=0
 for node in volvisor-cell-a volvisor-cell-b volvisor-cell-c; do

@@ -9,10 +9,11 @@ failSwapOn: true
 systemReserved:
   cpu: 500m
   memory: 1Gi
-  ephemeral-storage: 2Gi
 kubeReserved:
   cpu: 500m
   memory: 1Gi
+  # kubeReserved supports local ephemeral storage; systemReserved does not
+  # (cpu/memory only), so it is deliberately omitted there.
   ephemeral-storage: 2Gi
 evictionHard:
   memory.available: 1Gi
