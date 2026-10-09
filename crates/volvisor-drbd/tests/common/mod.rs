@@ -34,6 +34,12 @@
 //!   claimed `DRBDADM_VERSION=9.29.0` — including the unconditional
 //!   indent-2 `open:` line, reflecting the world's open-devices state —
 //!   and fails "No such resource" for unknown/down resources;
+//! - a minor pinned in the world's peer-apply-lag set models
+//!   asynchronous peer apply that has not converged through a
+//!   suspension's boundary: its status reports a resync in progress
+//!   (`replication:SyncSource ... peer-disk:Inconsistent`) until the
+//!   pin clears, so a convergence proof must observe the real tokens
+//!   rather than assume catch-up (P4b plan §8 item 3);
 //! - `drbdsetup suspend-io`/`resume-io` freeze/unfreeze a device's
 //!   data path by MINOR (a bare decimal or `/dev/drbd<N>` — a bare
 //!   resource name is NOT resolvable, mirroring drbdsetup's
@@ -345,6 +351,14 @@ pub struct FakeDrbd {
     /// `suspended:user` qualifier on its `drbdsetup status` resource
     /// line.
     pub suspended_minors: BTreeSet<u32>,
+    /// Minors whose peer has not converged through a suspension's
+    /// boundary yet (P4b plan §8 item 3): models asynchronous peer
+    /// apply lag — the status answers through the REAL tokens (a
+    /// `replication:SyncSource` resync line over a not-`UpToDate`
+    /// peer disk), never a side channel, so a convergence proof
+    /// (`track_sync`) must observe the tokens. Flip convergence
+    /// on/off by inserting/removing the minor.
+    pub peer_lagging: BTreeSet<u32>,
     /// The peer's DRBD node id (the generated resource files pin the
     /// local node to `node-id 0` and the peer to `node-id 1`; the
     /// peer-device-context `show-gi` addresses the peer device by it).
@@ -413,6 +427,7 @@ impl Default for FakeDrbd {
             resync_completes: true,
             open_devices: BTreeSet::new(),
             suspended_minors: BTreeSet::new(),
+            peer_lagging: BTreeSet::new(),
             peer_node_id: 1,
             lineage: BTreeMap::new(),
             lineage_salt: 0,
@@ -542,17 +557,30 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         ""
     };
     if world.peer_online {
+        // Peer-apply lag (P4b plan §8 item 3): a lagging minor reports
+        // a resync in progress over a not-`UpToDate` peer disk — the
+        // exact token shape a convergence proof must observe and
+        // refuse. The pinned peer-disk state models the asynchronous
+        // apply tail; the `replication:` line is what a resyncing
+        // peer-device really prints.
+        let lagging = world.peer_lagging.contains(&resource.minor);
+        let resyncing = resource.resyncing || lagging;
+        let peer_disk = if lagging {
+            DiskState::Inconsistent
+        } else {
+            resource.peer_disk.clone()
+        };
         // A seeding local (UpToDate) resyncs the fresh peer
         // (Inconsistent) FROM here, so the local replication state is
         // SyncSource — the direction as seen from this node. The
         // resyncing state always pairs with an Inconsistent peer.
-        let peer_disk_line = if resource.resyncing {
+        let peer_disk_line = if resyncing {
             format!(
                 "replication:SyncSource peer-disk:{} done:37.50",
-                disk_str(&resource.peer_disk)
+                disk_str(&peer_disk)
             )
         } else {
-            format!("peer-disk:{}", disk_str(&resource.peer_disk))
+            format!("peer-disk:{}", disk_str(&peer_disk))
         };
         format!(
             "{name} role:{role}{suspended}\n  disk:{disk} open:{open}\n  {peer} role:{peer_role}\n    \
@@ -1355,6 +1383,20 @@ pub fn flip_world_to_peer(world: &Arc<Mutex<FakeDrbd>>) {
     world.peer_node_id = 0;
 }
 
+/// Pin or clear asynchronous peer-apply lag on a minor (see
+/// [`FakeDrbd::peer_lagging`]): while pinned, the resource's status
+/// reports a resync in progress over a not-`UpToDate` peer disk — the
+/// real token shape `track_sync` must observe and refuse until the
+/// lag clears.
+pub fn set_peer_lag(world: &Arc<Mutex<FakeDrbd>>, minor: u32, lagging: bool) {
+    let mut world = world.lock().expect("world");
+    if lagging {
+        world.peer_lagging.insert(minor);
+    } else {
+        world.peer_lagging.remove(&minor);
+    }
+}
+
 /// Seed a running resource, its res file and its backing LV into the
 /// host directory and world WITHOUT any state entry — the shape the
 /// surviving (peer) host sees for a volume whose primary died (the
@@ -1536,6 +1578,7 @@ pub fn seed_volume_with_identity(
                 seeded: true,
                 authority: None,
                 fence: None,
+                migration: None,
             },
         },
     );
