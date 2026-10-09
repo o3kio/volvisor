@@ -296,10 +296,11 @@ fn spawn_renewal_task(provider: &Arc<DrbdProvider>) {
                     }
                     for failure in &report.fence_failures {
                         tracing::error!(
-                            kind = "fence_completion_failed",
+                            kind = "fence_failed",
                             volume_id = %failure.volume_id,
                             detail = %failure.detail,
-                            "completing a pending self-fence failed; retried next pass"
+                            "a self-fence (deadline, stale-epoch or pending-fence \
+                             completion) failed; retried next pass"
                         );
                     }
                 }

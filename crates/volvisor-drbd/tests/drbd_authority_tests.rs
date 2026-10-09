@@ -1617,3 +1617,115 @@ async fn delete_refusing_a_primary_resource_releases_no_lease() {
     let view = kit.client.inspect(&state.volume).await.expect("view");
     assert_eq!(view.lease_state, LeaseState::Revoked);
 }
+
+/// A runner wrapper for fault injection: `drbdsetup suspend-io` for
+/// one specific minor FAILS TO EXECUTE — that volume's self-fence
+/// cannot even suspend. Everything else forwards verbatim.
+struct SuspendFailsFor {
+    inner: Arc<FakeRunner>,
+    minor: u32,
+}
+
+impl CommandRunner for SuspendFailsFor {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ApiError> {
+        let device = format!("/dev/drbd{}", self.minor);
+        if program == "drbdsetup"
+            && args.first().copied() == Some("suspend-io")
+            && args.get(1).copied() == Some(device.as_str())
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "drbdsetup suspend-io: simulated failure",
+            ));
+        }
+        self.inner.run(program, args)
+    }
+}
+
+/// The pass-continues invariant: a fence that itself fails is
+/// reported (fence_failures) and retried next pass — it never aborts
+/// the other volumes' fences. The failing volume keeps its authority
+/// block (still Primary, lease live at the witness: the W7 window and
+/// the witness's own expiry remain the bound).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_failed_fence_does_not_abort_the_renewal_pass() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume_with_identity(
+        &f.base,
+        &f.world,
+        "vol-a-stuck",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR,
+        SEED_PORT,
+    );
+    seed_volume_with_identity(
+        &f.base,
+        &f.world,
+        "vol-z-fenced",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR + 1,
+        SEED_PORT + 1,
+    );
+    let vol_a = volume("vol-a-stuck");
+    let vol_z = volume("vol-z-fenced");
+    let provider = authority_provider(&kit, &f.state_path, &f.world);
+    provider.register_volume(&vol_a, None).expect("register a");
+    provider.register_volume(&vol_z, None).expect("register z");
+    provider
+        .attach_volume(&vol_a, &attach_req("vol-a-stuck", 1))
+        .await
+        .expect("attach a");
+    provider
+        .attach_volume(&vol_z, &attach_req("vol-z-fenced", 1))
+        .await
+        .expect("attach z");
+    // The pass runs on a provider whose suspend-io fails for
+    // vol-a's minor only (its construction reconcile reports vol-a
+    // unverifiable and leaves it Primary; vol-z validates normally).
+    let stuck = DrbdProvider::with_authority(
+        Arc::new(SuspendFailsFor {
+            inner: FakeDrbd::runner(&f.world),
+            minor: SEED_MINOR,
+        }),
+        config_for(&f.base),
+        f.state_path.clone(),
+        authority_for(&kit, NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("stuck provider construction");
+    // Both deadlines pass.
+    kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
+    let report = stuck.renew_leases().expect("the pass completes");
+    // vol-z's fence completed; vol-a's failed and was reported.
+    assert_eq!(report.fenced.len(), 1);
+    assert_eq!(report.fenced[0].volume_id, vol_z);
+    assert_eq!(report.fence_failures.len(), 1);
+    assert_eq!(report.fence_failures[0].volume_id, vol_a);
+    assert_eq!(report.renewed, Vec::<VolumeId>::new());
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-z-fenced")),
+        Role::Secondary
+    );
+    assert!(!suspended(&f.world, SEED_MINOR + 1));
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-a-stuck")),
+        Role::Primary,
+        "the stuck volume was not silently demoted"
+    );
+    // The stuck volume keeps its authority block and its live lease:
+    // the witness's own expiry and the W7 window remain the bound.
+    let disk = DrbdState::load(&f.state_path).expect("load state");
+    assert!(
+        disk.volume(&vol_a)
+            .expect("volume")
+            .runtime
+            .authority
+            .is_some(),
+        "a failed fence retains the authority block for the retry"
+    );
+    let view = kit.client.inspect(&vol_a).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+}

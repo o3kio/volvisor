@@ -1805,12 +1805,17 @@ impl DrbdProvider {
     }
 
     /// One writer-authority renewal pass (P4a plan §4): for every
-    /// volume holding a lease — attached or not, `Failed` included (a
-    /// resource the operator must still see fenced keeps its renewal
-    /// until its own deadline decides) — fence writers past their W5
-    /// local deadline, renew due leases, and defer failures that do
-    /// not prove authority lost (an unreachable witness: keep serving
-    /// until the local deadline, the honest bound).
+    /// volume holding a lease — attached or not, `Failed` included —
+    /// fence writers past their W5 local deadline, renew due leases,
+    /// and defer failures that do not prove authority lost (an
+    /// unreachable witness: keep serving until the local deadline, the
+    /// honest bound). The renewal predicate is deliberately "holds an
+    /// authority block", not "is Attached": the lease is never dropped
+    /// unilaterally — a `Failed` or zombie volume keeps renewing until
+    /// the WITNESS ends the lease (expiry after a failed renewal, a
+    /// recorded W6 forced revocation, or W4 epoch retirement), because
+    /// a deliberately lapped lease would auto-demote a zombie, which
+    /// P3's rules forbid, and the witness is the arbiter.
     ///
     /// The daemon's background task calls this on its renewal cadence.
     /// The deadline check runs on **every** call, so the task may (and
@@ -3344,6 +3349,7 @@ impl DrbdProvider {
         if let Some(authority) = &self.authority {
             let prior_authority = stored.runtime.authority.clone();
             let block = authority.acquire(volume_id, prior_authority.as_ref())?;
+            let acquired = block.clone();
             {
                 // The save needs the state exclusively, so the record
                 // borrow ends here and the tail re-acquires it.
@@ -3352,7 +3358,23 @@ impl DrbdProvider {
                     .ok_or_else(|| not_found(volume_id))?;
                 volume.runtime.authority = Some(block);
             }
-            state.save(&self.state_path)?;
+            if let Err(error) = state.save(&self.state_path) {
+                // A failed save leaves no durable record of a FRESH
+                // grant: release it best-effort so a retry is not
+                // refused with LEASE_HELD against our own orphan lease
+                // (the adopt path's discipline). Only the
+                // provably-not-writing case releases: a renewed lease
+                // still matches the durable record (same epoch,
+                // extended end) and self-heals on the next renewal
+                // save, and a suspended Primary must never have its
+                // lease released from under it — the next grant's W7
+                // wait would be waived while the device is only
+                // kernel-suspended.
+                if prior_authority.is_none() && !suspended {
+                    let _ = authority.release(volume_id, &acquired);
+                }
+                return Err(error);
+            }
         }
 
         let output = self.run_drbdadm("primary", &entry.resource_name)?;

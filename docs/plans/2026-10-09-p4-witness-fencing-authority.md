@@ -278,12 +278,20 @@ runs `primary --force` outside the two justified paths in §5.
 - **Detach**: demote (existing rules), then release the lease
   (`revoke` self-initiated, journaled), then save. Crash between demote
   and release leaves an expired lease — harmless (expiry + W1 bound it).
-- **Renewal (`renew_leases`)**: for every Attached volume with a live
-  lease: renew. `STALE_EPOCH` → self-fence immediately. Unreachable
-  witness → keep serving until the **local** deadline computed per W5
-  (response-received time + returned duration), then self-fence. The
-  writer never guesses expiry from its own clock against an absolute
-  witness timestamp.
+- **Renewal (`renew_leases`)**: for every volume holding a live
+  lease — attached or not, `Failed` included — renew. (Amended during
+  implementation: the renewal predicate is "holds an authority block",
+  not "is Attached". A `Failed` volume — e.g. a zombie primary serving
+  under a valid lease — must NOT have its lease dropped unilaterally:
+  P3's rule that zombies are never auto-demoted would be violated by a
+  deliberately lapsed lease, and the witness is the arbiter — the lease
+  ends when the WITNESS ends it: expiry after a failed renewal, a
+  recorded forced revocation (W6, the operator's failover tool), or
+  epoch retirement (W4 → self-fence). `STALE_EPOCH` → self-fence
+  immediately. Unreachable witness → keep serving until the **local**
+  deadline computed per W5 (response-received time + returned
+  duration), then self-fence. The writer never guesses expiry from its
+  own clock against an absolute witness timestamp.
 - **Self-fencing policy** (contract §7 "Witness/quorum lost"):
   `drbdsetup suspend-io <minor>` — the verified argv form is by **minor**
   (or `/dev/drbd<minor>`), which volvisor already tracks; a bare resource
