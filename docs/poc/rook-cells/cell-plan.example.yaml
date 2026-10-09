@@ -1,0 +1,56 @@
+# DESIGN EXAMPLE, NOT A VALID CURRENT VOLVISOR API OR LIVE DEVICE PLAN.
+# Physical BDF and serial values are placeholders; DO NOT execute VFIO claims from this.
+apiVersion: volvisor.io/experimental-v0
+kind: RookCellPlan
+metadata:
+  name: three-host-rook-cell-poc
+spec:
+  featureGate: rook-cell-experimental
+  kubernetes:
+    controlPlane: existing-independent-control-plane
+    workerNodeNamePrefix: volvisor-cell-
+    taint: "volvisor.io/storage-only=rook:NoSchedule"
+    reservedFor:
+    - kubelet
+    - containerd
+    - approved-kube-system
+    - rook-ceph
+  cells:
+  - hostId: host-a
+    cellId: volvisor-cell-a
+    physicalFailureDomain: host-a
+    cpu:
+      vcpus: 6
+      exclusivePhysicalReservation: true
+    memory:
+      fixedGiB: 16
+      balloonEnabled: false
+    boot:
+      rootDiskGiB: 40
+      storageProvider: host-local-not-ceph
+      persistentRookHostPath: /var/lib/rook
+    passthrough:
+    - deviceId: REPLACE_WITH_HOST_STABLE_PCI_NVME_DEVICE_ID_A
+      pciFunction: REPLACE_WITH_IOMMU_SAFE_BDF_A
+      mode: vfio-exclusive
+    networks:
+    - storage-public
+    - k8s-management
+  - hostId: host-b
+    cellId: volvisor-cell-b
+    physicalFailureDomain: host-b
+    cpu: {vcpus: 6, exclusivePhysicalReservation: true}
+    memory: {fixedGiB: 16, balloonEnabled: false}
+    boot: {rootDiskGiB: 40, storageProvider: host-local-not-ceph, persistentRookHostPath: /var/lib/rook}
+    passthrough:
+    - {deviceId: REPLACE_WITH_HOST_STABLE_PCI_NVME_DEVICE_ID_B, pciFunction: REPLACE_WITH_IOMMU_SAFE_BDF_B, mode: vfio-exclusive}
+    networks: [storage-public, k8s-management]
+  - hostId: host-c
+    cellId: volvisor-cell-c
+    physicalFailureDomain: host-c
+    cpu: {vcpus: 6, exclusivePhysicalReservation: true}
+    memory: {fixedGiB: 16, balloonEnabled: false}
+    boot: {rootDiskGiB: 40, storageProvider: host-local-not-ceph, persistentRookHostPath: /var/lib/rook}
+    passthrough:
+    - {deviceId: REPLACE_WITH_HOST_STABLE_PCI_NVME_DEVICE_ID_C, pciFunction: REPLACE_WITH_IOMMU_SAFE_BDF_C, mode: vfio-exclusive}
+    networks: [storage-public, k8s-management]
