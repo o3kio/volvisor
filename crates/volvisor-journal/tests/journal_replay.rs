@@ -148,7 +148,7 @@ fn idempotent_replay_same_hash_returns_recorded_outcome() {
         // Retry after the outcome: replayed with the recorded response.
         assert!(matches!(
             journal.append_intent(id.clone(), hash, "create_volume", payload.clone()),
-            Ok(IntentAppend::Replayed(Some(ref body))) if *body == response
+            Ok(IntentAppend::Replayed { success: true, response: ref body }) if *body == response
         ));
     }
 
@@ -156,12 +156,63 @@ fn idempotent_replay_same_hash_returns_recorded_outcome() {
     let mut journal = Journal::open(dir.path()).expect("reopen");
     assert!(matches!(
         journal.append_intent(id.clone(), hash, "create_volume", payload),
-        Ok(IntentAppend::Replayed(Some(ref body))) if *body == response
+        Ok(IntentAppend::Replayed { success: true, response: ref body }) if *body == response
     ));
 
     let entry = journal.lookup(&id).expect("registry entry");
     assert_eq!(entry.request_hash, hash);
     assert!(entry.has_outcome);
+}
+
+/// A recorded *failure* outcome replays with its success flag carried
+/// through, so the API layer can reconstruct the original HTTP status
+/// (replays must be status-compatible, not just body-compatible).
+#[test]
+fn failed_outcome_replays_with_the_success_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = op_id("op-failed-replay");
+    let hash = [8; 32];
+    let error_body = serde_json::json!({
+        "code": "NO_SAFE_CAPACITY",
+        "message": "no safe capacity: requested 1024 bytes, 0 remaining",
+    });
+
+    {
+        let mut journal = Journal::open(dir.path()).expect("open");
+        assert!(matches!(
+            journal.append_intent(
+                id.clone(),
+                hash,
+                "create_volume",
+                serde_json::json!({"size_bytes": 1024}),
+            ),
+            Ok(IntentAppend::New)
+        ));
+        journal
+            .append_outcome(id.clone(), false, error_body.clone())
+            .expect("outcome");
+        assert!(matches!(
+            journal.append_intent(
+                id.clone(),
+                hash,
+                "create_volume",
+                serde_json::json!({"size_bytes": 1024}),
+            ),
+            Ok(IntentAppend::Replayed { success: false, response: ref body }) if *body == error_body
+        ));
+    }
+
+    // The flag survives a reopen (registry derived from replay).
+    let mut journal = Journal::open(dir.path()).expect("reopen");
+    assert!(matches!(
+        journal.append_intent(
+            id,
+            hash,
+            "create_volume",
+            serde_json::json!({"size_bytes": 1024}),
+        ),
+        Ok(IntentAppend::Replayed { success: false, response: ref body }) if *body == error_body
+    ));
 }
 
 #[test]

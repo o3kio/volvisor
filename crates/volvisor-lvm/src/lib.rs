@@ -18,8 +18,10 @@
 //!   success);
 //! - **durable JSON state** (atomic tmp-write + fsync + rename) holding the
 //!   volume-to-LV cross-references, attachment records and device claims;
-//! - **startup reconciliation**: state entries whose LV vanished are marked
-//!   `Failed`; foreign LVs under our volume groups are reported, never
+//! - **startup reconciliation**: state entries whose LV vanished are
+//!   marked `Failed`; device claims whose volume group is verifiably
+//!   gone (from a successful `vgs` query — never on a failed one) are
+//!   dropped; foreign LVs under our volume groups are reported, never
 //!   touched.
 //!
 //! Everything is prototype evidence: health is `Unknown` until proven and

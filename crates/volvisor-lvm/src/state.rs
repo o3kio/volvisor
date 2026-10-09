@@ -25,7 +25,8 @@ use volvisor_types::{
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
 /// `lv_name` is derived from the `volume_id` (sanitized plus a hash
-/// suffix, so distinct identities can never collide on one LV name);
+/// suffix over the full id, so uniqueness rests on that 32-bit suffix
+/// rather than the sanitized segment itself);
 /// `vg_name` identifies the claimed pool the volume lives in (a
 /// provider-internal reference, never exposed to tenants).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

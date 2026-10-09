@@ -38,8 +38,8 @@ use volvisor_types::request::{
     GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
 };
 use volvisor_types::{
-    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, ProjectId,
-    VolumeId, VolumeLifecycle, validate_api_version,
+    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, DeviceId,
+    ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
 };
 
 use crate::report::{LvRow, VgRow};
@@ -58,6 +58,35 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// Free-space headroom kept in every volume group so LVM metadata can
 /// always be written (`NO_SAFE_CAPACITY` is reported before the VG fills).
 pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
+
+/// Physical extent size assumed when `vgs` does not report one (LVM's
+/// own default; bigger arrays legitimately use bigger extents).
+const DEFAULT_EXTENT_BYTES: u64 = 4 << 20;
+
+/// The free-space picture of one volume group.
+///
+/// Capacity checks need both numbers: thick LVM rounds every allocation
+/// up to whole physical extents, so the *effective* demand of a size
+/// request is [`extent_rounded`] against `extent_bytes`.
+#[derive(Clone, Copy, Debug)]
+struct VgCapacity {
+    /// Free bytes reported by `vgs`.
+    free_bytes: u64,
+    /// Physical extent bytes reported by `vgs` (4 MiB when absent).
+    extent_bytes: u64,
+}
+
+/// The space `size` bytes effectively occupy on a VG with `extent`-byte
+/// physical extents: `size` rounded up to a whole multiple of `extent`.
+///
+/// A zero or absent extent is treated as "no rounding" (guarded, never a
+/// division by zero).
+fn extent_rounded(size: u64, extent: u64) -> u64 {
+    if extent == 0 {
+        return size;
+    }
+    size.div_ceil(extent) * extent
+}
 
 /// Host identity of the single-host P0 daemon.
 const LOCAL_HOST_ID: &str = "local";
@@ -88,8 +117,11 @@ impl LvmProvider {
     /// Construct the provider.
     ///
     /// Loads the durable state (a missing file is a fresh, empty state) and
-    /// immediately reconciles it against real LVM state, marking volumes
-    /// whose LV vanished as `Failed`. `vg_prefix` namespaces the volume
+    /// immediately reconciles it against real LVM state: volumes whose LV
+    /// vanished are marked `Failed`, and device claims whose volume group
+    /// is verifiably absent from a successful `vgs` query are dropped
+    /// (claims are kept when the query fails — an honest unknown is never
+    /// resolved destructively). `vg_prefix` namespaces the volume
     /// groups created by [`claim_device`](crate::admin);
     /// `expected_auth_token` is the scoped destructive-authorization token
     /// required for device claiming and release (it is compared, never
@@ -134,8 +166,13 @@ impl LvmProvider {
     }
 
     /// Run `vgs` and return its report rows.
+    ///
+    /// The invocation explicitly requests `vg_extent_size` (it is not
+    /// part of `vgs`' default columns): thick LVM rounds every
+    /// allocation up to whole physical extents, so capacity checks must
+    /// know the extent size to compare against the *rounded* demand.
     pub(crate) fn list_vgs(&self) -> Result<Vec<VgRow>, ApiError> {
-        let output = self.runner.run("vgs", lvm_json_args())?;
+        let output = self.runner.run("vgs", vgs_json_args())?;
         if !output.success {
             return Err(command_failed("vgs", &output));
         }
@@ -151,26 +188,38 @@ impl LvmProvider {
         crate::report::parse_report(&output.stdout, "pv")
     }
 
-    /// Free bytes per volume group name, from one `vgs` query.
-    fn vg_free_map(&self) -> Result<BTreeMap<String, u64>, ApiError> {
+    /// Free space and extent size per volume group name, from one `vgs`
+    /// query.
+    fn vg_capacity_map(&self) -> Result<BTreeMap<String, VgCapacity>, ApiError> {
         let mut map = BTreeMap::new();
         for row in self.list_vgs()? {
             if let (Some(name), Some(free)) = (row.vg_name.clone(), row.free_bytes()) {
-                map.insert(name, free);
+                map.insert(
+                    name,
+                    VgCapacity {
+                        free_bytes: free,
+                        // Permissive: 4 MiB when `vgs` does not report
+                        // the extent size (LVM's own default).
+                        extent_bytes: row.extent_bytes().unwrap_or(DEFAULT_EXTENT_BYTES),
+                    },
+                );
             }
         }
         Ok(map)
     }
 
-    /// Free bytes of one volume group; `INTERNAL` (honest) when `vgs` does
-    /// not report the group at all.
-    fn vg_free(&self, vg_name: &str) -> Result<u64, ApiError> {
-        self.vg_free_map()?.get(vg_name).copied().ok_or_else(|| {
-            ApiError::new(
-                ApiErrorCode::Internal,
-                format!("volume group {vg_name:?} is not reported by vgs"),
-            )
-        })
+    /// Free space and extent size of one volume group; `INTERNAL`
+    /// (honest) when `vgs` does not report the group at all.
+    fn vg_capacity(&self, vg_name: &str) -> Result<VgCapacity, ApiError> {
+        self.vg_capacity_map()?
+            .get(vg_name)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("volume group {vg_name:?} is not reported by vgs"),
+                )
+            })
     }
 
     /// Actual size of one LV as reported by `lvs`, when it exists.
@@ -232,15 +281,17 @@ impl LvmProvider {
     }
 
     /// Pick the first claimed native-pool volume group with enough free
-    /// space (headroom included); `NO_SAFE_CAPACITY` when none qualifies.
+    /// space for the **extent-rounded** demand (headroom included);
+    /// `NO_SAFE_CAPACITY` when none qualifies.
     fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<String, ApiError> {
-        let free_map = self.vg_free_map()?;
+        let capacity_map = self.vg_capacity_map()?;
         for entry in state.devices().values() {
             if entry.role != volvisor_types::DeviceRole::NativePool {
                 continue;
             }
-            if let Some(free) = free_map.get(&entry.vg_name) {
-                if size_bytes.saturating_add(VG_HEADROOM_BYTES) <= *free {
+            if let Some(capacity) = capacity_map.get(&entry.vg_name) {
+                let demand = extent_rounded(size_bytes, capacity.extent_bytes);
+                if demand.saturating_add(VG_HEADROOM_BYTES) <= capacity.free_bytes {
                     return Ok(entry.vg_name.clone());
                 }
             }
@@ -249,30 +300,57 @@ impl LvmProvider {
             ApiErrorCode::NoSafeCapacity,
             format!(
                 "no safe capacity: no claimed native-local pool has {size_bytes} bytes \
-                 (plus headroom) free"
+                 (extent-rounded) free"
             ),
         ))
     }
 
     /// Startup reconciliation.
     ///
-    /// A state entry whose LV is absent from `lvs` output is marked
-    /// `Failed` and persisted (its data is gone or the VG was removed —
-    /// the volume is never silently recreated). Foreign LVs under our
-    /// volume groups are not touched here; they are surfaced by
-    /// [`reconcile_report`](crate::admin).
+    /// Two passes, both non-destructive towards volumes:
+    ///
+    /// - **Volumes**: a state entry whose LV is absent from `lvs` output
+    ///   is marked `Failed` and persisted (its data is gone or the VG
+    ///   was removed — the volume is never silently recreated). Foreign
+    ///   LVs under our volume groups are not touched here; they are
+    ///   surfaced by [`reconcile_report`](crate::admin).
+    /// - **Device claims**: a claim whose volume group is absent from a
+    ///   *successful* `vgs` query is dropped (state must match observed
+    ///   reality — e.g. the VG was removed while the daemon was down,
+    ///   or the crash landed between `vgremove` success and the state
+    ///   save). When `vgs` cannot be queried the claims are kept: an
+    ///   honest unknown is never resolved destructively. Volume entries
+    ///   are *not* touched here — a volume on a vanished VG is already
+    ///   marked `Failed` by the volume pass above.
     fn reconcile(&self) -> Result<(), ApiError> {
         let present: Vec<String> = self
             .list_lvs()?
             .into_iter()
             .filter_map(|row| row.vg_slash_lv())
             .collect();
+        // None = the query failed (honest unknown): keep every claim.
+        let observed_vgs: Option<Vec<String>> = match self.list_vgs() {
+            Ok(rows) => Some(rows.into_iter().filter_map(|row| row.vg_name).collect()),
+            Err(_) => None,
+        };
         let mut state = self.lock_state()?;
         let mut changed = false;
         for volume in state.volumes_mut() {
             let key = format!("{}/{}", volume.entry.vg_name, volume.entry.lv_name);
             if !present.contains(&key) && volume.runtime.state != VolumeLifecycle::Failed {
                 volume.runtime.state = VolumeLifecycle::Failed;
+                changed = true;
+            }
+        }
+        if let Some(vg_names) = &observed_vgs {
+            let stale_claims: Vec<DeviceId> = state
+                .devices()
+                .iter()
+                .filter(|(_, entry)| !vg_names.contains(&entry.vg_name))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale_claims {
+                state.remove_device(&id);
                 changed = true;
             }
         }
@@ -515,12 +593,23 @@ impl LvmProvider {
             )
         };
 
-        let free = self.vg_free(&vg_name)?;
+        let capacity = self.vg_capacity(&vg_name)?;
         let delta = req.new_size_bytes - current_size;
-        if delta.saturating_add(VG_HEADROOM_BYTES) > free {
+        // Thick LVM rounds the grown LV up to whole physical extents, so
+        // the space the grow actually consumes is the extent-rounded
+        // delta (the current size is already extent-aligned). Comparing
+        // the raw delta would under-cover the rounding and surface the
+        // over-allocation later as a raw INTERNAL instead of the typed
+        // NO_SAFE_CAPACITY.
+        let demand = extent_rounded(delta, capacity.extent_bytes);
+        if demand.saturating_add(VG_HEADROOM_BYTES) > capacity.free_bytes {
             return Err(ApiError::new(
                 ApiErrorCode::NoSafeCapacity,
-                format!("grow needs {delta} more bytes, {free} free in {vg_name}"),
+                format!(
+                    "grow needs {demand} more bytes (extent-rounded from {delta}), {} free \
+                     in {vg_name}",
+                    capacity.free_bytes
+                ),
             ));
         }
         let output = self.runner.run(
@@ -583,7 +672,7 @@ impl LvmProvider {
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
         let mut state = self.lock_state()?;
-        let (vg_name, lv_name) = {
+        let (vg_name, lv_name, volume_state) = {
             let stored = state
                 .volume_mut(volume_id)
                 .ok_or_else(|| not_found(volume_id))?;
@@ -622,14 +711,32 @@ impl LvmProvider {
                     "cryptographic erasure requires a separate evidence gate",
                 ));
             }
-            (stored.entry.vg_name.clone(), stored.entry.lv_name.clone())
+            (
+                stored.entry.vg_name.clone(),
+                stored.entry.lv_name.clone(),
+                stored.runtime.state,
+            )
         };
 
-        // A Failed volume whose LV is already absent has nothing to remove:
-        // check LVM's own report first so a vanished LV does not pin the
-        // pool forever (lvremove on a missing LV always fails). LVs that
-        // exist but fail to remove keep their typed-error path below.
+        // A Failed volume whose LV is already absent has nothing to
+        // remove: check LVM's own report first so a vanished LV does not
+        // pin the pool forever (lvremove on a missing LV always fails).
+        // For any *other* state an absent LV is unexpected: a Ready
+        // volume whose LV is (perhaps only transiently) invisible must
+        // never be deleted as if it had been erased — a ZeroDiscard
+        // delete would silently skip erasure and leave a foreign LV
+        // holding live data — so it fails loudly instead. LVs that exist
+        // but fail to remove keep their typed-error path below.
         let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
+        if !lv_exists && volume_state != VolumeLifecycle::Failed {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "LV {vg_name}/{lv_name} unexpectedly absent for volume in state \
+                     {volume_state:?}"
+                ),
+            ));
+        }
         if lv_exists {
             if matches!(req.data_erasure_policy, ErasurePolicy::ZeroDiscard) {
                 let device = format!("/dev/{vg_name}/{lv_name}");
@@ -738,6 +845,22 @@ fn lvm_json_args() -> &'static [&'static str] {
     &["--reportformat", "json", "--units", "b", "--nosuffix"]
 }
 
+/// The `vgs`-specific report arguments: the shared JSON arguments plus
+/// an explicit column list (so `vg_extent_size` is reported — it is not
+/// part of `vgs`' default columns, and capacity checks must round the
+/// demand to whole extents).
+fn vgs_json_args() -> &'static [&'static str] {
+    &[
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "vg_name,vg_free,vg_size,vg_extent_size",
+    ]
+}
+
 /// An `INTERNAL` error carrying the command name and a stderr excerpt.
 pub(crate) fn command_failed(program: &str, output: &CommandOutput) -> ApiError {
     ApiError::new(
@@ -756,21 +879,34 @@ fn not_found(volume_id: &VolumeId) -> ApiError {
     ApiError::not_found(format!("volume {volume_id} not found"))
 }
 
+/// The maximum length of the sanitized identity segment of an LV name.
+///
+/// LVM rejects LV names beyond ~127 characters; capping the sanitized
+/// segment at 100 keeps the full name (`vol-` + segment + `-` + 8 hex)
+/// at 113 characters even for a maximum-length (128-byte) volume id.
+const LV_NAME_SANITIZED_MAX_CHARS: usize = 100;
+
 /// The LV name for a volume identity.
 ///
 /// `.` and `:` are not safe in all LVM tooling contexts, so they are
 /// replaced with `-` (the ID charset otherwise consists of
 /// `[A-Za-z0-9_.:-]`). Sanitization alone is **not injective** (`vol.a`,
-/// `vol:a` and `vol-a` would all map to `vol-a`), so the first 8 hex
-/// characters of SHA-256(volume_id) are appended: distinct volume
-/// identities can never collide on one LV name, and the `vol-` prefix
-/// guarantees the name is never dash-leading.
+/// `vol:a` and `vol-a` all map to `vol-a`), and with the length cap
+/// below it is not even collision-free for distinct long ids; the name
+/// is therefore injective only up to its 32-bit hash suffix — the first
+/// 8 hex characters of SHA-256 over the **full** volume id (collision
+/// probability <= 2^-32 per distinct pair). The `vol-` prefix
+/// guarantees the name is never dash-leading, and the sanitized segment
+/// is truncated to `LV_NAME_SANITIZED_MAX_CHARS` characters so a
+/// 128-byte volume id still yields a name LVM accepts (at most
+/// `4 + 100 + 1 + 8 = 113` characters).
 #[must_use]
 pub fn lv_name_for(volume_id: &VolumeId) -> String {
     let sanitized: String = volume_id
         .as_str()
         .chars()
         .map(|c| if matches!(c, '.' | ':') { '-' } else { c })
+        .take(LV_NAME_SANITIZED_MAX_CHARS)
         .collect();
     let digest = Sha256::digest(volume_id.as_str().as_bytes());
     format!(

@@ -16,8 +16,13 @@
 //! Crash windows are handled so state always matches observed reality:
 //! a claim whose `vgcreate` fails undoes its `pvcreate` (best effort, with
 //! a manual-remediation hint when the undo fails); a release whose
-//! `pvremove` fails keeps the claim *removed* (the VG is already gone) and
-//! reports the exact manual remediation instead of silently diverging.
+//! `vgremove` fails *but whose VG is verifiably absent from `vgs`*
+//! reconciles forward (the claim is dropped and `pvremove` proceeds —
+//! a VG removed behind the daemon's back must not pin the claim
+//! forever); a release whose `pvremove` fails keeps the claim *removed*
+//! (the VG is already gone) and reports the exact manual remediation
+//! instead of silently diverging. Startup reconciliation drops device
+//! claims whose VG is verifiably gone (never on a failed query).
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -101,12 +106,18 @@ impl LvmProvider {
             if pv.pv_name.as_deref() == Some(device.path.as_str())
                 || pv.pv_name.as_deref() == Some(kernel_path.as_str())
             {
+                // The remediation names both steps in order: an
+                // interrupted claim can leave a full VG behind (crash
+                // after vgcreate), and pvremove fails while the VG
+                // exists.
                 return Err(ApiError::new(
                     ApiErrorCode::ForeignDeviceState,
                     format!(
                         "device path {} already hosts a physical volume; foreign state is \
                          never adopted (if this is a leftover from an interrupted volvisor \
-                         claim, remove it manually with pvremove)",
+                         claim, remove it manually with vgremove {} then pvremove {})",
+                        device.path,
+                        self.claim_vg_name(device_id),
                         device.path
                     ),
                 ));
@@ -184,8 +195,16 @@ impl LvmProvider {
     ///
     /// Requires the destructive-authorization token carried by `request`.
     /// The device's volume group must hold zero volumes in provider state
-    /// (`INVALID_STATE` otherwise). `vgremove` runs first; if it fails the
-    /// VG still exists and the claim stays put (state matches reality).
+    /// (`INVALID_STATE` otherwise). `vgremove` runs first; if it fails
+    /// but `vgs` shows the VG is *verifiably absent* (a crash between
+    /// `vgremove` success and the state save, or the VG was removed
+    /// while the daemon was down), the release reconciles forward: the
+    /// claim removal is persisted and `pvremove` proceeds. If the VG is
+    /// still present — or `vgs` cannot be queried, an honest unknown —
+    /// the claim stays put (state matches reality) and the error names
+    /// the manual remediation (`vgremove` then `pvremove`, in that
+    /// order: `pvremove` fails while the VG exists).
+    ///
     /// Once the VG is gone the claim removal is persisted **immediately**,
     /// then `pvremove` runs: if it fails, the claim is *not* restored —
     /// the VG really is gone — and the error names the exact manual
@@ -218,16 +237,29 @@ impl LvmProvider {
         }
 
         let vgremove = self.runner.run("vgremove", &["--yes", &entry.vg_name])?;
-        if !vgremove.success {
-            // The VG still exists: keep the claim so state matches the
-            // observed reality (an honest error, never a silent diverge).
-            return Err(command_failed("vgremove", &vgremove));
+        if !vgremove.success && !self.vg_verifiably_absent(&entry.vg_name) {
+            // The VG still exists (or its absence cannot be verified —
+            // an honest unknown): keep the claim so state matches the
+            // observed reality (an honest error, never a silent
+            // diverge). The remediation names both steps in order —
+            // pvremove fails while the VG exists.
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "vgremove failed: {}; manual remediation: vgremove {} then pvremove {} \
+                     (then retry the release, which reconciles forward)",
+                    vgremove.stderr_excerpt(),
+                    entry.vg_name,
+                    entry.path
+                ),
+            ));
         }
 
-        // The VG is gone: durably drop the claim *now*, before pvremove.
-        // If pvremove fails below, the claim is not restored (that would
-        // re-claim a device whose VG no longer exists); the operator gets
-        // the exact manual remediation instead.
+        // The VG is gone (removed above, or verifiably absent after a
+        // failed vgremove): durably drop the claim *now*, before
+        // pvremove. If pvremove fails below, the claim is not restored
+        // (that would re-claim a device whose VG no longer exists); the
+        // operator gets the exact manual remediation instead.
         state.remove_device(device_id);
         state.save(&self.state_path)?;
 
@@ -243,6 +275,21 @@ impl LvmProvider {
             ));
         }
         Ok(())
+    }
+
+    /// Whether a *successful* `vgs` query reports the VG as absent.
+    ///
+    /// Only verifiable absence counts as evidence: a failed query is an
+    /// honest unknown and yields `false`, so a destructive decision is
+    /// never made on missing data (the claim stays, the caller reports
+    /// the original `vgremove` failure).
+    fn vg_verifiably_absent(&self, vg_name: &str) -> bool {
+        match self.list_vgs() {
+            Ok(rows) => !rows
+                .iter()
+                .any(|row| row.vg_name.as_deref() == Some(vg_name)),
+            Err(_) => false,
+        }
     }
 
     /// Compare provider state against observed LVM state.

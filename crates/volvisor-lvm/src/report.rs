@@ -84,6 +84,11 @@ pub struct VgRow {
     /// Total size of the VG, in bytes.
     #[serde(default)]
     pub vg_size: Option<FlexibleNumber>,
+    /// Physical extent size of the VG, in bytes (LVM rounds every
+    /// allocation up to whole extents; larger extents on big arrays
+    /// make the rounding coarser).
+    #[serde(default)]
+    pub vg_extent_size: Option<FlexibleNumber>,
 }
 
 impl VgRow {
@@ -97,6 +102,14 @@ impl VgRow {
     #[must_use]
     pub fn size_bytes(&self) -> Option<u64> {
         self.vg_size.as_ref().and_then(FlexibleNumber::to_u64)
+    }
+
+    /// Physical extent bytes, when reported and parseable.
+    #[must_use]
+    pub fn extent_bytes(&self) -> Option<u64> {
+        self.vg_extent_size
+            .as_ref()
+            .and_then(FlexibleNumber::to_u64)
     }
 }
 
@@ -218,6 +231,31 @@ mod tests {
     fn lvm_report_rejects_non_json_loudly() {
         let err = parse_report::<LvRow>("not json", "lv").expect_err("must fail");
         assert_eq!(err.code, ApiErrorCode::Internal);
+    }
+
+    #[test]
+    fn vg_rows_parse_the_extent_size_permissively() {
+        // Present (string-style, as LVM emits it even with --units b).
+        let stdout = r#"{"report":[{"vg":[
+            {"vg_name":"vg0","vg_free":"1024","vg_extent_size":"33554432"}
+        ]}]}"#;
+        let rows: Vec<VgRow> = parse_report(stdout, "vg").expect("parse");
+        assert_eq!(rows[0].extent_bytes(), Some(33_554_432));
+
+        // Numeric style is accepted too.
+        let stdout = r#"{"report":[{"vg":[
+            {"vg_name":"vg0","vg_free":"1024","vg_extent_size":4194304}
+        ]}]}"#;
+        let rows: Vec<VgRow> = parse_report(stdout, "vg").expect("parse");
+        assert_eq!(rows[0].extent_bytes(), Some(4_194_304));
+
+        // Absent or unparseable -> None (the caller applies its own
+        // 4-MiB default; a fabricated value here would be dishonest).
+        let stdout = r#"{"report":[{"vg":[
+            {"vg_name":"vg0","vg_free":"1024"}
+        ]}]}"#;
+        let rows: Vec<VgRow> = parse_report(stdout, "vg").expect("parse");
+        assert_eq!(rows[0].extent_bytes(), None);
     }
 
     #[test]

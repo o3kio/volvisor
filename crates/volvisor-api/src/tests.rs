@@ -82,6 +82,24 @@ fn setup_without_admin_surface() -> (SharedState, Arc<FakeProvider>, tempfile::T
     (state, provider, dir)
 }
 
+/// Setup whose fake provider advertises only `capacity_bytes` of physical
+/// capacity: a create larger than that fails deterministically with
+/// `NO_SAFE_CAPACITY` (507), for failure-replay status-compatibility tests.
+fn setup_with_capacity(capacity_bytes: u64) -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new().with_capacity_bytes(capacity_bytes));
+    // The fake implements both surfaces; coerce one clone for admin routes.
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let state = Arc::new(AppState::new(
+        provider.clone(),
+        Some(admin),
+        journal,
+        Some(TEST_TOKEN.to_owned()),
+    ));
+    (state, provider, dir)
+}
+
 fn app(state: &SharedState) -> Router {
     router(state.clone(), ApiConfig::default().max_body_bytes)
 }
@@ -554,6 +572,124 @@ async fn concurrent_same_operation_id_creates_exactly_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(1));
     assert_eq!(listed["volumes"][0]["volume_id"], json!("vol-concurrent"));
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency (failure flavor): concurrent replay of a FAILED operation
+// must be status-compatible, never a 200 wrapping an error body
+// ---------------------------------------------------------------------------
+
+/// N concurrent POSTs of the SAME create request whose provider call
+/// deterministically fails (`NO_SAFE_CAPACITY` 507: the size exceeds the
+/// fake provider's capacity). Every caller — the one that executed the
+/// mutation, the ones that lost the intent-append race and re-resolved the
+/// recorded outcome inside `append_intent`, and the ones that looked the
+/// operation up after the outcome was journaled — must receive the SAME
+/// 507 with byte-identical bodies. A 200 wrapping the recorded error body
+/// (the round-2 review bug) or an in-doubt 409 are both regressions here.
+#[tokio::test]
+async fn concurrent_failed_operation_replays_status_compatible() {
+    const CALLERS: usize = 8;
+    // 512 MiB of capacity: the 1 GiB fixture create can never succeed.
+    let (state, _provider, _dir) = setup_with_capacity(GIB / 2);
+
+    let create = serde_json::to_value(fixture_create_request("vol-no-capacity", GIB))
+        .expect("serialize create fixture");
+
+    let mut handles = Vec::new();
+    for _ in 0..CALLERS {
+        let app = app(&state);
+        let body = create.clone();
+        handles.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(json_request(Method::POST, "/v2/volumes", &body))
+                .await
+                .expect("router call");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            (
+                status,
+                String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
+            )
+        }));
+    }
+
+    let mut bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for handle in handles {
+        let (status, body) = handle.await.expect("task join");
+        assert_eq!(
+            status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "every concurrent caller of a failed operation must see the recorded \
+             failure status, got {status} with body: {body}"
+        );
+        assert!(
+            body.contains("NO_SAFE_CAPACITY"),
+            "body must be the recorded error body: {body}"
+        );
+        bodies.insert(body);
+    }
+    assert_eq!(
+        bodies.len(),
+        1,
+        "all {CALLERS} responses must be byte-identical (executor, race-replay and \
+         post-outcome replay paths)"
+    );
+
+    // Exactly one provider execution: one failure, {CALLERS-1} replays, and
+    // never a success or an in-doubt resolution.
+    let metrics = state.metrics.render();
+    assert!(metrics.contains("operations_total{kind=\"create_volume\",outcome=\"failure\"} 1"));
+    assert!(metrics.contains(&format!(
+        "operations_total{{kind=\"create_volume\",outcome=\"replayed\"}} {}",
+        CALLERS - 1
+    )));
+    assert!(!metrics.contains("operations_total{kind=\"create_volume\",outcome=\"success\"}"));
+    assert!(!metrics.contains("operations_total{kind=\"create_volume\",outcome=\"in_doubt\"}"));
+
+    // One intent + one outcome, nothing else was journaled.
+    assert_eq!(journal_record_count(&state), 2);
+
+    // No volume was created.
+    let app = app(&state);
+    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(0));
+}
+
+/// Sequential failure replay (first-lookup path): the first request fails
+/// 507; a retry with the same `operation_id` after the outcome was journaled
+/// returns 507 again with the byte-identical body.
+#[tokio::test]
+async fn sequential_failed_operation_retry_replays_status_and_body() {
+    // 512 MiB of capacity: the 1 GiB fixture create can never succeed.
+    let (state, _provider, _dir) = setup_with_capacity(GIB / 2);
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-no-capacity-seq", GIB))
+        .expect("serialize create fixture");
+
+    let (first_status, first_body) =
+        send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(first_status, StatusCode::INSUFFICIENT_STORAGE);
+    assert!(first_body.contains("NO_SAFE_CAPACITY"));
+
+    // Retry after the outcome was journaled: same status, same bytes, no
+    // re-execution.
+    let (second_status, second_body) =
+        send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(second_status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(
+        second_body, first_body,
+        "failure replay must be status- and byte-compatible"
+    );
+
+    let metrics = state.metrics.render();
+    assert!(metrics.contains("operations_total{kind=\"create_volume\",outcome=\"failure\"} 1"));
+    assert!(metrics.contains("operations_total{kind=\"create_volume\",outcome=\"replayed\"} 1"));
+    assert_eq!(journal_record_count(&state), 2);
 }
 
 // ---------------------------------------------------------------------------

@@ -49,11 +49,23 @@ pub struct RegistryEntry {
 pub enum IntentAppend {
     /// Fresh intent, durably recorded; the caller may execute the mutation.
     New,
-    /// Replay of an already-recorded intent with the same request hash.
-    /// Carries the recorded outcome response when one exists; the inner
-    /// `Option` is `None` only for outcome kinds without a replayable body
-    /// (none exist today; the shape is reserved for forward compatibility).
-    Replayed(Option<serde_json::Value>),
+    /// Replay of an already-recorded intent with the same request hash,
+    /// carrying the recorded outcome.
+    ///
+    /// `success` lets the caller reconstruct the HTTP status of the
+    /// original response (successes replay as `200`, failures as the
+    /// recorded wire code's status), keeping replays status- and
+    /// byte-compatible with the first caller's response. An earlier
+    /// revision carried `Option<Value>` for outcome kinds "without a
+    /// replayable body"; no such kind exists (every recorded outcome
+    /// carries a JSON body), so the never-`None` `Option` is collapsed
+    /// into this unconditional shape.
+    Replayed {
+        /// Whether the recorded mutation succeeded.
+        success: bool,
+        /// The recorded response body, replayed verbatim.
+        response: serde_json::Value,
+    },
     /// The intent is durably recorded but has no outcome yet: the operation
     /// is in flight (or was interrupted before its outcome was journaled).
     AlreadyInFlight,
@@ -203,9 +215,9 @@ impl Journal {
     /// - unknown operation: journals and fsyncs the intent, returns
     ///   [`IntentAppend::New`];
     /// - known operation, same request hash: returns
-    ///   [`IntentAppend::Replayed`] with the recorded outcome response when
-    ///   one exists, otherwise [`IntentAppend::AlreadyInFlight`] (nothing is
-    ///   written);
+    ///   [`IntentAppend::Replayed`] with the recorded outcome (success flag
+    ///   and response body) when one exists, otherwise
+    ///   [`IntentAppend::AlreadyInFlight`] (nothing is written);
     /// - known operation, different request hash (or hash unverifiable):
     ///   `ApiError::idempotency_conflict`, fail closed.
     pub fn append_intent(
@@ -218,7 +230,10 @@ impl Journal {
         if let Some(state) = self.operations.get(&operation_id) {
             return match state.request_hash {
                 Some(recorded) if recorded == request_hash => Ok(match &state.outcome {
-                    Some(outcome) => IntentAppend::Replayed(Some(outcome.response.clone())),
+                    Some(outcome) => IntentAppend::Replayed {
+                        success: outcome.success,
+                        response: outcome.response.clone(),
+                    },
                     None => IntentAppend::AlreadyInFlight,
                 }),
                 // Different request hash, or an outcome-only entry whose

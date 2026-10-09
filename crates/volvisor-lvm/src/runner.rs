@@ -14,18 +14,25 @@
 //! reported as successful without evidence.
 //!
 //! [`RealRunner`] bounds every command with a watchdog timeout (60 s by
-//! default, [`RealRunner::with_timeout`] otherwise): a hung child is
-//! killed and surfaced as a typed `INTERNAL` timeout error instead of
-//! blocking the caller forever. Commands still *execute* on the calling
-//! thread (bounded by the timeout) — moving them to `spawn_blocking` is a
-//! recorded follow-up, not part of this design.
+//! default, [`RealRunner::with_timeout`] otherwise). The **calling
+//! thread** is the watchdog: it polls the child's status until it exits
+//! or the timeout elapses. Each of the child's pipes is drained by a
+//! dedicated **reader thread** that forwards the collected bytes over a
+//! channel, so a child producing more output than the pipe buffer can
+//! never deadlock against the caller. On timeout the child is killed
+//! and given a grace period to exit; a child stuck in uninterruptible
+//! sleep (D-state, plausible for `blkdiscard`/`lvremove` on a wedged
+//! device) is handed to a detached reaper thread and the typed
+//! `INTERNAL` timeout error is returned without blocking the caller
+//! (see [`RealRunner`] for the exact design and its caveats).
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use volvisor_types::{ApiError, ApiErrorCode};
 
@@ -102,24 +109,65 @@ pub trait CommandRunner: Send + Sync {
 /// Default per-command watchdog timeout (60 seconds).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often the calling-thread watchdog polls the child's status.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long the watchdog waits for a killed child to exit before
+/// handing it over to the detached reaper.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the calling thread waits for the reader threads to deliver
+/// their bytes after the child exited (normally immediate: EOF arrives
+/// when the child's write ends close).
+const PIPE_RECV_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the timeout path waits for the reader threads before
+/// returning the typed timeout error (best-effort; the error is the
+/// operative fact, not the output).
+const TIMEOUT_RECV_GRACE: Duration = Duration::from_millis(100);
+
 /// Production runner: executes commands via [`std::process::Command`].
 ///
 /// No shell is involved; arguments are passed verbatim, so values derived
 /// from identifiers (volume names, paths) can never be re-parsed as shell
 /// syntax.
 ///
-/// Every command is bounded by a watchdog timeout ([`DEFAULT_TIMEOUT`] by
-/// default, [`RealRunner::with_timeout`] to customize): a watchdog thread
-/// sleeps for the timeout and, unless the command has finished by then,
-/// kills the child. The kill/reap hand-off is guarded by a mutex around
-/// the [`Child`] plus a done-flag, so the watchdog can never signal an
-/// already-reaped process (no pid-reuse hazard) and no `unsafe` code is
-/// required. A command that hits the timeout is reported as a typed
-/// `INTERNAL` error naming the program and the timeout.
+/// # Watchdog design
 ///
-/// Commands still execute on the calling thread (bounded by the timeout);
-/// refactoring the providers to call the runner from `spawn_blocking` is a
-/// recorded follow-up.
+/// Every command is bounded by a watchdog timeout ([`DEFAULT_TIMEOUT`] by
+/// default, [`RealRunner::with_timeout`] to customize), and the calling
+/// thread *is* the watchdog — it never blocks on an unbounded read:
+///
+/// - Both child pipes (stdout, stderr) are drained by dedicated **reader
+///   threads** that read to EOF and forward the bytes over channels.
+///   Draining concurrently is what allows a child to write more than the
+///   pipe buffer without deadlocking against the caller.
+/// - The calling thread polls `try_wait` every
+///   `WATCHDOG_POLL_INTERVAL`. A child that exits within the timeout
+///   has its output collected from the channels (with a short
+///   `PIPE_RECV_GRACE` recv timeout) and its exit status reported
+///   honestly.
+/// - When the timeout elapses, the child is `kill()`ed and given
+///   `KILL_GRACE` to exit. A child that exits within the grace period
+///   is reported as a typed `INTERNAL` timeout error naming the program
+///   and the timeout.
+/// - A child that *still* has not exited after the grace period is stuck
+///   in uninterruptible sleep (D-state — plausible for `blkdiscard` or
+///   `lvremove` on a wedged device, where even `kill` cannot take
+///   effect). The [`Child`] is handed to a detached **reaper thread**
+///   that keeps polling `try_wait` until the kernel reaps the process,
+///   and the typed timeout error is returned immediately. This is a
+///   bounded, documented thread leak (one reaper thread — and two
+///   still-blocked reader threads — per D-state event); the alternative
+///   would be blocking the calling thread forever.
+///
+/// # Out of scope
+///
+/// A grandchild that inherits the child's pipes and outlives it can keep
+/// the reader threads waiting past `PIPE_RECV_GRACE`; the collected
+/// output is then whatever arrived within the grace window. The LVM
+/// toolchain does not daemonize, so this is accepted and documented
+/// rather than handled.
 #[derive(Debug, Clone, Copy)]
 pub struct RealRunner {
     /// Watchdog timeout applied to every executed command.
@@ -146,6 +194,95 @@ impl RealRunner {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// The typed timeout error for `program` (same shape as always).
+    fn timeout_error(&self, program: &str) -> ApiError {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!(
+                "command {program} timed out after {}s",
+                self.timeout.as_secs_f64()
+            ),
+        )
+    }
+
+    /// Kill a timed-out child and report the typed timeout error.
+    ///
+    /// After the kill the watchdog keeps polling for `KILL_GRACE`: a
+    /// child that exits within the grace period is a plain timeout. A
+    /// child still running after the grace period is in D-state (the
+    /// kill cannot take effect): it is handed to the detached reaper
+    /// thread and the timeout error is returned without reading the
+    /// pipes (a short best-effort recv only, so the reader threads are
+    /// not waited on).
+    fn kill_and_report_timeout(
+        &self,
+        mut child: Child,
+        program: &str,
+        stdout: &Receiver<io::Result<Vec<u8>>>,
+        stderr: &Receiver<io::Result<Vec<u8>>>,
+    ) -> ApiError {
+        // The kill result is deliberately not surfaced: the timeout is
+        // the operative fact, and a child that exits between the poll
+        // and the kill is still a timeout.
+        drop(child.kill());
+        let kill_started = Instant::now();
+        loop {
+            match child.try_wait() {
+                // Exited within the grace period (or the status is not
+                // obtainable): a plain, honest timeout.
+                Ok(Some(_)) | Err(_) => return self.timeout_error(program),
+                Ok(None) => {}
+            }
+            if kill_started.elapsed() >= KILL_GRACE {
+                break;
+            }
+            thread::sleep(WATCHDOG_POLL_INTERVAL);
+        }
+
+        // D-state: hand the child to the detached reaper so the kernel
+        // eventually collects it, and return without waiting on the
+        // (still open) pipes.
+        thread::spawn(move || reap_detached(child));
+        let _ = stdout.recv_timeout(TIMEOUT_RECV_GRACE);
+        let _ = stderr.recv_timeout(TIMEOUT_RECV_GRACE);
+        self.timeout_error(program)
+    }
+}
+
+/// Reap a child that outlived the kill grace period (D-state).
+///
+/// The thread polls `try_wait` until the kernel reports an exit status
+/// (or the status becomes unobtainable) and then finishes: one bounded
+/// thread per D-state event, documented in [`RealRunner`]. The
+/// alternative — waiting synchronously — would block the calling thread
+/// forever.
+fn reap_detached(mut child: Child) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(WATCHDOG_POLL_INTERVAL),
+        }
+    }
+}
+
+/// Spawn a dedicated reader thread for one child pipe.
+///
+/// The thread reads the pipe to EOF and sends the collected bytes (or
+/// the read error) over a channel. Both pipes are drained concurrently,
+/// so a child writing more than the pipe buffer can never deadlock
+/// against the calling thread.
+fn spawn_pipe_reader(pipe: Option<impl Read + Send + 'static>) -> Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = pipe.map_or(Ok(Vec::new()), |mut pipe| {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        // A closed receiver (the caller already returned) is fine.
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 impl CommandRunner for RealRunner {
@@ -157,76 +294,45 @@ impl CommandRunner for RealRunner {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| internal(format!("failed to execute {program}: {e}")))?;
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
 
-        // The child is shared with the watchdog behind a mutex; the
-        // done-flag plus taking the child out of the slot before dropping
-        // the lock make a kill-after-reap (pid reuse) impossible.
-        let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let shared = Arc::clone(&shared);
-            let done = Arc::clone(&done);
-            let timed_out = Arc::clone(&timed_out);
-            let timeout = self.timeout;
-            thread::spawn(move || {
-                thread::sleep(timeout);
-                if !done.load(std::sync::atomic::Ordering::SeqCst) {
-                    if let Ok(mut guard) = shared.lock() {
-                        // Re-check under the lock: the caller may have
-                        // finished between the load and the lock.
-                        if !done.load(std::sync::atomic::Ordering::SeqCst) {
-                            if let Some(child) = guard.as_mut() {
-                                if child.kill().is_ok() {
-                                    timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        let stdout_receiver = spawn_pipe_reader(child.stdout.take());
+        let stderr_receiver = spawn_pipe_reader(child.stderr.take());
 
-        // Read both pipes to end on the calling thread. A hung child keeps
-        // the pipes open, so this blocks until the child exits — or until
-        // the watchdog kills it, which closes the pipes.
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let stdout_result = stdout_pipe
-            .as_mut()
-            .map_or(Ok(0), |pipe| pipe.read_to_end(&mut stdout));
-        let stderr_result = stderr_pipe
-            .as_mut()
-            .map_or(Ok(0), |pipe| pipe.read_to_end(&mut stderr));
-
-        // Reap the child while holding the lock, then publish done. The
-        // watchdog can only kill what is still in the shared slot, so it
-        // can never signal a reaped (possibly reused) pid.
-        let status = {
-            let mut guard = shared
-                .lock()
-                .map_err(|_| internal(format!("command runner lock poisoned for {program}")))?;
-            let child = guard
-                .as_mut()
-                .ok_or_else(|| internal(format!("command {program} was already reaped")))?;
-            let status = child
-                .wait()
-                .map_err(|e| internal(format!("failed to wait for {program}: {e}")))?;
-            *guard = None;
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            status
+        // The calling thread is the watchdog: poll the child's status
+        // until it exits or the timeout elapses.
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| internal(format!("failed to wait for {program}: {e}")))?
+            {
+                break status;
+            }
+            if started.elapsed() >= self.timeout {
+                return Err(self.kill_and_report_timeout(
+                    child,
+                    program,
+                    &stdout_receiver,
+                    &stderr_receiver,
+                ));
+            }
+            thread::sleep(WATCHDOG_POLL_INTERVAL);
         };
 
-        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(internal(format!(
-                "command {program} timed out after {}s",
-                self.timeout.as_secs_f64()
-            )));
-        }
-        stdout_result.map_err(|e| internal(format!("failed to read stdout of {program}: {e}")))?;
-        stderr_result.map_err(|e| internal(format!("failed to read stderr of {program}: {e}")))?;
+        // The child exited within the timeout: collect the drained
+        // output. EOF normally arrives immediately (the write ends
+        // closed on exit); the grace timeout only bounds a grandchild
+        // that inherited the pipes (documented out of scope).
+        let stdout = match stdout_receiver.recv_timeout(PIPE_RECV_GRACE) {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(internal(format!("failed to read stdout of {program}: {e}"))),
+            Err(_) => Vec::new(),
+        };
+        let stderr = match stderr_receiver.recv_timeout(PIPE_RECV_GRACE) {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(internal(format!("failed to read stderr of {program}: {e}"))),
+            Err(_) => Vec::new(),
+        };
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -396,12 +502,28 @@ mod tests {
     // The remaining RealRunner tests execute real subprocesses; they are
     // kept fast (sub-second apart from the deliberate 1 s timeout).
     #[test]
-    fn real_runner_times_out_hung_commands() {
+    fn real_runner_times_out_hung_commands_without_blocking_the_caller() {
         let runner = RealRunner::with_timeout(Duration::from_secs(1));
         let started = std::time::Instant::now();
-        // `sh -c` is forbidden in this codebase; `sleep` is invoked
-        // directly as the program with a numeric argument.
-        let err = runner.run("sleep", &["30"]).expect_err("hung command");
+        // The command runs on a dedicated thread and the test proves the
+        // calling thread of `run` is never blocked indefinitely: the
+        // completion signal is awaited with a bounded receive, not a
+        // naked join. `sleep` is invoked directly as the program with a
+        // numeric argument (never a shell).
+        let (done_sender, done_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = runner.run("sleep", &["30"]);
+            let _ = done_sender.send(());
+            result
+        });
+        assert!(
+            done_receiver.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "run() must return after the timeout instead of blocking its caller forever"
+        );
+        let err = handle
+            .join()
+            .expect("runner thread must not panic")
+            .expect_err("hung command");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.detail.contains("timed out"), "{err}");
         assert!(err.detail.contains("sleep"), "{err}");
@@ -425,5 +547,19 @@ mod tests {
         // `false` exits non-zero without a shell.
         let out = runner.run("false", &[]).expect("runs");
         assert!(!out.success);
+    }
+
+    #[test]
+    fn real_runner_drains_output_larger_than_the_pipe_buffer() {
+        let runner = RealRunner::with_timeout(Duration::from_secs(10));
+        // 256 KiB is far beyond the 64 KiB kernel pipe buffer: without
+        // the concurrent reader threads the child would block on its
+        // write (and the caller on the read) forever.
+        let out = runner
+            .run("head", &["-c", "262144", "/dev/zero"])
+            .expect("large output command succeeds");
+        assert!(out.success);
+        assert_eq!(out.stdout.len(), 262_144);
+        assert!(out.stdout.bytes().all(|byte| byte == 0));
     }
 }

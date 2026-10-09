@@ -8,9 +8,10 @@
 //!
 //! The simulation mirrors real LVM semantics that matter to the provider:
 //! `lvcreate`/`lvextend` round sizes **up** to the configured physical
-//! extent size ([`FakeLvm::extent_size`], 4 MiB by default), `lvcreate`
-//! fails on an LV name that already exists, and `lvremove` on a missing
-//! LV fails.
+//! extent size ([`FakeLvm::extent_size`], 4 MiB by default, also reported
+//! as `vg_extent_size` by the simulated `vgs`), `lvcreate` fails on an LV
+//! name that already exists, `lvremove` on a missing LV fails, and
+//! `vgremove` on a missing VG fails.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention (see
 //! the crate-level `cfg_attr(test)` in the library).
@@ -69,6 +70,12 @@ pub struct FakeLvm {
     pub fail_vgcreate: bool,
     /// When true, `pvremove` fails (release crash-window injection).
     pub fail_pvremove: bool,
+    /// When true, `vgremove` fails even though the VG exists (release
+    /// crash-window injection).
+    pub fail_vgremove: bool,
+    /// When true, `vgs` fails (honest-unknown injection for device-claim
+    /// reconciliation).
+    pub fail_vgs: bool,
 }
 
 impl Default for FakeLvm {
@@ -85,6 +92,8 @@ impl Default for FakeLvm {
             extent_size: EXTENT_BYTES,
             fail_vgcreate: false,
             fail_pvremove: false,
+            fail_vgremove: false,
+            fail_vgs: false,
         }
     }
 }
@@ -142,6 +151,7 @@ fn vgs_report(world: &FakeLvm) -> CommandOutput {
                 "vg_name": vg,
                 "vg_free": world.vg_free.get(vg).copied().unwrap_or_default().to_string(),
                 "vg_size": world.vg_size.get(vg).copied().unwrap_or_default().to_string(),
+                "vg_extent_size": world.extent_size.to_string(),
             })
         })
         .collect();
@@ -162,7 +172,12 @@ fn pvs_report(world: &FakeLvm) -> CommandOutput {
 fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
     match program {
         "lvs" => Some(lvs_report(world)),
-        "vgs" => Some(vgs_report(world)),
+        "vgs" => {
+            if world.fail_vgs {
+                return Some(CommandOutput::failure("vgs: simulated failure"));
+            }
+            Some(vgs_report(world))
+        }
         "pvs" => Some(pvs_report(world)),
         "lsblk" => Some(CommandOutput::success(lsblk_for(world))),
         "lvcreate" => {
@@ -236,8 +251,17 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
         "vgremove" => {
             // vgremove --yes <vg>
             let vg = *args.last()?;
-            world.vg_free.remove(vg);
-            world.vg_size.remove(vg);
+            if world.fail_vgremove {
+                return Some(CommandOutput::failure("vgremove: simulated failure"));
+            }
+            // Real vgremove of a missing VG fails loudly ("Volume group
+            // ... not found"); the unconditional success here hid the
+            // release stuck-state crash window.
+            if world.vg_free.remove(vg).is_none() && world.vg_size.remove(vg).is_none() {
+                return Some(CommandOutput::failure(format!(
+                    "vgremove: volume group {vg} not found"
+                )));
+            }
             Some(CommandOutput::success(String::new()))
         }
         "pvremove" => {

@@ -39,7 +39,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
 use serde_json::Value;
-use volvisor_journal::{IntentAppend, Journal, RecordedOutcome};
+use volvisor_journal::{IntentAppend, Journal};
 use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
     GrowVolumeRequest,
@@ -155,7 +155,7 @@ where
                     operation_id = %operation_id,
                     "replaying recorded outcome without executing"
                 );
-                Ok(replay_response(&outcome)?)
+                replay_response(outcome.success, &outcome.response)
             }
             None => operation_in_doubt(state, op_kind, &operation_id),
         };
@@ -171,19 +171,17 @@ where
     }?;
     match append {
         IntentAppend::New => {}
-        IntentAppend::Replayed(response) => {
-            return match response {
-                Some(body) => {
-                    state.metrics.record_operation(op_kind, "replayed");
-                    tracing::info!(
-                        kind = op_kind,
-                        operation_id = %operation_id,
-                        "replaying concurrently recorded outcome without executing"
-                    );
-                    Ok(json_response(StatusCode::OK, &body))
-                }
-                None => operation_in_doubt(state, op_kind, &operation_id),
-            };
+        IntentAppend::Replayed { success, response } => {
+            state.metrics.record_operation(op_kind, "replayed");
+            tracing::info!(
+                kind = op_kind,
+                operation_id = %operation_id,
+                "replaying concurrently recorded outcome without executing"
+            );
+            // Same reconstruction as the first-lookup replay above: a
+            // concurrently recorded failure must serve the recorded error
+            // status, never a 200 wrapping the error body.
+            return replay_response(success, &response);
         }
         IntentAppend::AlreadyInFlight => {
             return operation_in_doubt(state, op_kind, &operation_id);
@@ -286,17 +284,20 @@ fn operation_in_doubt(
     ))
 }
 
-/// Rebuild the response for a recorded outcome.
+/// Rebuild the HTTP response for a recorded outcome.
 ///
-/// Successes replay as `200` with the stored body; failures replay with the
-/// status reconstructed from the recorded error code and the stored body, so
-/// a replay is status- and byte-compatible with the first caller's response.
-fn replay_response(outcome: &RecordedOutcome) -> Result<Response, ApiError> {
-    if outcome.success {
-        return Ok(json_response(StatusCode::OK, &outcome.response));
+/// This is the single status-reconstruction path shared by *every* replay:
+/// the first journal lookup before `append_intent`, and the race branch
+/// that re-resolves idempotency inside `append_intent`. Successes replay
+/// as `200` with the stored body; failures replay with the status
+/// reconstructed from the recorded error code and the stored body, so a
+/// replay is status- and byte-compatible with the first caller's response
+/// regardless of which caller executed the mutation.
+fn replay_response(success: bool, response: &Value) -> Result<Response, ApiError> {
+    if success {
+        return Ok(json_response(StatusCode::OK, response));
     }
-    let status = outcome
-        .response
+    let status = response
         .get("code")
         .and_then(Value::as_str)
         .and_then(status_for_wire_code)
@@ -312,7 +313,7 @@ fn replay_response(outcome: &RecordedOutcome) -> Result<Response, ApiError> {
             "recorded failure outcome carries an invalid HTTP status",
         )
     })?;
-    Ok(json_response(status, &outcome.response))
+    Ok(json_response(status, response))
 }
 
 // ---------------------------------------------------------------------------

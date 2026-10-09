@@ -643,6 +643,44 @@ async fn delete_of_a_failed_volume_without_an_lv_skips_lvm_entirely() {
     assert_eq!(err.code, ApiErrorCode::NotFound);
 }
 
+#[tokio::test]
+async fn delete_of_a_ready_volume_with_an_absent_lv_fails_loudly() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("hidden-lv", GIB))
+        .await
+        .expect("create");
+
+    // The LV disappears from `lvs` behind the provider's back WITHOUT a
+    // restart: the stored state is still Ready. A delete must not
+    // silently skip erasure on a (perhaps only transiently) invisible
+    // LV — a ZeroDiscard delete would report success while a foreign LV
+    // still holds live data — so it fails loudly instead.
+    fixture.world.lock().expect("world").lvs.remove(&format!(
+        "{}/{}",
+        common::CLAIMED_VG,
+        lv_name_for(&volume_id("hidden-lv"))
+    ));
+    let mut request = fixture_delete_request("hidden-lv", created.generation);
+    request.data_erasure_policy = ErasurePolicy::ZeroDiscard;
+    let err = fixture
+        .provider
+        .delete_volume(&created.volume_id, &request)
+        .await
+        .expect_err("absent LV on a Ready volume must not delete quietly");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("unexpectedly absent"), "{err}");
+    assert!(err.detail.contains("Ready"), "{err}");
+
+    // The volume entry survives for investigation.
+    fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("volume persists");
+}
+
 // ---------------------------------------------------------------------------
 // Extent rounding (thick LVM rounds sizes up to whole physical extents)
 // ---------------------------------------------------------------------------
@@ -739,6 +777,75 @@ async fn grow_rounds_up_to_the_extent_and_reports_the_effective_size() {
 }
 
 // ---------------------------------------------------------------------------
+// Extent-rounded capacity checks (big arrays use big physical extents)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_capacity_check_is_extent_rounded() {
+    let fixture = fixture();
+    // 32-MiB physical extents (realistic on big arrays). 34 MiB free
+    // satisfies the raw 20-MiB request plus the 4-MiB headroom, but not
+    // the 32-MiB extent-rounded demand: the typed NO_SAFE_CAPACITY must
+    // surface here, not a raw INTERNAL from LVM later.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.extent_size = 32 * MIB;
+        world
+            .vg_free
+            .insert(common::CLAIMED_VG.to_owned(), 34 * MIB);
+    }
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("ext-round-create", 20 * MIB))
+        .await
+        .expect_err("raw-fits-but-rounded-does-not create");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity, "{err}");
+
+    // Nothing was created or persisted.
+    let listed = fixture.provider.list_volumes(None).await.expect("list");
+    assert!(listed.is_empty());
+}
+
+#[tokio::test]
+async fn grow_capacity_check_is_extent_rounded() {
+    let fixture = fixture();
+    // Create at the default 4-MiB extent (aligned), then switch the
+    // world to 32-MiB extents with free space that covers the raw grow
+    // delta plus headroom but not the extent-rounded delta.
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("ext-round-grow", 4 * MIB))
+        .await
+        .expect("create");
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.extent_size = 32 * MIB;
+        world
+            .vg_free
+            .insert(common::CLAIMED_VG.to_owned(), 34 * MIB);
+    }
+    // 4 MiB -> 24 MiB: the raw delta is 20 MiB, the rounded delta 32 MiB.
+    let err = fixture
+        .provider
+        .grow_volume(
+            &created.volume_id,
+            &fixture_grow_request("ext-round-grow", 24 * MIB, created.generation),
+        )
+        .await
+        .expect_err("raw-fits-but-rounded-does-not grow");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity, "{err}");
+
+    // State is unchanged: size and generation stayed put.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.generation, created.generation);
+    assert_eq!(inspected.provisioned_bytes, 4 * MIB);
+}
+
+// ---------------------------------------------------------------------------
 // Injective LV naming
 // ---------------------------------------------------------------------------
 
@@ -781,6 +888,40 @@ async fn volumes_with_legacy_colliding_ids_coexist() {
     assert_ne!(first.volume_id, second.volume_id);
     let listed = fixture.provider.list_volumes(None).await.expect("list");
     assert_eq!(listed.len(), 2);
+}
+
+#[test]
+fn lv_names_for_max_length_ids_fit_the_lvm_limit() {
+    // A 128-byte volume id (the maximum) must still produce a name LVM
+    // accepts: the sanitized segment is truncated to 100 characters, so
+    // the full name is at most `vol-` + 100 + `-` + 8 hex = 113 chars
+    // (LVM's own limit is ~127).
+    let long_id = volume_id(&"v".repeat(128));
+    let name = lv_name_for(&long_id);
+    assert!(name.chars().count() <= 113, "{name} is too long");
+    assert!(name.starts_with("vol-"));
+    assert!(!name.starts_with('-'));
+
+    // Two distinct 128-char ids sharing a 100-char sanitized prefix
+    // still produce distinct names: uniqueness rests on the hash suffix
+    // computed over the FULL volume id, not on the (truncated)
+    // sanitized segment.
+    let shared_prefix = "p".repeat(100);
+    let first = lv_name_for(&volume_id(&format!("{shared_prefix}{}", "a".repeat(28))));
+    let second = lv_name_for(&volume_id(&format!("{shared_prefix}{}", "b".repeat(28))));
+    assert_ne!(first, second);
+    // Their sanitized segments are identical after truncation; only the
+    // hash suffix separates them.
+    let (first_prefix, _) = first
+        .rsplit_once('-')
+        .expect("hash suffix is dash-delimited");
+    let (second_prefix, _) = second
+        .rsplit_once('-')
+        .expect("hash suffix is dash-delimited");
+    assert_eq!(
+        first_prefix, second_prefix,
+        "the sanitized segments are identical after truncation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -881,5 +1022,166 @@ fn release_pvremove_failure_keeps_the_claim_removed_with_a_remediation() {
             .expect("world")
             .vg_free
             .contains_key(common::CLAIMED_VG)
+    );
+}
+
+#[test]
+fn release_vgremove_failure_with_the_vg_present_keeps_the_claim() {
+    let fixture = fixture();
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    fixture.world.lock().expect("world").fail_vgremove = true;
+
+    let err = fixture
+        .provider
+        .release_device(&device, &common::release_request(common::AUTH_TOKEN))
+        .expect_err("release with a failing vgremove and the VG present");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("vgremove"), "{err}");
+    // The remediation names both steps in order: pvremove fails while
+    // the VG still exists.
+    assert!(
+        err.detail.contains("manual remediation: vgremove") && err.detail.contains("then pvremove"),
+        "{err}"
+    );
+
+    // The claim is kept (the VG still exists) and the VG is untouched:
+    // state matches observed reality.
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device).is_some());
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .vg_free
+            .contains_key(common::CLAIMED_VG)
+    );
+}
+
+#[test]
+fn release_reconciles_forward_when_the_vg_is_verifiably_absent() {
+    let fixture = fixture();
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+
+    // Crash window between vgremove success and the state save: the VG
+    // (and its LVs) are gone, the PV is still on the device, and the
+    // claim is still recorded. Real vgremove fails "Volume group not
+    // found" forever, so a release that only trusted the vgremove exit
+    // status could never free the claim.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.vg_free.remove(common::CLAIMED_VG);
+        world.vg_size.remove(common::CLAIMED_VG);
+        world
+            .pvs
+            .push("/dev/disk/by-id/wwn-0x5000c500fixt0001".to_owned());
+    }
+
+    fixture
+        .provider
+        .release_device(&device, &common::release_request(common::AUTH_TOKEN))
+        .expect("release reconciles forward over the absent VG");
+
+    // The failing vgremove was followed by an honest re-query of vgs
+    // before the claim was dropped.
+    let programs = fixture.runner.programs();
+    let vgremove_at = programs
+        .iter()
+        .position(|program| program == "vgremove")
+        .expect("vgremove ran");
+    assert!(
+        programs
+            .iter()
+            .skip(vgremove_at + 1)
+            .any(|program| program == "vgs"),
+        "the release must re-query vgs after a failed vgremove"
+    );
+
+    // The claim is gone and the leftover PV was cleaned up.
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device).is_none());
+    assert!(fixture.world.lock().expect("world").pvs.is_empty());
+}
+
+#[test]
+fn release_keeps_the_claim_when_the_vgs_requery_fails() {
+    let fixture = fixture();
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    // vgremove fails AND the honest re-query of vgs cannot run: the
+    // absence of the VG is unknown, so the claim must stay and the
+    // reported error is the vgremove failure (never a destructive
+    // decision on missing data).
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.fail_vgremove = true;
+        world.fail_vgs = true;
+    }
+
+    let err = fixture
+        .provider
+        .release_device(&device, &common::release_request(common::AUTH_TOKEN))
+        .expect_err("release with a failing vgremove and an unqueryable vgs");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("vgremove failed"), "{err}");
+
+    let state = LvmState::load(&fixture.state_path).expect("state");
+    assert!(state.device(&device).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Startup device-claim reconciliation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn startup_reconcile_drops_a_stale_claim_whose_vg_is_gone() {
+    // The VG vanished while the daemon was down (or the crash landed
+    // between vgremove success and the state save): the claim is stale
+    // and must be dropped so state matches observed reality.
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    // A volume that lived on the vanished VG: it must be marked Failed
+    // (its LV is absent too) but never removed — the device-claim pass
+    // must not touch volume entries.
+    common::seed_volume(&state_path, "stale-claim-vol", common::CLAIMED_VG, GIB);
+    let world = std::sync::Arc::new(std::sync::Mutex::new(common::FakeLvm::default()));
+
+    let provider = common::provider_from(&state_path, &world);
+
+    let state = LvmState::load(&state_path).expect("state");
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    assert!(
+        state.device(&device).is_none(),
+        "a claim whose VG is verifiably absent is dropped"
+    );
+    let volume = state
+        .volume(&volume_id("stale-claim-vol"))
+        .expect("volume entry is kept");
+    assert_eq!(volume.runtime.state, VolumeLifecycle::Failed);
+    // The provider answers consistently from the reconciled state.
+    let inspected = provider
+        .inspect_volume(&volume_id("stale-claim-vol"))
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+}
+
+#[test]
+fn startup_reconcile_keeps_claims_when_vgs_cannot_be_queried() {
+    // An honest unknown (vgs fails) must never resolve into a
+    // destructive decision: the claims are kept.
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = std::sync::Arc::new(std::sync::Mutex::new(common::FakeLvm {
+        fail_vgs: true,
+        ..common::FakeLvm::default()
+    }));
+
+    let _provider = common::provider_from(&state_path, &world);
+
+    let state = LvmState::load(&state_path).expect("state");
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    assert!(
+        state.device(&device).is_some(),
+        "claims are kept when the vgs query fails"
     );
 }
