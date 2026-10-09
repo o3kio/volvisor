@@ -8,11 +8,11 @@
 4. docs/adr/0006-online-resize-and-live-local-block-relocation.md
 5. docs/adr/0007-drbd9-nearline-replication-provider.md
 6. docs/adr/0008-rook-only-hyperconverged-cells.md
-6. docs/adr/0008-rook-only-hyperconverged-cells.md
 7. docs/specs/SPEC-0002-volvisor-volume-virtualization.md
 8. contracts/volume-api-v2.md
 9. contracts/nearline-replication-v2.md
-10. docs/reviews/2026-10-09-volume-architecture-review.md
+10. contracts/rook-cell-experimental-v0.md
+11. docs/reviews/2026-10-09-volume-architecture-review.md
 
 ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented proposals**; keep for lineage. When an old draft contradicts v2, v2 is authoritative. Where v2 is silent, v1 operational invariants (storage backplane transport, control-plane outage behavior, peer authentication and secrets, endpoint isolation, observability truthfulness) continue to bind — see SPEC-0002 section 13. Each v2 ADR records its acceptance status in its header; do not treat a pending ADR as an accepted decision. Do not quietly map legacy class names to incompatible new semantics.
 
@@ -35,14 +35,13 @@ ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented propos
 15. Do not put an additional QSD/userspace proxy on all native foreground I/O solely to make it movable. Treat QSD/vhost-user-blk mirror/pivot as an optional, version-pinned, crash-tested backend.
 16. DRBD Protocol A/B/C are distinct durability contracts; quorum/witness is not data replication. Do not claim zero RPO for asynchronous acknowledgements.
 17. DRBD single-primary demotion requires releasing an in-use source block device. Temporary dual-primary for VM live migration is **not automatically permitted**; it requires a separate accepted fenced migration proof and contract amendment.
+18. In `rook-cell-experimental` the cell is a **Kubernetes worker VM**, not a general-purpose tenant-pod runtime. Rook operator and Kubernetes API must remain independently bootable. Allow essential kube-system pods, but refuse arbitrary tenant pods with admission beyond taints.
+19. Volvisor owns PCI/VFIO claims, vCPU/RAM fixed reservation, guest root/state and Node↔Host mapping; Rook owns the Ceph OSD/MON/MGR workloads. No device is implicitly adopted or reformatted.
+20. Three storage microVMs on one physical host are not three Ceph failure domains. Real VFIO, CRUSH physical-host placement, memory pressure and host loss require three-physical-host evidence.
+21. Do not patch or fork Rook unless the unmodified upstream POC demonstrates a reproducible missing capability and a separate accepted decision authorizes it.
 
 ## Implementation order
 
 Stable identity/volume contract -> native logical volumes -> external Ceph RBD adapter -> DRBD nearline baseline -> witness/fencing and full VMM/storage handoff -> aggressive failure campaign -> consider standalone Mayastor/clean io_uring/SPDK only with measured justification -> separately designed managed OSD infrastructure.
 
 A benchmark is not a durability proof. A happy-path migration is not a split-brain proof. No class is called production-supported until its exact implementation passes the failure and evidence requirements in SPEC-0002 and the relevant v2 contract.
-
-18. In `rook-cell-experimental` the cell is a **Kubernetes worker VM**, not a general-purpose tenant-pod runtime. Rook operator and Kubernetes API must remain independently bootable. Allow essential kube-system pods, but refuse arbitrary tenant pods with admission beyond taints.
-19. Volvisor owns PCI/VFIO claims, vCPU/RAM fixed reservation, guest root/state and Node↔Host mapping; Rook owns the Ceph OSD/MON/MGR workloads. No device is implicitly adopted or reformatted.
-20. Three storage microVMs on one physical host are not three Ceph failure domains. Real VFIO, CRUSH physical-host placement, memory pressure and host loss require three-physical-host evidence.
-21. Do not patch or fork Rook unless the unmodified upstream POC demonstrates a reproducible missing capability and a separate accepted decision authorizes it.
