@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Volvisor volvisor-provider"
+description = "Volvisor engine-neutral volume provider abstraction, fake provider and conformance kit"
 
 [lints]
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
+tokio = { workspace = true }
+serde_json = { workspace = true }
+volvisor-types = { workspace = true }
+
+# tokio (macros + rt) and serde_json are regular dependencies of this crate,
+# so no separate dev-dependency section is required for the in-crate tests.
