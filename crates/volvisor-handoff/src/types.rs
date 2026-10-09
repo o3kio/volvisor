@@ -302,7 +302,20 @@ impl MigrationRecord {
             // A live cut is observable only before DESTINATION_AUTHORIZED
             // (the rank guard); the write-ahead itself is retained
             // through `VmResumed` and cleared at `Complete` (plan §2).
-            if self
+            if self.state == HandoffState::Complete {
+                // Unreachable through the coordinator (drive_complete
+                // clears the cut in the same transition) — only a
+                // crafted or corrupted store file can hold this
+                // shape. Corruption reads as doubt, never as clean
+                // (the same fail-closed direction as every other
+                // observation rule).
+                let detail = format!("inconsistent record: complete with a live cut ({cut})");
+                in_doubt_detail = Some(detail.clone());
+                HandoffState::InDoubt {
+                    since: self.updated_at,
+                    detail,
+                }
+            } else if self
                 .state
                 .forward_rank()
                 .is_some_and(|rank| rank >= AUTHORIZED_RANK)
@@ -572,6 +585,25 @@ mod tests {
         assert_eq!(
             summary.in_doubt_detail.as_deref(),
             Some("source revoked; destination grant not yet authorized")
+        );
+    }
+
+    #[test]
+    fn observe_reads_a_complete_with_live_cut_record_as_in_doubt() {
+        // Unreachable through the coordinator (the cut is cleared in
+        // the Complete transition); only a crafted/corrupted store
+        // file can hold the shape. Corruption reads as doubt, never
+        // as clean — the fail-closed direction of every observation
+        // rule.
+        let summary = record(HandoffState::Complete, Some(CutProgress::Revoking)).observe();
+        assert!(
+            matches!(summary.state, HandoffState::InDoubt { .. }),
+            "complete-with-cut observes IN_DOUBT, got {:?}",
+            summary.state
+        );
+        assert_eq!(
+            summary.in_doubt_detail.as_deref(),
+            Some("inconsistent record: complete with a live cut (revoking)")
         );
     }
 

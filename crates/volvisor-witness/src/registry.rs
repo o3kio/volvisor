@@ -2417,6 +2417,76 @@ mod tests {
     }
 
     #[test]
+    fn pre_v2_journal_payloads_without_the_actor_still_parse() {
+        // Regression pin (round-2 review, NOTE 7): the W8 actor
+        // annotation is `#[serde(default)]` so a P4a-era journal —
+        // written before the field existed — must keep replaying.
+        // `deny_unknown_fields` rejects unknown keys, not
+        // missing-with-default; these hand-written pre-v2 payloads
+        // pin that mechanism so removing the default breaks a test
+        // instead of a stale journal's startup.
+        let cases: [(&str, serde_json::Value); 3] = [
+            (
+                "renew",
+                serde_json::json!({
+                    "mutation": "renew",
+                    "volume_id": "vol-1",
+                    "lease_id": 1,
+                    "end_secs": 1_100
+                }),
+            ),
+            (
+                "revoke",
+                serde_json::json!({
+                    "mutation": "revoke",
+                    "volume_id": "vol-1",
+                    "proof": {
+                        "volume_id": "vol-1",
+                        "retired_epoch": 1,
+                        "commit_index": 3
+                    },
+                    "self_released": false,
+                    "power_off_attested": false,
+                    "authorization": null
+                }),
+            ),
+            (
+                "revoke_set",
+                serde_json::json!({
+                    "mutation": "revoke_set",
+                    "releases": [{
+                        "volume_id": "vol-1",
+                        "proof": {
+                            "volume_id": "vol-1",
+                            "retired_epoch": 1,
+                            "commit_index": 5
+                        },
+                        "self_released": true
+                    }]
+                }),
+            ),
+        ];
+        for (label, mutation) in &cases {
+            let payload = serde_json::json!({
+                "mutation": mutation,
+                "response": {}
+            });
+            let envelope: MutationEnvelope =
+                serde_json::from_value(payload).expect("the pre-v2 payload parses");
+            assert!(
+                matches!(&envelope.mutation,
+                    Mutation::Renew { actor, .. } if actor.is_none())
+                    || matches!(&envelope.mutation,
+                        Mutation::Revoke { actor, .. } if actor.is_none())
+                    || matches!(&envelope.mutation,
+                        Mutation::RevokeSet { actor, .. } if actor.is_none()),
+                "{label}: the pre-v2 mutation parses with a None actor, got {:?}",
+                envelope.mutation
+            );
+        }
+    }
+
+    #[test]
     fn w8_the_acting_host_is_journaled_on_every_mutation() {
         // The W8 audit-trail sentence: every journaled mutation records
         // the bound identity. `Grant`, `RecordBarrier` and the barrier
