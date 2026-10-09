@@ -1796,24 +1796,54 @@ impl CephRbdProvider {
                 ));
             }
             Backing::Owned { .. } => {
-                let output = self.run_rbd(&["trash", "move", &spec])?;
-                if !output.success {
-                    return Err(command_failed("rbd trash move", &output));
-                }
-                // Verify the image landed in the trash (recoverable) — a
-                // successful exit status alone is not evidence.
-                if !self.list_trash()?.contains(&image_name) {
-                    return Err(ApiError::new(
-                        ApiErrorCode::Internal,
-                        format!(
-                            "rbd trash move reported success but rbd trash ls does not list {image_name}"
-                        ),
-                    ));
-                }
+                self.trash_owned_backing(&spec, &image_name)?;
             }
         }
         state.remove_volume(volume_id);
         state.save(&self.state_path)?;
+        Ok(())
+    }
+
+    /// Remove an owned backing: trash-move the image (recoverable
+    /// erasure) after verifying no live mapping still serves it.
+    ///
+    /// Fail-closed single-writer discipline: a live mapping that
+    /// serves this image without a volvisor attachment record (a stale
+    /// mapping, the reconcile classification that marks such volumes
+    /// `Failed`) means an unrecorded writer may still hold the device —
+    /// `rbd trash move` would succeed on a real cluster (the in-use
+    /// check lives in trash purge, not the move) and silently release
+    /// authority over it. Refuse; the documented remedy is the
+    /// operator's manual `rbd unmap`.
+    fn trash_owned_backing(&self, spec: &str, image_name: &str) -> Result<(), ApiError> {
+        if self
+            .showmapped()?
+            .iter()
+            .any(|m| m.pool_slash_image().as_deref() == Some(spec))
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "image {spec} is still mapped (rbd showmapped lists a device for \
+                     it) without a volvisor attachment record; unmap the rbd device \
+                     before deleting the volume"
+                ),
+            ));
+        }
+        let output = self.run_rbd(&["trash", "move", spec])?;
+        if !output.success {
+            return Err(command_failed("rbd trash move", &output));
+        }
+        // Verify the image landed in the trash (recoverable) — a
+        // successful exit status alone is not evidence.
+        if !self.list_trash()?.contains(&image_name.to_owned()) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "rbd trash move reported success but rbd trash ls does not list {image_name}"
+                ),
+            ));
+        }
         Ok(())
     }
 }

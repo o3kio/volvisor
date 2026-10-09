@@ -764,6 +764,62 @@ async fn a_same_named_foreign_pool_mapping_is_not_a_stale_mapping() {
 }
 
 #[tokio::test]
+async fn delete_refuses_a_live_unrecorded_mapping() {
+    let fixture = fixture();
+    let id = volume_id("del-mapped");
+    let image_name = image_name_for(&id);
+    let created = fixture
+        .provider
+        .create_volume(&create_request("del-mapped", MIB))
+        .await
+        .expect("create");
+
+    // A stale mapping exists without any attachment record (a previous
+    // incarnation's map, or an out-of-band `rbd map`).
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .mappings
+        .insert("/dev/rbd7".to_owned(), image_name.clone());
+
+    // Reconcile classifies it honestly: Failed, stale mapping reported,
+    // never auto-unmapped.
+    let report = fixture.provider.reconcile().expect("reconcile report");
+    assert_eq!(report.stale_mappings, vec![id.clone()]);
+
+    // Delete refuses while the device still maps the image: `rbd trash
+    // move` would succeed on a real cluster (the in-use check lives in
+    // trash purge, not the move), so without this refusal volvisor
+    // would silently release authority over a live mapping.
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-mapped", created.generation),
+        )
+        .await
+        .expect_err("delete must refuse a still-mapped image");
+    assert_eq!(err.code, ApiErrorCode::InvalidState, "{err}");
+
+    // The documented remedy: the operator unmaps, then delete succeeds.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .mappings
+        .remove("/dev/rbd7");
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-mapped", created.generation),
+        )
+        .await
+        .expect("delete after the operator unmaps");
+}
+
+#[tokio::test]
 async fn an_unrecorded_grow_is_healed_not_wedged() {
     let fixture = fixture();
     let id = volume_id("heal-vol");

@@ -42,7 +42,9 @@ Out (recorded follow-ups):
 
 - Managed OSD/Rook cells (ADR-0005 Phase B / ADR-0008) — separately gated.
 - `librbd` frontend, `rbd-nbd`, live-migration handoff proofs, snapshot/clone,
-  per-tenant Ceph credentials, trash GC (expired-image purging).
+  per-tenant Ceph credentials, trash GC (expired-image purging), feature
+  verification on existing images at adoption (P2 adopts on ownership
+  metadata alone).
 - CI job for real-cluster tests (no cluster available; the env-gated test
   path is the hook).
 
