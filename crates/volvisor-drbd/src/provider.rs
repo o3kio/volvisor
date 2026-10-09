@@ -71,8 +71,8 @@ use volvisor_types::request::{
 use volvisor_types::{
     AdoptVolumeResponse, ApiError, ApiErrorCode, AttachmentId, AttachmentState, AuthoritySummary,
     AuthorityView, Capability, CapabilitySet, EndpointBacking, FencingProof, HostId, LeaseState,
-    LossBoundary, MigrationId, ProjectId, PromotionClassification, RecordedBarrier, VolumeId,
-    VolumeLifecycle, validate_api_version,
+    LossBoundary, MigrationId, ProjectId, PromotionClassification, RecordedBarrier,
+    SafeCurrentEvidence, VolumeId, VolumeLifecycle, WriterEpoch, validate_api_version,
 };
 
 use crate::authority::{AuthorityContext, LeaseValidity, witness_error};
@@ -402,6 +402,49 @@ impl HandoffSurface for DrbdProvider {
     ) -> Result<InspectVolumeResponse, ApiError> {
         DrbdProvider::clear_cut_marker(self, volume_id, proof)
     }
+
+    async fn promote_target(
+        &self,
+        volume_id: &VolumeId,
+        migration_id: &MigrationId,
+        attach: &AttachVolumeRequest,
+    ) -> Result<AttachVolumeResponse, ApiError> {
+        DrbdProvider::promote_target(self, volume_id, migration_id, attach)
+    }
+}
+
+/// The migration-barrier evidence the classifier found for one
+/// source epoch (P4b plan §7) — the machine-checked `SAFE_CURRENT`
+/// source.
+///
+/// The truth of the attestations lives on the recording host (the
+/// same trust class as the P4a self-release); the witness binds the
+/// recorder to the epoch's holder (W8/W9 — `RecordBarrier` is refused
+/// from any other credential), the journal makes the record immutable,
+/// and each claim is independently re-checkable by an operator from
+/// the surviving host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationBarrierEvidence {
+    /// A qualifying barrier: non-voided, all three attestations true,
+    /// recorder-bound, and ordered before the source epoch's
+    /// retirement (or the epoch is still current — the vacuous
+    /// comparison target, D5). Carries the boundary's commit index.
+    Qualifying {
+        /// The barrier's ordering token in the witness journal.
+        boundary_commit_index: u64,
+    },
+    /// A non-voided barrier of the epoch exists but falls short of
+    /// qualification (a partial attestation, an unbound recorder, or
+    /// an ordering that cannot be proven): never `SAFE_CURRENT`
+    /// evidence, but its recorded boundary is the honest `Known` loss
+    /// boundary.
+    Short {
+        /// The barrier's ordering token in the witness journal.
+        boundary_commit_index: u64,
+    },
+    /// No non-voided barrier of the epoch (matching the expected
+    /// migration, when one was named) exists at all.
+    None,
 }
 
 struct AdoptionFacts {
@@ -423,6 +466,15 @@ struct AdoptionFacts {
     replication_mode: ReplicationMode,
     /// The observed local disk state.
     local_disk: DiskState,
+    /// The observed local role (the promote-under-granted-lease
+    /// re-drive admits our own Primary — the crash window between the
+    /// promotion and its completion save; a fresh adoption or
+    /// promotion target must be Secondary).
+    role: Role,
+    /// The observed resource-level suspension, when any (the
+    /// re-drive resumes its own suspended Primary once the lease is
+    /// proven, mirroring the attach path).
+    suspended: bool,
     /// The operator-attested barrier, when the registration
     /// recorded one.
     barrier: Option<RecordedBarrier>,
@@ -2228,14 +2280,20 @@ impl DrbdProvider {
     /// Adoption verification, host side (P4a plan §5 step 1): the
     /// derived resource name must name an up Secondary resource whose
     /// definition file names this host — never someone's live writer.
+    /// `allow_primary` admits **our own** Primary (the
+    /// promote-under-granted-lease re-drive's crash window between
+    /// the promotion and its completion save — the caller proves the
+    /// lease against the witness before anything is mutated).
     ///
     /// # Errors
-    /// `INVALID_STATE` when the resource is down, Primary, or not this
-    /// host's; `INTERNAL` when the definition cannot be parsed.
+    /// `INVALID_STATE` when the resource is down, Primary (unless
+    /// allowed), or not this host's; `INTERNAL` when the definition
+    /// cannot be parsed.
     fn verify_adoption_resource(
         &self,
         volume_id: &VolumeId,
-    ) -> Result<(String, ParsedResource, DiskState), ApiError> {
+        allow_primary: bool,
+    ) -> Result<(String, ParsedResource, ResourceStatus), ApiError> {
         let resource = resource_name_for(volume_id);
         let status = self.resource_status(&resource)?.ok_or_else(|| {
             ApiError::new(
@@ -2243,7 +2301,7 @@ impl DrbdProvider {
                 format!("resource {resource} is down; a downed resource cannot be adopted"),
             )
         })?;
-        if status.role != Role::Secondary {
+        if status.role == Role::Primary && !allow_primary {
             return Err(ApiError::new(
                 ApiErrorCode::InvalidState,
                 format!(
@@ -2268,7 +2326,7 @@ impl DrbdProvider {
                 ),
             ));
         }
-        Ok((resource, definition, status.local_disk))
+        Ok((resource, definition, status))
     }
 
     /// Adoption verification (P4a plan §5 step 1, rule 7 — never adopt
@@ -2277,6 +2335,9 @@ impl DrbdProvider {
     /// hole), the registration's endpoint for this host must match the
     /// resource-definition identity verbatim, and — in the
     /// volvisor-created branch — the LV must carry the ownership tag.
+    /// `allow_primary` passes through to
+    /// [`Self::verify_adoption_resource`] (the promote re-drive's own
+    /// Primary).
     ///
     /// # Errors
     /// Typed verification failures (`INVALID_STATE`,
@@ -2291,8 +2352,10 @@ impl DrbdProvider {
         &self,
         authority: &AuthorityContext,
         volume_id: &VolumeId,
+        allow_primary: bool,
     ) -> Result<AdoptionFacts, ApiError> {
-        let (resource, definition, local_disk) = self.verify_adoption_resource(volume_id)?;
+        let (resource, definition, status) =
+            self.verify_adoption_resource(volume_id, allow_primary)?;
         let disk = Self::definition_disk(&resource, &definition)?;
         let (vg_name, lv_name) = disk
             .strip_prefix("/dev/")
@@ -2429,59 +2492,246 @@ impl DrbdProvider {
             minor,
             port,
             replication_mode,
-            local_disk,
+            local_disk: status.local_disk.clone(),
+            role: status.role,
+            suspended: status.suspended.is_some(),
             barrier: registration.barrier.clone(),
             view,
         })
     }
 
-    /// The plan §5 classification from observed facts only.
-    /// `SAFE_CURRENT` is evidence-gated, never protocol-gated: the
-    /// only P4a evidence is a recorded barrier whose attestation
-    /// covers the last-acknowledged-boundary property (over protocol
-    /// C's synchronous completion). Every non-`SAFE_CURRENT` row
-    /// reports `POSSIBLE_LOSS` with an **unknown** boundary — a
-    /// recorded barrier names no provable boundary for a volume that
-    /// kept serving past it (the plan's table mandates `Unknown` for
-    /// all four cells; `Known` boundaries arrive only with P4b's
-    /// `BARRIER_DURABLE`, never from a registration-time attestation).
-    fn classify_adoption(
-        local_disk: DiskState,
-        replication_mode: ReplicationMode,
-        barrier: Option<&RecordedBarrier>,
-        allow_loss: bool,
-    ) -> PromotionClassification {
-        match local_disk {
-            DiskState::UpToDate if replication_mode == ReplicationMode::C && barrier.is_some() => {
-                PromotionClassification::SafeCurrent
+    /// Evaluate the migration-barrier evidence of `source_epoch`
+    /// from the witness view (P4b plan §7). When `expected_migration`
+    /// is named, only that migration's barriers of the epoch count
+    /// (the promote-under-granted-lease path); the adoption path
+    /// (`None`) admits any barrier of the epoch — the dead source's
+    /// handoff, whichever migration recorded it (D5).
+    ///
+    /// The comparison is **ordering, not terminality** (G2): the
+    /// barrier's boundary commit index is checked to *precede* the
+    /// epoch's retirement record, never to equal the epoch's final
+    /// mutation — renewals between the barrier and the retirement
+    /// write no data and never downgrade the classification. A
+    /// **voided** barrier is never evidence (the recording holder
+    /// repudiated the claim wholesale, boundary included — the
+    /// aborted migration's hygiene step).
+    ///
+    /// The recorder binding: for a still-current epoch the view still
+    /// carries the holder, so the recorder is checked against it;
+    /// for a retired epoch the view no longer names that epoch's
+    /// holder — the witness's own W8/W9 enforcement at record time
+    /// (`RecordBarrier` is refused from any credential but the
+    /// current epoch's holder, while the epoch is current) is the
+    /// guarantee, the same way the journal's immutability is.
+    #[must_use]
+    fn migration_barrier_evidence(
+        view: &AuthorityView,
+        source_epoch: WriterEpoch,
+        expected_migration: Option<&MigrationId>,
+    ) -> MigrationBarrierEvidence {
+        let mut evidence = MigrationBarrierEvidence::None;
+        for barrier in &view.barriers {
+            if barrier.epoch != source_epoch {
+                continue;
             }
-            DiskState::UpToDate | DiskState::Consistent | DiskState::Outdated => {
-                PromotionClassification::PossibleLoss {
-                    boundary: LossBoundary::Unknown,
-                    authorized: allow_loss,
+            if expected_migration
+                .is_some_and(|migration| barrier.migration_id.as_ref() != Some(migration))
+            {
+                continue;
+            }
+            // The strongest evidence present wins (§7): a qualifying
+            // barrier outranks a short one, and any barrier of the
+            // epoch outranks none.
+            let candidate = if barrier.voided {
+                MigrationBarrierEvidence::None
+            } else {
+                let boundary = barrier.boundary_commit_index;
+                let recorder_bound = barrier.epoch != view.current_epoch
+                    || view.holder.as_ref() == Some(&barrier.holder);
+                if !barrier.attestation.all_true()
+                    || !recorder_bound
+                    || !Self::barrier_precedes_retirement(view, source_epoch, boundary)
+                {
+                    MigrationBarrierEvidence::Short {
+                        boundary_commit_index: boundary,
+                    }
+                } else {
+                    MigrationBarrierEvidence::Qualifying {
+                        boundary_commit_index: boundary,
+                    }
                 }
-            }
-            other => PromotionClassification::Unsafe {
-                reasons: vec![format!(
-                    "the local disk is {other:?}: integrity is unprovable (mid-resync \
-                     loss); never a partial promotion"
-                )],
-            },
+            };
+            evidence = match (evidence, candidate) {
+                (MigrationBarrierEvidence::None, other) => other,
+                (
+                    MigrationBarrierEvidence::Qualifying {
+                        boundary_commit_index,
+                    },
+                    _,
+                ) => MigrationBarrierEvidence::Qualifying {
+                    boundary_commit_index,
+                },
+                (
+                    MigrationBarrierEvidence::Short { .. },
+                    MigrationBarrierEvidence::Qualifying {
+                        boundary_commit_index: upgraded,
+                    },
+                ) => MigrationBarrierEvidence::Qualifying {
+                    boundary_commit_index: upgraded,
+                },
+                // Two equally-short barriers: the oldest (the journal
+                // iterates oldest first) wins — the most conservative
+                // recorded boundary.
+                (short @ MigrationBarrierEvidence::Short { .. }, _) => short,
+            };
         }
+        evidence
+    }
+
+    /// Whether a barrier's boundary commit index precedes the source
+    /// epoch's retirement (P4b plan §7, G2 — ordering, never
+    /// terminality).
+    ///
+    /// When the epoch is **still current** at classification time
+    /// (the dead-source mid-cut path, D5 — no `RevokeSet` ever
+    /// landed, so no retirement record exists), the comparison
+    /// target is vacuous: the witness only ever accepts
+    /// `RecordBarrier` while the epoch is current (W9), so a barrier
+    /// of the current epoch was recorded during it by construction.
+    /// An epoch that is neither retired nor current cannot be
+    /// ordered at all — fail closed (the barrier is short evidence).
+    #[must_use]
+    fn barrier_precedes_retirement(
+        view: &AuthorityView,
+        source_epoch: WriterEpoch,
+        boundary_commit_index: u64,
+    ) -> bool {
+        match view
+            .retirements
+            .iter()
+            .find(|retired| retired.epoch == source_epoch)
+        {
+            Some(retirement) => boundary_commit_index < retirement.commit_index,
+            None => source_epoch == view.current_epoch,
+        }
+    }
+
+    /// The boundary token a migration barrier's commit index renders
+    /// as (the `Known` loss boundary's string form): the ordering
+    /// token names the witness journal position, nothing more.
+    #[must_use]
+    fn boundary_token(boundary_commit_index: u64) -> String {
+        format!("witness-commit-{boundary_commit_index}")
+    }
+
+    /// The plan §5/§7 classification from observed facts only, shared
+    /// by the adoption path and the promote-under-granted-lease path.
+    ///
+    /// `SAFE_CURRENT` is evidence-gated, never protocol-gated, and
+    /// has exactly two evidence classes: the P4a operator-attested
+    /// registration barrier (over protocol C's synchronous
+    /// completion) and the P4b machine-checked migration barrier
+    /// (protocol-independent — the suspension + `TrackSync`
+    /// attestation is the claim, not the steady-state protocol; plan
+    /// §6 deviation 2). The classifier prefers the strongest evidence
+    /// present and reports which class justified the decision (§7).
+    ///
+    /// Every non-`SAFE_CURRENT` row reports `POSSIBLE_LOSS` — with a
+    /// `Known` boundary only when a non-voided recorded barrier names
+    /// one (the migration barrier's ordering token; a qualifying
+    /// barrier over a not-`UpToDate` disk keeps its recorded boundary
+    /// too — the boundary is known, the local tail is not),
+    /// `Unknown` otherwise (the P4a table's mandate for all four
+    /// cells; a registration-time attestation never names a provable
+    /// boundary for a volume that kept serving past it).
+    fn classify_promotion(
+        local_disk: &DiskState,
+        replication_mode: ReplicationMode,
+        registration_barrier: Option<&RecordedBarrier>,
+        migration_evidence: MigrationBarrierEvidence,
+        allow_loss: bool,
+    ) -> (PromotionClassification, SafeCurrentEvidence) {
+        // Integrity first: a disk whose integrity is unprovable is
+        // never promoted, never "partial" — no evidence class
+        // overrides this (the P4a rule).
+        if !matches!(
+            local_disk,
+            DiskState::UpToDate | DiskState::Consistent | DiskState::Outdated
+        ) {
+            return (
+                PromotionClassification::Unsafe {
+                    reasons: vec![format!(
+                        "the local disk is {local_disk:?}: integrity is unprovable (mid-resync \
+                         loss); never a partial promotion"
+                    )],
+                },
+                SafeCurrentEvidence::None,
+            );
+        }
+        // The machine-checked class (strongest): a qualifying
+        // migration barrier proves the acknowledged tail present
+        // through the barrier — but only over an `UpToDate` local
+        // disk: claiming `SAFE_CURRENT` over a `Consistent`/`Outdated`
+        // disk would assert a local tail the barrier never attests
+        // (non-weakening versus the P4a row, which also requires
+        // `UpToDate`).
+        if matches!(
+            migration_evidence,
+            MigrationBarrierEvidence::Qualifying { .. }
+        ) && *local_disk == DiskState::UpToDate
+        {
+            return (
+                PromotionClassification::SafeCurrent,
+                SafeCurrentEvidence::MigrationBarrier,
+            );
+        }
+        // The P4a operator-attested class: protocol C's synchronous
+        // completion plus the registration's recorded barrier, over
+        // an `UpToDate` disk.
+        if replication_mode == ReplicationMode::C
+            && registration_barrier.is_some()
+            && *local_disk == DiskState::UpToDate
+        {
+            return (
+                PromotionClassification::SafeCurrent,
+                SafeCurrentEvidence::RegistrationBarrier,
+            );
+        }
+        // Anything less: possible loss, authorized only by the
+        // caller's explicit decision (the adoption path's
+        // `allow_loss`; the migration path passes `false` and refuses
+        // on it instead).
+        let boundary = match migration_evidence {
+            MigrationBarrierEvidence::Short {
+                boundary_commit_index,
+            }
+            | MigrationBarrierEvidence::Qualifying {
+                boundary_commit_index,
+            } => LossBoundary::Known(Self::boundary_token(boundary_commit_index)),
+            MigrationBarrierEvidence::None => LossBoundary::Unknown,
+        };
+        (
+            PromotionClassification::PossibleLoss {
+                boundary,
+                authorized: allow_loss,
+            },
+            SafeCurrentEvidence::None,
+        )
     }
 
     /// The state entry a successful adoption records: identity from
     /// the verified facts, sizes from the device itself, the adopt
-    /// classification as the creation payload (the honest provenance
-    /// of this entry), and the reserved `adopted` project grouping
-    /// (the original project identity died with the lost host's state
-    /// and is never invented).
+    /// classification and its evidence class as the creation payload
+    /// (the honest provenance of this entry), and the reserved
+    /// `adopted` project grouping (the original project identity died
+    /// with the lost host's state and is never invented).
     ///
     /// # Errors
     /// `INTERNAL` when the reserved project id is rejected.
     fn adopted_volume_entry(
         facts: &AdoptionFacts,
         classification: &PromotionClassification,
+        evidence: SafeCurrentEvidence,
         allow_loss: bool,
         size: u64,
     ) -> Result<VolumeEntry, ApiError> {
@@ -2504,8 +2754,64 @@ impl DrbdProvider {
             block_size: 4096,
             replication_mode: facts.replication_mode,
             creation_payload: format!(
-                "{{\"adopted\":true,\"classification\":{classification:?},\"allow_loss\":{allow_loss}}}"
+                "{{\"adopted\":true,\"classification\":{classification:?},\"evidence\":{evidence:?},\"allow_loss\":{allow_loss}}}"
             ),
+            created_at: unix_now(),
+        })
+    }
+
+    /// The state entry a successful `promote_target` records: identity
+    /// from the verified facts, sizes from the device itself, and the
+    /// migration's own provenance — the migration id, the granted
+    /// epoch and the classification evidence — as the creation payload
+    /// (the re-drive gate [`Self::entry_names_migration`] reads
+    /// exactly this provenance back, so it must stay a JSON object).
+    /// Like adoption's reserved `adopted` project, the reserved
+    /// `migrated` project groups these targets: the original project
+    /// identity lives in the source host's (lost or retiring) state
+    /// and the migration record, and is never invented here.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the reserved project id or the payload
+    /// serialization is rejected.
+    fn migrated_volume_entry(
+        facts: &AdoptionFacts,
+        migration_id: &MigrationId,
+        granted_epoch: WriterEpoch,
+        evidence: SafeCurrentEvidence,
+        size: u64,
+    ) -> Result<VolumeEntry, ApiError> {
+        let project_id = ProjectId::new("migrated").map_err(|error| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("reserved project id: {error}"),
+            )
+        })?;
+        let payload = serde_json::json!({
+            "migrated": true,
+            "migration_id": migration_id,
+            "granted_epoch": granted_epoch.0,
+            "classification": PromotionClassification::SafeCurrent,
+            "evidence": evidence,
+        });
+        Ok(VolumeEntry {
+            resource_name: facts.resource.clone(),
+            vg_name: facts.vg_name.clone(),
+            lv_name: facts.lv_name.clone(),
+            minor: facts.minor,
+            port: facts.port,
+            size_bytes: size,
+            requested_size_bytes: size,
+            generation: 1,
+            project_id,
+            block_size: 4096,
+            replication_mode: facts.replication_mode,
+            creation_payload: serde_json::to_string(&payload).map_err(|error| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("migration provenance payload: {error}"),
+                )
+            })?,
             created_at: unix_now(),
         })
     }
@@ -2556,7 +2862,7 @@ impl DrbdProvider {
             ));
         }
         // 1. Adoption verification (rule 7).
-        let facts = self.verify_adoption(authority, volume_id)?;
+        let facts = self.verify_adoption(authority, volume_id, false)?;
         // 2. Authority check: the witness must show no live lease — a
         //    proof the witness supplies, never one the caller brings.
         if facts.view.lease_state == LeaseState::Live {
@@ -2572,14 +2878,24 @@ impl DrbdProvider {
                         facts.view.current_epoch.0
                     )],
                 },
+                evidence: SafeCurrentEvidence::None,
                 volume: None,
             });
         }
-        // 3. Classification from observed facts only (plan §5 table).
-        let classification = Self::classify_adoption(
-            facts.local_disk.clone(),
+        // 3. Classification from observed facts only (plan §5 table;
+        //    §7's migration-barrier class applies protocol-independently
+        //    here too — the dead-source mid-cut shape D5 converges
+        //    through this path, and the source epoch is the current
+        //    one: its dead lease was the last writer, and barriers of
+        //    older, superseded epochs attest tails later epochs may
+        //    have written past — never current-tail evidence).
+        let migration_evidence =
+            Self::migration_barrier_evidence(&facts.view, facts.view.current_epoch, None);
+        let (classification, evidence) = Self::classify_promotion(
+            &facts.local_disk,
             facts.replication_mode,
             facts.barrier.as_ref(),
+            migration_evidence,
             allow_loss,
         );
         // 4. Promotion gate: UNSAFE never promotes; POSSIBLE_LOSS
@@ -2588,6 +2904,7 @@ impl DrbdProvider {
             PromotionClassification::Unsafe { .. } => {
                 return Ok(AdoptVolumeResponse {
                     classification,
+                    evidence,
                     volume: None,
                 });
             }
@@ -2597,6 +2914,7 @@ impl DrbdProvider {
         if !authorized {
             return Ok(AdoptVolumeResponse {
                 classification,
+                evidence,
                 volume: None,
             });
         }
@@ -2620,7 +2938,8 @@ impl DrbdProvider {
                 ),
             ));
         }
-        let entry = Self::adopted_volume_entry(&facts, &classification, allow_loss, size)?;
+        let entry =
+            Self::adopted_volume_entry(&facts, &classification, evidence, allow_loss, size)?;
         let block = authority.acquire(volume_id, None)?;
         let stored = StoredVolume {
             entry,
@@ -2662,7 +2981,7 @@ impl DrbdProvider {
             .and_then(|()| self.verify_promotion(&entry));
         if let Err(error) = promoted {
             let detail = error.detail.clone();
-            self.unwind_failed_adoption(&mut state, volume_id, &entry, &block, &detail)?;
+            self.unwind_failed_promotion(&mut state, volume_id, &entry, &block, &detail)?;
             return Err(error);
         }
         let Some(stored) = state.volume(volume_id) else {
@@ -2670,7 +2989,7 @@ impl DrbdProvider {
             // was saved above), but if the invariant ever broke, the
             // residue is fenced and released exactly like a failed
             // promotion — never left serving.
-            self.unwind_failed_adoption(
+            self.unwind_failed_promotion(
                 &mut state,
                 volume_id,
                 &entry,
@@ -2685,29 +3004,34 @@ impl DrbdProvider {
         let response = self.verified_inspect_response(volume_id, stored)?;
         Ok(AdoptVolumeResponse {
             classification,
+            evidence,
             volume: Some(response),
         })
     }
 
-    /// Unwind an adoption whose promotion failed after the durable
-    /// record: the volume is **fenced first** (suspend, durable
-    /// pending-fence marker, demote, resume — [`Self::self_fence`]),
-    /// because the resource may still be Primary. The just-granted
-    /// lease is released **only on a completed fence**: a
-    /// proven-demoted holder self-releasing waives the next grant's
-    /// W7 wait safely, while an incomplete fence (a busy device)
-    /// leaves the lease to expire at the witness, where the W7 window
-    /// then guards the next grant — never a release while a writer
-    /// might still be serving. The entry stays tracked and `Failed`
-    /// (reconcile and the renewal pass own the residue; the entry is
-    /// never silently removed, because an untracked Primary is exactly
-    /// the hole the pre-promotion save exists to prevent).
+    /// Unwind an adoption or promote-under-granted-lease whose
+    /// promotion failed after the durable record: the volume is
+    /// **fenced first** (suspend, durable pending-fence marker,
+    /// demote, resume — [`Self::self_fence`]), because the resource
+    /// may still be Primary. The just-granted lease is released
+    /// **only on a completed fence**: a proven-demoted holder
+    /// self-releasing waives the next grant's W7 wait safely, while
+    /// an incomplete fence (a busy device) leaves the lease to expire
+    /// at the witness, where the W7 window then guards the next
+    /// grant — never a release while a writer might still be serving.
+    /// The entry stays tracked and `Failed` (reconcile and the
+    /// renewal pass own the residue; the entry is never silently
+    /// removed, because an untracked Primary is exactly the hole the
+    /// pre-promotion save exists to prevent). On the migration path
+    /// the release retires the GrantSet lease, so the coordinator's
+    /// retry re-runs its own idempotent grant step — never a
+    /// promotion over a lease this host could not finish taking.
     ///
     /// # Errors
     /// The fence error itself, or `INTERNAL` from the final state
     /// save. The witness lease is only ever released after a completed
     /// fence.
-    fn unwind_failed_adoption(
+    fn unwind_failed_promotion(
         &self,
         state: &mut DrbdState,
         volume_id: &VolumeId,
@@ -2719,7 +3043,7 @@ impl DrbdProvider {
             state,
             volume_id,
             entry,
-            vec![format!("the adoption promotion failed: {detail}")],
+            vec![format!("the promotion failed: {detail}")],
         );
         match fenced {
             Ok(fenced) => {
@@ -2755,6 +3079,444 @@ impl DrbdProvider {
                 Err(error)
             }
         }
+    }
+
+    /// Whether a tracked entry's creation payload names `migration` as
+    /// its migrating handoff — the promote-under-granted-lease
+    /// re-drive gate: a tracked entry is completable only when it is
+    /// THIS migration's half-done target (its provenance says so);
+    /// anything else is a foreign entry this flow never touches.
+    #[must_use]
+    fn entry_names_migration(entry: &VolumeEntry, migration_id: &MigrationId) -> bool {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&entry.creation_payload) else {
+            return false;
+        };
+        payload.get("migrated") == Some(&serde_json::Value::Bool(true))
+            && payload.get("migration_id")
+                == Some(&serde_json::Value::String(migration_id.to_string()))
+    }
+
+    /// The destination-side half of the coordinated handoff (P4b plan
+    /// §6, `promote-under-granted-lease`): the caller (the
+    /// coordinator's `DESTINATION_AUTHORIZED` step) has already run
+    /// the W10 `GrantSet`, so this host holds a live lease at the
+    /// minted epoch. A sibling of [`Self::adopt_and_promote`], sharing
+    /// its verification core (`verify_adoption`: lineage,
+    /// Secondary role, the definition naming this host, ownership
+    /// tag) and its entry-creation tail, with the plan's three named
+    /// deviations:
+    ///
+    /// 1. *Authority gate inverted* (G3): the live lease is
+    ///    **required** and must be ours at the granted epoch, plus
+    ///    the source epoch's durable retirement — never adoption's
+    ///    no-live-lease gate run against the granted lease. A foreign
+    ///    live lease is still refused (`LEASE_HELD`).
+    /// 2. *Classification branch*: the migration-barrier evidence
+    ///    class (§7) applies, protocol-independent — and this path
+    ///    has **no `allow_loss`**: anything below `SAFE_CURRENT` is a
+    ///    typed refusal (an authorized-loss promotion belongs to the
+    ///    adoption path's operator decision, never to a coordinated
+    ///    cut that lost its evidence).
+    /// 3. *Entry provenance*: migration id + granted epoch in the
+    ///    creation payload, and the **attachment record** (vm id,
+    ///    host, device) the restore's disk-path verification needs —
+    ///    not adoption's `"adopted"`-project/`Ready` stamp.
+    ///
+    /// Crash discipline: the entry and the authority block are
+    /// persisted BEFORE the promotion (the attach/adopt discipline —
+    /// a crash in between leaves a tracked volume the reconciler
+    /// validates or fences, never an untracked Primary); the
+    /// attachment record and `Attached` land in the completion save
+    /// AFTER the verified promotion (the reconcile's
+    /// interrupted-detach rule would otherwise clear a Secondary
+    ///-with-attachment's records in the pre-promote window). A re-drive
+    /// of a tracked entry whose payload names this migration re-runs
+    /// the verification, gate and classification and completes the
+    /// tail — never a blind re-execution.
+    ///
+    /// `expected_volume_generation` is deliberately not enforced on
+    /// this path: the target's entry is created here (generation 1,
+    /// then 2 at the completion save), so there is no pre-existing
+    /// local generation to compare against — the identity gate is the
+    /// witness lease + lineage verification + the payload-provenance
+    /// re-drive gate, and the attachment-id replay/conflict rules are
+    /// the attach discipline's.
+    ///
+    /// # Errors
+    /// Typed refusals, see [`HandoffSurface::promote_target`]'s docs.
+    // A fail-closed promotion sequence like adopt (verification →
+    // inverted authority gate → classification gate → durable record
+    // → promote → verify → completion save → unwind); splitting it
+    // would scatter the crash-window invariants.
+    #[allow(clippy::too_many_lines)]
+    pub fn promote_target(
+        &self,
+        volume_id: &VolumeId,
+        migration_id: &MigrationId,
+        req: &AttachVolumeRequest,
+    ) -> Result<AttachVolumeResponse, ApiError> {
+        let Some(authority) = &self.authority else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                "this provider is not witness-managed (no authority context)",
+            ));
+        };
+        req.validate()?;
+        // Rule 17 / the attach gate: a read-only attachment is refused
+        // before any mutation (the same typed rejection as
+        // `attach_volume_inner` — a read-only claim over a writable
+        // primary would be a fail-open lie).
+        if matches!(req.access_mode, AccessModeRequest::ReadOnly) {
+            return Err(unsupported(
+                "read-only (shared-reader) attachments require a safe multi-reader contract \
+                 the drbd9 prototype has not qualified (dual-primary is forbidden by default); \
+                 only read-write single-writer attachments are supported",
+            ));
+        }
+        let mode = requested_mode(req.access_mode);
+        let mut state = self.lock_state()?;
+
+        // Re-drive gate: a tracked entry is completable only when its
+        // provenance names this migration; a completed promote replays
+        // the recorded attachment response (the attach discipline).
+        let mut re_drive = false;
+        if let Some(stored) = state.volume(volume_id) {
+            if !Self::entry_names_migration(&stored.entry, migration_id) {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "volume {volume_id} already exists in this host's state and is not the \
+                         target of migration {migration_id}; promote_target completes only its \
+                         own migration's half-done target"
+                    ),
+                ));
+            }
+            re_drive = true;
+            if let Some(record) = stored.runtime.attachment.clone() {
+                if record.id != req.attachment_id {
+                    return Err(ApiError::new(
+                        ApiErrorCode::WriterAlreadyActive,
+                        format!("volume {volume_id} already has an active attachment"),
+                    ));
+                }
+                if record.vm_id == req.vm_id
+                    && record.host_id == req.host_id
+                    && record.access_mode == mode
+                {
+                    return Ok(attach_response(&record, &stored.entry));
+                }
+                return Err(ApiError::idempotency_conflict(&req.attachment_id));
+            }
+        } else {
+            // A fresh promote must not collide with another volume's
+            // recorded attachment id (crash-replay idempotency, the
+            // attach discipline).
+            if state.volumes().values().any(|stored| {
+                stored
+                    .runtime
+                    .attachment
+                    .as_ref()
+                    .is_some_and(|record| record.id == req.attachment_id)
+            }) {
+                return Err(ApiError::idempotency_conflict(&req.attachment_id));
+            }
+        }
+
+        // 1. Verification core (rule 7): the re-drive admits our own
+        //    Primary (the crash window between the promotion and its
+        //    completion save); a fresh target must be Secondary.
+        let facts = self.verify_adoption(authority, volume_id, re_drive)?;
+
+        // 2. The inverted authority gate (plan §6 deviation 1, G3):
+        //    the witness must show a LIVE lease held by THIS host at
+        //    the epoch GrantSet minted — adoption's no-live-lease gate
+        //    is never run against it.
+        if facts.view.lease_state != LeaseState::Live {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the witness holds no live lease for epoch {} (state {:?}); the migration's \
+                     GrantSet grant is missing or no longer live — re-run the grant step before \
+                     promoting",
+                    facts.view.current_epoch.0, facts.view.lease_state
+                ),
+            ));
+        }
+        let our_host = host_id_of(&self.config.node_name)?;
+        if facts.view.holder.as_ref() != Some(&our_host) {
+            let holder = facts.view.holder.as_ref().map_or_else(
+                || "no holder".to_owned(),
+                |holder| holder.as_str().to_owned(),
+            );
+            return Err(ApiError::new(
+                ApiErrorCode::LeaseHeld,
+                format!(
+                    "the live lease for epoch {} is held by {holder}; a foreign live lease is \
+                     never promoted over",
+                    facts.view.current_epoch.0
+                ),
+            ));
+        }
+        let lease_id = facts.view.lease_id.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the live lease for epoch {} carries no identity; the witness response is \
+                     incomplete",
+                    facts.view.current_epoch.0
+                ),
+            )
+        })?;
+        let remaining = facts.view.lease_remaining_secs.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the live lease for epoch {} carries no remaining duration; the witness \
+                     response is incomplete",
+                    facts.view.current_epoch.0
+                ),
+            )
+        })?;
+        // W5 margin: a lease that cannot outlive the renewal cadence
+        // would lapse between renewals — the promote is refused (the
+        // grant step's own retry re-mints one that can).
+        if remaining < authority.renewal_interval_secs() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the granted lease's remaining {remaining}s is shorter than the renewal \
+                     margin {}s; it cannot be kept alive at this cadence — re-run the grant \
+                     step before promoting",
+                    authority.renewal_interval_secs()
+                ),
+            ));
+        }
+        // The migration's source epoch: a non-voided barrier naming
+        // this migration names it (the source recorded it during the
+        // cut); otherwise the greatest retired epoch (the GrantSet's
+        // W2 retirement of the source's lingering epoch — the FIRST
+        // retirement of that epoch is the sealed ordering target).
+        let source_epoch = facts
+            .view
+            .barriers
+            .iter()
+            .filter(|barrier| {
+                !barrier.voided && barrier.migration_id.as_ref() == Some(migration_id)
+            })
+            .map(|barrier| barrier.epoch)
+            .max()
+            .or_else(|| {
+                facts
+                    .view
+                    .retirements
+                    .iter()
+                    .map(|retired| retired.epoch)
+                    .max()
+            });
+        let Some(source_epoch) = source_epoch else {
+            return Err(ApiError::new(
+                ApiErrorCode::UnsafeDataLoss,
+                format!(
+                    "the witness holds no retired source epoch for {volume_id}: migration \
+                     {migration_id} recorded no barrier and no epoch was ever retired; the \
+                     source authority cannot be proven fenced"
+                ),
+            ));
+        };
+        // The source epoch must be durably retired with a recorded
+        // commit index, and strictly below the granted one: the
+        // GrantSet minted a NEW epoch for this host, so a barrier
+        // naming the granted (still-current) epoch cannot be this
+        // migration's source evidence.
+        if source_epoch >= facts.view.current_epoch
+            || !facts
+                .view
+                .retirements
+                .iter()
+                .any(|retired| retired.epoch == source_epoch)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::UnsafeDataLoss,
+                format!(
+                    "the source epoch {} of migration {migration_id} is not retired below the \
+                     granted epoch {}; the source authority cannot be proven fenced — never a \
+                     promotion (re-run the grant step, which retires lingering epochs)",
+                    source_epoch.0, facts.view.current_epoch.0
+                ),
+            ));
+        }
+
+        // 3. Classification (plan §6 deviation 2, §7): the
+        //    migration-barrier class is protocol-independent, and
+        //    there is no loss authorization on this path.
+        let migration_evidence =
+            Self::migration_barrier_evidence(&facts.view, source_epoch, Some(migration_id));
+        let (classification, evidence) = Self::classify_promotion(
+            &facts.local_disk,
+            facts.replication_mode,
+            facts.barrier.as_ref(),
+            migration_evidence,
+            false,
+        );
+        if !matches!(classification, PromotionClassification::SafeCurrent) {
+            return Err(ApiError::new(
+                ApiErrorCode::UnsafeDataLoss,
+                format!(
+                    "the promotion evidence for migration {migration_id} does not prove the \
+                     acknowledged tail present, and promote_target carries no loss \
+                     authorization: {classification:?} (evidence {evidence:?})"
+                ),
+            ));
+        }
+
+        // 4. The authority block from the granted lease (W5: the
+        //    deadline is a duration from THIS response, and the
+        //    witness commit index that last changed the authority —
+        //    the GrantSet — is the durable proof reference).
+        let now = authority.now_secs();
+        let block = VolumeAuthorityBlock {
+            epoch: facts.view.current_epoch,
+            lease_id,
+            lease_proof_ref: facts.view.commit_index,
+            authority_commit_index: facts.view.commit_index,
+            acquired_at: now,
+            deadline_at: now.saturating_add(remaining),
+        };
+
+        // 5. The durable record BEFORE the promotion (the attach/adopt
+        //    crash discipline).
+        if re_drive {
+            let stored = state
+                .volume_mut(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            // Refresh the block (a fresh W5 anchor at this response)
+            // and heal the lifecycle the reconcile may have marked
+            // Failed (the zombie report of a valid-lease Primary
+            // without an attachment record — exactly this crash
+            // window).
+            stored.runtime.authority = Some(block.clone());
+            stored.runtime.state = VolumeLifecycle::Ready;
+            state.save(&self.state_path)?;
+        } else {
+            let size = self.device_size(facts.minor)?;
+            if size == 0 {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "blockdev reports a zero-sized device for {}",
+                        facts.resource
+                    ),
+                ));
+            }
+            let entry = Self::migrated_volume_entry(
+                &facts,
+                migration_id,
+                facts.view.current_epoch,
+                evidence,
+                size,
+            )?;
+            let stored = StoredVolume {
+                entry,
+                runtime: VolumeRuntime {
+                    state: VolumeLifecycle::Ready,
+                    attachment: None,
+                    seeded: true,
+                    authority: Some(block.clone()),
+                    fence: None,
+                    migration: None,
+                },
+            };
+            let entry = stored.entry.clone();
+            state.insert_volume(volume_id.clone(), stored);
+            // Keep the monotonic allocators ahead of the migrated
+            // resource so a later allocation can never collide.
+            state.observe_minor(facts.minor);
+            state.observe_port(facts.port);
+            if let Err(error) = state.save(&self.state_path) {
+                // The durable record is absent: drop the in-memory
+                // entry (the renewal loop must not renew a lease for
+                // a volume this host does not durably hold). The
+                // GrantSet lease itself belongs to the coordinator's
+                // grant step — it is never released from here.
+                state.remove_volume(volume_id);
+                return Err(error);
+            }
+            drop(entry);
+        }
+        let entry = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?
+            .entry
+            .clone();
+
+        // 6. The promotion itself: `primary --force` (the same
+        //    justified-force case as adoption — the kernel's unforced
+        //    gate is expected to refuse against a `DUnknown`/`Outdated`
+        //    peer, and the witness lease is the fence, never the
+        //    kernel gate). A re-drive whose resource is already
+        //    Primary (the crash window after the promotion) verifies
+        //    the role instead of re-running the command.
+        let promoted = if facts.role == Role::Primary {
+            self.verify_promotion(&entry)
+        } else {
+            self.run_drbdadm_seed(&facts.resource)
+                .and_then(|output| {
+                    if output.success {
+                        Ok(())
+                    } else {
+                        Err(command_failed("drbdadm primary --force", &output))
+                    }
+                })
+                .and_then(|()| self.verify_promotion(&entry))
+        };
+        if let Err(error) = promoted {
+            let detail = error.detail.clone();
+            self.unwind_failed_promotion(&mut state, volume_id, &entry, &block, &detail)?;
+            return Err(error);
+        }
+        // A re-drive's suspended Primary (e.g. the startup validation
+        // froze it while the witness was unreachable) resumes only
+        // now that the lease is proven (the attach path's rule).
+        if facts.suspended {
+            self.resume_io(entry.minor)?;
+        }
+
+        // 7. The completion save: the attachment record + `Attached`
+        //    AFTER the verified promotion (the restore's disk-path
+        //    verification needs the record; a pre-promote save would
+        //    look like an interrupted detach to the reconcile and be
+        //    cleared).
+        let record = AttachmentRecord {
+            id: req.attachment_id.clone(),
+            vm_id: req.vm_id.clone(),
+            host_id: req.host_id.clone(),
+            generation: 1,
+            access_mode: mode,
+            device: format!("/dev/drbd{}", entry.minor),
+        };
+        let Some(stored) = state.volume_mut(volume_id) else {
+            // Structurally unreachable (the lock is held and the entry
+            // was saved above), but if the invariant ever broke, the
+            // residue is fenced and released exactly like a failed
+            // promotion — never left serving.
+            self.unwind_failed_promotion(
+                &mut state,
+                volume_id,
+                &entry,
+                &block,
+                "the migration record vanished mid-operation",
+            )?;
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!("the migration record for {volume_id} vanished mid-operation"),
+            ));
+        };
+        stored.runtime.attachment = Some(record.clone());
+        stored.runtime.state = VolumeLifecycle::Attached;
+        stored.entry.generation += 1;
+        let response = attach_response(&record, &stored.entry);
+        state.save(&self.state_path)?;
+        Ok(response)
     }
 
     /// Build the inspect response for one stored volume, verifying the

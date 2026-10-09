@@ -1,12 +1,12 @@
-//! Coordinated-handoff source-side behavior over the DRBD engine
-//! (P4b plan §9, stage-B1 rows 8, 9, 10, 12 and 16a): every test
-//! drives the real provider code through the real blocking witness
-//! boundary against a real loopback witness server, exactly like the
-//! P4a authority tests. The fake DRBD command surface
-//! (`tests/common`) provides the host facts — including the
-//! peer-apply-lag knob that models asynchronous peer apply through
-//! the REAL `drbdsetup status` tokens, so the convergence proof
-//! (`track_sync`) is proven to *wait*, never assume (plan §8 item 3).
+//! Coordinated-handoff behavior over the DRBD engine (P4b plan §9,
+//! stage-B1 rows 8, 9, 10, 11, 12, 16a and 17): every test drives the
+//! real provider code through the real blocking witness boundary
+//! against a real loopback witness server, exactly like the P4a
+//! authority tests. The fake DRBD command surface (`tests/common`)
+//! provides the host facts — including the peer-apply-lag knob that
+//! models asynchronous peer apply through the REAL `drbdsetup status`
+//! tokens, so the convergence proof (`track_sync`) is proven to
+//! *wait*, never assume (plan §8 item 3).
 //!
 //! Covered rows:
 //! - `quiesce_for_barrier`: suspension observed + the durable cut
@@ -32,7 +32,25 @@
 //! - the clear-cut-marker admin operation: refuses a Primary/writer,
 //!   clears + reconciles when Secondary, and accepts only a
 //!   witness-corroborated fencing proof of the volume's own retired
-//!   epoch otherwise (row 16a).
+//!   epoch otherwise (row 16a);
+//! - the `SAFE_CURRENT` classifier (§7, row 11): a qualifying
+//!   migration barrier classifies `SAFE_CURRENT` without
+//!   `allow_loss`, protocol-independent (protocol A through the
+//!   dead-source D5 adoption path, protocol C through the promote
+//!   path with no registration barrier — never the P4a row in
+//!   disguise); renewals between the barrier and the retirement do
+//!   not downgrade (ordering, not terminality); a voided barrier is
+//!   never evidence; a partial attestation reports `POSSIBLE_LOSS`
+//!   with the recorded `Known` boundary; no barrier keeps the P4a
+//!   behavior (row 17: the dead-source mid-cut converges through
+//!   adoption);
+//! - `promote_target` (§6, the destination half): the happy path
+//!   under the W10-granted lease (entry provenance, attachment
+//!   record, authority block), the inverted authority gate's typed
+//!   refusals (no live lease, a foreign holder, an unretired source
+//!   epoch, a lease shorter than the renewal margin), the attach
+//!   discipline's replay/conflict rules, and the crash-window re-drive
+//!   (payload provenance completes a half-done target).
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention.
 
@@ -46,23 +64,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{
-    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, fixture, provider_from_with_authority,
-    seed_volume_with_identity, set_peer_lag,
+    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for_peer, fixture, flip_world_to_peer,
+    provider_from_with_authority, seed_volume_with_identity, set_peer_lag,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
 use volvisor_drbd::report::Role;
 use volvisor_drbd::state::{DrbdState, MigrationCut, ReplicationMode};
 use volvisor_provider::{HandoffSurface, VolumeProvider};
+use volvisor_types::domain::{AccessMode, Frontend};
 use volvisor_types::request::{AccessModeRequest, AttachVolumeRequest, DetachVolumeRequest};
 use volvisor_types::{
-    ApiErrorCode, AttachmentId, BarrierAttestation, DrainProof, HostId, LeaseState, MigrationId,
-    OperationId, VolumeId,
+    ApiErrorCode, AttachmentId, AttachmentState, BarrierAttestation, DrainProof, HostId,
+    LeaseState, LossBoundary, MigrationId, OperationId, PromotionClassification,
+    SafeCurrentEvidence, VolumeId, VolumeLifecycle, WriterEpoch,
 };
 use volvisor_witness::BlockingWitness;
 use volvisor_witness::client::{HttpWitnessConnection, WitnessConnection};
 use volvisor_witness::proto::{
-    GrantRequest, RecordBarrierRequest, VoidBarrierRequest, WITNESS_PROTOCOL_VERSION,
+    BatchGrantVolume, BatchRelease, GrantRequest, GrantSetRequest, RecordBarrierRequest,
+    RevokeSetRequest, VoidBarrierRequest, WITNESS_PROTOCOL_VERSION,
 };
 use volvisor_witness::registry::{WitnessCore, WitnessCoreConfig};
 use volvisor_witness::server::{WitnessServerState, router};
@@ -261,22 +282,43 @@ async fn grant_to_peer(
 }
 
 /// Record a migration barrier at the witness with the NODE holder's
-/// own credential (W8/W9).
+/// own credential (W8/W9), all three attestations true.
 async fn record_barrier(kit: &WitnessKit, volume_id: &VolumeId, migration_id: &MigrationId) {
+    record_barrier_with(
+        kit,
+        volume_id,
+        migration_id,
+        NODE,
+        BarrierAttestation {
+            vm_paused_and_drained: true,
+            data_path_suspended: true,
+            peer_up_to_date: true,
+        },
+    )
+    .await;
+}
+
+/// Record a migration barrier at the witness with `host`'s own W8
+/// credential (which must be the current epoch's live holder — W9)
+/// and a chosen attestation (the witness records it verbatim; the
+/// classifier degrades on anything less than all-true).
+async fn record_barrier_with(
+    kit: &WitnessKit,
+    volume_id: &VolumeId,
+    migration_id: &MigrationId,
+    host: &str,
+    attestation: BarrierAttestation,
+) {
     let view = kit.client.inspect(volume_id).await.expect("view");
-    host_client_for(&kit.server, NODE)
+    host_client_for(&kit.server, host)
         .record_barrier(
             volume_id,
             RecordBarrierRequest {
                 protocol_version: WITNESS_PROTOCOL_VERSION,
-                operation_id: op("record-barrier"),
-                host_id: HostId::new(NODE).expect("valid host id"),
+                operation_id: op(&format!("record-barrier-{host}")),
+                host_id: HostId::new(host).expect("valid host id"),
                 epoch: view.current_epoch,
-                attestation: BarrierAttestation {
-                    vm_paused_and_drained: true,
-                    data_path_suspended: true,
-                    peer_up_to_date: true,
-                },
+                attestation,
                 migration_id: Some(migration_id.clone()),
             },
         )
@@ -362,6 +404,153 @@ fn suspended(world: &Arc<Mutex<FakeDrbd>>, minor: u32) -> bool {
         .expect("world")
         .suspended_minors
         .contains(&minor)
+}
+
+/// The destination host's provider: the peer-view configuration over
+/// the same host directory and world, a fresh state file of its own
+/// (it holds none of the source's volumes), and its own authority
+/// identity. Call after [`flip_world_to_peer`].
+fn peer_provider_over(
+    kit: &WitnessKit,
+    base: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    state_path: &Path,
+) -> Arc<DrbdProvider> {
+    DrbdProvider::with_authority(
+        FakeDrbd::runner(world),
+        config_for_peer(base),
+        state_path.to_path_buf(),
+        authority_for(kit, PEER_NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("peer provider construction")
+}
+
+/// See [`peer_provider_over`], over the destination's standard
+/// `state-peer.json`.
+fn peer_provider(kit: &WitnessKit, base: &Path, world: &Arc<Mutex<FakeDrbd>>) -> Arc<DrbdProvider> {
+    peer_provider_over(kit, base, world, &base.join("state-peer.json"))
+}
+
+/// The destination's promote request: the attach shape the
+/// coordinator's `DESTINATION_AUTHORIZED` restore step carries.
+/// `expected_volume_generation` is deliberately wrong — the target
+/// entry is CREATED by this path, so there is no pre-existing local
+/// generation to compare against (the identity gate is the witness
+/// lease + lineage verification, never a generation echo).
+fn promote_req(volume_id: &str) -> AttachVolumeRequest {
+    AttachVolumeRequest {
+        api_version: "volvisor.volume.v2".to_owned(),
+        operation_id: OperationId::new(format!("op-promote-{volume_id}")).expect("valid id"),
+        vm_id: "handoff-vm".to_owned(),
+        host_id: HostId::new("handoff-host").expect("valid id"),
+        attachment_id: AttachmentId::new(format!("att-{volume_id}")).expect("valid id"),
+        expected_volume_generation: 999,
+        access_mode: AccessModeRequest::SingleWriter,
+        requested_frontend: None,
+    }
+}
+
+/// Attach the source with a chosen replication protocol (the
+/// migration-barrier class is protocol-independent; the C row proves
+/// it is not the P4a registration-barrier row in disguise).
+async fn attached_protocol(
+    kit: &WitnessKit,
+    volume_id: &str,
+    protocol: ReplicationMode,
+) -> Attached {
+    let f = fixture();
+    seed_volume_with_identity(
+        &f.base, &f.world, volume_id, GIB, protocol, SEED_MINOR, SEED_PORT,
+    );
+    let provider = authority_provider(kit, &f.state_path, &f.world);
+    let vol = volume(volume_id);
+    provider.register_volume(&vol, None).expect("register");
+    provider
+        .attach_volume(&vol, &attach_req(volume_id, 1, "handoff-vm"))
+        .await
+        .expect("attach");
+    Attached {
+        provider,
+        world: f.world,
+        state_path: f.state_path,
+        resource: resource_of(volume_id),
+        volume: vol,
+    }
+}
+
+/// The source host's coordinated cut through the durable barrier:
+/// quiesce (suspension + marker), the convergence proof, and the W9
+/// barrier record at the source's current epoch. The source is left
+/// suspended, Primary and marked — the mid-cut shape — and the
+/// barrier is durably recorded with all three attestations true.
+async fn cut_with_barrier(
+    kit: &WitnessKit,
+    volume_id: &str,
+    protocol: ReplicationMode,
+    mig: &MigrationId,
+) -> Attached {
+    let state = attached_protocol(kit, volume_id, protocol).await;
+    state
+        .provider
+        .quiesce_for_barrier(&state.volume, mig)
+        .expect("quiesce");
+    state
+        .provider
+        .track_sync(&state.volume)
+        .expect("track sync");
+    record_barrier(kit, &state.volume, mig).await;
+    state
+}
+
+/// The handoff's witness tail after the source's cut: the W10
+/// self-release `RevokeSet` (the SOURCE host's own credential — it
+/// retires the source epoch and, as a self-release, waives the W7
+/// fence wait), then the W10 `GrantSet` minting the destination's
+/// live lease at a fresh epoch. After this the witness holds exactly
+/// the shape `promote_target`'s inverted authority gate demands.
+async fn revoke_source_and_grant_peer(kit: &WitnessKit, vol: &VolumeId, mig: &MigrationId) {
+    let view = kit.client.inspect(vol).await.expect("view");
+    host_client_for(&kit.server, NODE)
+        .revoke_set(RevokeSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op("revoke-set"),
+            host_id: HostId::new(NODE).expect("valid host id"),
+            migration_id: Some(mig.clone()),
+            releases: vec![BatchRelease {
+                volume_id: vol.clone(),
+                epoch: view.current_epoch,
+            }],
+        })
+        .await
+        .expect("revoke set");
+    host_client_for(&kit.server, PEER_NODE)
+        .grant_set(GrantSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op("grant-set"),
+            host_id: HostId::new(PEER_NODE).expect("valid host id"),
+            migration_id: Some(mig.clone()),
+            requests: vec![BatchGrantVolume {
+                volume_id: vol.clone(),
+            }],
+        })
+        .await
+        .expect("grant set");
+}
+
+/// Model the source host's death mid-cut: its kernel state vanishes
+/// (the suspension it took dies with it — the survivor's own data
+/// path was never suspended), and from the survivor's end the
+/// resource is its own Secondary view (the dead primary's role is
+/// unobservable and irrelevant to the survivor's promotion gate).
+fn model_dead_source(world: &Arc<Mutex<FakeDrbd>>, resource: &str) {
+    let mut world = world.lock().expect("world");
+    let minor = {
+        let resource_state = world.resources.get_mut(resource).expect("resource");
+        resource_state.role = Role::Secondary;
+        resource_state.minor
+    };
+    world.suspended_minors.remove(&minor);
 }
 
 /// The durable cut marker of a volume, straight from the state file.
@@ -1045,5 +1234,646 @@ async fn a_corroborated_fencing_proof_clears_and_reconciles_fail_closed() {
     assert_eq!(response.state, volvisor_types::VolumeLifecycle::Ready);
     // The witness shows the new holder — the fencing was real.
     let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.holder.as_ref().expect("holder").as_str(), PEER_NODE);
+}
+
+// --------------------------- promote_target (plan §6, §9 rows 11/17)
+
+/// The destination-side half (plan §6 `promote-under-granted-lease`):
+/// after the source's cut, W10 self-release and the destination's
+/// `GrantSet`, `promote_target` verifies the lineage, proves the
+/// granted lease (live, ours, at the minted epoch, enough remaining
+/// to renew), resolves the retired source epoch, classifies through
+/// the migration barrier and promotes — recording the migration
+/// provenance and the attachment record the restore needs. Protocol C
+/// here with NO registration barrier: the `SAFE_CURRENT` evidence is
+/// the migration barrier's, never the P4a row in disguise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_target_completes_under_the_granted_lease() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-promote");
+    let state = cut_with_barrier(&kit, "vol-promote", ReplicationMode::C, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let response = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-promote"))
+        .expect("promote target");
+    assert_eq!(response.state, AttachmentState::Prepared);
+    assert_eq!(response.attachment_generation, 1);
+    assert_eq!(response.volume_generation, 2);
+    assert_eq!(
+        response.frontend,
+        Frontend::VirtioBlk {
+            host_device_path: format!("/dev/drbd{SEED_MINOR}")
+        }
+    );
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+    // The witness shape the inverted gate proved: a live lease for
+    // the destination at the granted epoch, the source epoch retired.
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.current_epoch.0, 2);
+    assert_eq!(view.lease_state, LeaseState::Live);
+    assert_eq!(view.holder.as_ref().expect("holder").as_str(), PEER_NODE);
+    assert!(
+        view.retirements
+            .iter()
+            .any(|retired| retired.epoch == WriterEpoch(1)),
+        "the source epoch is durably retired: {:?}",
+        view.retirements
+    );
+    // The durable target entry: migration provenance, the attachment
+    // record the restore's disk-path verification needs, the
+    // authority block anchored to the granted lease.
+    let stored = DrbdState::load(&base.join("state-peer.json"))
+        .expect("peer state")
+        .volume(&state.volume)
+        .expect("migrated entry")
+        .clone();
+    assert_eq!(stored.runtime.state, VolumeLifecycle::Attached);
+    let record = stored.runtime.attachment.expect("attachment record");
+    assert_eq!(record.vm_id, "handoff-vm");
+    assert_eq!(record.host_id.as_str(), "handoff-host");
+    assert_eq!(record.access_mode, AccessMode::SingleWriter);
+    assert_eq!(record.device, format!("/dev/drbd{SEED_MINOR}"));
+    assert_eq!(stored.entry.generation, 2);
+    assert!(stored.entry.creation_payload.contains(mig.as_str()));
+    assert!(
+        stored
+            .entry
+            .creation_payload
+            .contains("\"granted_epoch\":2"),
+        "the provenance names the granted epoch: {}",
+        stored.entry.creation_payload
+    );
+    let block = stored.runtime.authority.expect("authority block");
+    assert_eq!(block.epoch, WriterEpoch(2));
+    assert_eq!(block.lease_id, view.lease_id.expect("lease id"));
+}
+
+/// The attach discipline's replay and conflict rules over a completed
+/// promote: a byte-identical re-drive replays the recorded attachment
+/// response; a different attachment id is `WRITER_ALREADY_ACTIVE`; a
+/// reused id with different content is an idempotency conflict; and a
+/// DIFFERENT migration never completes someone else's target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_promote_replays_and_refuses_mismatches_typed() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-replay");
+    let state = cut_with_barrier(&kit, "vol-replay", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let first = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-replay"))
+        .expect("promote target");
+    // The same request replays the recorded response (never a second
+    // promotion, never a second record).
+    let replay = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-replay"))
+        .expect("replay");
+    assert_eq!(replay, first);
+    let stored = DrbdState::load(&base.join("state-peer.json"))
+        .expect("peer state")
+        .volume(&state.volume)
+        .expect("migrated entry")
+        .clone();
+    assert_eq!(stored.entry.generation, 2, "the replay mutated nothing");
+    // A different attachment id over the completed target is the
+    // writer-active refusal.
+    let mut other_id = promote_req("vol-replay");
+    other_id.attachment_id = AttachmentId::new("att-vol-replay-second").expect("id");
+    other_id.operation_id = OperationId::new("op-promote-vol-replay-second").expect("id");
+    let active = peer
+        .promote_target(&state.volume, &mig, &other_id)
+        .expect_err("one writer at a time");
+    assert_eq!(active.code, ApiErrorCode::WriterAlreadyActive);
+    // The same id with different content is the idempotency conflict.
+    let mut diverging = promote_req("vol-replay");
+    diverging.vm_id = "another-vm".to_owned();
+    let conflict = peer
+        .promote_target(&state.volume, &mig, &diverging)
+        .expect_err("reused id, different content");
+    assert_eq!(conflict.code, ApiErrorCode::IdempotencyConflict);
+    // A foreign migration never completes this target: the re-drive
+    // gate is the entry's own provenance.
+    let foreign = peer
+        .promote_target(
+            &state.volume,
+            &migration("mig-other"),
+            &promote_req("vol-replay"),
+        )
+        .expect_err("a tracked entry is completable only by its own migration");
+    assert_eq!(foreign.code, ApiErrorCode::InvalidState);
+    assert!(foreign.detail.contains("mig-other"));
+}
+
+/// Row 11's ordering rule (G2): renewals between the barrier and the
+/// retirement write no data and never downgrade the classification —
+/// the barrier's boundary commit index precedes the retirement record
+/// even though a renewal (its own journal commit) sits in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewals_between_the_barrier_and_the_retirement_do_not_downgrade() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-renew-order");
+    let state = cut_with_barrier(&kit, "vol-renew-order", ReplicationMode::A, &mig).await;
+    // One real renewal between the barrier and the retirement: it
+    // journals its own commit, so the barrier is provably NOT the
+    // epoch's final mutation.
+    kit.writer_clock
+        .store(START + INTERVAL + 1, Ordering::SeqCst);
+    let report = state.provider.renew_leases().expect("renewal pass");
+    assert_eq!(report.renewed, vec![state.volume.clone()]);
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    // The ordering is real: barrier < renewal < retirement.
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    let barrier = view
+        .barriers
+        .iter()
+        .find(|barrier| barrier.migration_id.as_ref() == Some(&mig))
+        .expect("the migration's barrier");
+    assert!(
+        barrier.boundary_commit_index < view.commit_index,
+        "the renewal journaled a commit after the barrier"
+    );
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    let retirement = view
+        .retirements
+        .iter()
+        .find(|retired| retired.epoch == WriterEpoch(1))
+        .expect("the source epoch's retirement");
+    assert!(
+        barrier.boundary_commit_index < retirement.commit_index,
+        "the barrier precedes the retirement despite the renewal between"
+    );
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    peer.promote_target(&state.volume, &mig, &promote_req("vol-renew-order"))
+        .expect("still SAFE_CURRENT: ordering, not terminality");
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+}
+
+/// Row 11: a voided barrier is never evidence — the recording holder
+/// repudiated the claim wholesale, and the promote (which carries no
+/// loss authorization) refuses typed with nothing promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_voided_barrier_is_never_safe_current_evidence() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-voided");
+    let state = cut_with_barrier(&kit, "vol-voided", ReplicationMode::A, &mig).await;
+    void_barriers(&kit, &state.volume, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let error = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-voided"))
+        .expect_err("a voided barrier proves nothing");
+    assert_eq!(error.code, ApiErrorCode::UnsafeDataLoss);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    assert!(
+        DrbdState::load(&base.join("state-peer.json"))
+            .expect("peer state")
+            .volume(&state.volume)
+            .is_none(),
+        "no target entry is created by a refused promote"
+    );
+}
+
+/// The inverted authority gate (plan §6 deviation 1): with no live
+/// lease at the witness the promote refuses typed — the migration's
+/// `GrantSet` grant is missing, and adoption's no-live-lease semantics
+/// are never run against the granted lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_without_a_live_lease_is_refused_typed() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-nolease");
+    let state = cut_with_barrier(&kit, "vol-nolease", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    // The self-release retires the epoch but no GrantSet follows.
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    host_client_for(&kit.server, NODE)
+        .revoke_set(RevokeSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op("revoke-set"),
+            host_id: HostId::new(NODE).expect("valid host id"),
+            migration_id: Some(mig.clone()),
+            releases: vec![BatchRelease {
+                volume_id: state.volume.clone(),
+                epoch: view.current_epoch,
+            }],
+        })
+        .await
+        .expect("revoke set");
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let error = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-nolease"))
+        .expect_err("no granted lease");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(error.detail.contains("no live lease"));
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// A foreign live lease is never promoted over: the lease exists and
+/// is live, but another host holds it — `LEASE_HELD`, nothing
+/// promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_over_a_foreign_live_lease_is_lease_held() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-foreign");
+    let state = cut_with_barrier(&kit, "vol-foreign", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    host_client_for(&kit.server, NODE)
+        .revoke_set(RevokeSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op("revoke-set"),
+            host_id: HostId::new(NODE).expect("valid host id"),
+            migration_id: Some(mig.clone()),
+            releases: vec![BatchRelease {
+                volume_id: state.volume.clone(),
+                epoch: view.current_epoch,
+            }],
+        })
+        .await
+        .expect("revoke set");
+    // The SOURCE re-grants its own epoch: live, but not the
+    // destination's.
+    host_client_for(&kit.server, NODE)
+        .grant_set(GrantSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op("grant-set-source"),
+            host_id: HostId::new(NODE).expect("valid host id"),
+            migration_id: Some(mig.clone()),
+            requests: vec![BatchGrantVolume {
+                volume_id: state.volume.clone(),
+            }],
+        })
+        .await
+        .expect("source re-grant");
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let error = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-foreign"))
+        .expect_err("a foreign live lease is never promoted over");
+    assert_eq!(error.code, ApiErrorCode::LeaseHeld);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// An unretired source epoch is never promoted over: a barrier of
+/// THIS migration naming the (still-current) granted epoch cannot be
+/// the source evidence — the source authority cannot be proven
+/// fenced, and the refusal is `UNSAFE_DATA_LOSS`, never "partial".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_over_an_unretired_source_epoch_is_refused_typed() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-unretired");
+    let state = cut_with_barrier(&kit, "vol-unretired", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    // The destination's own current epoch records a barrier of the
+    // same migration (a coordinator bug or a hostile recorder): the
+    // migration's newest barrier names the granted epoch, which is
+    // not retired below itself.
+    record_barrier_with(
+        &kit,
+        &state.volume,
+        &mig,
+        PEER_NODE,
+        BarrierAttestation {
+            vm_paused_and_drained: true,
+            data_path_suspended: true,
+            peer_up_to_date: true,
+        },
+    )
+    .await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let error = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-unretired"))
+        .expect_err("the source epoch is not retired below the granted one");
+    assert_eq!(error.code, ApiErrorCode::UnsafeDataLoss);
+    assert!(error.detail.contains("not retired"));
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// A granted lease that cannot outlive the renewal cadence (W5
+/// margin) is refused: it would lapse between renewals, and the
+/// promote never starts from a lease it cannot keep alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_with_a_lease_shorter_than_the_renewal_margin_is_refused_typed() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-margin");
+    let state = cut_with_barrier(&kit, "vol-margin", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    // The granted lease is live but nearly spent: 10s remain, under
+    // the 20s renewal cadence.
+    kit.witness_clock.store(START + TTL - 10, Ordering::SeqCst);
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let error = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-margin"))
+        .expect_err("the lease cannot outlive the renewal cadence");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(error.detail.contains("renewal margin"));
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// The attach gate's read-only refusal (rule 17 / dual-primary): a
+/// read-only promote request is rejected typed before any mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promote_refuses_a_read_only_attachment_typed() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-readonly");
+    let state = cut_with_barrier(&kit, "vol-readonly", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let mut read_only = promote_req("vol-readonly");
+    read_only.access_mode = AccessModeRequest::ReadOnly;
+    let error = peer
+        .promote_target(&state.volume, &mig, &read_only)
+        .expect_err("read-only attachments are unqualified");
+    assert_eq!(error.code, ApiErrorCode::UnsupportedClassOrPolicy);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// Row 17 (D5, with row 11's protocol independence): a source that
+/// dies mid-cut — after the barrier, before any `RevokeSet` — leaves
+/// a still-current epoch whose barrier the surviving host's ADOPTION
+/// classifies `SAFE_CURRENT` through the vacuous still-current
+/// ordering branch: no `allow_loss`, protocol A, evidence
+/// `migration-barrier` (the P4a classifier would have said
+/// `POSSIBLE_LOSS`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_source_mid_cut_adopts_safe_current_protocol_independently() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-d5");
+    let state = cut_with_barrier(&kit, "vol-d5", ReplicationMode::A, &mig).await;
+    // The source dies mid-cut: no release, no revoke — the lease
+    // simply lapses, and the W7 window passes.
+    model_dead_source(&state.world, &state.resource);
+    kit.witness_clock
+        .store(START + TTL + 5 + 5 + 1, Ordering::SeqCst);
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let response = peer
+        .adopt_and_promote(&state.volume, false)
+        .expect("classified");
+    assert_eq!(
+        response.classification,
+        PromotionClassification::SafeCurrent
+    );
+    assert_eq!(response.evidence, SafeCurrentEvidence::MigrationBarrier);
+    let adopted = response.volume.expect("adopted");
+    assert_eq!(adopted.state, VolumeLifecycle::Ready);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+    // The survivor now holds the live lease at a fresh epoch.
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+    assert_eq!(view.holder.as_ref().expect("holder").as_str(), PEER_NODE);
+    assert_eq!(view.current_epoch.0, 2);
+}
+
+/// Row 11's short-boundary cell: a partial attestation (the recorder
+/// honestly marked the VM not yet drained) is never `SAFE_CURRENT`,
+/// but its recorded boundary is the honest `Known` loss boundary —
+/// `POSSIBLE_LOSS` naming the barrier's witness-commit token,
+/// unauthorized, nothing promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_attestation_reports_the_known_loss_boundary() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-partial");
+    let state = attached_protocol(&kit, "vol-partial", ReplicationMode::A).await;
+    // The source records an honest partial attestation mid-cut, then
+    // dies: the barrier is durable, the claim is short.
+    record_barrier_with(
+        &kit,
+        &state.volume,
+        &mig,
+        NODE,
+        BarrierAttestation {
+            vm_paused_and_drained: false,
+            data_path_suspended: true,
+            peer_up_to_date: true,
+        },
+    )
+    .await;
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    let boundary = view
+        .barriers
+        .iter()
+        .find(|barrier| barrier.migration_id.as_ref() == Some(&mig))
+        .expect("the partial barrier")
+        .boundary_commit_index;
+    model_dead_source(&state.world, &state.resource);
+    kit.witness_clock
+        .store(START + TTL + 5 + 5 + 1, Ordering::SeqCst);
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let response = peer
+        .adopt_and_promote(&state.volume, false)
+        .expect("classified");
+    assert_eq!(
+        response.classification,
+        PromotionClassification::PossibleLoss {
+            boundary: LossBoundary::Known(format!("witness-commit-{boundary}")),
+            authorized: false,
+        }
+    );
+    assert_eq!(response.evidence, SafeCurrentEvidence::None);
+    assert!(response.volume.is_none());
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+}
+
+/// Row 11's regression cell: with no barrier at all, the P4a behavior
+/// is unchanged — protocol A without evidence stays `POSSIBLE_LOSS`
+/// with an `Unknown` boundary, waiting for the operator's explicit
+/// loss authorization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_without_a_barrier_is_unchanged() {
+    let kit = witness_kit().await;
+    let state = attached_protocol(&kit, "vol-nobarrier", ReplicationMode::A).await;
+    model_dead_source(&state.world, &state.resource);
+    kit.witness_clock
+        .store(START + TTL + 5 + 5 + 1, Ordering::SeqCst);
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer = peer_provider(&kit, &base, &state.world);
+    let response = peer
+        .adopt_and_promote(&state.volume, false)
+        .expect("classified");
+    assert_eq!(
+        response.classification,
+        PromotionClassification::PossibleLoss {
+            boundary: LossBoundary::Unknown,
+            authorized: false,
+        }
+    );
+    assert_eq!(response.evidence, SafeCurrentEvidence::None);
+    assert!(response.volume.is_none());
+}
+
+/// The promote crash window (§6's crash discipline): a crash between
+/// the pre-promote save and the completion save leaves a tracked,
+/// authority-holding entry with no attachment record — the restart's
+/// reconcile reports it as the zombie it cannot prove, and a re-drive
+/// whose provenance names this migration re-runs the verification,
+/// gate and classification and completes the tail to `Attached`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_promote_is_re_driven_by_provenance_to_completion() {
+    let kit = witness_kit().await;
+    let mig = migration("mig-restart");
+    let state = cut_with_barrier(&kit, "vol-restart", ReplicationMode::A, &mig).await;
+    state
+        .provider
+        .release_source(&state.volume, &mig)
+        .expect("release");
+    revoke_source_and_grant_peer(&kit, &state.volume, &mig).await;
+    flip_world_to_peer(&state.world);
+    let base = state
+        .state_path
+        .parent()
+        .expect("state path parent")
+        .to_path_buf();
+    let peer_state = base.join("state-peer.json");
+    let peer = peer_provider(&kit, &base, &state.world);
+    let first = peer
+        .promote_target(&state.volume, &mig, &promote_req("vol-restart"))
+        .expect("promote target");
+    assert_eq!(first.volume_generation, 2);
+    // Rewind the durable state to the pre-completion crash shape: the
+    // entry and the authority block are durable, the attachment
+    // record and the `Attached` stamp are not (the promotion itself
+    // already happened — the resource is Primary).
+    {
+        let mut disk = DrbdState::load(&peer_state).expect("load peer state");
+        let stored = disk.volume_mut(&state.volume).expect("migrated entry");
+        stored.runtime.state = VolumeLifecycle::Ready;
+        stored.runtime.attachment = None;
+        disk.save(&peer_state).expect("save peer state");
+    }
+    // A daemon restart over that state: the reconcile reports the
+    // valid-lease Primary without an attachment record as the zombie
+    // of exactly this crash window (never auto-demoted).
+    let restarted = peer_provider_over(&kit, &base, &state.world, &peer_state);
+    let report = restarted
+        .last_reconcile_report()
+        .expect("report")
+        .expect("a pass ran");
+    assert!(
+        report.zombie_primaries.contains(&state.volume),
+        "the crash window is the zombie shape: {report:?}"
+    );
+    // The re-drive: the same request, gated on the entry's own
+    // provenance, completes the tail.
+    let re_driven = restarted
+        .promote_target(&state.volume, &mig, &promote_req("vol-restart"))
+        .expect("re-drive completes the crashed promote");
+    assert_eq!(re_driven.attachment_id, first.attachment_id);
+    assert_eq!(re_driven.attachment_generation, 1);
+    assert_eq!(re_driven.volume_generation, 3);
+    let stored = DrbdState::load(&peer_state)
+        .expect("peer state")
+        .volume(&state.volume)
+        .expect("migrated entry")
+        .clone();
+    assert_eq!(stored.runtime.state, VolumeLifecycle::Attached);
+    assert!(stored.runtime.attachment.is_some());
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
     assert_eq!(view.holder.as_ref().expect("holder").as_str(), PEER_NODE);
 }
