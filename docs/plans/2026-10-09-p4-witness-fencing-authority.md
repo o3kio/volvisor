@@ -68,12 +68,12 @@ In (P4a):
   admin adopt/promote endpoint. Volume API v2 contract text updated to
   match exactly what is implemented.
 - A `witness register` admin operation: record an existing P3-era volume
-  into the witness. The registration attestation captures the volume's
-  **data lineage** (the DRBD data-generation UUID set, read via
-  `drbdsetup show-gi` — argv and output shape verified against the real
-  sources before parsing, like every other DRBD form) and, for the local
-  side, the current LV identity; on a peer host it captures the
-  operator-provisioned backing (the peer's LV is **not** volvisor-created
+  into the witness. The registration attestation captures, in one record,
+  the volume's **data lineage** (the DRBD data-generation UUID set, read
+  via `drbdsetup show-gi` — argv and output shape verified against the
+  real sources before parsing, like every other DRBD form) and **both
+  endpoints' backing identities** (each side's LV identity and the
+  resource definition facts; the peer's LV is **not** volvisor-created
   and carries no `volvisor.owner` tag — see §5). The witness then
   linearizes all **future** authority for the volume; no historical claims
   are made. This is the migration path for volumes created before P4 —
@@ -143,9 +143,13 @@ Out (recorded follow-ups; each maps to P4b or later):
   - **W3b (roll-forward on restart)**: a replayed intent without an
     outcome (crash between append and response) is completed at startup by
     reconstructing the response from the intent and journaled state, then
-    appending the outcome. A retried `operation_id` therefore never wedges
-    in `in-flight`, and a retry with a fresh `operation_id` is never
-    blocked by an orphan lease.
+    appending the outcome. The intent payload carries the **complete
+    computed response** (epoch, lease id, deadline duration, proof), so
+    the reconstructed outcome is deterministic and byte-identical to what
+    the normal path returns — a retry and a roll-forward can never
+    disagree. A retried `operation_id` therefore never wedges in
+    `in-flight`, and a retry with a fresh `operation_id` is never blocked
+    by an orphan lease.
 - **W4 (stale renewal rejected)**: renewing a retired epoch is a typed
   `STALE_EPOCH` refusal carrying the current epoch, so a stale writer
   *learns* it is fenced instead of guessing.
@@ -165,13 +169,21 @@ Out (recorded follow-ups; each maps to P4b or later):
   the revocation. It is never silent and never inferred.
 - **W7 (grant waits out the fence)**: the witness does not grant a new
   epoch until the previous writer is — under the §2 timing assumption —
-  provably suspended. After expiry, grants are delayed by the quarantine
-  (`grace + suspend budget`); after a forced revocation of a live lease,
-  by `renewal_interval + grace + suspend budget` (the revoked writer
-  learns at its next renewal, which precedes its deadline because
-  `renewal_interval < ttl` is a config invariant). A grant requested
-  inside the window is a typed `FENCE_PENDING` refusal carrying a
-  retry-after duration — the candidate retries; nothing blocks.
+  provably suspended. The wait is computed from the revoked lease's
+  **recorded end** (which the witness knows exactly: `last grant or renew
+  + ttl`), because the writer's own local deadline is exactly that end
+  plus the bounded latency term: grants are delayed until `lease end +
+  grace + suspend budget`, after expiry and forced revocation alike.
+  (Delays keyed to the writer *learning* of a revocation would be wrong:
+  W6's own scenario is an alive-but-**partitioned** source that cannot
+  reach the witness — it serves until its local deadline no matter how
+  often it tries to renew, so only the lease's end bounds it. A
+  power-off STONITH attestation may shorten the wait: the forced-revoke
+  authorization can record that the source host is provably powered off,
+  in which case there is nothing to wait out — recorded, never assumed.)
+  A grant requested inside the window is a typed `FENCE_PENDING`
+  refusal carrying a retry-after duration — the candidate retries;
+  nothing blocks.
 
 ### Dual-write window analysis (the honest fence boundary)
 
@@ -211,18 +223,28 @@ runs `primary --force` outside the two justified paths in §5.
   not "for free": the in-flight state is handled explicitly. Concurrent
   requests serialize through a single journal-holding mutex, following the
   `volvisor-api` state convention.
-- Operations: `register(volume_id, lineage attestation, optional
+- Operations: `register(volume_id, lineage attestation — both endpoints'
+  backing identities and the DRBD data-generation UUID set — optional
   operator-attested barrier)`, `grant(volume_id, host_id, operation_id) →
   {epoch, lease deadline (duration), fencing proof}`, `renew(volume_id,
   epoch, lease_id)`, `revoke(volume_id, epoch, authorization)`,
-  `inspect(volume_id) → AuthorityView`.
-- Deployment: `volvisor-witnessd` on a **third failure domain**. The
-  storage daemon refuses a witness endpoint whose host equals **either**
-  its own replication address **or** the configured peer address — a
-  witness colocated on a data node defeats the failure-domain claim from
-  either side. (Name-vs-literal resolution is handled conservatively: the
-  guard compares against both the configured literal and, where they
-  differ, the resolvable address, and refuses on ambiguity.)
+  `inspect(volume_id) → AuthorityView` where `AuthorityView` carries not
+  only the epoch/holder/lease-state/commit-index but also the **full
+  registration record** (lineage UUID set, both endpoints' backing
+  identities, any recorded barrier) — the adopt flow of §5 reads back
+  exactly what it must compare against, through this one operation.
+- Deployment: `volvisor-witnessd` on a **third failure domain**, with its
+  own config: `listen`, `state_dir`, `auth_token`, `lease_ttl_secs`,
+  `lease_grace_secs` (the response-latency bound W7 assumes — the one
+  number the correctness argument needs from the deployment; documented
+  as an operator network responsibility) and the fixed, documented
+  suspend budget used in the W7 wait. The storage daemon refuses a
+  witness endpoint whose host equals **either** its own replication
+  address **or** the configured peer address — a witness colocated on a
+  data node defeats the failure-domain claim from either side. (Name-vs-
+  literal resolution is handled conservatively: the guard compares
+  against both the configured literal and, where they differ, the
+  resolvable address, and refuses on ambiguity.)
 - Availability honesty: witness loss blocks **new** grants, renewals past
   deadline (→ self-fencing per policy) and failover — never established
   guest I/O before the lease deadline. This is the contract's conscious
@@ -261,15 +283,22 @@ runs `primary --force` outside the two justified paths in §5.
   event surfaced; reconcile completes the demotion once the device
   closes. Never a silent resume (rule 5).
 - **Startup fail-closed**: the provider's startup reconciliation (P3
-  already runs one) treats every witness-managed volume found Primary
-  with a recorded attachment as **unproven until validated**: I/O is
-  suspended before the API surface starts, the lease is validated via
+  already runs one) treats every **witness-managed volume found Primary**
+  as **unproven until validated** — keyed on the role and the lease,
+  *not* on the attachment record (a crash between `drbdadm primary` and
+  the record save, or a zombie promotion, leaves a Primary with no
+  attachment; it is still an unvalidated writer). I/O is suspended
+  before the API surface starts, the lease is validated via
   `inspect`, and the device is resumed only on a live lease for our
   epoch. An unreachable witness leaves it suspended — a restarted daemon
-  never silently resumes a writer it cannot prove (rule 5). Epoch-0
+  never silently resumes a writer it cannot prove (rule 5). This subsumes
+  the P3 zombie-primary case safely: the zombie is reported exactly as
+  before (never auto-demoted) and additionally suspended when it holds
+  no live lease. Epoch-0
   (P3-era, unregistered) volumes keep exactly their P3 behavior.
-- **Reconcile**: validates each Attached volume's lease against the
-  witness (`inspect`); a superseded or expired lease self-fences as above.
+- **Reconcile**: validates the lease of every witness-managed volume
+  found Primary (`inspect`), attachment record or not; a superseded or
+  expired lease self-fences as above.
 
 Every new DRBD command form (`suspend-io`/`resume-io` by minor, `show-gi`
 for lineage UUIDs) is verified against the real drbd-utils 9.29.0 sources
@@ -324,24 +353,31 @@ model), so failover is an **adopt-and-promote** admin operation:
    ACKing writes locally (degraded mode) while the survivor's disk stays
    `UpToDate` — the tail is unknowable from the survivor's DRBD state
    under *any* protocol. `SAFE_CURRENT` therefore requires a **recorded
-   barrier** for the volume: a source-committed boundary with
-   connection-established evidence at that boundary. In P4a no automated
-   component writes barriers (P4b's `BARRIER_DURABLE` will); the only
-   source is an operator-attested barrier recorded at `register` time.
-   Absent that evidence the honest verdict is `POSSIBLE_LOSS` with an
-   *unknown* boundary — the contract explicitly requires reporting
-   unknown rather than pretending precise loss bounds. An `Inconsistent`
-   local disk means integrity is unprovable (mid-resync loss) — `UNSAFE`,
-   never a "partial" promotion.
+   barrier** for the volume: an attestation that the named boundary was
+   the **last acknowledged boundary** — source-committed, with
+   connection-established evidence at it, **and no writes acknowledged
+   past it** (a barrier recorded mid-serving would prove nothing about
+   the tail written after it; a volume keeps serving after registration).
+   In P4a no automated component writes barriers (P4b's `BARRIER_DURABLE`
+   will); the only source is an operator-attested barrier recorded at
+   `register` time, and its attestation must explicitly cover the
+   last-acknowledged property. Absent that evidence the honest verdict is
+   `POSSIBLE_LOSS` with an *unknown* boundary — the contract explicitly
+   requires reporting unknown rather than pretending precise loss bounds.
+   An `Inconsistent` local disk means integrity is unprovable
+   (mid-resync loss) — `UNSAFE`, never a "partial" promotion.
 4. **Promotion**: takes a **new** epoch from the witness (`grant` — W2
    durably retires the old one; W7 has already waited out the fence
    window; the grant record returned is the `FencingProof`), then
    `drbdadm primary --force`, then verifies the role and device.
-   `--force` is required here because the kernel's unforced promotion gate
-   refuses promotion against a `DUnknown`/`Outdated` peer (an unplanned
-   failover is exactly that case); this is the second and last justified
-   `--force` path in the provider (P3's is seeding a provably-fresh
-   resource) and it is gated on the authority check above. `POSSIBLE_LOSS`
+   `--force` is used here because the kernel's unforced promotion gate is
+   `ASSUMPTION(unverified)`-expected to refuse promotion against a
+   `DUnknown`/`Outdated` peer (an unplanned failover is exactly that
+   case; the gate cannot be confirmed from the userspace sources — see
+   the real-cluster verification item in §8); this is the second and last
+   justified `--force` path in the provider (P3's is seeding a
+   provably-fresh resource) and it is gated on the authority check above,
+   not on the gate behaving as expected. `POSSIBLE_LOSS`
    additionally requires an explicit `allow_loss` authorization in the
    request (recorded with the exposure evidence — contract §8's recorded
    authorization). `UNSAFE` never promotes.
@@ -353,17 +389,16 @@ model), so failover is an **adopt-and-promote** admin operation:
 
 ## 6. Daemon and API surface
 
-- `volvisord` config: `witness_url`, `witness_token`, `lease_ttl_secs`,
-   `renewal_interval_secs`, `fence_grace_secs` (the response-latency bound
-   of W5), `fence_quarantine_secs`. Validation: `renewal_interval <
-   lease_ttl / 2` (the W7 precondition — a revoked writer always learns
-   before its deadline); `quarantine ≥ grace + suspend budget` (the §2
-   window bound — the suspend budget is a fixed documented constant, not a
-   guess about demotion; the forced-revoke wait is derived from these, not
-   separately configured); token required for non-loopback witness URLs;
-   the §3 two-sided failure-domain guard. A background tokio task runs
-   `renew_leases` every renewal interval; failures surface as events, not
-   crashes.
+- `volvisord` config: `witness_url`, `witness_token`,
+   `renewal_interval_secs`. The lease TTL, grace and the W7 wait live on
+   the **witness** (§3) — they are enforced there, so they are configured
+   there; the writer daemon validates `renewal_interval < ttl / 2`
+   against the TTL the witness reports in its responses (fail-closed
+   startup refusal on violation), rather than duplicating the value.
+   Token is required for non-loopback witness URLs, plus the §3
+   two-sided failure-domain guard. A background tokio task runs
+   `renew_leases` every renewal interval; failures surface as events,
+   not crashes.
 - `volvisor-api`: `GET /v2/volumes/{id}` (nearline) reports the
    `authority` section; `POST /v2/admin/nearline/{id}/adopt` runs §5 with
    body `{allow_loss: bool}` and responds with the classification and
@@ -396,9 +431,14 @@ model), so failover is an **adopt-and-promote** admin operation:
   roll-forward (kill between intent and outcome → retry with same
   `operation_id` completes, retry with fresh id is not blocked);
   idempotent grant replay; forced-revoke authorization recording; W7
-  window enforcement (`FENCE_PENDING` with retry-after after expiry, the
-  longer derived wait after forced revocation);
-  duration-from-response deadline shape.
+  window enforcement keyed on the **lease's recorded end** (`FENCE_PENDING`
+  with retry-after both after expiry and after forced revocation of a
+  partitioned writer's live lease — the exact case a
+  renewal-interval-based wait would get wrong); a power-off STONITH
+  attestation shortening the wait;
+  duration-from-response deadline shape; `inspect` returning the full
+  registration record (lineage UUIDs, both endpoints' backing identities,
+  barrier) for the adopt flow to compare against.
 - **Witness server (real loopback HTTP)**: auth fail-closed (no token →
   401; loopback-only without token); request/response round-trips against
   the proto types; journal-backed restart mid-traffic with W3a/W3b
@@ -411,7 +451,10 @@ model), so failover is an **adopt-and-promote** admin operation:
   cleared, demote completed on close); `STALE_EPOCH` → immediate
   self-fence; detach releases; reconcile validates; **startup
   fail-closed** (Primary witness-managed volume + unreachable witness →
-  stays suspended); epoch-0 volumes behave exactly as P3.
+  stays suspended; a Primary with **no attachment record** — the
+  crash-between-promote-and-save and zombie cases — is suspended the
+  same way, keyed on role + lease rather than the record); epoch-0
+  volumes behave exactly as P3.
 - **Promotion**: every row of the §5 table, including the two `UpToDate`/
   Protocol-C rows (with and without recorded barrier evidence); adoption
   verification refusals (foreign LV, missing tag on a volvisor-created
