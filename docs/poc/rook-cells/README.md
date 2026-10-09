@@ -47,7 +47,7 @@ Reference conservative cell budget: 6 vCPUs pinned/charged to physical host allo
 
 ## 3. Example enrollment plan
 
-[Example cell claim and resource plan](cell-plan.example.yaml) is illustrative YAML **not an executable current Volvisor API**. An implementation must create/version the machine-readable plan separately, with immutable storage device IDs and trusted host/guest identity verification before any mutation.
+[Example cell claim and resource plan](cell-plan.example.yaml) is illustrative YAML **not an executable current Volvisor API**. An implementation must create/version the machine-readable plan separately, with immutable storage device IDs and trusted host/guest identity verification before any mutation. An illustrative [kubelet configuration](kubelet-config.example.yaml) shows the in-guest system/kube reservation and eviction starting point for the fixed 6 vCPU / 16 GiB cell budget.
 
 The Kubernetes CephCluster CR is the **real Rook integration surface**. Disk paths are guest-visible and must be revalidated on every cell restart; the host claim is an independent Volvisor transaction. Rook's RBD StorageClass is optional for Kubernetes CSI consumers; O3K's direct Ceph RBD volume adapter can use an existing cluster with host-level mapping and appropriate Ceph credentials without running guest workloads inside cells.
 
@@ -79,6 +79,8 @@ The Kubernetes CephCluster CR is the **real Rook integration surface**. Disk pat
 **NO-GO for Rook-cell mode**: require a Rook fork with invasive changes; host cannot VFIO-isolate OSD controllers; cell-only Pod policy cannot be enforced; Ceph cannot survive intended physical-host failure; bootstrap depends on Ceph; resource competition disrupts tenant VMs; or unacceptable latency/ops overhead relative to direct Rook.
 
 ## 5. Evidence bundle and follow-up
+
+The read-only [collect-evidence.sh](collect-evidence.sh) helper snapshots the Kubernetes-side state and runs the node pre-flight checks (names, Ready, trusted role label); it performs **no disk mutations**, is not an automated GO verdict, and the physical-host evidence below is still required manually.
 
 Each iteration stores:
 - immutable HostId/CellId, source commit, guest image/kernel, CHV/Rook/Ceph/K8s/containerd/CNI digests;
