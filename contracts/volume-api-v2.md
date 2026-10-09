@@ -82,6 +82,26 @@ Resize up/down and snapshot/clone are **capabilities**, not guaranteed features 
 
 Delete requires correct generation, fully detached/stopped writer, no dependent snapshots/clones, safe backend deletion proof and explicit data-erasure policy. Foreign/mismatched state is quarantined. A successful API response must correspond to persisted observed state, or unambiguously indicate accepted asynchronous work.
 
+## 4A. GrowVolume and MoveVolumeBackingOnline
+
+Online size growth and same-host live backing relocation are **separate APIs**, both different from cross-host VM migration. See [ADR-0006](../docs/adr/0006-online-resize-and-live-local-block-relocation.md).
+
+```text
+GrowVolume(volume_id, new_size_bytes, expected_generation, idempotency_key)
+  -> backing_resized, guest_notification_status, effective_size_bytes
+
+MoveVolumeBackingOnline(volume_id, target_pool_id, expected_generation,
+                        operation_id, max_copy_bytes_per_sec)
+  -> PREPARING | COPYING | MIRROR_READY | PIVOTED | COMPLETE |
+     FAILED | IN_DOUBT
+```
+
+- Grow-only by default; backend may grow before the VMM/guest is notified. The provider must retry notification, not automatically shrink. Guest filesystem expansion is not implied.
+- `MoveVolumeBackingOnline` does not change compute host or guest disk identity. Backends advertise `same_vg_extent_move` and `same_host_live_backing_move` separately, bound to actual LV layout/VMM/frontend/QSD qualification.
+- Native LVM `pvmove` is restricted to supported physical extent migrations within the same VG, and should not be presented as arbitrary per-thin-LV cross-pool movement.
+- General online same-host move via QEMU Storage Daemon vhost-user-blk is an **experimental** capability until mirror, pivot, reattach/restart, writer fencing, guest flush/FUA, idempotency and in-doubt recovery pass fault injection.
+- Source deletion must only occur after the target pivot and persistent ownership reconciliation; an unknown result is not a safe reason to revert authority or delete either copy.
+
 ## 5. MigrateVolume / MigrateVM
 
 ```text

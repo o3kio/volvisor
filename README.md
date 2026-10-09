@@ -34,6 +34,7 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 - [ADR-0003 — volume architecture](docs/adr/0003-tiered-volume-virtualization.md)
 - [ADR-0004 — nearline replication and migration](docs/adr/0004-nearline-replication-and-mobility.md)
 - [ADR-0005 — Ceph RBD versus OSD lifecycle](docs/adr/0005-ceph-rbd-and-managed-osds.md)
+- [ADR-0006 — online resize and live local block relocation](docs/adr/0006-online-resize-and-live-local-block-relocation.md)
 - [SPEC-0002 — v2 implementation specification](docs/specs/SPEC-0002-volvisor-volume-virtualization.md)
 - [Volume API contract v2](contracts/volume-api-v2.md)
 - [Nearline replication contract v2](contracts/nearline-replication-v2.md)
@@ -48,3 +49,5 @@ The v1 drafts remain available for traceability and historical design research. 
 ## Status
 
 **Design proposal, not implementation.** No class is production supported; no durability, performance, zero-RPO failover, or live-migration capability is claimed until exact-SHA real-host conformance and fault-injection evidence passes. The first recommended implementations are a host-native logical-volume provider and an adapter to an existing Ceph RBD cluster. Nearline distributed authority is the highest-risk R&D area.
+
+Online growth of a local LV is distinct from **same-host live relocation** of its backing storage, which is itself distinct from cross-host live VM migration. See ADR-0006 for native Cloud Hypervisor resize, same-VG LVM pvmove, and optional QEMU Storage Daemon + vhost-user-blk block mirroring.

@@ -77,6 +77,16 @@ Phase B (separate acceptance): Volvisor-managed OSD placement in Storage Cells, 
 
 Never double-replicate under an OSD by default. Existing Ceph clusters do not require OSDs to move into Storage Cell VMs. RBD snapshots, clones and resize are conditional on safe backend-validated workflows, not automatically shared API guarantees.
 
+## 6A. Online resize and same-host local storage relocation
+
+[ADR-0006](../adr/0006-online-resize-and-live-local-block-relocation.md) distinguishes three different operations:
+
+- **Online native LV growth:** grow underlying LVM/dm capacity, verify actual size, notify the running Cloud Hypervisor disk via the qualified `/vm.resize-disk` API, and let the guest resize partitions/filesystems. No disk-content copy or VM migration is needed. A failed guest notification after successful LV growth is a retryable partial completion, never an instruction to shrink backing data.
+- **Same-VG physical-extent evacuation:** LVM `pvmove` may relocate supported LV extents online while the guest-facing dm mapping remains stable. It cannot be assumed to move an individual thin LV to a different thin pool; validate supported layout and scope.
+- **Online whole-volume backing migration across pools/VGs on the same host:** optional QEMU Storage Daemon + Cloud Hypervisor vhost-user-blk mirror/pivot experiment. This introduces an external I/O engine and requires exclusive writer ownership, mirror/pivot failure semantics, flush/FUA correctness, guest identity stability, backend restart recovery and exact-VMM-version qualification before exposing a supported capability.
+
+**None of these operations makes a native-local VM live-migratable to a different compute host.** Online backing relocation and cross-host nearline handoff have separate capability flags, failure modes and evidence requirements.
+
 ## 7. Consumer API and operation states
 
 Operations are specified in [Volume API v2](../../contracts/volume-api-v2.md). Every mutation must carry idempotency key, expected generation and authorization scope. A provider must not return `Ready` while an attachment is merely declared.
