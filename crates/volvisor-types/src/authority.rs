@@ -132,17 +132,16 @@ pub struct VolumeRegistration {
 /// The witness's durable statement that an epoch of a volume was retired.
 ///
 /// Produced by the grant of a strictly newer epoch (which retires all older
-/// ones) or by an explicit recorded revocation. Irrevocable: the witness
-/// will never accept a renewal for a retired epoch.
+/// ones) or by an explicit recorded revocation — in both cases the
+/// retirement is bound to the witness commit index that durably recorded
+/// it. Irrevocable: the witness will never accept a renewal for a retired
+/// epoch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FencingProof {
     /// The volume whose writer was fenced.
     pub volume_id: VolumeId,
     /// The epoch that can no longer admit writes.
     pub retired_epoch: WriterEpoch,
-    /// The epoch whose grant retired it (strictly newer; equals
-    /// `retired_epoch + 1` or more).
-    pub granted_epoch: WriterEpoch,
     /// The witness commit index that durably recorded the retirement —
     /// contract §1's `authority_commit_index`.
     pub commit_index: u64,
