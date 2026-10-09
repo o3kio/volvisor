@@ -121,8 +121,10 @@ Out (recorded follow-ups):
 
 - `provider = "ceph"` with: `ceph_cluster_fsid`, `ceph_mon_hosts` (1..=9
   entries), `ceph_pool`, `ceph_user` (default `client.volvisor`),
-  `ceph_keyring_path` (path only; contents never logged or journaled),
   `ceph_state_path` (durable state, default `<journal_dir>/ceph-state.json`).
+  Credentials are resolved entirely by the `ceph`/`rbd` CLIs from the host's
+  standard keyring/configuration conventions — volvisor passes only `--id` and
+  `-m` and never reads, stores or logs key material.
 - Startup: FSID must match configuration exactly; pool must exist; a health
   query must succeed. Any mismatch → refuse to start (fail-closed; a
   mis-pointed cluster must never be adopted).

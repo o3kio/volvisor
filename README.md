@@ -49,20 +49,25 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 
 A Rust workspace implements the P0 control plane (stable IDs, device claiming,
 single-volume API/attachments, provider conformance — SPEC-0002 section 12)
-plus the first native-local LVM slice:
+plus the native-local LVM slice and the external Ceph RBD adapter slice:
 
 ```text
 crates/volvisor-types      typed domain vocabulary (Volume API v2 mirror)
 crates/volvisor-journal    durable intent journal + idempotency registry
-crates/volvisor-provider   engine-neutral provider trait + conformance kit
+crates/volvisor-provider   engine-neutral provider trait, command runner,
+                           fake provider + conformance kit
 crates/volvisor-lvm        native-local LVM provider (thick LV, P1 slice)
+crates/volvisor-ceph       ceph-rbd adapter for an existing external Ceph
+                           cluster (P2 slice, ADR-0005 Phase A)
 crates/volvisor-api        HTTP/JSON Volume API v2 server
 crates/volvisord           daemon binary
 ```
 
 Build and test: `cargo build`, `cargo test --workspace`,
 `cargo clippy --all-targets` (CI denies warnings). Real-LVM integration tests
-run only when `VOLVISOR_TEST_LVM=1` and root are available. This is prototype
+run only when `VOLVISOR_TEST_LVM=1` and root are available; real-Ceph
+integration tests run only when `VOLVISOR_TEST_CEPH=1` plus
+`VOLVISOR_CEPH_*` cluster configuration are present. This is prototype
 software: no production-support claim is made or implied (AGENTS rule 12).
 
 ## Historical draft v1 (superseded proposals)

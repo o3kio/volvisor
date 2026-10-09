@@ -1142,6 +1142,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "volvisor-api",
+ "volvisor-ceph",
  "volvisor-journal",
  "volvisor-lvm",
  "volvisor-provider",
