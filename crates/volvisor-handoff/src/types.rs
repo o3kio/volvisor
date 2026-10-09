@@ -123,9 +123,11 @@ impl std::fmt::Display for HandoffState {
 }
 
 /// The durable cut progress record (plan D1a): written **before** each
-/// irreversible external act, cleared when the state lands at
-/// [`HandoffState::SourceRevoked`] (the revoke is the last cut step;
-/// from there the state itself carries the forward-only property).
+/// irreversible external act, and retained through the whole
+/// forward-only window — the state lands at
+/// [`HandoffState::SourceRevoked`] with the last cut step still
+/// recorded (the D3 crash window stays `IN_DOUBT`-observable, G1) and
+/// the field is cleared only at [`HandoffState::Complete`].
 ///
 /// A sub-field of [`MigrationRecord`], never a canonical state. The
 /// names are the serde snake_case spellings; [`std::fmt::Display`]
@@ -262,9 +264,10 @@ pub struct MigrationRecord {
     pub participants: Vec<Participant>,
     /// The canonical state.
     pub state: HandoffState,
-    /// The cut progress (write-ahead), `None` outside the cut; cleared
-    /// when the state lands at `SourceRevoked` and therefore `None`
-    /// at `Complete`.
+    /// The cut progress (write-ahead), `None` outside the cut; retained
+    /// through `SourceRevoked`/`DestinationAuthorized`/`VmResumed` (the
+    /// D3 window stays `IN_DOUBT`-observable, G1) and cleared at
+    /// `Complete`.
     pub cut: Option<CutProgress>,
     /// The append-only observable trace.
     pub state_history: Vec<StateHistoryEntry>,
@@ -297,14 +300,34 @@ impl MigrationRecord {
         let mut in_doubt_detail = None;
         let state = if let Some(cut) = self.cut {
             // A live cut is observable only before DESTINATION_AUTHORIZED
-            // (the cut field is cleared when the state lands at
-            // SourceRevoked); the rank guard keeps the mapping total.
+            // (the rank guard); the write-ahead itself is retained
+            // through `VmResumed` and cleared at `Complete` (plan §2).
             if self
                 .state
                 .forward_rank()
                 .is_some_and(|rank| rank >= AUTHORIZED_RANK)
             {
+                if self
+                    .state
+                    .forward_rank()
+                    .is_some_and(|rank| (AUTHORIZED_RANK..COMPLETE_RANK).contains(&rank))
+                {
+                    in_doubt_detail = Some(format!(
+                        "stalled in {}: migration not yet complete",
+                        self.state
+                    ));
+                }
                 self.state.clone()
+            } else if self.state == HandoffState::SourceRevoked {
+                // The D3 window: the revoke landed, the grant has not.
+                // The record is forward-only and must not read as a
+                // clean, progress-like canonical state (G1).
+                let detail = "source revoked; destination grant not yet authorized".to_owned();
+                in_doubt_detail = Some(detail.clone());
+                HandoffState::InDoubt {
+                    since: self.updated_at,
+                    detail,
+                }
             } else {
                 let detail = format!("cut in progress: {cut}");
                 in_doubt_detail = Some(detail.clone());
@@ -519,14 +542,37 @@ mod tests {
     #[test]
     fn observe_reports_canonical_state_with_stall_detail_from_authorization() {
         for state in [HandoffState::DestinationAuthorized, HandoffState::VmResumed] {
-            let summary = record(state.clone(), None).observe();
-            assert_eq!(summary.state, state);
-            let detail = summary.in_doubt_detail.expect("stall detail");
-            assert!(detail.contains("stalled"), "{detail}");
+            // The cut write-ahead is retained through these states
+            // (cleared at Complete); the canonical state still
+            // reports, with the stall detail.
+            for cut in [None, Some(CutProgress::Revoking)] {
+                let summary = record(state.clone(), cut).observe();
+                assert_eq!(summary.state, state, "cut={cut:?}");
+                let detail = summary.in_doubt_detail.expect("stall detail");
+                assert!(detail.contains("stalled"), "{detail}");
+            }
         }
         let complete = record(HandoffState::Complete, None).observe();
         assert_eq!(complete.state, HandoffState::Complete);
         assert_eq!(complete.in_doubt_detail, None);
+    }
+
+    #[test]
+    fn observe_reports_a_stalled_source_revoked_as_in_doubt() {
+        // G1/D3: the cut write-ahead is retained through the D3 crash
+        // window (revoke landed, grant has not). A record parked at
+        // SOURCE_REVOKED must read as IN_DOUBT with a typed detail —
+        // never as a clean, progress-like canonical state.
+        let summary = record(HandoffState::SourceRevoked, Some(CutProgress::Revoking)).observe();
+        assert!(
+            matches!(summary.state, HandoffState::InDoubt { .. }),
+            "a stalled SourceRevoked observes IN_DOUBT, got {:?}",
+            summary.state
+        );
+        assert_eq!(
+            summary.in_doubt_detail.as_deref(),
+            Some("source revoked; destination grant not yet authorized")
+        );
     }
 
     #[test]

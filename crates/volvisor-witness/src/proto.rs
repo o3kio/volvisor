@@ -68,6 +68,19 @@ pub enum CallerIdentity {
 }
 
 impl CallerIdentity {
+    /// The named host behind this identity, when the caller
+    /// authenticated with a host credential (the legacy shared token
+    /// has none — it is read-only). Journaled as the acting host on
+    /// mutations whose records would otherwise not carry it (W8's
+    /// audit-trail sentence).
+    #[must_use]
+    pub const fn host(&self) -> Option<&HostId> {
+        match self {
+            Self::Legacy => None,
+            Self::Host(host) => Some(host),
+        }
+    }
+
     /// W8 enforcement for every mutating core call: the caller must be
     /// the host the request asserts. A `Legacy` caller (shared token)
     /// and a `Host` caller asserting a different host are both refused

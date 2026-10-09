@@ -6798,4 +6798,242 @@ mod tests {
             ApiErrorCode::InsufficientFailureDomains
         );
     }
+
+    // ------------------------------------------------------------------
+    // Migration-barrier evidence edge cells (round-1 review, finding
+    // 5): the arms the integration harness cannot reach — the
+    // recorder-binding guard on a still-current epoch, the
+    // oldest-of-equally-short fold, an unorderable epoch, and a
+    // qualifying barrier over a not-UpToDate local disk.
+
+    fn all_true() -> volvisor_types::BarrierAttestation {
+        volvisor_types::BarrierAttestation {
+            vm_paused_and_drained: true,
+            data_path_suspended: true,
+            peer_up_to_date: true,
+        }
+    }
+
+    fn barrier(
+        holder: &str,
+        epoch: u32,
+        boundary_commit_index: u64,
+        attestation: volvisor_types::BarrierAttestation,
+        voided: bool,
+    ) -> volvisor_types::RecordedMigrationBarrier {
+        volvisor_types::RecordedMigrationBarrier {
+            holder: HostId::new(holder).expect("valid holder"),
+            epoch: WriterEpoch(epoch.into()),
+            boundary_commit_index,
+            attestation,
+            migration_id: Some(MigrationId::new("mig-1").expect("valid migration id")),
+            recorded_at: 1_000,
+            voided,
+        }
+    }
+
+    fn view(
+        current_epoch: u32,
+        holder: Option<&str>,
+        barriers: Vec<volvisor_types::RecordedMigrationBarrier>,
+        retirements: Vec<(u32, u64)>,
+    ) -> AuthorityView {
+        AuthorityView {
+            volume_id: volume_id("vol-edge"),
+            current_epoch: WriterEpoch(current_epoch.into()),
+            holder: holder.map(|raw| HostId::new(raw).expect("valid holder")),
+            lease_state: LeaseState::Revoked,
+            lease_id: None,
+            lease_remaining_secs: None,
+            commit_index: 90,
+            registration: None,
+            barriers,
+            retirements: retirements
+                .into_iter()
+                .map(|(epoch, commit_index)| volvisor_types::EpochRetirement {
+                    epoch: WriterEpoch(epoch.into()),
+                    commit_index,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn migration_evidence_binds_the_recorder_to_the_current_epoch_holder() {
+        // Defense-in-depth arm: a barrier of the STILL-CURRENT epoch
+        // whose recorded holder is not the epoch's holder is short
+        // evidence, never qualifying (W8/W9 make a legitimate record
+        // unable to reach this shape — the witness only accepts
+        // RecordBarrier from the live holder — but the classifier
+        // must not trust the log's shape to prove it).
+        let mismatched = view(
+            2,
+            Some("holder-a"),
+            vec![barrier("holder-b", 2, 40, all_true(), false)],
+            vec![],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&mismatched, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Short {
+                boundary_commit_index: 40
+            }
+        );
+        // The matching holder qualifies (the vacuous still-current
+        // comparison target, D5).
+        let bound = view(
+            2,
+            Some("holder-a"),
+            vec![barrier("holder-a", 2, 40, all_true(), false)],
+            vec![],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&bound, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Qualifying {
+                boundary_commit_index: 40
+            }
+        );
+    }
+
+    #[test]
+    fn migration_evidence_prefers_the_oldest_of_equally_short_barriers() {
+        // Two partial-attestation barriers of the same epoch: the
+        // oldest (the journal iterates oldest first) wins — the most
+        // conservative recorded boundary.
+        let oldest_first = view(
+            2,
+            Some("holder-a"),
+            vec![
+                barrier(
+                    "holder-a",
+                    2,
+                    40,
+                    volvisor_types::BarrierAttestation {
+                        vm_paused_and_drained: true,
+                        data_path_suspended: true,
+                        peer_up_to_date: false,
+                    },
+                    false,
+                ),
+                barrier(
+                    "holder-a",
+                    2,
+                    55,
+                    volvisor_types::BarrierAttestation {
+                        vm_paused_and_drained: false,
+                        data_path_suspended: true,
+                        peer_up_to_date: true,
+                    },
+                    false,
+                ),
+            ],
+            vec![(2, 80)],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&oldest_first, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Short {
+                boundary_commit_index: 40
+            }
+        );
+        // A later qualifying barrier upgrades the evidence (the
+        // strongest present wins, §7).
+        let upgraded = view(
+            2,
+            Some("holder-a"),
+            vec![
+                barrier(
+                    "holder-a",
+                    2,
+                    40,
+                    volvisor_types::BarrierAttestation {
+                        vm_paused_and_drained: true,
+                        data_path_suspended: true,
+                        peer_up_to_date: false,
+                    },
+                    false,
+                ),
+                barrier("holder-a", 2, 55, all_true(), false),
+            ],
+            vec![(2, 80)],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&upgraded, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Qualifying {
+                boundary_commit_index: 55
+            }
+        );
+    }
+
+    #[test]
+    fn a_barrier_of_a_neither_retired_nor_current_epoch_is_short() {
+        // Source epoch 2, current epoch 3, no retirement record for
+        // 2: the barrier cannot be ordered against any retirement —
+        // fail closed (short evidence, its recorded boundary only).
+        let unorderable = view(
+            3,
+            Some("holder-b"),
+            vec![barrier("holder-a", 2, 40, all_true(), false)],
+            vec![],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&unorderable, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Short {
+                boundary_commit_index: 40
+            }
+        );
+        // The same shape with epoch 2 retired at 60 is qualifying:
+        // 40 < 60 (ordering, never terminality).
+        let ordered = view(
+            3,
+            Some("holder-b"),
+            vec![barrier("holder-a", 2, 40, all_true(), false)],
+            vec![(2, 60)],
+        );
+        assert_eq!(
+            DrbdProvider::migration_barrier_evidence(&ordered, WriterEpoch(2), None),
+            MigrationBarrierEvidence::Qualifying {
+                boundary_commit_index: 40
+            }
+        );
+    }
+
+    #[test]
+    fn a_qualifying_barrier_over_a_not_uptodate_disk_keeps_the_known_boundary() {
+        // A qualifying barrier over a `Consistent`/`Outdated` local
+        // disk never claims SAFE_CURRENT (the barrier attests the
+        // acknowledged tail, not the local one) — the honest result is
+        // possible loss with the barrier's recorded boundary.
+        for disk in [DiskState::Consistent, DiskState::Outdated] {
+            let (classification, evidence) = DrbdProvider::classify_promotion(
+                &disk,
+                ReplicationMode::A,
+                None,
+                MigrationBarrierEvidence::Qualifying {
+                    boundary_commit_index: 40,
+                },
+                false,
+            );
+            assert_eq!(evidence, SafeCurrentEvidence::None, "disk={disk:?}");
+            assert_eq!(
+                classification,
+                PromotionClassification::PossibleLoss {
+                    boundary: LossBoundary::Known("witness-commit-40".to_owned()),
+                    authorized: false,
+                },
+                "disk={disk:?}"
+            );
+        }
+        // Over `UpToDate` the same evidence is SAFE_CURRENT,
+        // protocol-independent.
+        let (classification, evidence) = DrbdProvider::classify_promotion(
+            &DiskState::UpToDate,
+            ReplicationMode::A,
+            None,
+            MigrationBarrierEvidence::Qualifying {
+                boundary_commit_index: 40,
+            },
+            false,
+        );
+        assert_eq!(evidence, SafeCurrentEvidence::MigrationBarrier);
+        assert_eq!(classification, PromotionClassification::SafeCurrent);
+    }
 }

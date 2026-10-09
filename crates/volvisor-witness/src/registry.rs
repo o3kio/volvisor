@@ -131,6 +131,11 @@ enum Mutation {
         lease_id: LeaseId,
         /// New witness-clock end (`renewal time + ttl`).
         end_secs: u64,
+        /// The acting host (the resolved caller identity) — journaled
+        /// for the audit trail; the fold derives state from the lease,
+        /// not from this field. `None` only in pre-v2 journals.
+        #[serde(default)]
+        actor: Option<HostId>,
     },
     /// Revocation of the current lease (forced or self-release).
     Revoke {
@@ -145,6 +150,13 @@ enum Mutation {
         power_off_attested: bool,
         /// The W6 authorization record, when one was required/received.
         authorization: Option<crate::proto::RevocationAuthorization>,
+        /// The acting host (the resolved caller identity) — journaled
+        /// for the audit trail; the only recoverable record of **who**
+        /// performed a forced revocation (the authorization names the
+        /// human operator, not the daemon host). `None` only in
+        /// pre-v2 journals.
+        #[serde(default)]
+        actor: Option<HostId>,
     },
     /// Recording of a migration barrier (P4b plan §4 W9): the witness
     /// stamps the entry into the volume's barrier log; the entry is
@@ -178,6 +190,11 @@ enum Mutation {
     RevokeSet {
         /// The member releases (volume, proof, self-release flag).
         releases: Vec<RevokeSetEntry>,
+        /// The acting host (the resolved caller identity — the whole
+        /// set releases as one host) — journaled for the audit trail.
+        /// `None` only in pre-v2 journals.
+        #[serde(default)]
+        actor: Option<HostId>,
     },
     /// Batch grant (P4b plan §4 W10): one host acquiring writer
     /// authority for every member volume in one journaled mutation —
@@ -568,6 +585,7 @@ impl WitnessCore {
             volume_id: volume_id.clone(),
             lease_id: lease.lease_id,
             end_secs,
+            actor: caller.host().cloned(),
         };
         self.commit(
             &request.operation_id,
@@ -689,6 +707,7 @@ impl WitnessCore {
             self_released: self_release,
             power_off_attested,
             authorization: request.authorization.clone(),
+            actor: caller.host().cloned(),
         };
         self.commit(
             &request.operation_id,
@@ -981,7 +1000,10 @@ impl WitnessCore {
                 })
                 .collect(),
         };
-        let mutation = Mutation::RevokeSet { releases: entries };
+        let mutation = Mutation::RevokeSet {
+            releases: entries,
+            actor: caller.host().cloned(),
+        };
         self.commit(
             &request.operation_id,
             hash,
@@ -1264,6 +1286,7 @@ impl WitnessCore {
                 volume_id,
                 lease_id,
                 end_secs,
+                ..
             } => self.apply_renew(volume_id, *lease_id, *end_secs),
             Mutation::Revoke {
                 volume_id,
@@ -1287,7 +1310,7 @@ impl WitnessCore {
                 epoch,
                 boundary_commit_index,
             } => self.apply_void_barrier(volume_id, holder, *epoch, *boundary_commit_index),
-            Mutation::RevokeSet { releases } => self.apply_revoke_set(commit_index, releases),
+            Mutation::RevokeSet { releases, .. } => self.apply_revoke_set(commit_index, releases),
             Mutation::GrantSet { grants } => self.apply_grant_set(commit_index, grants),
         }
         for volume_id in mutation.volume_ids() {
@@ -1414,6 +1437,13 @@ impl WitnessCore {
     /// index.
     fn apply_revoke_set(&mut self, commit_index: u64, releases: &[RevokeSetEntry]) {
         for entry in releases {
+            // An unknown member is skipped, never invented: the live
+            // path pre-validates every member (`UnknownVolume` before
+            // anything is journaled) and a replayed batch was already
+            // validated, so this arm is twice-defensive — it guards a
+            // corrupted journal or a host bug writing an unregistered
+            // member. A skipped member keeps its prior state, which
+            // the caller's own reconcile re-checks externally.
             let Some(vol) = self.volumes.get_mut(&entry.volume_id) else {
                 continue;
             };
@@ -1431,6 +1461,9 @@ impl WitnessCore {
     /// index.
     fn apply_grant_set(&mut self, commit_index: u64, grants: &[GrantRecord]) {
         for record in grants {
+            // Unknown member: skipped, never invented — the live path
+            // pre-validates every member before journaling, so this is
+            // twice-defensive (see apply_revoke_set).
             let Some(vol) = self.volumes.get_mut(&record.volume_id) else {
                 continue;
             };
@@ -1477,7 +1510,7 @@ impl Mutation {
             | Mutation::Revoke { volume_id, .. }
             | Mutation::RecordBarrier { volume_id, .. }
             | Mutation::VoidBarrier { volume_id, .. } => vec![volume_id],
-            Mutation::RevokeSet { releases } => {
+            Mutation::RevokeSet { releases, .. } => {
                 releases.iter().map(|entry| &entry.volume_id).collect()
             }
             Mutation::GrantSet { grants } => {
@@ -2359,6 +2392,100 @@ mod tests {
     }
 
     // ------------------------------------------------------ P4b W8
+
+    /// The journaled mutations of a dropped core, oldest first — the
+    /// audit trail (the journal enforces single-writer, so the core
+    /// must be closed before its records are read).
+    fn journaled_mutations(dir: &std::path::Path) -> Vec<Mutation> {
+        let (journal, records) =
+            Journal::open_with_records(dir).expect("reopen the journal read-only");
+        drop(journal);
+        records
+            .into_iter()
+            .filter_map(|record| {
+                let JournalRecord::Intent(intent) = record else {
+                    return None;
+                };
+                if !intent.op_kind.starts_with(OP_KIND_PREFIX) {
+                    return None;
+                }
+                let envelope: MutationEnvelope =
+                    serde_json::from_value(intent.payload.clone()).ok()?;
+                Some(envelope.mutation)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn w8_the_acting_host_is_journaled_on_every_mutation() {
+        // The W8 audit-trail sentence: every journaled mutation records
+        // the bound identity. `Grant`, `RecordBarrier` and the barrier
+        // voids carry their host structurally; these three carry it
+        // only through the actor annotation — the forced revoke most
+        // importantly, where the W6 authorization names the human
+        // operator, not the daemon host that presented the credential.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, grant) = granted(dir.path(), 1_000);
+        core.renew(
+            &volume(1),
+            &renew_request(3, 1, grant.epoch, grant.lease_id),
+            1_020,
+            &caller(1),
+        )
+        .expect("renew by the holder");
+        let mut forced = revoke_request(4, 2, WriterEpoch(1));
+        forced.authorization = Some(RevocationAuthorization {
+            operator: "op@example".to_owned(),
+            reason: "host-1 partitioned; forced failover".to_owned(),
+        });
+        core.revoke(&volume(1), &forced, 1_050, &caller(2))
+            .expect("forced revocation by host-2");
+        drop(core);
+        let mutations = journaled_mutations(dir.path());
+        let renew_actor = mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Renew { actor, .. } => Some(actor.clone()),
+                _ => None,
+            })
+            .expect("a journaled renew");
+        assert_eq!(renew_actor, Some(host(1)));
+        let revoke_actor = mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                Mutation::Revoke { actor, .. } => Some(actor.clone()),
+                _ => None,
+            })
+            .expect("a journaled revoke");
+        assert_eq!(
+            revoke_actor,
+            Some(host(2)),
+            "the forced revoke records the acting daemon host"
+        );
+
+        // The batch self-release journals the one host releasing the set.
+        let set_dir = tempfile::tempdir().expect("tempdir");
+        let mut pair = registered_pair(set_dir.path());
+        pair.grant(&volume(1), &grant_request(10, 1), 1_100, &caller(1))
+            .expect("grant vol-1");
+        pair.grant(&volume(2), &grant_request(11, 1), 1_100, &caller(1))
+            .expect("grant vol-2");
+        pair.revoke_set(
+            &revoke_set_request(12, 1, vec![batch_release(1, WriterEpoch(1))]),
+            1_150,
+            &caller(1),
+        )
+        .expect("revoke set");
+        drop(pair);
+        let set_actor = journaled_mutations(set_dir.path())
+            .into_iter()
+            .find_map(|mutation| match mutation {
+                Mutation::RevokeSet { actor, .. } => Some(actor.clone()),
+                _ => None,
+            })
+            .expect("a journaled revoke set");
+        assert_eq!(set_actor, Some(host(1)));
+    }
 
     #[test]
     fn w8_mutations_require_the_bound_host_identity() {

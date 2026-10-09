@@ -642,9 +642,15 @@ fn expected_happy_history() -> Vec<(HandoffState, Option<CutProgress>)> {
         ),
         (HandoffState::BarrierDurable, Some(CutProgress::Demoting)),
         (HandoffState::BarrierDurable, Some(CutProgress::Revoking)),
-        (HandoffState::SourceRevoked, None),
-        (HandoffState::DestinationAuthorized, None),
-        (HandoffState::VmResumed, None),
+        // The cut write-ahead is retained through the D3 window
+        // (G1: `IN_DOUBT`-observable until DESTINATION_AUTHORIZED)…
+        (HandoffState::SourceRevoked, Some(CutProgress::Revoking)),
+        (
+            HandoffState::DestinationAuthorized,
+            Some(CutProgress::Revoking),
+        ),
+        (HandoffState::VmResumed, Some(CutProgress::Revoking)),
+        // …and cleared at Complete.
         (HandoffState::Complete, None),
     ]
 }
@@ -1023,7 +1029,26 @@ async fn resolve_drives_forward_from_authorization_states() {
         let coordinator = fixture.coordinator();
         let record = fixture.stored_record();
         assert_eq!(record.state, expected_state, "{act}");
-        assert_eq!(record.cut, None, "{act}");
+        // The cut write-ahead is retained (cleared at Complete), so a
+        // record stalled at SourceRevoked observes IN_DOUBT — never a
+        // clean canonical state without a doubt signal (G1/D3).
+        assert_eq!(record.cut, Some(CutProgress::Revoking), "{act}");
+        if expected_state == HandoffState::SourceRevoked {
+            let summary = coordinator
+                .observe(&migration_id())
+                .expect("observe the stalled record")
+                .expect("the stalled record must be observable");
+            assert!(
+                matches!(summary.state, HandoffState::InDoubt { .. }),
+                "{act}: a stalled SourceRevoked must be IN_DOUBT-observable, got {:?}",
+                summary.state
+            );
+            assert_eq!(
+                summary.in_doubt_detail.as_deref(),
+                Some("source revoked; destination grant not yet authorized"),
+                "{act}"
+            );
+        }
 
         let resolved = coordinator.resolve(&migration_id()).await.expect("resolve");
         assert_eq!(resolved.state, HandoffState::Complete, "{act}");

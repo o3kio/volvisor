@@ -112,6 +112,17 @@ pub trait HandoffDriver: Send + Sync {
     /// Void every barrier this migration recorded. **Must confirm**:
     /// `Ok` means every recorded barrier of the epoch is durably
     /// voided (G5's hard gate on any source resume).
+    ///
+    /// B2 seam contract (round-1 review, finding 3): confirm by
+    /// **state**, never by fresh-mutation success — a void whose
+    /// response was lost already journaled, so a re-attempt under a
+    /// fresh operation id is refused (`no matching recorded barrier`)
+    /// even though the barrier IS voided and resuming would be safe.
+    /// The correct confirmation is a witness `inspect`: every barrier
+    /// this migration recorded for the epoch carries `voided: true`.
+    /// (Alternatively the driver may derive a deterministic void op
+    /// id so the journal replays the recorded outcome — the batch
+    /// operations already do; either path satisfies "confirm".)
     async fn void_barriers(&self, record: &MigrationRecord) -> Result<(), ApiError>;
 
     /// Unsuspend one participant's source I/O (the abort tail).
@@ -661,9 +672,13 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
                 )?;
                 self.driver.revoke_set(record, &op_id).await?;
             }
-            // The cut is over: the state itself carries forward-only
-            // from here.
-            self.transition(record, HandoffState::SourceRevoked, None, None)?;
+            // The cut is over, but the write-ahead is retained through
+            // `VmResumed` and cleared at `Complete` (plan §2): a
+            // record parked here is inside the D3 crash window and
+            // must stay `IN_DOUBT`-observable until
+            // `DESTINATION_AUTHORIZED` (G1).
+            let cut = record.cut;
+            self.transition(record, HandoffState::SourceRevoked, cut, None)?;
         }
         Ok(())
     }
@@ -693,7 +708,10 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             )?;
             self.driver.grant_set(record, &op_id).await?;
         }
-        self.transition(record, HandoffState::DestinationAuthorized, None, None)
+        // The cut write-ahead is retained (cleared at `Complete`):
+        // `observe()` stops mapping it to `IN_DOUBT` from this rank on.
+        let cut = record.cut;
+        self.transition(record, HandoffState::DestinationAuthorized, cut, None)
     }
 
     /// `DestinationAuthorized → VmResumed`: promote every participant
@@ -709,7 +727,8 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         }
         self.driver.restore_vm(record).await?;
         self.driver.resume_vm(&record.vm_id).await?;
-        self.transition(record, HandoffState::VmResumed, None, None)
+        let cut = record.cut;
+        self.transition(record, HandoffState::VmResumed, cut, None)
     }
 
     /// `VmResumed → Complete`: clear the cut markers, verify the
@@ -846,19 +865,21 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             )?;
         }
         if record.cut == Some(CutProgress::Revoking) && all_revoked {
+            let cut = record.cut;
             self.transition(
                 record,
                 HandoffState::SourceRevoked,
-                None,
+                cut,
                 Some("leases revoked: the revoke is observed done".to_owned()),
             )?;
         }
         // State folds.
         if record.state == HandoffState::SourceRevoked && all_granted {
+            let cut = record.cut;
             self.transition(
                 record,
                 HandoffState::DestinationAuthorized,
-                None,
+                cut,
                 Some("target grants observed: the grant is observed done".to_owned()),
             )?;
         }

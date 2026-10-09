@@ -1,5 +1,8 @@
 //! Coordinated-handoff behavior over the DRBD engine (P4b plan §9,
-//! stage-B1 rows 8, 9, 10, 11, 12, 16a and 17): every test drives the
+//! stage-B1 rows 8–12, plus early provider-level coverage of the B2
+//! rows 16a and 17 — 16a's journaled-admin-operation component and
+//! 17's end-to-end fake-VMM drive are deferred to stage B2): every
+//! test drives the
 //! real provider code through the real blocking witness boundary
 //! against a real loopback witness server, exactly like the P4a
 //! authority tests. The fake DRBD command surface (`tests/common`)
