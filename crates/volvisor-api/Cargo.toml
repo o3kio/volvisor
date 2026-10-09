@@ -5,9 +5,23 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Volvisor volvisor-api"
+description = "Volvisor HTTP/JSON Volume API v2 server (contract surface, validation, idempotent journal flow)"
 
 [lints]
 workspace = true
 
 [dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+volvisor-journal = { workspace = true }
+volvisor-provider = { workspace = true }
+volvisor-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `oneshot` for driving the router in tests without a TCP listener; test-only,
+# never linked into the library.
+tower = { version = "0.5", features = ["util"] }
