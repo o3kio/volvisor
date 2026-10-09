@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use volvisor_api::{AppState, SharedState, router};
+use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
 use volvisor_journal::Journal;
 use volvisor_lvm::{LvmProvider, RealRunner};
 use volvisor_provider::AdminSurface;
@@ -21,15 +22,19 @@ use crate::config::{Config, ProviderKind};
 /// the configured provider and reconcile it.
 ///
 /// Opening the journal acquires the single-writer lock; a competing daemon
-/// fails here rather than mid-flight. The LVM provider's constructor runs
-/// its startup reconciliation (missing LVs are marked `Failed`, foreign LVs
-/// are reported, never adopted).
+/// fails here rather than mid-flight. The provider constructors run their
+/// startup reconciliations (the LVM provider marks missing LVs `Failed`;
+/// the Ceph provider refuses to start unless the external cluster answers
+/// its fail-closed verification).
 ///
-/// The concrete provider is constructed first and then coerced into *both*
-/// trait-object views: `Arc<dyn VolumeProvider>` for volume operations and
-/// `Arc<dyn AdminSurface>` for the privileged `/v2/admin` device-enrollment
-/// routes (both providers implement both traits; the two `Arc`s share one
-/// underlying object).
+/// The concrete provider is constructed first and then coerced into the
+/// trait-object views: `Arc<dyn VolumeProvider>` for volume operations
+/// and, where the provider exposes one, `Arc<dyn AdminSurface>` for the
+/// privileged `/v2/admin` device-enrollment routes (both LVM providers
+/// implement both traits; the two `Arc`s share one underlying object).
+/// The ceph provider is an external-cluster adapter with no local devices
+/// to claim, so it contributes no admin surface and admin routes keep
+/// their typed 404.
 ///
 /// # Errors
 /// Returns [`DaemonError`] when the journal cannot be locked/opened or the
@@ -46,6 +51,10 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             let provider = Arc::new(lvm_provider(config)?);
             let admin: Arc<dyn AdminSurface> = provider.clone();
             AppState::new(provider, Some(admin), journal, config.admin_token.clone())
+        }
+        ProviderKind::Ceph => {
+            let provider = Arc::new(ceph_provider(config)?);
+            AppState::new(provider, None, journal, config.admin_token.clone())
         }
     };
     Ok(Arc::new(state))
@@ -77,6 +86,50 @@ fn lvm_provider(config: &Config) -> Result<LvmProvider, DaemonError> {
         claim_token,
     )
     .map_err(|e| DaemonError::Config(format!("lvm provider construction failed: {e}")))
+}
+
+/// Resolve the durable ceph provider state path (defaults to
+/// `<journal_dir>/ceph-state.json`, mirroring the LVM provider).
+fn ceph_state_path(config: &Config) -> std::path::PathBuf {
+    config
+        .ceph_state_path
+        .clone()
+        .unwrap_or_else(|| config.journal_dir.join("ceph-state.json"))
+}
+
+/// Construct the external-cluster Ceph RBD provider from validated
+/// configuration.
+///
+/// The provider's constructor performs the fail-closed startup
+/// verification (the cluster FSID must match `ceph_cluster_fsid`
+/// exactly, the configured pool must exist, and a health query must
+/// succeed); any failure refuses daemon startup. The provider's typed
+/// error detail (fsid mismatch, missing pool, unqueryable health) is
+/// preserved verbatim in the [`DaemonError`] message. Credential
+/// resolution stays entirely with the ceph CLI (`--name` only); nothing
+/// beyond field names is logged.
+fn ceph_provider(config: &Config) -> Result<CephRbdProvider, DaemonError> {
+    let cluster_fsid = config.ceph_cluster_fsid.clone().ok_or_else(|| {
+        DaemonError::Config("ceph_cluster_fsid is required for the ceph provider".to_owned())
+    })?;
+    let mon_hosts = config.ceph_mon_hosts.clone().ok_or_else(|| {
+        DaemonError::Config("ceph_mon_hosts is required for the ceph provider".to_owned())
+    })?;
+    let pool = config.ceph_pool.clone().ok_or_else(|| {
+        DaemonError::Config("ceph_pool is required for the ceph provider".to_owned())
+    })?;
+    let provider_config = CephProviderConfig {
+        cluster_fsid,
+        mon_hosts,
+        pool,
+        user: config.ceph_user_or_default().to_owned(),
+    };
+    CephRbdProvider::new(
+        Arc::new(RealRunner::default()),
+        provider_config,
+        ceph_state_path(config),
+    )
+    .map_err(|e| DaemonError::Config(format!("ceph provider construction failed: {e}")))
 }
 
 /// Serve the Volume API v2 surface until a shutdown signal arrives, then
@@ -159,8 +212,35 @@ mod tests {
             lvm_vg_prefix: None,
             device_claim_token: None,
             lvm_state_path: None,
+            ceph_cluster_fsid: None,
+            ceph_mon_hosts: None,
+            ceph_pool: None,
+            ceph_user: None,
+            ceph_state_path: None,
             sysfs_root: None,
             admin_token: admin_token.map(str::to_owned),
+            max_body_bytes: 1 << 20,
+        }
+    }
+
+    /// A validated ceph-provider configuration pointing at a monitor
+    /// address nothing will ever answer (the fail-closed paths are the
+    /// point, not a live cluster).
+    fn ceph_config(journal_dir: std::path::PathBuf) -> Config {
+        Config {
+            listen: "127.0.0.1:8787".parse().expect("valid listen address"),
+            journal_dir,
+            provider: ProviderKind::Ceph,
+            lvm_vg_prefix: None,
+            device_claim_token: None,
+            lvm_state_path: None,
+            ceph_cluster_fsid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            ceph_mon_hosts: Some(vec!["127.0.0.1:1".to_owned()]),
+            ceph_pool: Some("volvisor".to_owned()),
+            ceph_user: None,
+            ceph_state_path: None,
+            sysfs_root: None,
+            admin_token: None,
             max_body_bytes: 1 << 20,
         }
     }
@@ -197,5 +277,72 @@ mod tests {
         let config = fake_config("192.0.2.10:8787", None);
         let error = serve(config).await.expect_err("must refuse to serve");
         assert!(matches!(error, DaemonError::Config(_)), "error: {error}");
+    }
+
+    #[test]
+    fn ceph_state_path_defaults_into_the_journal_dir() {
+        let config = ceph_config(std::path::PathBuf::from("/j"));
+        assert_eq!(
+            ceph_state_path(&config),
+            std::path::PathBuf::from("/j/ceph-state.json"),
+            "unset ceph_state_path defaults to <journal_dir>/ceph-state.json"
+        );
+        let config = Config {
+            ceph_state_path: Some(std::path::PathBuf::from("/custom/ceph-state.json")),
+            ..config
+        };
+        assert_eq!(
+            ceph_state_path(&config),
+            std::path::PathBuf::from("/custom/ceph-state.json")
+        );
+    }
+
+    #[test]
+    fn ceph_provider_missing_required_field_maps_to_a_config_error() {
+        // Config::validate would reject this earlier in a real load; the
+        // runtime must still map a missing field to a typed error rather
+        // than panic or silently default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            ceph_pool: None,
+            ..ceph_config(dir.path().join("journal"))
+        };
+        let error = build_state(&config)
+            .err()
+            .expect("missing ceph_pool must refuse daemon startup");
+        assert!(matches!(error, DaemonError::Config(_)), "error: {error}");
+        assert!(
+            error.to_string().contains("ceph_pool is required"),
+            "error names the missing field: {error}"
+        );
+    }
+
+    #[test]
+    fn ceph_provider_construction_fails_closed_without_a_cluster() {
+        // A live cluster does not exist in this environment, which is the
+        // honest test condition: `CephRbdProvider::new` must refuse to
+        // construct (fail-closed startup verification) and the daemon must
+        // surface the failure as a typed DaemonError. The ceph binary is
+        // absent here, so the very first `ceph fsid` query fails to
+        // execute (instantly — no watchdog involvement); on a host with
+        // the toolchain the unreachable monitor list produces the typed
+        // unqueryable/unhealthy error instead. Either way: no start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ceph_config(dir.path().join("journal"));
+        let error = build_state(&config)
+            .err()
+            .expect("unverified cluster must refuse daemon startup");
+        assert!(matches!(error, DaemonError::Config(_)), "error: {error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("ceph provider construction failed"),
+            "error must surface the provider construction failure: {message}"
+        );
+        assert!(
+            message.contains("failed to execute ceph")
+                || message.contains("ceph fsid")
+                || message.contains("CEPH_CLUSTER_UNHEALTHY"),
+            "error must preserve the verification failure detail: {message}"
+        );
     }
 }

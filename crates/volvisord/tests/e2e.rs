@@ -4,6 +4,14 @@
 //! Mutations authenticate with the configured admin bearer token (fail-closed
 //! auth); a tokenless mutation is asserted to be rejected with `401`, and the
 //! privileged admin discovery route is exercised over real HTTP.
+//!
+//! There is deliberately no ceph-provider e2e here: constructing
+//! `CephRbdProvider` requires a live external cluster answering its
+//! fail-closed startup verification, and none exists in this environment
+//! or CI. The daemon's ceph wiring (config-to-error mapping, default
+//! state path, fail-closed startup refusal) is covered by the runtime
+//! unit tests instead; a real-cluster path would follow the
+//! `VOLVISOR_TEST_LVM` env-gate pattern.
 
 // Integration-test code: invariant assertions may use expect/unwrap.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -65,6 +73,11 @@ fn e2e_config(dir: &tempfile::TempDir) -> volvisord::Config {
         lvm_vg_prefix: None,
         device_claim_token: None,
         lvm_state_path: None,
+        ceph_cluster_fsid: None,
+        ceph_mon_hosts: None,
+        ceph_pool: None,
+        ceph_user: None,
+        ceph_state_path: None,
         sysfs_root: None,
         admin_token: Some(E2E_ADMIN_TOKEN.to_owned()),
         max_body_bytes: 1 << 20,
@@ -176,6 +189,11 @@ async fn daemon_journal_lock_fails_fast_for_second_instance() {
         lvm_vg_prefix: None,
         device_claim_token: None,
         lvm_state_path: None,
+        ceph_cluster_fsid: None,
+        ceph_mon_hosts: None,
+        ceph_pool: None,
+        ceph_user: None,
+        ceph_state_path: None,
         sysfs_root: None,
         admin_token: None,
         max_body_bytes: 1 << 20,

@@ -1,4 +1,5 @@
-//! Command execution abstraction for driving the LVM toolchain.
+//! Command execution abstraction for driving external storage CLIs
+//! (shared by the LVM and Ceph RBD adapters).
 //!
 //! Every external command (`lsblk`, `pvcreate`, `vgcreate`, `lvcreate`,
 //! `lvextend`, `lvremove`, `blkdiscard`, ...) is executed through a
@@ -165,7 +166,7 @@ const TIMEOUT_RECV_GRACE: Duration = Duration::from_millis(100);
 ///
 /// A grandchild that inherits the child's pipes and outlives it can keep
 /// the reader threads waiting past `PIPE_RECV_GRACE`; the collected
-/// output is then whatever arrived within the grace window. The LVM
+/// output is then whatever arrived within the grace window. The child
 /// toolchain does not daemonize, so this is accepted and documented
 /// rather than handled.
 #[derive(Debug, Clone, Copy)]
@@ -351,7 +352,7 @@ impl CommandRunner for RealRunner {
 /// - **closure mode** ([`FakeRunner::with_closure`]): the closure receives
 ///   program and args and returns the scripted output (or `None` for "not
 ///   scripted", which is an `INTERNAL` error). This is the easiest way to
-///   simulate a stateful LVM for the conformance kit.
+///   simulate a stateful storage CLI for the conformance kit.
 ///
 /// Every invocation is recorded and can be inspected via
 /// [`FakeRunner::invocations`] to assert exactly which commands ran.

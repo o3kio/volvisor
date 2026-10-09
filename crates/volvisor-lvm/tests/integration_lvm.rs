@@ -24,8 +24,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use volvisor_lvm::provider::{LvmProvider, lv_name_for};
-use volvisor_lvm::runner::{CommandRunner, RealRunner};
 use volvisor_lvm::state::{DeviceEntry, LvmState};
+use volvisor_lvm::{CommandRunner, RealRunner};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,

@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use volvisor_lvm::provider::{LvmProvider, lv_name_for};
-use volvisor_lvm::runner::{CommandOutput, CommandRunner, FakeRunner, RealRunner};
 use volvisor_lvm::state::{DeviceEntry, LvmState};
+use volvisor_lvm::{CommandOutput, CommandRunner, FakeRunner, RealRunner};
 use volvisor_types::{ApiError, DeviceId, DeviceRole, VolumeId, VolumeLifecycle};
 
 /// VG prefix used by the fixtures.

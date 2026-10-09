@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use volvisor_types::domain::{Generation, PhysicalDevice};
 use volvisor_types::{ApiError, ApiErrorCode, DeviceId, Health, HostId};
 
+use crate::CommandRunner;
 use crate::report::LsblkOutput;
-use crate::runner::CommandRunner;
 
 /// Host identity stamped on discovered devices.
 ///
@@ -251,7 +251,7 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::{CommandOutput, FakeRunner};
+    use crate::{CommandOutput, FakeRunner};
     use std::path::PathBuf;
 
     const LSBLK_JSON: &str = r#"{"blockdevices":[

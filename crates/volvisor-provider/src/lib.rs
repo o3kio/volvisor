@@ -30,7 +30,9 @@ pub mod admin;
 pub mod conformance;
 pub mod fake;
 pub mod provider;
+pub mod runner;
 
 pub use admin::AdminSurface;
 pub use fake::FakeProvider;
 pub use provider::VolumeProvider;
+pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
