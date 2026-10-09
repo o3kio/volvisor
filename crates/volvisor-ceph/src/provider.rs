@@ -1774,12 +1774,27 @@ impl CephRbdProvider {
         match self.verify_backing(&image_name, volume_id)? {
             Backing::Absent if volume_state == VolumeLifecycle::Failed => {}
             Backing::Absent => {
-                return Err(ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!(
-                        "image {spec} unexpectedly absent for volume in state {volume_state:?}"
-                    ),
-                ));
+                // A non-Failed volume whose image is absent from `rbd ls`
+                // is either an out-of-band removal (fail loudly; the
+                // restart remedy lets reconciliation record the loss as
+                // Failed) or OUR OWN half-finished Retain delete: the
+                // crash window after `rbd trash move` — or a post-move
+                // verification failure — left the volume in its
+                // pre-delete lifecycle with the image already in the
+                // recoverable trash, which is Retain's terminal state.
+                // Image names are injective in the pool, so a trash hit
+                // is a replay of our delete, never an adoption; the
+                // replay completes by dropping the state entry.
+                if !self.list_trash()?.contains(&image_name) {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "image {spec} unexpectedly absent for volume in state \
+                             {volume_state:?}; if this follows an out-of-band removal, restart \
+                             the daemon so reconciliation records the loss"
+                        ),
+                    ));
+                }
             }
             Backing::Mismatch => {
                 return Err(ApiError::new(

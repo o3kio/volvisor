@@ -151,7 +151,11 @@ pub struct FakeCeph {
     pub fail_df: bool,
     /// When true, `ceph fsid` fails.
     pub fail_fsid: bool,
-    /// When true, `rbd showmapped` fails.
+    /// When true, `rbd trash ls` fails (a transient query failure after
+    /// a successful trash move — delete's post-move verification
+    /// window).
+    pub fail_trash_ls: bool,
+    /// When true, `rbd showmapped` fails (transient query failure).
     pub fail_showmapped: bool,
     /// When true, `rbd image-meta set` fails.
     pub fail_meta_set: bool,
@@ -190,6 +194,7 @@ impl Default for FakeCeph {
             fail_health: false,
             fail_df: false,
             fail_fsid: false,
+            fail_trash_ls: false,
             fail_showmapped: false,
             fail_meta_set: false,
             fail_meta_get_transient: false,
@@ -620,6 +625,9 @@ fn script_rbd_trash(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutput
         }
         "ls" => {
             // rbd trash ls --pool <pool> --format json
+            if world.fail_trash_ls {
+                return Some(CommandOutput::failure("rbd trash ls: simulated failure"));
+            }
             let entries: Vec<serde_json::Value> = world
                 .trash
                 .iter()

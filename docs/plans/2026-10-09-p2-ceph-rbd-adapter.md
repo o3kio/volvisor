@@ -118,6 +118,14 @@ Out (recorded follow-ups):
   attachments are rejected with a typed `UNSUPPORTED_CLASS_OR_POLICY`: the
   prototype has no qualified multi-reader contract, and a `--read-only`-less
   mapping recorded as read-only would be a fail-open lie.
+- Delete of an owned image also refuses a typed `INVALID_STATE` while any
+  live mapping serves the full pool/image spec without a volvisor
+  attachment record (`rbd trash move` succeeds on an in-use image on a
+  real cluster — the in-use check lives in trash purge, not the move);
+  the remedy is the operator's manual `rbd unmap`. A delete replay that
+  finds the image already in the trash (our own half-finished move)
+  completes instead of wedging; image names are injective in the pool,
+  so a trash hit is never an adoption.
 - Shared-backend note: a `ceph-rbd` volume does not pin the volume to one
   host the way a local LV does — placement constraints reflect that the
   cluster (not a host) backs the volume — but migration eligibility is still

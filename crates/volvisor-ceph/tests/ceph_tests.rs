@@ -820,6 +820,126 @@ async fn delete_refuses_a_live_unrecorded_mapping() {
 }
 
 #[tokio::test]
+async fn a_transient_showmapped_failure_mid_delete_is_fail_closed() {
+    let fixture = fixture();
+    let id = volume_id("del-showmapped-fail");
+    let image_name = image_name_for(&id);
+    let created = fixture
+        .provider
+        .create_volume(&create_request("del-showmapped-fail", MIB))
+        .await
+        .expect("create");
+
+    // The delete-time mapping consult fails transiently: the delete is
+    // refused (INTERNAL), the image is intact and the state entry
+    // unchanged — never a silent authority release.
+    fixture.world.lock().expect("world").fail_showmapped = true;
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-showmapped-fail", created.generation),
+        )
+        .await
+        .expect_err("delete must not proceed on an unknown mapping table");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .images
+            .contains_key(&image_name),
+        "the image is untouched"
+    );
+    assert!(
+        CephState::load(&fixture.state_path)
+            .expect("state")
+            .volume(&id)
+            .is_some(),
+        "the state entry is untouched"
+    );
+
+    // The failure is transient: after the outage the delete completes.
+    fixture.world.lock().expect("world").fail_showmapped = false;
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-showmapped-fail", created.generation),
+        )
+        .await
+        .expect("delete after the transient outage");
+}
+
+#[tokio::test]
+async fn a_half_finished_trash_move_is_completed_by_the_delete_replay() {
+    let fixture = fixture();
+    let id = volume_id("del-trash-window");
+    let image_name = image_name_for(&id);
+    let created = fixture
+        .provider
+        .create_volume(&create_request("del-trash-window", MIB))
+        .await
+        .expect("create");
+
+    // The crash window after `rbd trash move`: the move succeeded but
+    // the post-move verification (and, in the real world, the state
+    // save) did not — the volume is still Ready while its image sits
+    // in the recoverable trash.
+    fixture.world.lock().expect("world").fail_trash_ls = true;
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-trash-window", created.generation),
+        )
+        .await
+        .expect_err("the post-move verification fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .trash
+            .contains(&image_name),
+        "the trash move itself succeeded"
+    );
+    assert_eq!(
+        CephState::load(&fixture.state_path)
+            .expect("state")
+            .volume(&id)
+            .expect("entry kept")
+            .runtime
+            .state,
+        VolumeLifecycle::Ready,
+        "the stored lifecycle is still Ready — the crash window (the \
+         verified inspect honestly reports Failed over the absent image)"
+    );
+
+    // The replay completes instead of wedging: the image name is
+    // injective in the pool, so finding it in the trash is OUR
+    // half-finished delete (Retain's terminal state), not an adoption.
+    fixture.world.lock().expect("world").fail_trash_ls = false;
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &fixture_delete_request("del-trash-window", created.generation),
+        )
+        .await
+        .expect("the replay completes the half-finished delete");
+    assert!(
+        CephState::load(&fixture.state_path)
+            .expect("state")
+            .volume(&id)
+            .is_none(),
+        "the state entry is gone"
+    );
+}
+
+#[tokio::test]
 async fn an_unrecorded_grow_is_healed_not_wedged() {
     let fixture = fixture();
     let id = volume_id("heal-vol");
