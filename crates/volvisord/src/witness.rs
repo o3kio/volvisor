@@ -62,9 +62,11 @@ pub async fn serve(config: WitnessConfig) -> Result<(), DaemonError> {
     let core = WitnessCore::open(&config.state_dir, config.core_config())
         .map_err(|e| DaemonError::Config(format!("witness journal open failed: {e}")))?;
     let token = config.auth_token.clone();
+    let host_tokens = config.host_tokens.clone();
     let state = Arc::new(WitnessServerState::with_clock(
         core,
         token,
+        host_tokens,
         Arc::new(crate::unix_now_secs),
     ));
     let app = router(state);
@@ -73,7 +75,8 @@ pub async fn serve(config: WitnessConfig) -> Result<(), DaemonError> {
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
     tracing::info!(
         listen = %config.listen,
-        "volvisor-witnessd serving (prototype; not production supported)"
+        host_credentials = config.host_tokens.len(),
+        "volvisor-witnessd serving (protocol v2; prototype; not production supported)"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -148,5 +151,20 @@ mod tests {
         let (_dir, path) = config_dir();
         let error = load_config(&path).expect_err("missing file");
         assert!(matches!(error, DaemonError::Config(_)));
+    }
+
+    #[test]
+    fn host_credentials_load_from_the_toml_table() {
+        let (_dir, path) = config_dir();
+        write(
+            &path,
+            "listen = \"127.0.0.1:9101\"\nstate_dir = \"/tmp/opencode/witness\"\
+             \nauth_token = \"shared-read\"\n\n[host_tokens]\nnode-a = \"host-a\"\n",
+        );
+        let config = load_config(&path).expect("load");
+        assert_eq!(
+            config.host_tokens.get("node-a").map(String::as_str),
+            Some("host-a")
+        );
     }
 }

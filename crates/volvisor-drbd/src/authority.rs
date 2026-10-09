@@ -437,6 +437,16 @@ pub fn witness_error(err: WitnessError) -> ApiError {
         WitnessError::IdempotencyConflict => {
             ApiError::new(ApiErrorCode::IdempotencyConflict, detail)
         }
+        // W8: the daemon's credential is not the host the request
+        // asserts. On the provider's own mutation path this means the
+        // witness host-token configuration does not match this host's
+        // identity — an operator problem, surfaced typed.
+        WitnessError::IdentityRequired => ApiError::new(
+            ApiErrorCode::Forbidden,
+            "witness rejected this daemon's credential for the asserted holder (check the \
+             witness host_tokens configuration)"
+                .to_owned(),
+        ),
         WitnessError::Internal(_) => ApiError::new(ApiErrorCode::Internal, detail),
     }
 }
@@ -478,6 +488,32 @@ mod tests {
         ) -> Result<volvisor_witness::proto::RevokeResponse, WitnessError> {
             Err(WitnessError::Internal("not used".to_owned()))
         }
+        fn record_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: volvisor_witness::proto::RecordBarrierRequest,
+        ) -> Result<volvisor_witness::proto::RecordBarrierResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn void_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: volvisor_witness::proto::VoidBarrierRequest,
+        ) -> Result<volvisor_witness::proto::VoidBarrierResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn revoke_set(
+            &self,
+            _request: volvisor_witness::proto::RevokeSetRequest,
+        ) -> Result<volvisor_witness::proto::RevokeSetResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn grant_set(
+            &self,
+            _request: volvisor_witness::proto::GrantSetRequest,
+        ) -> Result<volvisor_witness::proto::GrantSetResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
         fn inspect(&self, _volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {
             Err(WitnessError::Internal("not used".to_owned()))
         }
@@ -515,9 +551,12 @@ mod tests {
             current_epoch: WriterEpoch(epoch),
             holder: holder.cloned(),
             lease_state: state,
+            lease_id: None,
             lease_remaining_secs: remaining,
             commit_index: 7,
             registration: None,
+            barriers: Vec::new(),
+            retirements: Vec::new(),
         }
     }
 
@@ -739,6 +778,32 @@ mod tests {
             _volume_id: &VolumeId,
             _request: RevokeRequest,
         ) -> Result<volvisor_witness::proto::RevokeResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn record_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: volvisor_witness::proto::RecordBarrierRequest,
+        ) -> Result<volvisor_witness::proto::RecordBarrierResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn void_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: volvisor_witness::proto::VoidBarrierRequest,
+        ) -> Result<volvisor_witness::proto::VoidBarrierResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn revoke_set(
+            &self,
+            _request: volvisor_witness::proto::RevokeSetRequest,
+        ) -> Result<volvisor_witness::proto::RevokeSetResponse, WitnessError> {
+            Err(WitnessError::Internal("not used".to_owned()))
+        }
+        fn grant_set(
+            &self,
+            _request: volvisor_witness::proto::GrantSetRequest,
+        ) -> Result<volvisor_witness::proto::GrantSetResponse, WitnessError> {
             Err(WitnessError::Internal("not used".to_owned()))
         }
         fn inspect(&self, _volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {

@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use volvisor_types::{
-    AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, LeaseId, ProjectId, VolumeId,
-    VolumeLifecycle, WriterEpoch,
+    AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, LeaseId, MigrationId, ProjectId,
+    VolumeId, VolumeLifecycle, WriterEpoch,
 };
 
 /// The DRBD replication protocol of a resource, fixed at create time.
@@ -147,6 +147,31 @@ pub struct VolumeRuntime {
     /// AGENTS rule 17). Never a silent resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence: Option<PendingFence>,
+    /// The migration-cut marker (P4b plan D6a): this volume's source
+    /// data path is suspended for the named coordinated handoff. While
+    /// set, the provider's own reconcile reports the volume as
+    /// migration-suspended and never resumes it, the renewal pass
+    /// keeps renewing the lease (the cut needs a live lease; the W5
+    /// deadline remains the bound), and attach/detach are refused
+    /// typed. Only the coordinator (the handoff surface's
+    /// `release_source`/`abort_prepare`) or the fencing-gated
+    /// clear-cut-marker admin operation clears it. Persisted
+    /// **before** the suspend command (write-ahead), so a crash in
+    /// between leaves a marked volume reconcile refuses to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationCut>,
+}
+
+/// A recorded, incomplete migration cut (see
+/// [`VolumeRuntime::migration`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationCut {
+    /// The coordinated handoff this cut belongs to (the marker's
+    /// owner: every release or abort must name it back).
+    pub migration_id: MigrationId,
+    /// Local unix time the cut began (the marker's stamp; the
+    /// suspension timestamp recorded at quiesce).
+    pub suspended_at: u64,
 }
 
 /// A recorded, incomplete self-fence (see
@@ -306,6 +331,24 @@ pub struct ReconcileReport {
     /// Leases self-fenced this pass (stale epoch, local deadline
     /// passed, or a failed validation) — see [`FencedVolume`].
     pub fenced_volumes: Vec<FencedVolume>,
+    /// Volumes found carrying a migration-cut marker (P4b plan D6a):
+    /// reported as migration-suspended, left suspended and untouched
+    /// by this pass — the marker is only cleared by the coordinator
+    /// or the fencing-gated clear-cut-marker admin operation, never
+    /// by reconcile. A marked Primary observed unsuspended (the
+    /// write-ahead crash window between the marker save and the
+    /// suspend command) was suspended fail-closed this pass.
+    pub migration_suspended: Vec<MigrationSuspendedVolume>,
+}
+
+/// A volume reported as migration-suspended by reconcile (see
+/// [`ReconcileReport::migration_suspended`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationSuspendedVolume {
+    /// The migration-suspended volume.
+    pub volume_id: VolumeId,
+    /// The migration owning the cut marker.
+    pub migration_id: MigrationId,
 }
 
 /// A lease this host self-fenced (writer authority provably lost).
@@ -644,6 +687,7 @@ mod tests {
                     seeded: true,
                     authority: None,
                     fence: None,
+                    migration: None,
                     attachment: Some(AttachmentRecord {
                         id: AttachmentId::new("att-1").expect("valid id"),
                         vm_id: "vm-1".to_owned(),

@@ -16,7 +16,10 @@
 //!   (idempotent create, generation fencing, single-writer enforcement,
 //!   detach drain preconditions, delete preconditions, unknown-health
 //!   truthfulness), runnable via `conformance::assert_conformance` or the
-//!   `provider_conformance_tests!` macro.
+//!   `provider_conformance_tests!` macro;
+//! - [`handoff`]: the optional source-side coordinated-handoff surface
+//!   ([`HandoffSurface`], the `AdoptionSurface` pattern) providers
+//!   implement to back the migration coordinator (P4b plan §6).
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -29,10 +32,14 @@
 pub mod admin;
 pub mod conformance;
 pub mod fake;
+pub mod handoff;
 pub mod provider;
 pub mod runner;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
+pub use handoff::{
+    EligibilityParticipant, EligibilityReport, HandoffSurface, QuiesceProof, SyncProof,
+};
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};

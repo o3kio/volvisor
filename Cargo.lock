@@ -1121,6 +1121,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "volvisor-handoff"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "volvisor-types",
+]
+
+[[package]]
 name = "volvisor-journal"
 version = "0.1.0"
 dependencies = [
@@ -1152,6 +1165,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "volvisor-types",

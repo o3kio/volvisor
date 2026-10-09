@@ -1500,6 +1500,7 @@ impl volvisor_provider::AdoptionSurface for FakeAdoption {
                 boundary: volvisor_types::LossBoundary::Unknown,
                 authorized: allow_loss,
             },
+            evidence: volvisor_types::SafeCurrentEvidence::None,
             volume: None,
         })
     }

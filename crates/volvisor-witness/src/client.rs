@@ -22,8 +22,10 @@ use volvisor_types::error::ApiErrorBody;
 use volvisor_types::{AuthorityView, VolumeId};
 
 use crate::proto::{
-    GrantRequest, GrantResponse, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
-    RevokeRequest, RevokeResponse, WitnessError,
+    GrantRequest, GrantResponse, GrantSetRequest, GrantSetResponse, RecordBarrierRequest,
+    RecordBarrierResponse, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
+    RevokeRequest, RevokeResponse, RevokeSetRequest, RevokeSetResponse, VoidBarrierRequest,
+    VoidBarrierResponse, WitnessError,
 };
 
 /// The witness protocol surface, as seen by a storage daemon.
@@ -72,6 +74,60 @@ pub trait WitnessConnection: Send + Sync {
         volume_id: &VolumeId,
         request: RevokeRequest,
     ) -> Result<RevokeResponse, WitnessError>;
+
+    /// Record a migration barrier (P4b plan §4 W9). The witness stamps
+    /// the boundary commit index and recording time; the caller must
+    /// present the epoch holder's host credential (W8 — the server
+    /// resolves the identity from the bearer token this connection was
+    /// built with).
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`] when the connection's token
+    /// is not bound to the asserted holder), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    async fn record_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: RecordBarrierRequest,
+    ) -> Result<RecordBarrierResponse, WitnessError>;
+
+    /// Void a recorded barrier (P4b plan §4 W9) — the abort path's
+    /// evidence-hygiene step, only from the recording holder before
+    /// the epoch retires.
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    async fn void_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: VoidBarrierRequest,
+    ) -> Result<VoidBarrierResponse, WitnessError>;
+
+    /// Batch self-release (P4b plan §4 W10 `revoke-set`): one host
+    /// releasing every member lease in one journaled, all-or-nothing
+    /// mutation.
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    async fn revoke_set(
+        &self,
+        request: RevokeSetRequest,
+    ) -> Result<RevokeSetResponse, WitnessError>;
+
+    /// Batch grant (P4b plan §4 W10 `grant-set`): one host acquiring
+    /// writer authority for every member volume in one journaled,
+    /// all-or-nothing mutation.
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    async fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError>;
 
     /// Read the authority view (P4a plan §3 `inspect`).
     ///
@@ -217,6 +273,45 @@ impl WitnessConnection for HttpWitnessConnection {
             Some(&request),
         )
         .await
+    }
+
+    async fn record_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: RecordBarrierRequest,
+    ) -> Result<RecordBarrierResponse, WitnessError> {
+        self.request(
+            Method::POST,
+            &format!("/v1/volumes/{}/record-barrier", volume_id.as_str()),
+            Some(&request),
+        )
+        .await
+    }
+
+    async fn void_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: VoidBarrierRequest,
+    ) -> Result<VoidBarrierResponse, WitnessError> {
+        self.request(
+            Method::POST,
+            &format!("/v1/volumes/{}/void-barrier", volume_id.as_str()),
+            Some(&request),
+        )
+        .await
+    }
+
+    async fn revoke_set(
+        &self,
+        request: RevokeSetRequest,
+    ) -> Result<RevokeSetResponse, WitnessError> {
+        self.request(Method::POST, "/v1/batch/revoke-set", Some(&request))
+            .await
+    }
+
+    async fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError> {
+        self.request(Method::POST, "/v1/batch/grant-set", Some(&request))
+            .await
     }
 
     async fn inspect(&self, volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {

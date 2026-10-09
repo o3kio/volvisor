@@ -12,8 +12,9 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 volvisor-types = { workspace = true }
 
 # tokio (macros + rt) and serde_json are regular dependencies of this crate,

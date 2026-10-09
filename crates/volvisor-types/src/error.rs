@@ -63,6 +63,11 @@ pub enum ApiErrorCode {
     InvalidState,
     /// `operation_id` reused with a different request payload.
     IdempotencyConflict,
+    /// The caller's identity is not permitted to perform this
+    /// operation (witness invariant W8: a mutating witness call requires
+    /// the host credential bound to the holder it asserts; the legacy
+    /// shared token is read-only).
+    Forbidden,
     /// Internal error; no state claims are made.
     Internal,
 }
@@ -93,6 +98,7 @@ impl ApiErrorCode {
             Self::NotFound => "NOT_FOUND",
             Self::InvalidState => "INVALID_STATE",
             Self::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
+            Self::Forbidden => "FORBIDDEN",
             Self::Internal => "INTERNAL",
         }
     }
@@ -106,6 +112,7 @@ impl ApiErrorCode {
             | Self::UnsafeDataLoss
             | Self::InvalidRequest => 400,
             Self::NotFound => 404,
+            Self::Forbidden => 403,
             Self::VmmHandoffUnsupported => 501,
             Self::NoSafeCapacity | Self::ThinMetadataExhausted => 507,
             Self::CephClusterUnhealthy => 503,
@@ -231,6 +238,7 @@ mod tests {
             ApiErrorCode::OperationInDoubt,
             ApiErrorCode::UnsafeDataLoss,
             ApiErrorCode::CephClusterUnhealthy,
+            ApiErrorCode::Forbidden,
         ];
         for code in codes {
             assert_eq!(code.as_str(), code.as_str().to_uppercase());
