@@ -6,7 +6,7 @@
 //! the requested vs. effective size, and the ownership generation. It is
 //! never exposed to tenants (the API surface derives all responses from
 //! it), and it stores **no credentials**: the keyring is daemon-side and
-//! the provider only ever passes `--id <user>` to the CLI.
+//! the provider only ever passes `--name <user>` to the CLI.
 //!
 //! Persistence is atomic: [`CephState::save`] writes `<path>.tmp`, fsyncs
 //! the file, renames it over the target and fsyncs the parent directory,
@@ -93,11 +93,34 @@ pub struct AttachmentRecord {
     pub device: String,
 }
 
+/// A state entry whose backing could not be verified this pass.
+///
+/// Carries the summarized error so the report is an honest unknown, not
+/// a silent skip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnverifiableVolume {
+    /// The volume whose verification failed.
+    pub volume_id: VolumeId,
+    /// Summarized error from the failed query.
+    pub detail: String,
+}
+
+/// An untracked image whose ownership could not be classified this pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnverifiableImage {
+    /// The image whose ownership query failed.
+    pub image_name: String,
+    /// Summarized error from the failed query.
+    pub detail: String,
+}
+
 /// Result of reconciling provider state against the observed cluster.
 ///
 /// Everything here is *reported*, never auto-fixed destructively: missing
 /// and mismatched volumes are marked `Failed` in state, foreign images are
-/// left untouched (AGENTS rule 7).
+/// left untouched (AGENTS rule 7). The one deliberate bookkeeping heal is
+/// [`ReconcileReport::healed_grown`](#structfield.healed_grown): a grow
+/// that completed on the cluster but was never recorded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// State entries whose image is absent from a successful `rbd ls`
@@ -107,10 +130,24 @@ pub struct ReconcileReport {
     /// metadata is missing or names a different volume (marked `Failed`;
     /// never adopted).
     pub mismatched_volumes: Vec<VolumeId>,
-    /// Volumes whose image is currently mapped but that carry no
+    /// State entries whose image reports LESS than the recorded size —
+    /// the image changed outside volvisor (marked `Failed`; the recorded
+    /// size is never healed downward).
+    pub shrunk_volumes: Vec<VolumeId>,
+    /// State entries whose image is currently mapped but that carry no
     /// attachment record — a stale mapping from a previous incarnation.
     /// Reported honestly; never automatically unmapped (destructive).
     pub stale_mappings: Vec<VolumeId>,
+    /// State entries whose recorded size was healed UP to the image's
+    /// actual size: a completed-but-unrecorded grow (the crash window
+    /// after `rbd resize` succeeded but the state save did not). The
+    /// image's own report is the authority; only the bookkeeping lagged.
+    pub healed_grown: Vec<VolumeId>,
+    /// State entries whose backing could not be verified this pass (a
+    /// transient query failure, e.g. a mon timeout). Their lifecycle is
+    /// deliberately left untouched — an unknown is never recorded as
+    /// `Failed` — and counted here instead.
+    pub unverifiable_volumes: Vec<UnverifiableVolume>,
     /// Images in the pool without any `volvisor.owner` metadata: foreign.
     /// Reported, never touched.
     pub foreign_images: Vec<String>,
@@ -118,6 +155,10 @@ pub struct ReconcileReport {
     /// (e.g. a crash between `rbd create` and the state save). Reported,
     /// never adopted.
     pub untracked_owned_images: Vec<String>,
+    /// Untracked images whose ownership could not be classified (a
+    /// transient query failure): neither foreign nor ours, counted
+    /// honestly instead of guessed.
+    pub unverifiable_images: Vec<UnverifiableImage>,
 }
 
 /// The whole durable provider state.

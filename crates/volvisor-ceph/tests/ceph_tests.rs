@@ -3,8 +3,10 @@
 //! Covers the semantics unique to the external-cluster RBD backend: the
 //! fail-closed startup verification, ownership metadata proofs, stale
 //! `rbd map` mappings, trash-verified deletes, honest capacity against
-//! `ceph df`, startup reconciliation (missing/mismatched/foreign/stale
-//! state) and the argv contract (`-m`/`--id` on every invocation).
+//! `ceph df`, crash-window recovery (create reclaim, unrecorded-grow
+//! healing), honest unknowns on transient metadata failures, startup
+//! reconciliation (missing/mismatched/foreign/stale state) and the argv
+//! contract (`-m`/`--name` on every invocation).
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention.
 
@@ -219,6 +221,34 @@ async fn create_replays_idempotently_and_conflicts_on_a_different_size() {
 }
 
 #[tokio::test]
+async fn create_replay_reflects_a_vanished_backing_instead_of_reporting_ready() {
+    let fixture = fixture();
+    let id = volume_id("replay-gone");
+    fixture
+        .provider
+        .create_volume(&create_request("replay-gone", MIB))
+        .await
+        .expect("create");
+
+    // The image is manually removed behind the provider's back; the
+    // replayed create must route through the same backing verification
+    // as a fresh inspect and reflect the observed failure, not echo a
+    // stale Ready.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .remove(&image_name_for(&id));
+    let replayed = fixture
+        .provider
+        .create_volume(&create_request("replay-gone", MIB))
+        .await
+        .expect("the replay itself still succeeds idempotently");
+    assert_eq!(replayed.state, VolumeLifecycle::Failed, "{replayed:?}");
+}
+
+#[tokio::test]
 async fn create_rejects_a_non_512_aligned_size() {
     let fixture = fixture();
     let err = fixture
@@ -345,13 +375,173 @@ async fn create_failure_cleans_up_and_persists_nothing() {
     assert!(fixture.world.lock().expect("world").images.is_empty());
 
     // The best-effort cleanup really ran as an rbd rm invocation (the
-    // subcommand follows the fixed -m/--id argv prefix).
+    // subcommand follows the fixed -m/--name argv prefix).
     assert!(
         fixture.runner.invocations().into_iter().any(|invocation| {
             invocation.program == "rbd" && invocation.args.get(4).map(String::as_str) == Some("rm")
         }),
         "the create failure must trigger a best-effort rbd rm"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Crash-window recovery on create
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_reclaims_our_half_created_image_after_a_crash_window() {
+    let fixture = fixture();
+    let id = volume_id("reclaim-vol");
+    let image_name = image_name_for(&id);
+    // Crash window: a previous create stamped the image (with our
+    // ownership record) but died before the state save, so a retry hits
+    // "rbd create: already exists".
+    fixture.world.lock().expect("world").images.insert(
+        image_name.clone(),
+        common::FakeImage::owned(2 * MIB, "reclaim-vol"),
+    );
+
+    let created = fixture
+        .provider
+        .create_volume(&create_request("reclaim-vol", MIB))
+        .await
+        .expect("the orphaned image is reclaimed, not wedged forever");
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    // The actual (larger) size is adopted as the effective size.
+    assert_eq!(created.provisioned_bytes, 2 * MIB);
+    assert_eq!(created.allocated_bytes, 2 * MIB);
+
+    // Exactly one image exists, still carrying the ownership record, and
+    // the state entry matches the reclaimed image.
+    let world = fixture.world.lock().expect("world");
+    assert_eq!(
+        world
+            .images
+            .get(&image_name)
+            .expect("reclaimed image")
+            .meta
+            .get(common::OWNER_META_KEY),
+        Some(&"reclaim-vol".to_owned())
+    );
+    let state = CephState::load(&fixture.state_path).expect("state");
+    let stored = state.volume(&id).expect("state entry persisted");
+    assert_eq!(stored.entry.size_bytes, 2 * MIB);
+    assert_eq!(stored.entry.requested_size_bytes, MIB);
+}
+
+#[tokio::test]
+async fn create_reclaim_restamps_a_missing_generation_record() {
+    let fixture = fixture();
+    let id = volume_id("regen-vol");
+    let image_name = image_name_for(&id);
+    // The crash closed before the generation record was stamped: only
+    // the owner metadata proves the image is ours.
+    let mut image = common::FakeImage::owned(MIB, "regen-vol");
+    image.meta.remove(common::GENERATION_META_KEY);
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .insert(image_name, image);
+
+    fixture
+        .provider
+        .create_volume(&create_request("regen-vol", MIB))
+        .await
+        .expect("reclaim with a re-stamped generation record");
+    assert_eq!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .images
+            .get(&image_name_for(&id))
+            .expect("image")
+            .meta
+            .get(common::GENERATION_META_KEY),
+        Some(&"1".to_owned()),
+        "the missing generation record is re-stamped"
+    );
+}
+
+#[tokio::test]
+async fn create_never_adopts_an_existing_image_without_our_ownership_record() {
+    let fixture = fixture();
+
+    // A different owner's record: typed conflict, never adopted.
+    let foreign_id = volume_id("clash-vol");
+    let mut foreign = common::FakeImage::owned(MIB, "someone-elses-volume");
+    foreign.meta.insert(
+        common::OWNER_META_KEY.to_owned(),
+        "someone-elses-volume".to_owned(),
+    );
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .insert(image_name_for(&foreign_id), foreign);
+    let err = fixture
+        .provider
+        .create_volume(&create_request("clash-vol", MIB))
+        .await
+        .expect_err("an image owned by someone else is never adopted");
+    assert_eq!(err.code, ApiErrorCode::ForeignDeviceState, "{err}");
+    assert!(err.detail.contains("never adopted"), "{err}");
+
+    // No metadata at all: equally foreign, equally refused.
+    let bare_id = volume_id("bare-vol");
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .insert(image_name_for(&bare_id), common::FakeImage::foreign(MIB));
+    let err = fixture
+        .provider
+        .create_volume(&create_request("bare-vol", MIB))
+        .await
+        .expect_err("an image without ownership metadata is never adopted");
+    assert_eq!(err.code, ApiErrorCode::ForeignDeviceState, "{err}");
+
+    // Nothing was persisted and both images were left untouched.
+    let listed = fixture.provider.list_volumes(None).await.expect("list");
+    assert_eq!(listed, []);
+    let world = fixture.world.lock().expect("world");
+    assert!(world.images.contains_key(&image_name_for(&foreign_id)));
+    assert!(world.images.contains_key(&image_name_for(&bare_id)));
+    assert_eq!(world.trash, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn create_reclaim_refuses_an_orphan_smaller_than_the_request() {
+    let fixture = fixture();
+    let id = volume_id("small-vol");
+    // Our own orphan, but half a mebibyte: the request cannot be
+    // satisfied by adopting it.
+    fixture.world.lock().expect("world").images.insert(
+        image_name_for(&id),
+        common::FakeImage::owned(MIB / 2, "small-vol"),
+    );
+    let err = fixture
+        .provider
+        .create_volume(&create_request("small-vol", MIB))
+        .await
+        .expect_err("a smaller orphan is never adopted as-is");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("smaller than the request"), "{err}");
+    // The orphan survives for investigation (never destroyed by us).
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .images
+            .contains_key(&image_name_for(&id))
+    );
+    let listed = fixture.provider.list_volumes(None).await.expect("list");
+    assert_eq!(listed, []);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +680,146 @@ async fn grow_capacity_check_is_typed() {
             .size,
         GIB
     );
+}
+
+#[tokio::test]
+async fn an_unrecorded_grow_is_healed_not_wedged() {
+    let fixture = fixture();
+    let id = volume_id("heal-vol");
+    fixture
+        .provider
+        .create_volume(&create_request("heal-vol", GIB))
+        .await
+        .expect("create");
+
+    // Crash window after `rbd resize` but before the state save: the
+    // image is 2 GiB while state still records 1 GiB. This must not be a
+    // one-way door.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name_for(&id))
+        .expect("image")
+        .size = 2 * GIB;
+
+    // Inspect reflects the observed reality (the actual size), with the
+    // persisted heal left to reconcile.
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.state, VolumeLifecycle::Ready);
+
+    // Reconcile heals the recorded size and reports it.
+    let report = fixture.provider.reconcile().expect("reconcile");
+    assert_eq!(report.healed_grown, vec![id.clone()], "the heal is counted");
+    let state = CephState::load(&fixture.state_path).expect("state");
+    assert_eq!(
+        state.volume(&id).expect("entry").entry.size_bytes,
+        2 * GIB,
+        "the recorded size is healed to the actual"
+    );
+
+    // A subsequent grow proceeds from the healed size and succeeds.
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("heal-vol", 3 * GIB, inspected.generation),
+        )
+        .await
+        .expect("grow after the heal");
+    assert!(grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 3 * GIB);
+    assert_eq!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .images
+            .get(&image_name_for(&id))
+            .expect("image")
+            .size,
+        3 * GIB
+    );
+}
+
+#[tokio::test]
+async fn grow_proceeds_from_the_actual_size_without_a_reconcile_first() {
+    let fixture = fixture();
+    let id = volume_id("heal-direct");
+    let created = fixture
+        .provider
+        .create_volume(&create_request("heal-direct", GIB))
+        .await
+        .expect("create");
+
+    // Same crash window, but the operator grows immediately: the grow
+    // path itself must proceed from the image's actual size (2 GiB), so
+    // only the 1 GiB delta is checked against capacity and resized.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name_for(&id))
+        .expect("image")
+        .size = 2 * GIB;
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("heal-direct", 3 * GIB, created.generation),
+        )
+        .await
+        .expect("grow from the actual size");
+    assert_eq!(grown.effective_size_bytes, 3 * GIB);
+
+    let state = CephState::load(&fixture.state_path).expect("state");
+    assert_eq!(state.volume(&id).expect("entry").entry.size_bytes, 3 * GIB);
+}
+
+#[tokio::test]
+async fn a_shrunk_image_is_failed_and_never_healed_downward() {
+    let fixture = fixture();
+    let id = volume_id("shrink-vol");
+    fixture
+        .provider
+        .create_volume(&create_request("shrink-vol", GIB))
+        .await
+        .expect("create");
+
+    // The image shrank outside volvisor: a violation, never healed.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name_for(&id))
+        .expect("image")
+        .size = GIB / 2;
+    let report = fixture.provider.reconcile().expect("reconcile");
+    assert_eq!(report.shrunk_volumes, vec![id.clone()]);
+    assert_eq!(report.healed_grown, [], "a shrink is never healed");
+
+    let state = CephState::load(&fixture.state_path).expect("state");
+    let stored = state.volume(&id).expect("entry kept");
+    assert_eq!(stored.runtime.state, VolumeLifecycle::Failed);
+    assert_eq!(
+        stored.entry.size_bytes, GIB,
+        "the recorded size is never healed downward"
+    );
+
+    // A grow of the Failed volume is refused.
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("shrink-vol", 2 * GIB, stored.entry.generation),
+        )
+        .await
+        .expect_err("grow requires a healthy volume");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1541,126 @@ async fn startup_reconcile_clears_an_interrupted_detach() {
     );
 }
 
+#[test]
+fn reconcile_treats_a_transient_metadata_failure_as_an_honest_unknown() {
+    let state_path = leak_tempdir().join("state.json");
+    let world = Arc::new(Mutex::new(FakeCeph::default()));
+    seed_volume(&state_path, &world, "transient-vol", GIB);
+    // A transient metadata-read failure (mon timeout, NON-ENOENT): the
+    // volume's lifecycle must stay untouched — never Failed from an
+    // outage — and the unknown must be counted, not swallowed.
+    world.lock().expect("world").fail_meta_get_transient = true;
+
+    // The constructor's reconcile already ran with the failure present.
+    let provider = provider_from(&state_path, &world);
+    let state = CephState::load(&state_path).expect("state");
+    assert_eq!(
+        state
+            .volume(&volume_id("transient-vol"))
+            .expect("entry kept")
+            .runtime
+            .state,
+        VolumeLifecycle::Ready,
+        "a transient failure must not flip the lifecycle"
+    );
+
+    let report = provider.reconcile().expect("reconcile report");
+    assert_eq!(report.unverifiable_volumes.len(), 1, "{report:?}");
+    assert_eq!(
+        report.unverifiable_volumes[0].volume_id,
+        volume_id("transient-vol")
+    );
+    assert!(
+        report.unverifiable_volumes[0]
+            .detail
+            .contains("rbd image-meta get"),
+        "the error is summarized: {report:?}"
+    );
+    assert_eq!(report.mismatched_volumes, [], "no mismatch was verified");
+    assert_eq!(report.missing_volumes, [], "the image still exists");
+    assert_eq!(report.healed_grown, []);
+
+    // Once the outage passes, the very same volume verifies clean.
+    world.lock().expect("world").fail_meta_get_transient = false;
+    let report = provider.reconcile().expect("reconcile report");
+    assert_eq!(report.unverifiable_volumes, []);
+    assert_eq!(report.mismatched_volumes, []);
+    let state = CephState::load(&state_path).expect("state");
+    assert_eq!(
+        state
+            .volume(&volume_id("transient-vol"))
+            .expect("entry")
+            .runtime
+            .state,
+        VolumeLifecycle::Ready
+    );
+}
+
+#[test]
+fn reconcile_marks_a_volume_failed_when_ownership_metadata_is_absent() {
+    let state_path = leak_tempdir().join("state.json");
+    let world = Arc::new(Mutex::new(FakeCeph::default()));
+    seed_volume(&state_path, &world, "no-meta-vol", GIB);
+    // Genuinely absent ownership metadata (an ENOENT-class read): a
+    // verified mismatch, Failed — this is NOT a transient failure.
+    world
+        .lock()
+        .expect("world")
+        .images
+        .get_mut(&image_name_for(&volume_id("no-meta-vol")))
+        .expect("image")
+        .meta
+        .remove(common::OWNER_META_KEY);
+
+    let provider = provider_from(&state_path, &world);
+    let report = provider.reconcile().expect("reconcile report");
+    assert_eq!(
+        report.mismatched_volumes,
+        vec![volume_id("no-meta-vol")],
+        "key absence is a verified mismatch"
+    );
+    assert_eq!(report.unverifiable_volumes, []);
+    let state = CephState::load(&state_path).expect("state");
+    assert_eq!(
+        state
+            .volume(&volume_id("no-meta-vol"))
+            .expect("entry")
+            .runtime
+            .state,
+        VolumeLifecycle::Failed
+    );
+}
+
+#[test]
+fn reconcile_does_not_classify_an_unverifiable_image_as_foreign() {
+    let state_path = leak_tempdir().join("state.json");
+    let world = Arc::new(Mutex::new(FakeCeph::default()));
+    // An image with no state entry whose ownership cannot be read: it
+    // must be counted as unverifiable, not labeled foreign.
+    seed_foreign_image(&world, "unreadable-image", MIB);
+    world.lock().expect("world").fail_meta_get_transient = true;
+
+    let provider = provider_from(&state_path, &world);
+    let report = provider.reconcile().expect("reconcile report");
+    assert_eq!(
+        report.foreign_images,
+        Vec::<String>::new(),
+        "an unknown is not a foreign fact"
+    );
+    assert_eq!(report.untracked_owned_images, Vec::<String>::new());
+    assert_eq!(report.unverifiable_images.len(), 1);
+    assert_eq!(report.unverifiable_images[0].image_name, "unreadable-image");
+
+    // The image was left untouched.
+    assert!(
+        world
+            .lock()
+            .expect("world")
+            .images
+            .contains_key("unreadable-image")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read-only pool discovery
 // ---------------------------------------------------------------------------
@@ -1233,14 +1683,62 @@ fn discover_pools_reports_the_configured_pool_honestly() {
         POOL_MAX_AVAIL - CEPH_HEADROOM_BYTES,
         "headroom is withheld from allocatable capacity"
     );
-    // Never a local mirror beneath Ceph; replication is the pool policy.
+    // Never a local mirror beneath Ceph; replication is reported from the
+    // pool's own policy query (`ceph osd pool get <pool> size`, default
+    // size 3 in the fake) — never inferred from capacity output.
     assert!(!pool.protection.local_mirror);
     assert!(pool.protection.remote_replication);
 
+    // A size-1 pool keeps no remote copy: not established.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.pool_size = 1;
+        world.pool_min_size = 1;
+    }
+    let pools = fixture.provider.discover_pools().expect("discover pools");
+    assert!(!pools[0].protection.remote_replication);
+
+    // A failing policy query is a typed error, never a guessed fact.
+    fixture.world.lock().expect("world").fail_pool_get = true;
+    let err = fixture
+        .provider
+        .discover_pools()
+        .expect_err("policy query failure must surface");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("ceph osd pool get"), "{err}");
+
     // A failing health query degrades to Unknown, never a fabricated fact.
-    fixture.world.lock().expect("world").fail_health = true;
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.fail_pool_get = false;
+        world.fail_health = true;
+    }
     let pools = fixture.provider.discover_pools().expect("discover pools");
     assert_eq!(pools[0].health, volvisor_types::domain::Health::Unknown);
+}
+
+#[tokio::test]
+async fn inspect_does_not_claim_an_unproven_remote_protection_axis() {
+    let fixture = fixture();
+    let id = volume_id("protect-vol");
+    fixture
+        .provider
+        .create_volume(&create_request("protect-vol", MIB))
+        .await
+        .expect("create");
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    // The per-volume inspect path makes no policy queries (it must stay
+    // cheap), so the remote axis is honestly NOT established — never
+    // asserted from a heuristic. The authoritative replication facts
+    // live on the pool discovery surface (see the discover_pools test).
+    assert_eq!(
+        inspected.effective_protection.remote,
+        volvisor_types::domain::RemoteProtectionAxis::None
+    );
+    assert_eq!(
+        inspected.effective_protection.local,
+        volvisor_types::domain::LocalProtectionAxis::None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,7 +1821,10 @@ async fn every_invocation_carries_the_monitor_and_user_flags() {
             invocation.args.get(1).map(String::as_str),
             Some(mons.as_str())
         );
-        assert_eq!(invocation.args.get(2).map(String::as_str), Some("--id"));
+        // The user is the FULL entity name and must travel via --name:
+        // --id takes a bare id and would double-prefix into the
+        // nonexistent client.client.volvisor.
+        assert_eq!(invocation.args.get(2).map(String::as_str), Some("--name"));
         assert_eq!(invocation.args.get(3).map(String::as_str), Some(USER));
     }
 }

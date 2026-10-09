@@ -1,9 +1,9 @@
 //! Permissive parsing of `ceph`/`rbd` CLI JSON output.
 //!
 //! CLI JSON output drifts across tool versions: sizes may appear as JSON
-//! numbers or as strings, `rbd showmapped --format json` prints a JSON
-//! *object* keyed by device-mapper id rather than an array, and fields may
-//! be absent. Parsing here is therefore permissive — every field is an
+//! numbers or as strings, `rbd showmapped --format json` prints an object
+//! with a `devices` array (a bare array and a legacy keyed object appear
+//! in older builds), and fields may be absent. Parsing here is therefore permissive — every field is an
 //! `Option` with `#[serde(default)]`, unknown fields are ignored — and
 //! callers treat a missing field as "unknown", mapping it to honest typed
 //! errors instead of defaults that pretend knowledge. A payload that is
@@ -125,6 +125,13 @@ pub struct CephDfPool {
 }
 
 /// The per-pool statistics this provider consumes.
+///
+/// Real `ceph df --format json` per-pool stats carry `stored`,
+/// `objects`, `kb_used`, `bytes_used`, `percent_used` and `max_avail` —
+/// **no** replication `size`/`min_size` (those are policy facts owned by
+/// `ceph osd pool get`, see [`parse_pool_policy_value`]); fields for
+/// them are deliberately absent here so a replication fact can never be
+/// hallucinated from a capacity report.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CephDfStats {
     /// Bytes stored in the pool (raw usage basis as reported).
@@ -133,12 +140,6 @@ pub struct CephDfStats {
     /// Bytes still allocatable in the pool.
     #[serde(default)]
     pub max_avail: Option<FlexibleNumber>,
-    /// Replication `size` of the pool, when the CLI reports it.
-    #[serde(default)]
-    pub size: Option<FlexibleNumber>,
-    /// Replication `min_size` of the pool, when the CLI reports it.
-    #[serde(default)]
-    pub min_size: Option<FlexibleNumber>,
 }
 
 impl CephDfPool {
@@ -156,21 +157,6 @@ impl CephDfPool {
     pub fn max_avail(&self) -> Option<u64> {
         self.stats
             .max_avail
-            .as_ref()
-            .and_then(FlexibleNumber::to_u64)
-    }
-
-    /// Pool replication `size`, when reported and parseable.
-    #[must_use]
-    pub fn size(&self) -> Option<u64> {
-        self.stats.size.as_ref().and_then(FlexibleNumber::to_u64)
-    }
-
-    /// Pool replication `min_size`, when reported and parseable.
-    #[must_use]
-    pub fn min_size(&self) -> Option<u64> {
-        self.stats
-            .min_size
             .as_ref()
             .and_then(FlexibleNumber::to_u64)
     }
@@ -252,23 +238,95 @@ impl MappedDevice {
 
 /// Parse `rbd showmapped --format json` output.
 ///
-/// The CLI prints a JSON **object** keyed by device-mapper id (e.g.
-/// `{"3": {"pool": "rbd", "name": "img", "device": "/dev/rbd3", ...}}`);
-/// the key itself is not meaningful here, only the values. Parsing is
-/// permissive: non-object payloads and non-object values are skipped.
+/// Three real output shapes are accepted, anything else is a typed
+/// `INTERNAL` error (a mapping table is never silently emptied — an
+/// unparseable report must fail the caller loudly, because attach
+/// verification and detach both depend on it):
+///
+/// - the shape modern `rbd` prints: an object with a `devices` array,
+///   e.g. `{"devices":[{"id":"0","pool":"rbd","name":"img","snap":"-",
+///   "device":"/dev/rbd0"}]}`;
+/// - a bare JSON array of device entries;
+/// - the legacy shape: an object keyed by device-mapper id whose values
+///   are the device entries (the key itself is not meaningful).
+///
+/// The legitimately empty outputs (`{}`, `{"devices":[]}` and `[]`) mean
+/// "no mappings". Entry fields stay permissive (`Option` +
+/// `#[serde(default)]`, unknown fields ignored), but an entry that does
+/// not decode as an object at all is an error, not a skip.
 pub fn parse_showmapped(stdout: &str) -> Result<Vec<MappedDevice>, ApiError> {
     let value: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|e| parse_error("rbd showmapped", format!("JSON decode: {e}")))?;
-    let Some(entries) = value.as_object() else {
-        return Ok(Vec::new());
+    let entries: Vec<serde_json::Value> = match &value {
+        serde_json::Value::Object(map) => match map.get("devices") {
+            // Real shape: {"devices": [...]}.
+            Some(devices) => devices.as_array().cloned().ok_or_else(|| {
+                parse_error("rbd showmapped", "the devices field is not an array")
+            })?,
+            // Legacy shape: {"0": {...}, "3": {...}}.
+            None => map.values().cloned().collect(),
+        },
+        // Bare array shape.
+        serde_json::Value::Array(entries) => entries.clone(),
+        other => {
+            return Err(parse_error(
+                "rbd showmapped",
+                format!(
+                    "expected an object with a devices array, an array, or a legacy keyed \
+                     object; got {}",
+                    type_name_of(other)
+                ),
+            ));
+        }
     };
-    let mut devices = Vec::new();
-    for entry in entries.values() {
-        let device: MappedDevice = serde_json::from_value(entry.clone())
-            .map_err(|e| parse_error("rbd showmapped", format!("entry decode: {e}")))?;
-        devices.push(device);
+    entries
+        .iter()
+        .map(|entry| {
+            serde_json::from_value(entry.clone())
+                .map_err(|e| parse_error("rbd showmapped", format!("entry decode: {e}")))
+        })
+        .collect()
+}
+
+/// The JSON type name of `value` for parse-error details.
+fn type_name_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
     }
-    Ok(devices)
+}
+
+/// Parse one numeric field of `ceph osd pool get <pool> <key> --format json`.
+///
+/// Real output is a small object such as `{"size":"3"}` (the value is a
+/// string in some builds, a number in others, and fields like `pool` or
+/// `key` may ride along). Parsing is permissive about the value's JSON
+/// type but strict about shape: anything that is not an object carrying
+/// the requested key as a plain decimal is a typed `INTERNAL` error — a
+/// pool policy fact is never guessed (this is the *true* replication
+/// policy query; `ceph df` does not report replication at all).
+pub fn parse_pool_policy_value(stdout: &str, key: &str) -> Result<u64, ApiError> {
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .map_err(|e| parse_error("ceph osd pool get", format!("JSON decode: {e}")))?;
+    let field = value.get(key).ok_or_else(|| {
+        parse_error(
+            "ceph osd pool get",
+            format!("the output carries no {key} field"),
+        )
+    })?;
+    serde_json::from_value::<FlexibleNumber>(field.clone())
+        .ok()
+        .and_then(|number| number.to_u64())
+        .ok_or_else(|| {
+            parse_error(
+                "ceph osd pool get",
+                format!("the {key} field is not a plain decimal"),
+            )
+        })
 }
 
 /// Parse `rbd ls --pool <pool> --format json` output (an array of names).
@@ -348,10 +406,14 @@ mod tests {
 
     #[test]
     fn ceph_df_parses_pool_stats_permissively() {
+        // The real per-pool stats shape: stored/objects/kb_used/
+        // bytes_used/percent_used/max_avail — no replication fields
+        // (those come from `ceph osd pool get`).
         let stdout = r#"{
             "pools": [
-                {"name": "rbd", "stats": {"bytes_used": 1024, "max_avail": "2048",
-                 "size": 3, "min_size": 2}},
+                {"name": "rbd", "stats": {"stored": 0, "objects": 0,
+                 "kb_used": 1, "bytes_used": 1024, "percent_used": 0.01,
+                 "max_avail": "2048"}},
                 {"name": "other", "stats": {}}
             ]
         }"#;
@@ -361,8 +423,6 @@ mod tests {
         assert_eq!(pool.name.as_deref(), Some("rbd"));
         assert_eq!(pool.bytes_used(), Some(1024));
         assert_eq!(pool.max_avail(), Some(2048));
-        assert_eq!(pool.size(), Some(3));
-        assert_eq!(pool.min_size(), Some(2));
         // Absent stats stay unknown, never zero.
         let other = &df.pools[1];
         assert_eq!(other.bytes_used(), None);
@@ -389,7 +449,35 @@ mod tests {
     }
 
     #[test]
-    fn showmapped_parses_the_object_keyed_form() {
+    fn showmapped_parses_the_real_devices_array_shape_verbatim() {
+        // Verbatim real `rbd showmapped --format json` output.
+        let stdout =
+            r#"{"devices":[{"id":"0","pool":"rbd","name":"img","snap":"-","device":"/dev/rbd0"}]}"#;
+        let devices = parse_showmapped(stdout).expect("parse");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].pool_slash_image().as_deref(),
+            Some("rbd/img"),
+            "the real shape must parse — attach verification and detach \
+             depend on it"
+        );
+        assert_eq!(devices[0].device.as_deref(), Some("/dev/rbd0"));
+    }
+
+    #[test]
+    fn showmapped_parses_the_bare_array_and_legacy_keyed_shapes() {
+        // A bare JSON array of entries.
+        let devices = parse_showmapped(
+            r#"[{"pool": "volvisortest", "name": "vol-a-00000000",
+                 "device": "/dev/rbd0", "snap": "-"}]"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            devices[0].pool_slash_image().as_deref(),
+            Some("volvisortest/vol-a-00000000")
+        );
+
+        // The legacy shape: an object keyed by device-mapper id.
         let stdout = r#"{
             "0": {"pool": "volvisortest", "name": "vol-a-00000000",
                   "device": "/dev/rbd0", "snap": "-", "client": "-"},
@@ -403,9 +491,74 @@ mod tests {
         );
         assert_eq!(devices[0].device.as_deref(), Some("/dev/rbd0"));
         assert_eq!(devices[1].pool_slash_image(), None);
+    }
 
-        // A non-object payload is not an error, just no mappings.
-        assert!(parse_showmapped("[]").expect("parse").is_empty());
+    #[test]
+    fn showmapped_empty_outputs_mean_no_mappings() {
+        // The legitimately empty outputs: {} / {"devices":[]} / [].
+        for stdout in ["{}", r#"{"devices": []}"#, "[]"] {
+            assert!(
+                parse_showmapped(stdout)
+                    .expect("an empty mapping table parses")
+                    .is_empty(),
+                "{stdout} must mean no mappings"
+            );
+        }
+    }
+
+    #[test]
+    fn showmapped_rejects_shapes_matching_no_real_form() {
+        // Strict philosophy (mirroring parse_image_list): a payload that
+        // matches none of the known real forms is a typed INTERNAL
+        // error, never a silent empty mapping table.
+        for stdout in [
+            r#"{"devices": 3}"#,
+            r#"{"devices": [3]}"#,
+            r#"{"0": 3}"#,
+            r#"["/dev/rbd0"]"#,
+            "3",
+            r#""text""#,
+            "null",
+        ] {
+            let err = parse_showmapped(stdout)
+                .expect_err(&format!("{stdout} must not parse as mappings"));
+            assert_eq!(err.code, ApiErrorCode::Internal, "{stdout}: {err}");
+        }
+    }
+
+    #[test]
+    fn pool_policy_values_parse_permissively_but_never_guess() {
+        // Real shapes: a bare object, a string value, a numeric value,
+        // and extra riding fields.
+        assert_eq!(
+            parse_pool_policy_value(r#"{"size":"3"}"#, "size").expect("parse"),
+            3
+        );
+        assert_eq!(
+            parse_pool_policy_value(r#"{"size": 3}"#, "size").expect("parse"),
+            3
+        );
+        assert_eq!(
+            parse_pool_policy_value(
+                r#"{"pool": "rbd", "key": "min_size", "min_size": "2"}"#,
+                "min_size"
+            )
+            .expect("parse"),
+            2
+        );
+        // Garbage is a typed error, never a fabricated policy fact.
+        for stdout in [
+            "oops",
+            "{}",
+            r#"{"size": "three"}"#,
+            r#"{"size": true}"#,
+            "3",
+        ] {
+            let err = parse_pool_policy_value(stdout, "size")
+                .expect_err(&format!("{stdout} must not parse as a policy value"));
+            assert_eq!(err.code, ApiErrorCode::Internal, "{stdout}: {err}");
+            assert!(err.detail.contains("ceph osd pool get"), "{err}");
+        }
     }
 
     #[test]

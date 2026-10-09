@@ -8,7 +8,8 @@
 //! - `VOLVISOR_CEPH_FSID` — the cluster FSID (`ceph fsid`),
 //! - `VOLVISOR_CEPH_MONS` — comma-separated monitor addresses,
 //! - `VOLVISOR_CEPH_POOL` — the pool test images are created in,
-//! - `VOLVISOR_CEPH_USER` — the Ceph user id passed as `--id`.
+//! - `VOLVISOR_CEPH_USER` — the full Ceph entity name passed via
+//!   `--name` (e.g. `client.volvisor`).
 //!
 //! The tests are read-mostly: one volume is created, mapped, grown,
 //! unmapped and moved to the RBD trash in the configured pool, and the
@@ -116,7 +117,7 @@ fn rbd_query(cluster: &Cluster, tail: &[&str]) -> Result<CommandOutput, volvisor
     let mut args = vec![
         "-m".to_owned(),
         cluster.config.mon_hosts.join(","),
-        "--id".to_owned(),
+        "--name".to_owned(),
         cluster.config.user.clone(),
     ];
     args.extend(tail.iter().map(|arg| (*arg).to_owned()));

@@ -24,10 +24,10 @@ pub enum ProviderKind {
     Ceph,
 }
 
-/// Default Ceph user id (`--id`) when `ceph_user` is unset.
+/// Default Ceph entity name (`--name`) when `ceph_user` is unset.
 ///
 /// The ceph CLI resolves the matching keyring itself (CEPH_CONF /
-/// keyring conventions); volvisor only passes `--id` and `-m` and never
+/// keyring conventions); volvisor only passes `--name` and `-m` and never
 /// reads or logs credential material.
 pub const DEFAULT_CEPH_USER: &str = "client.volvisor";
 
@@ -59,9 +59,11 @@ pub struct Config {
     pub ceph_mon_hosts: Option<Vec<String>>,
     /// The single RBD pool volumes are created in (ceph provider only).
     pub ceph_pool: Option<String>,
-    /// The Ceph user id passed as `--id` (ceph provider only; defaults
-    /// to [`DEFAULT_CEPH_USER`]). The ceph CLI resolves the keyring
-    /// itself; volvisor never reads or logs key material.
+    /// The Ceph entity name passed as `--name` (ceph provider only; defaults
+    /// to [`DEFAULT_CEPH_USER`]). Must be a full `client.<id>` entity name —
+    /// `--name` takes the complete form, unlike the bare-id `--id` flag.
+    /// The ceph CLI resolves the keyring itself; volvisor never reads or
+    /// logs key material.
     pub ceph_user: Option<String>,
     /// Durable ceph provider state path (defaults to
     /// `<journal_dir>/ceph-state.json`).
@@ -169,10 +171,21 @@ impl Config {
             }
         }
         if let Some(user) = &self.ceph_user {
-            if user.is_empty() || user.chars().any(char::is_whitespace) {
+            // `--name` takes the FULL entity name; a bare id (or a non-client
+            // entity type) is a configuration mistake that would silently
+            // authenticate as the wrong principal.
+            let valid = user.strip_prefix("client.").is_some_and(|id| {
+                !id.is_empty()
+                    && !id.chars().any(char::is_whitespace)
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            });
+            if !valid {
                 return Err(DaemonError::Config(
-                    "ceph_user must be non-empty and free of whitespace when set (leave it \
-                     unset for the documented default)"
+                    "ceph_user must be a full client entity name like 'client.volvisor' \
+                     (client. prefix plus a non-empty id of alnum, '-', '_' or '.') when set \
+                     (leave it unset for the documented default)"
                         .to_owned(),
                 ));
             }
@@ -525,10 +538,25 @@ provider = \"ceph\"
 
     #[test]
     fn ceph_user_must_be_set_to_something_sane() {
-        for bad in ["", "client with spaces", "client\tvolvisor"] {
+        // `--name` takes the full entity name: a bare id, a wrong entity
+        // type, or an empty/garbage id is a config mistake.
+        for bad in [
+            "",
+            "volvisor",
+            "client.",
+            "client with spaces",
+            "client\tvolvisor",
+            "mon.volvisor",
+            "client.volvisor/extra",
+        ] {
             let raw = minimal_ceph_toml() + &format!("ceph_user = \"{bad}\"\n");
             let cfg: Config = toml::from_str(&raw).expect("parse");
             assert!(cfg.validate().is_err(), "user {bad:?} must be rejected");
+        }
+        for good in ["client.admin", "client.volvisor-2", "client.a.b_c"] {
+            let raw = minimal_ceph_toml() + &format!("ceph_user = \"{good}\"\n");
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            assert!(cfg.validate().is_ok(), "user {good:?} must be accepted");
         }
         let raw = minimal_ceph_toml() + "ceph_user = \"client.admin\"\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");

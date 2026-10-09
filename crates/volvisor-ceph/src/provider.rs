@@ -5,7 +5,7 @@
 //! of an **existing, externally operated** Ceph cluster, driven through
 //! the `ceph`/`rbd` CLIs via the shell-free
 //! [`CommandRunner`](volvisor_provider::runner). Every invocation carries
-//! `-m <mons>` and `--id <user>` (never an environment-variable or
+//! `-m <mons>` and `--name <user>` (never an environment-variable or
 //! config-file side channel); the ceph CLI resolves credentials itself,
 //! so this provider never reads or stores key material.
 //!
@@ -53,10 +53,12 @@ use volvisor_types::{
 
 use crate::report::{
     CephDfPool, HealthDetail, MappedDevice, RbdInfo, parse_ceph_df, parse_fsid,
-    parse_health_detail, parse_image_list, parse_rbd_info, parse_showmapped, parse_trash_list,
+    parse_health_detail, parse_image_list, parse_pool_policy_value, parse_rbd_info,
+    parse_showmapped, parse_trash_list,
 };
 use crate::state::{
-    AttachmentRecord, CephState, StoredVolume, VolumeEntry, VolumeRuntime, unix_now,
+    AttachmentRecord, CephState, StoredVolume, UnverifiableImage, UnverifiableVolume, VolumeEntry,
+    VolumeRuntime, unix_now,
 };
 use crate::{CommandOutput, CommandRunner, ReconcileReport};
 
@@ -71,6 +73,23 @@ pub const GENERATION_META_KEY: &str = "volvisor.generation";
 
 /// The only volume class served by this provider.
 static SUPPORTED_CLASSES: &[VolumeClass] = &[VolumeClass::CephRbd];
+
+/// The size-agreement outcome for an owned image, from `rbd info`.
+#[derive(Clone, Debug)]
+enum SizeAgreement {
+    /// The image reports exactly the recorded size.
+    Agree,
+    /// The image reports MORE than recorded: a completed-but-unrecorded
+    /// grow (the crash window after `rbd resize`), carrying the actual
+    /// size so the record can be healed.
+    Grown(u64),
+    /// The image reports LESS than recorded: it changed outside volvisor
+    /// (a shrink) — a violation, never healed.
+    Shrunk,
+    /// The size could not be verified (a transient read failure): an
+    /// honest unknown carrying the summarized error.
+    Unknown(String),
+}
 
 /// Logical block size assumed when a create request omits one.
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -104,15 +123,30 @@ enum Backing {
     Mismatch,
 }
 
+/// The replication policy facts of the configured pool (from
+/// `ceph osd pool get`).
+#[derive(Clone, Copy, Debug)]
+struct PoolReplicationPolicy {
+    /// Replication factor (`size`): how many copies the pool keeps.
+    size: u64,
+    /// Minimum healthy replicas the pool still accepts I/O at
+    /// (`min_size`).
+    min_size: u64,
+}
+
 /// The usable-capacity picture of the configured pool (from `ceph df`).
+///
+/// Deliberately carries no replication facts: real `ceph df` per-pool
+/// stats have `stored`/`objects`/`kb_used`/`bytes_used`/
+/// `percent_used`/`max_avail` and nothing else. Replication policy is
+/// queried separately through `ceph osd pool get` (see
+/// [`CephRbdProvider::discover_pools`]).
 #[derive(Clone, Copy, Debug)]
 struct PoolCapacity {
     /// Bytes used in the pool as reported by `ceph df`.
     bytes_used: u64,
     /// Bytes still allocatable in the pool as reported by `ceph df`.
     max_avail: u64,
-    /// Pool replication `size`, when reported (protection policy fact).
-    size: Option<u64>,
 }
 
 /// Verified connection parameters for one external Ceph cluster.
@@ -120,7 +154,8 @@ struct PoolCapacity {
 /// The constructor fail-closes unless the cluster answers with exactly
 /// `cluster_fsid`, the pool exists, and a health query succeeds; a
 /// mis-pointed cluster is never adopted. No keyring lives here: the
-/// daemon-side keyring is resolved by the ceph CLI through `--id user`.
+/// daemon-side keyring is resolved by the ceph CLI through
+/// `--name <user>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CephProviderConfig {
     /// The cluster FSID this provider may operate on (exact match).
@@ -130,7 +165,9 @@ pub struct CephProviderConfig {
     pub mon_hosts: Vec<String>,
     /// The single pool volumes are created in.
     pub pool: String,
-    /// The Ceph user id passed as `--id` (e.g. `client.volvisor`).
+    /// The full Ceph entity name, e.g. `client.volvisor`, passed via
+    /// `--name` on every invocation (`--id` takes a bare id and would
+    /// double-prefix a full entity name into a nonexistent user).
     pub user: String,
 }
 
@@ -227,14 +264,19 @@ impl CephRbdProvider {
         })
     }
 
-    // -- Command plumbing (argv arrays; -m and --id on every invocation) --
+    // -- Command plumbing (argv arrays; -m and --name on every invocation) --
 
     /// The shared argv prefix of every `ceph`/`rbd` invocation.
+    ///
+    /// The user is passed via `--name` because the config carries the
+    /// FULL entity name (e.g. `client.volvisor`); `--id` takes a bare id
+    /// and would authenticate as the nonexistent
+    /// `client.client.volvisor`.
     fn base_args(&self) -> Vec<String> {
         vec![
             "-m".to_owned(),
             self.config.mon_hosts.join(","),
-            "--id".to_owned(),
+            "--name".to_owned(),
             self.config.user.clone(),
         ]
     }
@@ -314,7 +356,6 @@ impl CephRbdProvider {
             // fact worth failing over.
             bytes_used: pool.bytes_used().unwrap_or_default(),
             max_avail,
-            size: pool.size(),
         })
     }
 
@@ -355,17 +396,24 @@ impl CephRbdProvider {
 
     /// Read one RBD image metadata key.
     ///
-    /// Returns `Ok(None)` when the CLI exits non-zero, which — for an
-    /// image whose existence was just confirmed through `rbd ls` — means
-    /// the key is absent (a cluster-wide failure would have failed the
-    /// `rbd ls` query too). Only `Err` on execution failure.
+    /// `Ok(None)` means *genuine key absence* only: a non-zero exit whose
+    /// stderr carries an ENOENT-flavored message (real `rbd image-meta
+    /// get` on an absent key prints e.g. `failed to get metadata <key> of
+    /// image : (2) No such file or directory`; some builds spell the
+    /// errno name or `No such attribute` instead). Every OTHER non-zero
+    /// exit — a transient mon timeout, a permission failure — is a typed
+    /// `INTERNAL` error, never a silent `None`: conflating the two would
+    /// persist `Failed` on healthy volumes out of a mere outage.
     fn image_meta_get(&self, image_name: &str, key: &str) -> Result<Option<String>, ApiError> {
         let spec = self.image_spec(image_name);
         let output = self.run_rbd(&["image-meta", "get", &spec, key])?;
         if output.success {
-            Ok(Some(output.stdout.trim().to_owned()))
-        } else {
+            return Ok(Some(output.stdout.trim().to_owned()));
+        }
+        if is_key_absent(&output.stderr) {
             Ok(None)
+        } else {
+            Err(command_failed("rbd image-meta get", &output))
         }
     }
 
@@ -459,6 +507,21 @@ impl CephRbdProvider {
 
     // -- Reconciliation and read-only discovery --
 
+    /// The size-agreement outcome for a verifiably owned image.
+    fn size_agreement(&self, image_name: &str, recorded: u64) -> SizeAgreement {
+        match self.image_info(image_name) {
+            Ok(info) => match info.size_bytes() {
+                Some(actual) if actual > recorded => SizeAgreement::Grown(actual),
+                Some(actual) if actual < recorded => SizeAgreement::Shrunk,
+                Some(_) => SizeAgreement::Agree,
+                None => SizeAgreement::Unknown(format!(
+                    "rbd info did not report a size for {image_name}"
+                )),
+            },
+            Err(error) => SizeAgreement::Unknown(error.detail),
+        }
+    }
+
     /// Reconcile provider state against the observed cluster.
     ///
     /// Non-destructive by construction (nothing is unmapped, adopted or
@@ -469,6 +532,11 @@ impl CephRbdProvider {
     ///   silently recreated or dropped;
     /// - a state entry whose `volvisor.owner` metadata is missing or
     ///   names a different volume is marked `Failed` (never adopted);
+    /// - a state entry whose image reports LESS than the recorded size
+    ///   (a shrink outside volvisor) is marked `Failed`; MORE is a
+    ///   completed-but-unrecorded grow and the recorded size is healed
+    ///   up to the image's actual report (counted in
+    ///   [`ReconcileReport::healed_grown`]);
     /// - a volume whose image is mapped while no attachment record exists
     ///   (a stale mapping from a previous incarnation) is marked `Failed`
     ///   and reported — the mapping is never unmapped automatically
@@ -478,6 +546,10 @@ impl CephRbdProvider {
     ///   succeeded, the state save did not) is cleared and the volume
     ///   returns to `Ready` — state matches observed reality, mirroring
     ///   the LVM release reconciliation;
+    /// - a volume whose verification could not complete (a transient
+    ///   query failure, e.g. a mon timeout) is left COMPLETELY untouched
+    ///   and counted as unverifiable — an unknown is never persisted as
+    ///   `Failed`;
     /// - images without our metadata are foreign: reported, never touched.
     ///
     /// # Errors
@@ -512,6 +584,39 @@ impl CephRbdProvider {
             let owner = self.image_meta_get(image_name, OWNER_META_KEY);
             match owner {
                 Ok(Some(owner)) if owner == id.as_str() => {
+                    // Size agreement against the image's own report.
+                    match self.size_agreement(image_name, snapshot.entry.size_bytes) {
+                        SizeAgreement::Grown(actual) => {
+                            // A completed-but-unrecorded grow (the crash
+                            // window after `rbd resize`): heal the
+                            // bookkeeping up to the image's report.
+                            if let Some(volume) = state.volume_mut(&id) {
+                                volume.entry.size_bytes = actual;
+                                changed = true;
+                            }
+                            report.healed_grown.push(id.clone());
+                        }
+                        SizeAgreement::Shrunk => {
+                            // The image changed outside volvisor: Failed,
+                            // never healed downward.
+                            if snapshot.runtime.state != VolumeLifecycle::Failed {
+                                if let Some(volume) = state.volume_mut(&id) {
+                                    volume.runtime.state = VolumeLifecycle::Failed;
+                                    changed = true;
+                                }
+                            }
+                            report.shrunk_volumes.push(id.clone());
+                        }
+                        SizeAgreement::Unknown(detail) => {
+                            // Transient read failure: an honest unknown,
+                            // never a Failed from an outage.
+                            report.unverifiable_volumes.push(UnverifiableVolume {
+                                volume_id: id.clone(),
+                                detail,
+                            });
+                        }
+                        SizeAgreement::Agree => {}
+                    }
                     let mapped = mappings.as_ref().is_some_and(|maps| {
                         maps.iter().any(|m| m.name.as_deref() == Some(image_name))
                     });
@@ -553,29 +658,21 @@ impl CephRbdProvider {
                     }
                     report.mismatched_volumes.push(id);
                 }
-                Err(_) => {
-                    // Honest unknown: leave the entry untouched.
+                Err(error) => {
+                    // Honest unknown (e.g. a transient mon timeout): leave
+                    // the entry untouched and count it — never persist
+                    // Failed from an outage.
+                    report.unverifiable_volumes.push(UnverifiableVolume {
+                        volume_id: id,
+                        detail: error.detail,
+                    });
                 }
             }
         }
 
         // Foreign / untracked pass: images we have no state for. Never
         // touched, only reported (AGENTS rule 7).
-        let our_images: Vec<String> = state
-            .volumes()
-            .values()
-            .map(|volume| volume.entry.image_name.clone())
-            .collect();
-        for image_name in &listed {
-            if our_images.contains(image_name) {
-                continue;
-            }
-            match self.image_meta_get(image_name, OWNER_META_KEY) {
-                Ok(Some(_)) => report.untracked_owned_images.push(image_name.clone()),
-                Ok(None) => report.foreign_images.push(image_name.clone()),
-                Err(_) => {}
-            }
-        }
+        self.reconcile_untracked_images(&state, &listed, &mut report);
 
         if changed {
             state.save(&self.state_path)?;
@@ -583,17 +680,54 @@ impl CephRbdProvider {
         Ok(report)
     }
 
+    /// The untracked-images pass of [`Self::reconcile`]: classify images
+    /// we have no state entry for (foreign / owned-but-untracked /
+    /// unverifiable) without touching any of them (AGENTS rule 7).
+    fn reconcile_untracked_images(
+        &self,
+        state: &CephState,
+        listed: &[String],
+        report: &mut ReconcileReport,
+    ) {
+        let our_images: Vec<String> = state
+            .volumes()
+            .values()
+            .map(|volume| volume.entry.image_name.clone())
+            .collect();
+        for image_name in listed {
+            if our_images.contains(image_name) {
+                continue;
+            }
+            match self.image_meta_get(image_name, OWNER_META_KEY) {
+                Ok(Some(_)) => report.untracked_owned_images.push(image_name.clone()),
+                Ok(None) => report.foreign_images.push(image_name.clone()),
+                Err(error) => {
+                    // A transient read failure must not classify the
+                    // image as foreign: count it as unverifiable.
+                    report.unverifiable_images.push(UnverifiableImage {
+                        image_name: image_name.clone(),
+                        detail: error.detail,
+                    });
+                }
+            }
+        }
+    }
+
     /// Read-only pool discovery: the configured pool as a [`Pool`], with
-    /// capacity from `ceph df` and health reflected from `ceph health`
-    /// (query failure → `Unknown`, never fabricated). No cluster mutation
-    /// of any kind; foreign images are invisible here (they are a
-    /// reconcile concern, not a pool fact).
+    /// capacity from `ceph df`, health reflected from `ceph health`
+    /// (query failure → `Unknown`, never fabricated) and replication
+    /// reported from the pool's own policy (`ceph osd pool get`). No
+    /// cluster mutation of any kind; foreign images are invisible here
+    /// (they are a reconcile concern, not a pool fact).
     ///
     /// # Errors
     /// Returns an [`ApiError`] when `ceph df` cannot establish the pool's
-    /// capacity (the pool list is then unknown, not empty).
+    /// capacity or `ceph osd pool get` cannot establish its replication
+    /// policy (the pool list is then unknown, not guessed — replication
+    /// is never asserted from absent facts).
     pub fn discover_pools(&self) -> Result<Vec<Pool>, ApiError> {
         let stats = self.pool_stats()?;
+        let policy = self.pool_replication_policy()?;
         let health = self
             .run_health()
             .map_or(Health::Unknown, |detail| detail.health());
@@ -616,14 +750,63 @@ impl CephRbdProvider {
             protection: PoolProtection {
                 // Never claim a local mirror beneath Ceph (contract §6).
                 local_mirror: false,
-                // Remote replication is a pool policy fact: claimed only
-                // when ceph df reports a replication size >= 2; otherwise
-                // not established (the volume-level protection axis is the
-                // authoritative ceph_policy statement).
-                remote_replication: stats.size.is_some_and(|size| size >= 2),
+                // Remote replication is a pool POLICY fact, established
+                // only from the policy query (`osd pool get size`), never
+                // inferred from capacity output: a replicated pool
+                // (size >= 2) keeps redundancy across failure domains; a
+                // size-1 pool has no remote copy at all.
+                remote_replication: policy.size >= 2,
             },
             health,
         }])
+    }
+
+    /// The pool's replication policy facts, from `ceph osd pool get`.
+    ///
+    /// `ceph df` does not report replication; the true (read-only)
+    /// policy query is `ceph osd pool get <pool> size|min_size
+    /// --format json` (real output: `{"size":"3"}`). Used only by
+    /// [`Self::discover_pools`] — the per-volume inspect path stays
+    /// cheap and makes no policy queries.
+    ///
+    /// # Errors
+    /// `INTERNAL` when either query fails or its output is garbage — a
+    /// policy fact is never guessed.
+    fn pool_replication_policy(&self) -> Result<PoolReplicationPolicy, ApiError> {
+        let policy = PoolReplicationPolicy {
+            size: self.pool_policy_value("size")?,
+            min_size: self.pool_policy_value("min_size")?,
+        };
+        // A policy whose min_size exceeds its size cannot exist on a
+        // healthy cluster: garbage data is never adopted as a fact.
+        if policy.min_size > policy.size {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "ceph osd pool get reported min_size {} above size {} for pool {:?}: \
+                     garbage policy data is never adopted",
+                    policy.min_size, policy.size, self.config.pool
+                ),
+            ));
+        }
+        Ok(policy)
+    }
+
+    /// One numeric pool-policy field from `ceph osd pool get`.
+    fn pool_policy_value(&self, key: &str) -> Result<u64, ApiError> {
+        let output = self.run_ceph(&[
+            "osd",
+            "pool",
+            "get",
+            &self.config.pool,
+            key,
+            "--format",
+            "json",
+        ])?;
+        if !output.success {
+            return Err(command_failed("ceph osd pool get", &output));
+        }
+        parse_pool_policy_value(&output.stdout, key)
     }
 
     // -- Volume operations (sync bodies behind the async trait surface) --
@@ -636,6 +819,14 @@ impl CephRbdProvider {
     /// (best-effort `rbd rm`) and a typed `INTERNAL` error is returned,
     /// so neither an orphaned image nor a state entry survives a failed
     /// create.
+    ///
+    /// Crash-window recovery: if `rbd create` fails because the image
+    /// already exists — the signature of a crash after
+    /// [`Self::create_owned_image`] but before the caller's state save —
+    /// the existing image is RECLAIMED when (and only when) its
+    /// `volvisor.owner` metadata names this very volume: the ownership
+    /// record is the proof that the image is ours, so adopting it cannot
+    /// touch foreign state (see [`Self::reclaim_owned_image`]).
     fn create_owned_image(
         &self,
         volume_id: &VolumeId,
@@ -652,7 +843,10 @@ impl CephRbdProvider {
             &spec,
         ])?;
         if !output.success {
-            return Err(command_failed("rbd create", &output));
+            // The image may be our own half-created orphan from a crash
+            // between create and the state save: reclaim it when the
+            // ownership metadata proves it, fail typed otherwise.
+            return self.reclaim_owned_image(volume_id, requested_bytes, &output);
         }
         // Stamp the ownership record and verify it read-back before any
         // state is persisted: an image whose ownership cannot be proven is
@@ -708,6 +902,68 @@ impl CephRbdProvider {
         Ok(effective)
     }
 
+    /// Reclaim our own half-created image after a crash window, or fail
+    /// typed.
+    ///
+    /// A create retry that hits "already exists" would otherwise be
+    /// wedged forever; the escape hatch is the ownership record itself:
+    /// an image whose `volvisor.owner` metadata equals THIS volume id
+    /// was created by a previous incarnation of this very create, so
+    /// adopting it touches no foreign state (AGENTS rule 7). The image
+    /// must be at least as large as the request (the actual size becomes
+    /// the effective size) and a missing `volvisor.generation` record is
+    /// re-stamped. An image whose ownership metadata is absent, differs
+    /// or cannot be read is NEVER adopted — a typed
+    /// `FOREIGN_DEVICE_STATE` conflict (or the original create error,
+    /// when the image does not exist at all).
+    fn reclaim_owned_image(
+        &self,
+        volume_id: &VolumeId,
+        requested_bytes: u64,
+        create_output: &CommandOutput,
+    ) -> Result<u64, ApiError> {
+        let image_name = image_name_for(volume_id);
+        let spec = self.image_spec(&image_name);
+        match self.verify_backing(&image_name, volume_id)? {
+            Backing::Owned { size_bytes } => {
+                if size_bytes < requested_bytes {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "orphaned image {spec} carries volume {volume_id}'s ownership \
+                             record but is smaller than the request ({size_bytes} < \
+                             {requested_bytes} bytes); refusing to adopt it"
+                        ),
+                    ));
+                }
+                // Re-stamp the generation record when the crash window
+                // closed before it was written.
+                if self
+                    .image_meta_get(&image_name, GENERATION_META_KEY)?
+                    .is_none()
+                {
+                    let output = self.image_meta_set(&image_name, GENERATION_META_KEY, "1")?;
+                    if !output.success {
+                        return Err(command_failed("rbd image-meta set", &output));
+                    }
+                }
+                Ok(size_bytes)
+            }
+            // The create failure was real (the image does not exist):
+            // surface the original error untouched.
+            Backing::Absent => Err(command_failed("rbd create", create_output)),
+            // An existing image without our ownership record is foreign:
+            // never adopted, never destroyed.
+            Backing::Mismatch => Err(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                format!(
+                    "image {spec} already exists and does not carry the ownership record of \
+                     volume {volume_id}; foreign state is never adopted"
+                ),
+            )),
+        }
+    }
+
     fn create_volume_inner(
         &self,
         req: &CreateVolumeRequest,
@@ -732,13 +988,26 @@ impl CephRbdProvider {
             if existing.entry.creation_payload == payload
                 && existing.entry.requested_size_bytes == req.size_bytes
             {
-                return Ok(inspect_response(&req.volume_id, existing));
+                // The replay routes through the same backing verification
+                // as a fresh inspect: a replay must never report `Ready`
+                // for an image that was manually removed behind the
+                // provider's back (the observed health is reflected, the
+                // persisted state is left to reconcile).
+                return self.verified_inspect_response(&req.volume_id, existing);
             }
             return Err(ApiError::idempotency_conflict(&req.volume_id));
         }
 
         // Capacity envelope: the request plus headroom must fit into the
         // pool's max_avail (typed NO_SAFE_CAPACITY before the pool fills).
+        //
+        // Advisory by design: `max_avail` from `ceph df` is an ESTIMATE
+        // that races with concurrent writers on a shared external
+        // cluster, so this check only refuses obviously-unsafe requests
+        // up front — over-commitment is not prevented, it surfaces as
+        // Ceph's own ENOSPC at write time (RBD images are
+        // thin-provisioned and allocate lazily). The P2 plan already
+        // records quota-based enforcement as the follow-up.
         let capacity = self.pool_stats()?;
         if req.size_bytes.saturating_add(CEPH_HEADROOM_BYTES) > capacity.max_avail {
             return Err(ApiError::new(
@@ -781,7 +1050,12 @@ impl CephRbdProvider {
     /// A verifiably absent or mismatched image is reported as `Failed`
     /// (honest observation) — the persisted state is left alone so the
     /// next reconcile owns the transition. A volume already stored as
-    /// `Failed` stays `Failed` (no implicit recovery).
+    /// `Failed` stays `Failed` (no implicit recovery). Size is reflected
+    /// from the image's own report: an image LARGER than recorded is a
+    /// completed-but-unrecorded grow (the crash window after
+    /// `rbd resize`), so the observed size is reported while reconcile
+    /// heals the record; an image SMALLER than recorded changed outside
+    /// volvisor and is reported `Failed`.
     fn verified_inspect_response(
         &self,
         volume_id: &VolumeId,
@@ -792,7 +1066,17 @@ impl CephRbdProvider {
             return Ok(response);
         }
         match self.verify_backing(&stored.entry.image_name, volume_id)? {
-            Backing::Owned { .. } => Ok(response),
+            Backing::Owned { size_bytes } => {
+                if size_bytes > stored.entry.size_bytes {
+                    // Observed reality outranks the stale record; the
+                    // persisted heal belongs to reconcile.
+                    response.provisioned_bytes = size_bytes;
+                    response.allocated_bytes = size_bytes;
+                } else if size_bytes < stored.entry.size_bytes {
+                    response.state = VolumeLifecycle::Failed;
+                }
+                Ok(response)
+            }
             Backing::Absent | Backing::Mismatch => {
                 response.state = VolumeLifecycle::Failed;
                 Ok(response)
@@ -855,23 +1139,29 @@ impl CephRbdProvider {
 
     /// Ownership proof **and size agreement** before a grow mutation.
     ///
-    /// The image must carry this volume's ownership record and report
-    /// exactly the size the state records: an image that changed outside
-    /// volvisor is never resized on assumption.
+    /// The image must carry this volume's ownership record and report at
+    /// LEAST the size the state records; the actual size is returned so
+    /// the grow proceeds from observed reality. `actual < recorded` is
+    /// the one violation (the image changed outside volvisor — a shrink
+    /// — and the grow is refused); `actual > recorded` is a
+    /// completed-but-unrecorded grow from the crash window after
+    /// `rbd resize` (the state save never ran): the grow continues from
+    /// the ACTUAL size and reconciliation heals the record, rather than
+    /// wedging the volume behind a one-way door.
     fn verify_owned_size(
         &self,
         image_name: &str,
         volume_id: &VolumeId,
         current_size: u64,
-    ) -> Result<(), ApiError> {
+    ) -> Result<u64, ApiError> {
         let spec = self.image_spec(image_name);
         match self.verify_backing(image_name, volume_id)? {
-            Backing::Owned { size_bytes } if size_bytes == current_size => Ok(()),
+            Backing::Owned { size_bytes } if size_bytes >= current_size => Ok(size_bytes),
             Backing::Owned { size_bytes } => Err(ApiError::new(
                 ApiErrorCode::Internal,
                 format!(
                     "image {spec} reports {size_bytes} bytes but state records {current_size}; \
-                     the image changed outside volvisor"
+                     the image changed outside volvisor (shrunk)"
                 ),
             )),
             Backing::Absent => Err(ApiError::new(
@@ -1134,12 +1424,20 @@ impl CephRbdProvider {
             )
         };
 
-        // Ownership proof and size agreement before the mutation.
-        self.verify_owned_size(&image_name, volume_id, current_size)?;
+        // Ownership proof and size agreement before the mutation: the
+        // grow proceeds from the image's ACTUAL size, which may exceed
+        // the recorded one (a completed-but-unrecorded grow).
+        let actual_size = self.verify_owned_size(&image_name, volume_id, current_size)?;
 
         // Capacity envelope for the growth delta.
+        //
+        // Advisory by design (same reasoning as the create check):
+        // `max_avail` is an estimate that races with concurrent writers
+        // on a shared external cluster; over-commitment surfaces as
+        // Ceph's own ENOSPC at write time, never as a fabricated
+        // durability claim here.
         let capacity = self.pool_stats()?;
-        let delta = req.new_size_bytes - current_size;
+        let delta = req.new_size_bytes.saturating_sub(actual_size);
         if delta.saturating_add(CEPH_HEADROOM_BYTES) > capacity.max_avail {
             return Err(ApiError::new(
                 ApiErrorCode::NoSafeCapacity,
@@ -1150,39 +1448,45 @@ impl CephRbdProvider {
             ));
         }
         let spec = self.image_spec(&image_name);
-        let output = self.run_rbd(&[
-            "resize",
-            "--allow-shrink=false",
-            "-s",
-            &format!("{}B", req.new_size_bytes),
-            &spec,
-        ])?;
-        if !output.success {
-            return Err(command_failed("rbd resize", &output));
-        }
-        // Verify the effective size from rbd's own report; RBD is
-        // byte-granular, so anything below the request is a failure.
-        let actual = self.image_info(&image_name)?.size_bytes().ok_or_else(|| {
-            ApiError::new(
-                ApiErrorCode::Internal,
-                format!("rbd info did not report a size for {spec} after rbd resize"),
-            )
-        })?;
-        if actual < req.new_size_bytes {
-            return Err(ApiError::new(
-                ApiErrorCode::Internal,
-                format!(
-                    "image size mismatch after rbd resize of {spec}: requested {} bytes, rbd \
-                     info reports {actual} bytes",
-                    req.new_size_bytes
-                ),
-            ));
+        // An image already at or beyond the target (the unrecorded grow
+        // was at least this large) needs no resize: the target is met,
+        // the actual size is what gets recorded.
+        let mut effective = actual_size;
+        if actual_size < req.new_size_bytes {
+            let output = self.run_rbd(&[
+                "resize",
+                "--allow-shrink=false",
+                "-s",
+                &format!("{}B", req.new_size_bytes),
+                &spec,
+            ])?;
+            if !output.success {
+                return Err(command_failed("rbd resize", &output));
+            }
+            // Verify the effective size from rbd's own report; RBD is
+            // byte-granular, so anything below the request is a failure.
+            effective = self.image_info(&image_name)?.size_bytes().ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("rbd info did not report a size for {spec} after rbd resize"),
+                )
+            })?;
+            if effective < req.new_size_bytes {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "image size mismatch after rbd resize of {spec}: requested {} bytes, rbd \
+                         info reports {effective} bytes",
+                        req.new_size_bytes
+                    ),
+                ));
+            }
         }
 
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
-        stored.entry.size_bytes = actual;
+        stored.entry.size_bytes = effective;
         stored.entry.generation += 1;
         state.save(&self.state_path)?;
         Ok(GrowVolumeResponse {
@@ -1195,7 +1499,7 @@ impl CephRbdProvider {
             } else {
                 GrowGuestNotification::NotApplicable
             },
-            effective_size_bytes: actual,
+            effective_size_bytes: effective,
         })
     }
 
@@ -1410,6 +1714,19 @@ fn command_failed(program: &str, output: &CommandOutput) -> ApiError {
     )
 }
 
+/// Whether an `rbd image-meta get` stderr means "the key is absent".
+///
+/// Real rbd reports a missing metadata key as an ENOENT-class failure
+/// (e.g. `(2) No such file or directory`, the errno name, or `No such
+/// attribute` depending on the build). Only these spellings count as
+/// absence; anything else is a failure to *read* and must surface as a
+/// typed error.
+fn is_key_absent(stderr: &str) -> bool {
+    stderr.contains("No such attribute")
+        || stderr.contains("ENOENT")
+        || stderr.contains("(2) No such file or directory")
+}
+
 /// An `UNSUPPORTED_CLASS_OR_POLICY` rejection (fail-closed negotiation).
 fn unsupported(detail: impl Into<String>) -> ApiError {
     ApiError::new(ApiErrorCode::UnsupportedClassOrPolicy, detail)
@@ -1545,12 +1862,22 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         // usage is not measured in this prototype).
         provisioned_bytes: stored.entry.size_bytes,
         allocated_bytes: stored.entry.size_bytes,
-        // Honest protection axes (contract section 6): the cluster's
-        // placement/replication policy is the remote axis; no local mirror
-        // is ever claimed for ceph-rbd.
+        // Honest protection axes (contract section 6): no local mirror is
+        // ever claimed for ceph-rbd, and the remote axis is reported as
+        // NOT ESTABLISHED here — deliberately, not as an assertion that
+        // no replication exists. Reasoning: whether the pool's placement
+        // policy actually keeps remote copies is a POOL policy fact
+        // (`ceph osd pool get <pool> size`), and the per-volume inspect
+        // path must stay cheap, so it makes no policy queries; asserting
+        // `ceph_policy` unconditionally would claim replication from a
+        // heuristic (a size-1 pool has no remote copy at all), and the
+        // axis type has no `unknown` variant. The authoritative policy
+        // facts are reported on the read-only pool discovery surface
+        // (`discover_pools`); per-volume health stays `Unknown` until
+        // proven, and `evidence_status` says `PrototypeOnly`.
         effective_protection: EffectiveProtection {
             local: LocalProtectionAxis::None,
-            remote: RemoteProtectionAxis::CephPolicy,
+            remote: RemoteProtectionAxis::None,
         },
         // Ceph's default replicated-pool failure domain is the host; the
         // pool's actual CRUSH rule is not queried in this prototype.

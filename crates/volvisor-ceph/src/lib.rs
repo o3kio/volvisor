@@ -19,7 +19,8 @@
 //! - **CLI-driven** through the shell-free
 //!   [`CommandRunner`](volvisor_provider::runner) shared with the LVM
 //!   adapter (watchdog-bounded, argv arrays, never a shell); every
-//!   invocation carries `-m <mons>` and `--id <user>` so no environment
+//!   invocation carries `-m <mons>` and `--name <user>` (the FULL Ceph
+//!   entity name, e.g. `client.volvisor`) so no environment
 //!   or config-file side channel is involved (the ceph CLI resolves
 //!   credentials itself; this provider never reads key material);
 //! - **single-writer attach** via the RBD `exclusive-lock` image feature:
@@ -28,10 +29,14 @@
 //!   mapping is detected through `rbd showmapped` and rejected
 //!   fail-closed, never silently adopted;
 //! - **honest capacity** (`ceph df` pool statistics against a documented
-//!   headroom) and **honest health reflection** (`ceph health`:
+//!   headroom; advisory — over-commit surfaces as Ceph's own ENOSPC at
+//!   write time) and **honest health reflection** (`ceph health`:
 //!   OK→Healthy, WARN→Degraded, ERR→Unhealthy, query failure→Unknown) on
 //!   the read-only pool discovery surface — never converted into a
-//!   Volvisor-made durability guarantee (ADR-0005);
+//!   Volvisor-made durability guarantee (ADR-0005); replication is
+//!   reported there from the pool's own policy
+//!   (`ceph osd pool get <pool> size`), never inferred from capacity
+//!   output;
 //! - **grow-only resize** (`rbd resize --allow-shrink=false`) with the
 //!   effective size verified from `rbd info` afterwards;
 //! - **erasure policy**: `Retain` moves the image to the RBD trash
@@ -42,8 +47,13 @@
 //! - **durable JSON state** (owner-only `0600`, atomic tmp-write + fsync +
 //!   rename) holding the volume-to-image cross-references and attachment
 //!   records; **startup reconciliation** marks volumes whose image
-//!   vanished or whose ownership metadata mismatched as `Failed` and
-//!   reports foreign images without touching them.
+//!   vanished or whose ownership metadata mismatched as `Failed`, heals
+//!   the one benign crash window (a completed-but-unrecorded grow:
+//!   recorded size raised to the image's actual report), counts
+//!   transiently-unverifiable volumes honestly instead of guessing, and
+//!   reports foreign images without touching them. A create retry whose
+//!   image was already created by a crashed predecessor reclaims it when
+//!   the `volvisor.owner` metadata proves it is ours.
 //!
 //! Everything is prototype evidence: volume health axes report `Unknown`
 //! until proven and `evidence_status` reports `PrototypeOnly` (AGENTS rule

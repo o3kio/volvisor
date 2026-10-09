@@ -15,8 +15,14 @@
 //! an existing name fails "already exists", `rbd unmap` on a missing
 //! device fails, `rbd trash move` on a missing image fails, `rbd info`
 //! on a missing image fails ENOENT-style, and `rbd showmapped` reflects
-//! the live mapping table. Sizes are byte-granular — there is **no**
+//! the live mapping table in the REAL output shape (an object with a
+//! `devices` array). Sizes are byte-granular — there is **no**
 //! extent rounding anywhere.
+//!
+//! The argv contract is pinned inside the fake: every invocation must
+//! carry the configured FULL entity name via `--name` (fail the
+//! dispatch otherwise), so a regression back to `--id` (which
+//! double-prefixes) cannot pass silently.
 //!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention (see
 //! the crate-level `cfg_attr(test)` in the library).
@@ -49,7 +55,8 @@ pub const FSID: &str = "f340f0d0-feed-4000-8000-000000000001";
 pub const MON_HOSTS: &[&str] = &["mon-a:6789", "mon-b:6789"];
 /// The pool the fixture provider operates on.
 pub const POOL: &str = "volvisortest";
-/// The Ceph user id the fixture provider passes as `--id`.
+/// The Ceph user the fixture provider authenticates as (the FULL entity
+/// name, passed via `--name` and pinned by the fake's dispatch check).
 pub const USER: &str = "client.volvisor";
 /// Simulated pool capacity (1 TiB) before any image allocation.
 pub const POOL_MAX_AVAIL: u64 = 1 << 40;
@@ -108,6 +115,10 @@ pub struct FakeCeph {
     pub pool_max_avail: u64,
     /// Pool baseline `bytes_used` before any image allocations.
     pub pool_bytes_used: u64,
+    /// Pool replication `size` reported by `ceph osd pool get`.
+    pub pool_size: u64,
+    /// Pool replication `min_size` reported by `ceph osd pool get`.
+    pub pool_min_size: u64,
     /// Image name → simulated image.
     pub images: BTreeMap<String, FakeImage>,
     /// Image names moved to the RBD trash (`rbd trash ls` reports them).
@@ -134,6 +145,12 @@ pub struct FakeCeph {
     pub fail_showmapped: bool,
     /// When true, `rbd image-meta set` fails.
     pub fail_meta_set: bool,
+    /// When true, `rbd image-meta get` fails with a NON-ENOENT message
+    /// (a transient read failure, e.g. a mon timeout — must never be
+    /// mistaken for genuine key absence).
+    pub fail_meta_get_transient: bool,
+    /// When true, `ceph osd pool get` fails.
+    pub fail_pool_get: bool,
     /// When true, `rbd create` claims success but never shows up in
     /// `rbd ls` (verification-failure injection).
     pub create_silent: bool,
@@ -149,6 +166,8 @@ impl Default for FakeCeph {
             health: "HEALTH_OK".to_owned(),
             pool_max_avail: POOL_MAX_AVAIL,
             pool_bytes_used: 0,
+            pool_size: 3,
+            pool_min_size: 2,
             images: BTreeMap::new(),
             trash: Vec::new(),
             mappings: BTreeMap::new(),
@@ -162,6 +181,8 @@ impl Default for FakeCeph {
             fail_fsid: false,
             fail_showmapped: false,
             fail_meta_set: false,
+            fail_meta_get_transient: false,
+            fail_pool_get: false,
             create_silent: false,
             resize_silent: false,
         }
@@ -182,9 +203,12 @@ impl FakeCeph {
 
 /// The JSON body of `ceph df --format json` for the simulated world.
 ///
-/// Reported `max_avail` is derived (baseline minus live image sizes) so
-/// capacity checks observe real consumption; `bytes_used` is the sum of
-/// the live image sizes over the baseline.
+/// Mirrors the REAL per-pool stats shape (`stored`/`objects`/`kb_used`/
+/// `bytes_used`/`percent_used`/`max_avail` — no replication fields;
+/// those belong to `ceph osd pool get`). Reported `max_avail` is
+/// derived (baseline minus live image sizes) so capacity checks observe
+/// real consumption; `bytes_used` is the sum of the live image sizes
+/// over the baseline.
 fn ceph_df_body(world: &FakeCeph) -> String {
     let allocated: u64 = world.images.values().map(|image| image.size).sum();
     serde_json::json!({
@@ -192,10 +216,12 @@ fn ceph_df_body(world: &FakeCeph) -> String {
             {
                 "name": POOL,
                 "stats": {
+                    "stored": 0,
+                    "objects": 0,
+                    "kb_used": world.pool_bytes_used.saturating_add(allocated) / 1024,
                     "bytes_used": world.pool_bytes_used.saturating_add(allocated),
+                    "percent_used": 0.01,
                     "max_avail": world.pool_max_avail.saturating_sub(allocated),
-                    "size": 3,
-                    "min_size": 2,
                 },
             },
             {"name": "other-pool", "stats": {"bytes_used": 1, "max_avail": 1}},
@@ -204,32 +230,33 @@ fn ceph_df_body(world: &FakeCeph) -> String {
     .to_string()
 }
 
-/// The JSON body of `rbd showmapped --format json` (an object keyed by
-/// device number, exactly like the real CLI).
+/// The JSON body of `rbd showmapped --format json` — the REAL shape: an
+/// object with a `devices` array (each entry carrying the device id,
+/// pool, image name, snapshot and device path).
 fn showmapped_body(world: &FakeCeph) -> String {
-    let mut root = serde_json::Map::new();
-    for (device, image) in &world.mappings {
-        let number = device.trim_start_matches("/dev/rbd");
-        root.insert(
-            number.to_owned(),
+    let devices: Vec<serde_json::Value> = world
+        .mappings
+        .iter()
+        .map(|(device, image)| {
             serde_json::json!({
+                "id": device.trim_start_matches("/dev/rbd"),
                 "pool": POOL,
                 "name": image,
-                "device": device,
                 "snap": "-",
-            }),
-        );
-    }
-    serde_json::Value::Object(root).to_string()
+                "device": device,
+            })
+        })
+        .collect();
+    serde_json::json!({ "devices": devices }).to_string()
 }
 
-/// Skip the `-m <mons>` / `--id <user>` global flag pairs and return the
+/// Skip the `-m <mons>` / `--name <user>` global flag pairs and return the
 /// CLI subcommand.
 fn subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
     let mut index = 0;
     while index < args.len() {
         match args[index] {
-            "-m" | "--id" => index += 2,
+            "-m" | "--name" => index += 2,
             subcommand => return Some(subcommand),
         }
     }
@@ -250,7 +277,16 @@ fn split_spec(spec: &str) -> Option<(&str, &str)> {
 }
 
 /// The scripted behavior for one command.
+///
+/// The argv contract is pinned first: both CLIs must receive the FULL
+/// configured entity name via `--name`; a dispatch without it fails the
+/// fake (an `INTERNAL` "not scripted" error), so a regression back to
+/// `--id` (which would authenticate as the nonexistent
+/// `client.client.volvisor` on a real cluster) cannot pass silently.
 fn script(world: &mut FakeCeph, program: &str, args: &[&str]) -> Option<CommandOutput> {
+    if arg_after(args, "--name") != Some(USER) {
+        return None;
+    }
     match program {
         "ceph" => match subcommand(args)? {
             "fsid" => {
@@ -278,11 +314,47 @@ fn script(world: &mut FakeCeph, program: &str, args: &[&str]) -> Option<CommandO
                     Some(CommandOutput::success(ceph_df_body(world)))
                 }
             }
+            "osd" => script_ceph_osd(world, args),
             _ => None,
         },
         "rbd" => script_rbd(world, args),
         _ => None,
     }
+}
+
+/// `ceph osd pool get <pool> <key> --format json` (read-only policy
+/// query). Real output is a small object such as `{"size":"3"}`.
+fn script_ceph_osd(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutput> {
+    // args: [-m, mons, --name, user,] osd pool get <pool> <key> --format json
+    if args.get(5).copied() != Some("pool") || args.get(6).copied() != Some("get") {
+        return None;
+    }
+    let pool = args.get(7)?;
+    let key = args.get(8)?;
+    if pool != &POOL {
+        return Some(CommandOutput::failure(format!(
+            "pool {pool} does not exist"
+        )));
+    }
+    if world.fail_pool_get {
+        return Some(CommandOutput::failure(
+            "ceph osd pool get: simulated failure (mon timeout)",
+        ));
+    }
+    let value = match *key {
+        "size" => world.pool_size,
+        "min_size" => world.pool_min_size,
+        _ => return None,
+    };
+    // Real output shape: {"pool": "<pool>", "key": "<key>", "<key>": "<n>"}
+    // (values are strings; extra fields ride along).
+    let mut body = serde_json::Map::new();
+    body.insert("pool".to_owned(), serde_json::json!(POOL));
+    body.insert("key".to_owned(), serde_json::json!(*key));
+    body.insert((*key).to_owned(), serde_json::json!(value.to_string()));
+    Some(CommandOutput::success(
+        serde_json::Value::Object(body).to_string(),
+    ))
 }
 
 /// The scripted behavior for one `rbd` invocation.
@@ -406,13 +478,23 @@ fn script_rbd_image_meta(world: &mut FakeCeph, args: &[&str]) -> Option<CommandO
             let spec = *args.get(6)?;
             let key = *args.get(7)?;
             let (_, image) = split_spec(spec)?;
+            if world.fail_meta_get_transient {
+                // A NON-ENOENT failure: a transient read problem that the
+                // provider must surface as a typed error, never as key
+                // absence.
+                return Some(CommandOutput::failure(
+                    "rbd image-meta get: simulated transient failure (mon timeout)",
+                ));
+            }
             match world
                 .images
                 .get(image)
                 .and_then(|image| image.meta.get(key))
             {
+                // Real rbd reports a missing metadata key as an
+                // ENOENT-class failure ("(2) No such file or directory").
                 None => Some(CommandOutput::failure(format!(
-                    "rbd: failed to read metadata {key}"
+                    "failed to get metadata {key} of image {spec}: (2) No such file or directory"
                 ))),
                 Some(value) => Some(CommandOutput::success(value.clone())),
             }
