@@ -22,7 +22,7 @@ use volvisor_drbd::report::{DiskState, Role};
 use volvisor_drbd::resgen::res_file_path;
 use volvisor_drbd::state::DrbdState;
 use volvisor_provider::VolumeProvider;
-use volvisor_types::domain::{Frontend, VolumeClass};
+use volvisor_types::domain::{Frontend, RemoteProtectionAxis, VolumeClass};
 use volvisor_types::request::{
     AccessModeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest, ReplicationModeRequest,
@@ -47,6 +47,21 @@ fn nearline_create_degraded(
     size_bytes: u64,
     allow_degraded: bool,
 ) -> CreateVolumeRequest {
+    nearline_create_protocol(
+        volume_id,
+        size_bytes,
+        ReplicationModeRequest::Async,
+        allow_degraded,
+    )
+}
+
+/// A nearline create request with an explicit replication protocol.
+fn nearline_create_protocol(
+    volume_id: &str,
+    size_bytes: u64,
+    mode: ReplicationModeRequest,
+    allow_degraded: bool,
+) -> CreateVolumeRequest {
     CreateVolumeRequest {
         api_version: "volvisor.volume.v2".to_owned(),
         operation_id: OperationId::new(format!("op-create-{volume_id}")).expect("valid id"),
@@ -60,7 +75,7 @@ fn nearline_create_degraded(
         local_protection: None,
         replication: Some(ReplicationPolicyRequest {
             engine: Some("drbd9".to_owned()),
-            mode: ReplicationModeRequest::Async,
+            mode,
             remote_replicas: 1,
             allow_degraded_create: allow_degraded,
         }),
@@ -438,7 +453,10 @@ fn stored_maybe(fixture: &Fixture, volume_id: &str) -> bool {
 
 /// Seed the world half-way through a crashed create: owned LV,
 /// metadata, res file (minor/port `minor`/`port`) and — when `up` — a
-/// running resource.
+/// running resource. `lv_has_data` pins whether the crashed
+/// predecessor got as far as writing data (a completed seed leaves a
+/// non-zero data area; a crash before seeding leaves an all-zero LV —
+/// real drbdmeta's create-md decision rests on exactly this).
 fn seed_crashed_create(
     fixture: &Fixture,
     volume_id: &str,
@@ -446,9 +464,17 @@ fn seed_crashed_create(
     minor: u32,
     port: u16,
     up: bool,
+    lv_has_data: bool,
 ) {
     let resource = resource_of(volume_id);
-    seed_lv(&fixture.world, VG, &resource, size_bytes, Some(volume_id));
+    seed_lv(
+        &fixture.world,
+        VG,
+        &resource,
+        size_bytes,
+        Some(volume_id),
+        lv_has_data,
+    );
     common::write_seed_res_file(&fixture.base, &resource, minor, port);
     let mut world = fixture.world.lock().expect("world");
     world.metadata.insert(resource.clone());
@@ -472,7 +498,7 @@ fn seed_crashed_create(
 #[tokio::test]
 async fn a_crashed_create_with_the_resource_up_is_reclaimed_and_adopted() {
     let fixture = fixture();
-    seed_crashed_create(&fixture, "crash-up", GIB, 13, 7903, true);
+    seed_crashed_create(&fixture, "crash-up", GIB, 13, 7903, true, false);
     let response = fixture
         .provider
         .create_volume(&nearline_create("crash-up", GIB))
@@ -490,7 +516,7 @@ async fn a_crashed_create_with_the_resource_up_is_reclaimed_and_adopted() {
 #[tokio::test]
 async fn a_crashed_create_with_the_resource_down_keeps_a_fresh_allocation() {
     let fixture = fixture();
-    seed_crashed_create(&fixture, "crash-down", GIB, 13, 7903, false);
+    seed_crashed_create(&fixture, "crash-down", GIB, 13, 7903, false, false);
     let response = fixture
         .provider
         .create_volume(&nearline_create("crash-down", GIB))
@@ -505,12 +531,84 @@ async fn a_crashed_create_with_the_resource_down_keeps_a_fresh_allocation() {
     assert!(stored.runtime.seeded);
 }
 
+/// Real drbdmeta semantics: over an ALL-ZERO LV that carries a crashed
+/// predecessor's metadata, create-md RE-INITIALIZES (succeeds and
+/// rewrites) instead of refusing — the create converges through the
+/// plain create-md + up path, and the world records that create-md
+/// actually ran over the pre-existing metadata.
+#[tokio::test]
+async fn create_md_reinitializes_metadata_on_an_all_zero_predecessor_lv() {
+    let fixture = fixture();
+    let resource = resource_of("reinit");
+    seed_crashed_create(&fixture, "reinit", GIB, 13, 7903, false, false);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .metadata
+            .contains(&resource),
+        "the predecessor left metadata behind"
+    );
+    let response = fixture
+        .provider
+        .create_volume(&nearline_create("reinit", GIB))
+        .await
+        .expect("create over predecessor metadata");
+    assert_eq!(response.state, VolumeLifecycle::Ready);
+    let world = fixture.world.lock().expect("world");
+    assert!(
+        world.create_md_ran.contains(&resource),
+        "create-md SUCCEEDED over existing metadata (re-init, not refusal)"
+    );
+    assert!(world.metadata.contains(&resource));
+}
+
+/// Real drbdmeta semantics: create-md refuses only when the backing
+/// LV carries NON-ZERO data ("Operation refused"). An owned orphan LV
+/// with data but no DRBD metadata can neither be re-initialized nor
+/// brought up: the refusal surfaces typed and the LV survives for the
+/// operator.
+#[tokio::test]
+async fn an_owned_lv_with_data_and_no_metadata_fails_create_md_and_survives() {
+    let fixture = fixture();
+    let resource = resource_of("orphan-data");
+    seed_lv(
+        &fixture.world,
+        VG,
+        &resource,
+        GIB,
+        Some("orphan-data"),
+        true,
+    );
+    let error = fixture
+        .provider
+        .create_volume(&nearline_create("orphan-data", GIB))
+        .await
+        .expect_err("create-md refuses non-zero data");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    assert!(
+        error.detail.contains("Operation refused"),
+        "the real drbdmeta refusal text surfaces: {error:?}"
+    );
+    let world = fixture.world.lock().expect("world");
+    // The reclaimed LV is never destroyed (fresh_lv is false), and no
+    // create-md ran over it.
+    assert!(world.lvs.contains_key(&format!("{VG}/{resource}")));
+    assert!(!world.create_md_ran.contains(&resource));
+    assert!(!world.metadata.contains(&resource));
+}
+
 #[tokio::test]
 async fn a_crashed_local_uptodate_disk_is_a_state_loss_replay() {
     let fixture = fixture();
-    // The predecessor seeded but died before the state save: the local
-    // disk already holds data on OUR owned resource.
-    seed_crashed_create(&fixture, "replay", GIB, 13, 7903, true);
+    // The predecessor seeded (data on the LV) but died before the
+    // state save: the local disk already holds data on OUR owned
+    // resource. Real drbdmeta refuses create-md over the non-zero LV,
+    // `up` adopts the predecessor's valid metadata, and the status
+    // answers with the data-holding disk — the replay adoption the
+    // provider performs.
+    seed_crashed_create(&fixture, "replay", GIB, 13, 7903, true, true);
     let resource = resource_of("replay");
     {
         let mut world = fixture.world.lock().expect("world");
@@ -530,13 +628,18 @@ async fn a_crashed_local_uptodate_disk_is_a_state_loss_replay() {
     // as seeded, never re-forced.
     assert!(stored(&fixture, "replay").runtime.seeded);
     assert!(!fixture.world.lock().expect("world").peer_overwritten);
+    // create-md was REFUSED (non-zero data) and the refusal was not
+    // fatal: `up` adopted the predecessor's metadata.
+    let world = fixture.world.lock().expect("world");
+    assert!(!world.create_md_ran.contains(&resource));
+    assert!(world.metadata.contains(&resource));
 }
 
 #[tokio::test]
 async fn a_crashed_create_refuses_a_foreign_lv() {
     let fixture = fixture();
     let resource = resource_of("foreign-lv");
-    seed_lv(&fixture.world, VG, &resource, GIB, None);
+    seed_lv(&fixture.world, VG, &resource, GIB, None, false);
     let error = fixture
         .provider
         .create_volume(&nearline_create("foreign-lv", GIB))
@@ -558,7 +661,14 @@ async fn a_crashed_create_refuses_a_foreign_lv() {
 async fn a_crashed_create_refuses_a_smaller_owned_lv() {
     let fixture = fixture();
     let resource = resource_of("small-orphan");
-    seed_lv(&fixture.world, VG, &resource, GIB / 2, Some("small-orphan"));
+    seed_lv(
+        &fixture.world,
+        VG,
+        &resource,
+        GIB / 2,
+        Some("small-orphan"),
+        false,
+    );
     let error = fixture
         .provider
         .create_volume(&nearline_create("small-orphan", GIB))
@@ -584,7 +694,7 @@ async fn an_adopted_minor_claimed_by_another_volume_is_refused() {
     let fixture = common::fixture_after(|base, world| {
         seed_volume(base, world, "vol-a", GIB);
     });
-    seed_crashed_create(&fixture, "vol-b", GIB, SEED_MINOR, 7905, true);
+    seed_crashed_create(&fixture, "vol-b", GIB, SEED_MINOR, 7905, true, false);
     let error = fixture
         .provider
         .create_volume(&nearline_create("vol-b", GIB))
@@ -1322,8 +1432,9 @@ async fn reconcile_reports_untracked_and_foreign_lvs_without_touching_them() {
         "vol-orphan",
         GIB,
         Some("a-volume-without-state"),
+        false,
     );
-    seed_lv(&fixture.world, VG, "not-ours", GIB, None);
+    seed_lv(&fixture.world, VG, "not-ours", GIB, None, false);
     let report = provider.reconcile().expect("reconcile");
     assert_eq!(report.untracked_owned_lvs, vec!["vol-orphan".to_owned()]);
     assert_eq!(report.foreign_lvs, vec!["not-ours".to_owned()]);
@@ -1386,6 +1497,84 @@ async fn inspect_reflects_observed_health_and_the_remote_axis() {
     assert_eq!(
         inspected.effective_protection.remote,
         volvisor_types::domain::RemoteProtectionAxis::None
+    );
+}
+
+/// The remote protection axis is classified by the protocol READ BACK
+/// from the resource's own definition file, not by the recorded
+/// intent: Protocol C reports the synchronous peer, Protocol B stays
+/// the asynchronous axis (remote memory arrival is still possible-RPO
+/// on peer loss).
+#[tokio::test]
+async fn inspect_classifies_the_remote_axis_by_the_protocol_read_back() {
+    let fixture = fixture();
+
+    // Protocol C (Sync): the established replica is the synchronous
+    // peer.
+    fixture
+        .provider
+        .create_volume(&nearline_create_protocol(
+            "sync-vol",
+            GIB,
+            ReplicationModeRequest::Sync,
+            false,
+        ))
+        .await
+        .expect("create protocol C");
+    let inspected = fixture
+        .provider
+        .inspect_volume(&VolumeId::new("sync-vol").expect("id"))
+        .await
+        .expect("inspect");
+    assert!(matches!(
+        inspected.effective_protection.remote,
+        RemoteProtectionAxis::SynchronousPeer
+    ));
+    // The definition the axis was classified by really carries C.
+    let res = std::fs::read_to_string(res_file_path(
+        &fixture.base.join("drbd.d"),
+        &resource_of("sync-vol"),
+    ))
+    .expect("res file");
+    assert!(res.contains("protocol C;"));
+
+    // Protocol B (SemiSync): remote MEMORY arrival only — still the
+    // asynchronous axis, never the synchronous one.
+    fixture
+        .provider
+        .create_volume(&nearline_create_protocol(
+            "semisync-vol",
+            GIB,
+            ReplicationModeRequest::SemiSync,
+            false,
+        ))
+        .await
+        .expect("create protocol B");
+    let inspected = fixture
+        .provider
+        .inspect_volume(&VolumeId::new("semisync-vol").expect("id"))
+        .await
+        .expect("inspect");
+    assert!(matches!(
+        inspected.effective_protection.remote,
+        RemoteProtectionAxis::AsynchronousPeer
+    ));
+
+    // A definition file that can no longer be read back is an honest
+    // unknown: no remote claim even for Protocol C.
+    std::fs::remove_file(res_file_path(
+        &fixture.base.join("drbd.d"),
+        &resource_of("sync-vol"),
+    ))
+    .expect("remove res file");
+    let inspected = fixture
+        .provider
+        .inspect_volume(&VolumeId::new("sync-vol").expect("id"))
+        .await
+        .expect("inspect");
+    assert_eq!(
+        inspected.effective_protection.remote,
+        RemoteProtectionAxis::None
     );
 }
 

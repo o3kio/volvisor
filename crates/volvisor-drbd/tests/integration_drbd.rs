@@ -27,6 +27,16 @@
 //! (Retain: resource down, res file removed, backing LV retained); a
 //! cleanup guard best-effort-removes the LV on every path.
 //!
+//! OUTSTANDING CONFIRMATION: the `drbdmeta` create-md semantics the
+//! simulated world models — re-initialize (succeed) over an all-zero
+//! data area even with existing metadata, refuse ("Operation refused")
+//! only over non-zero data — derive from the drbdmeta source, not from
+//! a run on a real cluster: no CI slice executes these gated tests.
+//! The crash-recovery disposition in the provider depends on exactly
+//! this distinction, so the first operator run against a real
+//! drbd-utils build must observe the create-md behavior documented
+//! here before it is trusted.
+//!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention.
 
 #![cfg(feature = "integration-drbd")]

@@ -9,12 +9,24 @@
 //! ```text
 //! <res> role:<Primary|Secondary>            # indent 0
 //!   disk:<DiskState>                        # indent 2
+//!   open:<yes|no>                           # indent 2, unconditional
+//!                                           # on kernel >= 9.2.9
+//!   [quorum:<yes|no>]                       # indent 2, only when
+//!                                           # quorum is enabled
 //!   <peer-node> role:<Role>                 # indent 2, when Connected
 //!     peer-disk:<DiskState>                 # indent 4, when Connected
-//!     [replication:<SyncTarget|...> done:%.2f]
+//!       [replication:<SyncTarget|...> done:%.2f]
 //!   <peer-node> connection:<CState>         # indent 2, when NOT Connected
 //! <blank line>
 //! ```
+//!
+//! The `open:` line is printed unconditionally by drbd-utils against
+//! kernel 9.2.9 and newer (drbdsetup.c:3350–3355), so every real
+//! non-verbose status of this generation carries it; the parser keeps
+//! it optional only for older kernels. `quorum:` appears only when
+//! quorum is enabled on the resource (drbdsetup.c:3345) — a volvisor
+//! resource cannot print it today (volvisor never enables quorum), but
+//! the parser must not explode the day that changes.
 //!
 //! The connection is named by the **peer node name**; when it is
 //! `Connected` the peer's role is printed on that line instead of a
@@ -148,6 +160,15 @@ pub struct ResourceStatus {
     pub replication: Option<String>,
     /// Resync progress (`done:` percentage), when resyncing.
     pub resync_done: Option<f64>,
+    /// Whether the local device is currently held open (the indent-2
+    /// `open:` line, printed unconditionally by drbd-utils against
+    /// kernel 9.2.9 and newer). `None` when the line is absent (an
+    /// older kernel); a `Some(false)` here is the detached-resource
+    /// fact the demotion path can rely on.
+    pub local_open: Option<bool>,
+    /// The quorum verdict (the indent-2 `quorum:` line), present only
+    /// when quorum is enabled on the resource.
+    pub quorum: Option<bool>,
 }
 
 /// An `INTERNAL` parse error for `drbdsetup status` output.
@@ -159,6 +180,18 @@ fn parse_error(detail: impl Into<String>) -> ApiError {
             detail.into()
         ),
     )
+}
+
+/// Parse a `yes`/`no` token value (`open:`, `quorum:`); anything else
+/// is an honest error (fail-closed on unknown spellings).
+fn parse_yes_no(field: &str, value: &str) -> Result<bool, ApiError> {
+    match value {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        other => Err(parse_error(format!(
+            "unknown {field} value {other:?} (expected yes|no)"
+        ))),
+    }
 }
 
 /// Parse the text output of `drbdsetup status <res>` (one resource).
@@ -181,6 +214,8 @@ pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> 
     let mut peer_disk: Option<DiskState> = None;
     let mut replication: Option<String> = None;
     let mut resync_done: Option<f64> = None;
+    let mut local_open: Option<bool> = None;
+    let mut quorum: Option<bool> = None;
 
     for line in stdout.lines() {
         if line.trim().is_empty() {
@@ -200,11 +235,16 @@ pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> 
                 name = Some(first.to_owned());
                 role = Some(Role::parse(tokens[1].trim_start_matches("role:"))?);
             }
-            // Device/connection line (`disk:`, `connection:`) or the
-            // connected peer line (`<peer-node> role:<Role>`).
+            // Device/connection line (`disk:`, `open:`, `quorum:`,
+            // `connection:`) or the connected peer line
+            // (`<peer-node> role:<Role>`).
             2 => {
                 if let Some(value) = first.strip_prefix("disk:") {
                     local_disk = Some(DiskState::parse(value));
+                } else if let Some(value) = first.strip_prefix("open:") {
+                    local_open = Some(parse_yes_no("open", value)?);
+                } else if let Some(value) = first.strip_prefix("quorum:") {
+                    quorum = Some(parse_yes_no("quorum", value)?);
                 } else if let Some(value) = first.strip_prefix("connection:") {
                     let state = ConnectionState::parse(value);
                     connected = connected || state.is_connected();
@@ -262,6 +302,8 @@ pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> 
         peer_disk,
         replication,
         resync_done,
+        local_open,
+        quorum,
     })
 }
 
@@ -447,17 +489,20 @@ mod tests {
 
     #[test]
     fn parses_the_connected_single_volume_shape() {
-        // Verified grammar: resource line, disk line, peer-role line
-        // (connection named by the PEER NODE NAME), peer-disk line,
-        // trailing blank line.
+        // Verified grammar: resource line, disk line, open line, peer
+        // line (connection named by the PEER NODE NAME), peer-disk
+        // line, trailing blank line.
         let stdout = "vol-r0 role:Secondary\n  \
                       disk:UpToDate\n  \
+                      open:no\n  \
                       node-b role:Secondary\n    \
                       peer-disk:UpToDate\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.name, "vol-r0");
         assert_eq!(status.role, Role::Secondary);
         assert_eq!(status.local_disk, DiskState::UpToDate);
+        assert_eq!(status.local_open, Some(false));
+        assert_eq!(status.quorum, None);
         assert!(status.connected);
         assert_eq!(status.connection, None);
         assert_eq!(status.peer_role, Some(Role::Secondary));
@@ -470,9 +515,11 @@ mod tests {
     fn parses_the_disconnected_shape() {
         let stdout = "vol-r0 role:Primary\n  \
                       disk:UpToDate\n  \
+                      open:yes\n  \
                       node-b connection:WFConnection\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.role, Role::Primary);
+        assert_eq!(status.local_open, Some(true));
         assert!(!status.connected);
         assert_eq!(status.connection, Some(ConnectionState::WFConnection));
         assert_eq!(status.peer_role, None);
@@ -483,6 +530,7 @@ mod tests {
     fn parses_resync_progress_on_the_peer_disk_line() {
         let stdout = "vol-r0 role:Primary\n  \
                       disk:UpToDate\n  \
+                      open:no\n  \
                       node-b role:Secondary\n    \
                       peer-disk:Inconsistent replication:SyncTarget done:12.50%\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
@@ -491,11 +539,79 @@ mod tests {
         assert_eq!(status.resync_done, Some(12.5));
     }
 
+    /// A verbatim `drbdsetup status <res>` sample exactly as
+    /// drbd-utils 9.29.0 prints it against kernel >= 9.2.9, constructed
+    /// in drbdsetup.c's print order (role; disk; open — unconditional;
+    /// peer line with role when connected; peer-disk with
+    /// replication/done while resyncing).
+    #[test]
+    fn parses_a_verbatim_drbd_utils_9_29_0_connected_status() {
+        let stdout = "vol-r0 role:Secondary\n  \
+                      disk:UpToDate\n  \
+                      open:yes\n  \
+                      node-b role:Secondary\n    \
+                      peer-disk:Inconsistent replication:SyncTarget done:37.50%\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.name, "vol-r0");
+        assert_eq!(status.role, Role::Secondary);
+        assert_eq!(status.local_disk, DiskState::UpToDate);
+        assert_eq!(status.local_open, Some(true));
+        assert!(status.connected);
+        assert_eq!(status.peer_role, Some(Role::Secondary));
+        assert_eq!(status.peer_disk, Some(DiskState::Inconsistent));
+        assert_eq!(status.replication.as_deref(), Some("SyncTarget"));
+        assert_eq!(status.resync_done, Some(37.5));
+    }
+
+    /// The disconnected WFConnection variant of the verbatim 9.29.0
+    /// shape (peer line carries `connection:` instead of a role, no
+    /// peer-disk line).
+    #[test]
+    fn parses_a_verbatim_drbd_utils_9_29_0_wfconnection_status() {
+        let stdout = "vol-r0 role:Primary\n  \
+                      disk:UpToDate\n  \
+                      open:yes\n  \
+                      node-b connection:WFConnection\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.role, Role::Primary);
+        assert_eq!(status.local_disk, DiskState::UpToDate);
+        assert_eq!(status.local_open, Some(true));
+        assert!(!status.connected);
+        assert_eq!(status.connection, Some(ConnectionState::WFConnection));
+        assert_eq!(status.peer_role, None);
+        assert_eq!(status.peer_disk, None);
+        assert_eq!(status.replication, None);
+    }
+
+    #[test]
+    fn parses_the_quorum_line_when_quorum_is_enabled() {
+        // A volvisor resource cannot print this today (quorum is never
+        // enabled), but the spelling is a known grammar element: it
+        // must parse, not explode.
+        let stdout = "vol-r0 role:Secondary\n  \
+                      disk:UpToDate\n  \
+                      quorum:yes\n  \
+                      open:no\n  \
+                      node-b role:Secondary\n    \
+                      peer-disk:UpToDate\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.quorum, Some(true));
+        assert_eq!(status.local_open, Some(false));
+    }
+
     #[test]
     fn rejects_malformed_and_multi_volume_output() {
         assert!(parse_drbdsetup_status("garbage\n").is_err());
         assert!(parse_drbdsetup_status("vol-r0 role:SideWays\n  disk:UpToDate\n").is_err());
         assert!(parse_drbdsetup_status("vol-r0 role:Primary\n").is_err()); // no disk line
+        // Unknown yes/no spellings on the known indent-2 tokens stay
+        // malformed (fail-closed).
+        assert!(
+            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate\n  open:maybe\n").is_err()
+        );
+        assert!(
+            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate\n  quorum:1\n").is_err()
+        );
         // Single-volume grammar has no `volume:0` prefix; a multi-volume
         // shape must fail loudly instead of being mis-parsed.
         assert!(parse_drbdsetup_status("vol-r0 role:Primary\n  volume:0 disk:UpToDate\n").is_err());
@@ -503,12 +619,15 @@ mod tests {
 
     #[test]
     fn unknown_disk_states_are_kept_verbatim() {
+        // Legacy pre-9.2.9 shape: no `open:` line (the parser keeps it
+        // optional for older kernels) and an unrecognized disk spelling.
         let stdout = "vol-r0 role:Secondary\n  disk:SomeFutureState\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(
             status.local_disk,
             DiskState::Other("SomeFutureState".to_owned())
         );
+        assert_eq!(status.local_open, None);
     }
 
     #[test]

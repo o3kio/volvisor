@@ -204,8 +204,16 @@ pub struct DrbdProviderConfig {
     /// Inclusive upper bound of the local replication port range.
     pub port_max: u16,
     /// Inclusive lower bound of the DRBD minor range.
+    ///
+    /// The configured `[minor_min, minor_max]` range must be
+    /// **exclusively reserved for volvisor**: the allocator never
+    /// probes the kernel's minor space, so a minor already in use by a
+    /// foreign resource is only discovered as a create-time failure
+    /// that tears the half-created volume back down.
     pub minor_min: u32,
-    /// Inclusive upper bound of the DRBD minor range.
+    /// Inclusive upper bound of the DRBD minor range (see
+    /// [`Self::minor_min`]: the range must be exclusively reserved for
+    /// volvisor).
     pub minor_max: u32,
     /// Root of the procfs mount used for the module check
     /// (`<proc_root>/drbd` must be readable; `/proc` on a real host, a
@@ -401,13 +409,14 @@ impl DrbdProvider {
     /// <resource>`. Only ever called on a resource whose local disk is
     /// provably fresh (see [`Self::establish_replica`]).
     ///
-    /// ASSUMPTION(unverified): `--force` is accepted between the action
-    /// and the resource name, and on a fresh `Inconsistent` local disk
-    /// with no live peer it makes this node Primary without destroying
-    /// data (the FakeDrbd world models exactly this; a real drbd-utils
-    /// may place or scope `--force` differently — the role is always
-    /// re-verified from `drbdsetup status` afterwards, so a different
-    /// behavior surfaces as `INTERNAL`, never as silent success).
+    /// `--force` placed between the action and the resource name is the
+    /// drbd-utils spelling (verified against the drbd-utils source:
+    /// `config_flags.c` builds the primary command context with the
+    /// force flag, and the kernel accepts the forced promotion of a
+    /// fresh local disk via `CS_FP_LOCAL_UP_TO_DATE`). The role is
+    /// always re-verified from `drbdsetup status` afterwards, so any
+    /// deviation on a real toolchain surfaces as `INTERNAL`, never as
+    /// silent success.
     fn run_drbdadm_seed(&self, resource: &str) -> Result<CommandOutput, ApiError> {
         self.run_drbdadm_args(resource, &["primary", "--force"])
     }
@@ -814,22 +823,25 @@ impl DrbdProvider {
         }
     }
 
-    /// Bring a resource up: `create-md` (fresh internal metadata), then
-    /// `up`, then verify the resource answers `drbdsetup status`.
+    /// Bring a resource up: `create-md` (internal metadata), then `up`,
+    /// then verify the resource answers `drbdsetup status`.
     ///
-    /// `create-md` refuses non-interactively when metadata already
-    /// exists — the signature of a crashed predecessor that got past
-    /// `lvcreate` — and `up` adopts existing metadata, so a failed
-    /// `create-md` is not fatal by itself: `up` is the decider, and if
-    /// it also fails, the original `create-md` error surfaces.
+    /// Real `drbdmeta` semantics (verified against the drbdmeta
+    /// source): with a non-tty stdin the move prompt auto-declines and
+    /// `md_initialize` then RE-INITIALIZES (wipes and rewrites) the
+    /// metadata whenever the data-area start is all-zero — so on a
+    /// fresh all-zero LV, even one carrying a crashed predecessor's
+    /// valid metadata, `create-md` SUCCEEDS and rewrites. Only
+    /// non-zero data at the data-area start makes it refuse ("Operation
+    /// refused"). A `create-md` refusal is therefore not fatal by
+    /// itself: the LV may hold data under valid metadata that `up`
+    /// adopts (the crash-recovery decider is the status
+    /// [`Self::establish_replica`] reads, not the create-md exit), and
+    /// if `up` also fails, the original `create-md` error surfaces.
     ///
-    /// ASSUMPTION(unverified): `create-md` on a fresh LV needs no
-    /// `--force` (its interactive "already contains metadata" prompt
-    /// cannot appear on a blank device), and its non-interactive
-    /// refusal on existing metadata still exits non-zero while `up`
-    /// afterwards succeeds — the crash-recovery path depends on this
-    /// distinction, and the integration tests must confirm it on a
-    /// real cluster.
+    /// Real-cluster confirmation of these create-md semantics is
+    /// outstanding (see the integration test's gating note) — no CI
+    /// slice runs the gated real-cluster tests.
     ///
     /// # Errors
     /// `INTERNAL` when the commands fail or the resource does not answer
@@ -1259,10 +1271,12 @@ impl DrbdProvider {
     /// map the observed role/connection/disk states (see
     /// [`observed_health`] and [`backend_health_of`]); the remote
     /// protection axis states only that a remote replica is currently
-    /// established and observed `UpToDate` ([`remote_axis_of`]) — never
-    /// a durability claim (rule 16). When the status cannot be observed,
-    /// the health axes honestly stay `Unknown` and the sizes come from
-    /// `lvs`.
+    /// established and observed `UpToDate`, classified by the
+    /// replication protocol read back from the resource's own
+    /// definition file ([`remote_axis_of`]) — an observed fact, never
+    /// an unconditional durability claim (rule 16). When the status
+    /// cannot be observed, the health axes honestly stay `Unknown` and
+    /// the sizes come from `lvs`.
     fn verified_inspect_response(
         &self,
         volume_id: &VolumeId,
@@ -1319,8 +1333,28 @@ impl DrbdProvider {
         response.provisioned_bytes = device;
         response.health = observed_health(&status);
         response.backend_health = backend_health_of(&status);
-        response.effective_protection.remote = remote_axis_of(&status);
+        response.effective_protection.remote =
+            remote_axis_of(&status, self.observed_protocol(&stored.entry));
         Ok(response)
+    }
+
+    /// The replication protocol read back from the resource's own
+    /// definition file (the observed fact the remote protection axis is
+    /// classified by, never the recorded create-time intent).
+    ///
+    /// `None` when the file is missing, unparsable or carries no
+    /// recognized protocol letter — an honest unknown that reports no
+    /// remote protection instead of guessing.
+    fn observed_protocol(&self, entry: &VolumeEntry) -> Option<ReplicationMode> {
+        let path = res_file_path(&self.config.config_dir, &entry.resource_name);
+        let content = fs::read_to_string(path).ok()?;
+        let parsed = parse_resource_file(&content).ok()?;
+        match parsed.protocol.as_deref() {
+            Some("A") => Some(ReplicationMode::A),
+            Some("B") => Some(ReplicationMode::B),
+            Some("C") => Some(ReplicationMode::C),
+            _ => None,
+        }
     }
 }
 
@@ -1984,11 +2018,17 @@ impl DrbdProvider {
     // verify → resize → verify → honest boundary persist); each step's
     // failure mode is distinct and ordered.
     //
-    // ASSUMPTION(unverified): `drbdadm resize` succeeds while the
-    // resource is Secondary (volvisor never grows a Primary — every
-    // grow runs detached from any VM attachment, and a still-attached
-    // grow is refused earlier); if a real drbd-utils refuses this, the
-    // failure surfaces as `INTERNAL` with the excerpt preserved.
+    // `drbdadm resize` is the standard supported path in BOTH roles:
+    // drbdadm's resize carries no role gate and the kernel executes a
+    // cluster-wide size transaction (drbd_nl.c), so an ATTACHED grow
+    // runs resize while the resource is Primary — the ordinary,
+    // guest-visible online-grow case whose notification status below
+    // honestly stays RetryRequired — and a detached grow runs the same
+    // resize over a Secondary resource. The only role refusal is the
+    // zombie gate above (Primary without a recorded attachment). When
+    // the peer backing was not grown, the device stays below the
+    // request: that honest boundary is persisted before the typed
+    // failure so a retry continues from observed reality.
     #[allow(clippy::too_many_lines)]
     fn grow_volume_inner(
         &self,
@@ -2726,20 +2766,46 @@ fn backend_health_of(status: &ResourceStatus) -> Health {
     }
 }
 
-/// The remote protection axis from a resource status.
+/// The remote protection axis from a resource status plus the
+/// replication protocol read back from the resource's own definition
+/// file (an observed fact, not the recorded create-time intent).
 ///
-/// [`RemoteProtectionAxis::AsynchronousPeer`] states only that a remote
-/// replica is **currently established and observed `UpToDate`** — it is
-/// never a durability claim, and Protocol A possible-RPO semantics are
-/// never upgraded by it (AGENTS rule 16). Everything else (no
-/// connection, peer not `UpToDate`, resync in progress) reports `None`:
+/// The axis states only that a remote replica is **currently
+/// established and observed `UpToDate`** outside resync; the protocol
+/// read back from the resource selects which *class* of remote
+/// protection that replica provides (AGENTS rule 16):
+///
+/// - Protocol A → [`RemoteProtectionAxis::AsynchronousPeer`]:
+///   possible-RPO; the peer's arrival is never acknowledged, so the
+///   axis is never a durability claim.
+/// - Protocol B → `AsynchronousPeer` as well: semi-synchronous B
+///   acknowledges write arrival in the peer's **memory** only — the
+///   peer can still lose acknowledged writes on peer loss, so B is
+///   deliberately NOT the synchronous axis.
+/// - Protocol C → [`RemoteProtectionAxis::SynchronousPeer`]: writes
+///   are acknowledged after both durable media completed. RPO=0 only
+///   under the protocol's own conditions — both backings durable, the
+///   connection in the correct state — never a simultaneous-failure
+///   claim.
+///
+/// Everything else (no connection, peer not `UpToDate`, resync in
+/// progress, or a protocol that could not be read back) reports `None`:
 /// remote protection not established.
-fn remote_axis_of(status: &ResourceStatus) -> RemoteProtectionAxis {
+fn remote_axis_of(
+    status: &ResourceStatus,
+    protocol: Option<ReplicationMode>,
+) -> RemoteProtectionAxis {
+    let Some(protocol) = protocol else {
+        return RemoteProtectionAxis::None;
+    };
     if status.connected
         && status.peer_disk == Some(DiskState::UpToDate)
         && status.replication.is_none()
     {
-        RemoteProtectionAxis::AsynchronousPeer
+        match protocol {
+            ReplicationMode::A | ReplicationMode::B => RemoteProtectionAxis::AsynchronousPeer,
+            ReplicationMode::C => RemoteProtectionAxis::SynchronousPeer,
+        }
     } else {
         RemoteProtectionAxis::None
     }
@@ -2748,19 +2814,23 @@ fn remote_axis_of(status: &ResourceStatus) -> RemoteProtectionAxis {
 /// Whether a `drbdadm secondary` stderr means "the device is still
 /// open" (the kernel's refusal to demote an in-use source device).
 ///
-/// Real drbd-utils surfaces the kernel's `-EBUSY` with spellings like
-/// "Device or resource busy" / "device is in use" (case varies with the
-/// message source); the match is deliberately case-insensitive and
+/// Real drbd-utils surfaces the kernel's `SS_DEVICE_IN_USE` (`-EBUSY`)
+/// as `State change failed: (-12) Device is held open by someone`,
+/// followed by the kernel's opener info (`open_cnt:` and the
+/// `<dev> opened by <proc> (pid N) ...` list); those are the PRIMARY
+/// patterns. Other drbd-utils generations spell the same refusal
+/// "Device or resource busy" / "device is in use", so those stay as
+/// fallbacks. The match is deliberately case-insensitive and
 /// substring-based. Any OTHER failure is an honest `INTERNAL`, never a
 /// mistyped busy refusal.
-///
-/// ASSUMPTION(unverified): the exact stderr spellings of a refused
-/// `drbdadm secondary`; an unrecognized real-world spelling degrades to
-/// `INTERNAL` (fail-closed, the excerpt is preserved verbatim) rather
-/// than to a wrong classification.
 fn is_device_busy(stderr: &str) -> bool {
     let lowered = stderr.to_lowercase();
-    lowered.contains("busy") || lowered.contains("in use")
+    lowered.contains("held open")
+        || lowered.contains("open_cnt")
+        || lowered.contains("opened by")
+        // Fallback spellings from other drbd-utils versions.
+        || lowered.contains("busy")
+        || lowered.contains("in use")
 }
 
 /// Build the contract-shaped inspect response from stored state.
@@ -3000,6 +3070,8 @@ mod tests {
 
     #[test]
     fn is_device_busy_matches_busy_spellings_only() {
+        // The PRIMARY patterns: the real refused-demotion stderr of
+        // drbd-utils printing the kernel's SS_DEVICE_IN_USE.
         for busy in [
             "drbdadm: /dev/drbd7: Device or resource busy",
             "error: device is BUSY",
@@ -3015,6 +3087,29 @@ mod tests {
         ] {
             assert!(!is_device_busy(other), "{other:?} must not read as busy");
         }
+    }
+
+    #[test]
+    fn is_device_busy_matches_the_verbatim_real_refused_demotion_stderr() {
+        // Verbatim shape of a refused `drbdadm secondary` on a real
+        // cluster (drbdsetup.c printing SS_DEVICE_IN_USE plus the
+        // kernel's opener info).
+        let stderr = "drbd0: State change failed: (-12) Device is held open by someone\n\
+                      additional info from kernel:\n\
+                      \x20/dev/drbd0 open_cnt:1, writable:1; list of openers follows\n\
+                      drbd0 opened by qemu (pid 1234) at 2026-10-09 12:34:56\n";
+        assert!(is_device_busy(stderr), "the real refusal must read as busy");
+        // The opener-info fragments alone must classify too (stderr
+        // truncation must not lose the busy classification).
+        assert!(is_device_busy(
+            "drbd0: State change failed: (-12) Device is held open by someone"
+        ));
+        assert!(is_device_busy(
+            "/dev/drbd0 open_cnt:1, writable:1; list of openers follows"
+        ));
+        assert!(is_device_busy(
+            "drbd0 opened by qemu (pid 1234) at 2026-10-09 12:34:56"
+        ));
     }
 
     /// A minimal status for the mapping tests.
@@ -3035,6 +3130,8 @@ mod tests {
             peer_disk,
             replication: replication.map(str::to_owned),
             resync_done: None,
+            local_open: None,
+            quorum: None,
         }
     }
 
@@ -3175,33 +3272,67 @@ mod tests {
 
         // The remote axis is an observed fact, never a durability claim:
         // established only when connected with an UpToDate peer outside
-        // resync.
+        // resync, and CLASSIFIED by the protocol read back from the
+        // resource's own definition file.
+        let established = up_to_date_peer(DiskState::UpToDate);
+        // Protocol A: possible-RPO asynchronous arrival — the
+        // asynchronous axis.
         assert_eq!(
-            remote_axis_of(&up_to_date_peer(DiskState::UpToDate)),
+            remote_axis_of(&established, Some(ReplicationMode::A)),
             RemoteProtectionAxis::AsynchronousPeer
         );
+        // Protocol B: semi-synchronous arrival in remote MEMORY only —
+        // still possible-RPO on peer loss, so B is NOT the synchronous
+        // axis.
         assert_eq!(
-            remote_axis_of(&status(DiskState::UpToDate, false, None, None, None)),
+            remote_axis_of(&established, Some(ReplicationMode::B)),
+            RemoteProtectionAxis::AsynchronousPeer
+        );
+        // Protocol C: both durable media acknowledge — the synchronous
+        // axis (RPO=0 only under the protocol's own conditions).
+        assert_eq!(
+            remote_axis_of(&established, Some(ReplicationMode::C)),
+            RemoteProtectionAxis::SynchronousPeer
+        );
+        // A protocol that could not be read back (missing/unparsable
+        // resource file) is an honest unknown: no remote claim.
+        assert_eq!(
+            remote_axis_of(&established, None),
+            RemoteProtectionAxis::None
+        );
+        // Not established (or resyncing): no remote claim regardless of
+        // the protocol.
+        assert_eq!(
+            remote_axis_of(
+                &status(DiskState::UpToDate, false, None, None, None),
+                Some(ReplicationMode::C)
+            ),
             RemoteProtectionAxis::None
         );
         assert_eq!(
-            remote_axis_of(&status(
-                DiskState::UpToDate,
-                true,
-                Some(DiskState::Inconsistent),
-                Some("SyncTarget"),
-                Some(Role::Secondary)
-            )),
+            remote_axis_of(
+                &status(
+                    DiskState::UpToDate,
+                    true,
+                    Some(DiskState::Inconsistent),
+                    Some("SyncTarget"),
+                    Some(Role::Secondary)
+                ),
+                Some(ReplicationMode::C)
+            ),
             RemoteProtectionAxis::None
         );
         assert_eq!(
-            remote_axis_of(&status(
-                DiskState::UpToDate,
-                true,
-                Some(DiskState::Inconsistent),
-                None,
-                Some(Role::Secondary)
-            )),
+            remote_axis_of(
+                &status(
+                    DiskState::UpToDate,
+                    true,
+                    Some(DiskState::Inconsistent),
+                    None,
+                    Some(Role::Secondary)
+                ),
+                Some(ReplicationMode::C)
+            ),
             RemoteProtectionAxis::None
         );
     }

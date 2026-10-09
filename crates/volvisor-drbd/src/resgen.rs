@@ -40,12 +40,10 @@ pub const RESOURCE_HEADER: &str = "# managed by volvisor (drbd9-nearline-prototy
 /// The hash algorithm configured alongside `shared-secret` for peer
 /// authentication (`cram-hmac-alg`; drbd.conf(5) states peer
 /// authentication is only active with both set). `sha1` is the
-/// algorithm drbd-utils documents for this HMAC use; it authenticates
-/// the peer, it does not protect data confidentiality.
-/// (ASSUMPTION(unverified): that the man-page-recommended `sha1` is
-/// accepted by the peer's drbd-utils build; a mismatch fails at
-/// `connect` time and surfaces as an unhealthy resource, never as
-/// silent unauthenticated traffic.)
+/// algorithm drbd-utils documents for this HMAC use (verified against
+/// the drbd-utils source: `sha1` is an accepted `cram-hmac-alg`
+/// value); it authenticates the peer, it does not protect data
+/// confidentiality.
 const CRAM_HMAC_ALG: &str = "sha1";
 
 /// One volvisor-generated DRBD resource definition.
@@ -191,12 +189,19 @@ pub(crate) fn write_file_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), Ap
 /// (the secret is peer-authentication material; a leak through a log
 /// line would defeat it).
 ///
+/// A secret carrying a double quote, a backslash or a line break is
+/// rejected typed: drbd.conf(5) values are C-style quoted strings, so
+/// such a value would yield an unparsable or re-scoped resource file
+/// (and could silently change what the peer authenticates with).
+/// Fail-closed and operator-friendly — the error names the file path
+/// and the offending character class, never the secret value.
+///
 /// # Errors
-/// `INTERNAL` when the file cannot be read or is empty. Keeping the
-/// file owner-only (`0600`) is operator responsibility, recorded in the
-/// provider documentation. (ASSUMPTION(unverified): drbd-utils itself
-/// imposes no permission requirement on this file; `0600` is volvisor's
-/// own hygiene requirement per the plan's operator contract.)
+/// `INTERNAL` when the file cannot be read or is empty;
+/// `INVALID_REQUEST` when the value contains a character the
+/// drbd.conf string grammar cannot carry. Keeping the file owner-only
+/// (`0600`) is operator responsibility, recorded in the provider
+/// documentation.
 pub fn read_shared_secret(path: &Path) -> Result<String, ApiError> {
     let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
     let content = fs::read_to_string(path).map_err(|e| {
@@ -211,6 +216,21 @@ pub fn read_shared_secret(path: &Path) -> Result<String, ApiError> {
             "shared secret file {} is empty",
             path.display()
         )));
+    }
+    if secret.contains('"')
+        || secret.contains('\\')
+        || secret.contains('\n')
+        || secret.contains('\r')
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "shared secret file {} contains a character the drbd.conf string grammar cannot \
+                 carry (a double quote, a backslash or a line break); use a secret made of plain \
+                 printable characters",
+                path.display()
+            ),
+        ));
     }
     Ok(secret.to_owned())
 }
@@ -525,6 +545,33 @@ mod tests {
         let err = read_shared_secret(&dir.path().join("missing")).expect_err("missing");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(!err.detail.contains("sekrit"));
+    }
+
+    #[test]
+    fn read_shared_secret_rejects_grammar_breaking_characters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secret");
+        // The drbd.conf string grammar is C-style quoted: a secret with
+        // `"`, `\` or a line break would produce an unparsable or
+        // re-scoped resource file. Each offender is rejected typed,
+        // naming the path and the character class — never the value.
+        for bad in ["bad\"value", "bad\\value", "bad\nvalue", "bad\rvalue"] {
+            fs::write(&path, bad).expect("write");
+            let err = read_shared_secret(&path).expect_err("grammar-breaking secret");
+            assert_eq!(err.code, ApiErrorCode::InvalidRequest);
+            assert!(
+                err.detail.contains(path.display().to_string().as_str()),
+                "the error names the secret file path: {err:?}"
+            );
+            assert!(!err.detail.contains("bad"), "never leak the value");
+            assert!(!err.detail.contains("value"), "never leak the value");
+        }
+        // A trailing newline is trimmed away (the ordinary file shape).
+        fs::write(&path, b"plain-printable-secret\n").expect("write");
+        assert_eq!(
+            read_shared_secret(&path).expect("secret"),
+            "plain-printable-secret"
+        );
     }
 
     #[test]

@@ -21,14 +21,19 @@
 //!   guarantee is exercised end to end;
 //! - `lvcreate` on an existing name fails "already exists", and sizes
 //!   round UP to whole extents (thick LVM);
-//! - `drbdadm create-md` refuses non-interactively when metadata
-//!   already exists on the backing LV (the crashed-predecessor
-//!   signature), while `up` adopts it;
+//! - `drbdadm create-md` models the real `drbdmeta` semantics: over an
+//!   all-zero backing LV it (re-)initializes the metadata — even over
+//!   a crashed predecessor's existing metadata — while a backing LV
+//!   carrying non-zero data is refused ("Operation refused");
 //! - `drbdadm primary` without `--force` refuses over a non-`UpToDate`
 //!   local disk ("Refusing to be Primary..."), and `secondary` refuses
-//!   while the device is open (EBUSY-class stderr);
-//! - `drbdsetup status` answers in the verified text grammar and fails
-//!   "No such resource" for unknown/down resources;
+//!   while the device is open with the real held-open stderr
+//!   (`(-12) Device is held open by someone` plus the kernel's opener
+//!   info);
+//! - `drbdsetup status` answers in the verified text grammar of the
+//!   claimed `DRBDADM_VERSION=9.29.0` — including the unconditional
+//!   indent-2 `open:` line, reflecting the world's open-devices state —
+//!   and fails "No such resource" for unknown/down resources;
 //! - `blockdev --getsize64` reports the STORED device size (set at `up`
 //!   and `resize` to the minimum of the local and peer backing sizes),
 //!   never a live computation.
@@ -98,6 +103,13 @@ pub struct FakeLv {
     pub size: u64,
     /// LVM tags (`volvisor.owner=<id>`, `volvisor.generation=1`, ...).
     pub tags: Vec<String>,
+    /// Whether the LV's data area carries non-zero data. Real
+    /// `drbdmeta` re-initializes metadata over an all-zero data area
+    /// (even one with existing metadata) and refuses create-md only
+    /// over non-zero data, so this is the bit its decision rests on.
+    /// Fresh `lvcreate` starts all-zero; seeding (`primary --force`)
+    /// and fixture pins mark data.
+    pub has_data: bool,
 }
 
 /// One simulated running DRBD resource.
@@ -144,6 +156,12 @@ pub struct FakeDrbd {
     /// ran; survives `down`, dies with `lvremove` — internal metadata
     /// lives on the LV).
     pub metadata: BTreeSet<String>,
+    /// Resources whose `create-md` SUCCEEDED (initialized or
+    /// re-initialized metadata). Real drbdmeta re-initializes over an
+    /// all-zero LV even when metadata already exists, so this set —
+    /// not the absence of a refusal — is the proof the tests assert
+    /// the real (non-inverted) create-md semantics.
+    pub create_md_ran: BTreeSet<String>,
     /// Resource name → running resource.
     pub resources: BTreeMap<String, FakeResource>,
     /// Whether the replication link to the peer is up (affects every
@@ -215,6 +233,7 @@ impl Default for FakeDrbd {
             vg_extent_size: EXTENT,
             lvs: BTreeMap::new(),
             metadata: BTreeSet::new(),
+            create_md_ran: BTreeSet::new(),
             resources: BTreeMap::new(),
             peer_online: true,
             new_peer_disk: DiskState::Inconsistent,
@@ -307,18 +326,29 @@ fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
 }
 
 /// The `drbdsetup status` text for one running resource — the verified
-/// grammar: resource line (indent 0, `role:`), `disk:` line (indent 2),
-/// a peer-node-named connection line (indent 2), `peer-disk:` line
-/// (indent 4, optionally with `replication:`/`done:`), trailing blank
-/// line.
+/// grammar of the claimed DRBDADM_VERSION=9.29.0: resource line
+/// (indent 0, `role:`), `disk:` line (indent 2), the UNCONDITIONAL
+/// `open:` line (indent 2, kernel >= 9.2.9) reflecting the world's
+/// open-devices state, a peer-node-named connection line (indent 2),
+/// `peer-disk:` line (indent 4, optionally with `replication:`/
+/// `done:`), trailing blank line.
 fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String {
+    // drbdsetup.c:3350–3355: `open:` is printed unconditionally on
+    // kernel >= 9.2.9, naming whether the device is currently held
+    // open.
+    let open = if world.open_devices.contains(&resource.minor) {
+        "yes"
+    } else {
+        "no"
+    };
     if world.peer_online {
         let mut peer_disk_line = format!("    peer-disk:{}", disk_str(&resource.peer_disk));
         if resource.resyncing {
             peer_disk_line.push_str(" replication:SyncTarget done:37.50%");
         }
         format!(
-            "{name} role:{role}\n  disk:{disk}\n  {peer} role:{peer_role}\n{peer_disk_line}\n\n",
+            "{name} role:{role}\n  disk:{disk}\n  open:{open}\n  {peer} role:{peer_role}\n\
+             {peer_disk_line}\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
             peer = resource.peer_node,
@@ -326,7 +356,7 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         )
     } else {
         format!(
-            "{name} role:{role}\n  disk:{disk}\n  {peer} connection:WFConnection\n\n",
+            "{name} role:{role}\n  disk:{disk}\n  open:{open}\n  {peer} connection:WFConnection\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
             peer = resource.peer_node,
@@ -405,15 +435,22 @@ fn script_drbdadm(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> 
                     "drbdadm create-md: simulated failure",
                 ));
             }
-            // Real create-md refuses non-interactively when metadata
-            // already exists (it would ask for confirmation).
-            if world.metadata.contains(resource) {
+            // Real drbdmeta semantics (drbdmeta.c): with a non-tty
+            // stdin the move prompt auto-declines, then md_initialize
+            // RE-INITIALIZES the metadata whenever the data-area start
+            // is all-zero — even over a crashed predecessor's existing
+            // valid metadata. Only non-zero data at the data-area start
+            // is refused ("Operation refused").
+            let disk = parsed.disks.first().map(String::as_str)?;
+            let lv_key = disk.strip_prefix("/dev/")?;
+            if world.lvs.get(lv_key).is_some_and(|lv| lv.has_data) {
                 return Some(CommandOutput::failure(format!(
-                    "drbdadm create-md {resource}: metadata already exists on the backing \
-                     device; confirmation requires a terminal, aborting"
+                    "drbdadm create-md {resource}: Operation refused: {disk} seems to contain \
+                     non-zero data; this operation would destroy it (exit code 40)"
                 )));
             }
             world.metadata.insert(resource.to_owned());
+            world.create_md_ran.insert(resource.to_owned());
             Some(CommandOutput::success(format!(
                 "initial metadata created for {resource}\n"
             )))
@@ -519,8 +556,16 @@ fn script_drbdadm_primary(
     let state = world.resources.get_mut(resource)?;
     if force {
         // The seeding promotion: the forced source becomes UpToDate and
-        // the peer is overwritten (resync follows).
+        // the peer is overwritten (resync follows). Seeding makes the
+        // backing LV hold the volume's data — from here on create-md
+        // over it would be refused (non-zero data area).
         state.local_disk = DiskState::UpToDate;
+        if let Some(lv) = world
+            .lvs
+            .get_mut(&format!("{}/{}", world.vg_name, resource))
+        {
+            lv.has_data = true;
+        }
         if world.peer_online {
             world.peer_overwritten = true;
             if world.resync_completes {
@@ -561,12 +606,16 @@ fn script_drbdadm_secondary(world: &mut FakeDrbd, resource: &str) -> Option<Comm
         ));
     }
     let state = world.resources.get_mut(resource)?;
-    // Real kernel refusal while the device is open (EBUSY).
+    // The real kernel refusal while the device is open
+    // (SS_DEVICE_IN_USE): drbdsetup prints the state-change failure and
+    // the kernel's opener info verbatim.
     if world.open_devices.contains(&state.minor) {
+        let minor = state.minor;
         return Some(CommandOutput::failure(format!(
-            "drbdadm secondary {resource}: State change failed: (-16) Device or resource busy: \
-             /dev/drbd{} is open by another process",
-            state.minor
+            "drbd{minor}: State change failed: (-12) Device is held open by someone\n\
+             additional info from kernel:\n\
+             \x20/dev/drbd{minor} open_cnt:1, writable:1; list of openers follows\n\
+             drbd{minor} opened by qemu (pid 1234) at 2026-10-09 12:34:56\n"
         )));
     }
     state.role = Role::Secondary;
@@ -687,6 +736,9 @@ fn script_lvcreate(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput>
         FakeLv {
             size: extent_round_up(size, world.vg_extent_size),
             tags,
+            // A freshly created LV is all-zero (drbdmeta's
+            // re-initialize-vs-refuse decision rests on this).
+            has_data: false,
         },
     );
     Some(CommandOutput::success(format!(
@@ -947,6 +999,9 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
                 format!("volvisor.owner={}", volume_id.as_str()),
                 "volvisor.generation=1".to_owned(),
             ],
+            // A seeded volume holds data on both ends (create-md over
+            // this LV would be refused — the real drbdmeta rule).
+            has_data: true,
         },
     );
     world.metadata.insert(resource.clone());
@@ -969,13 +1024,15 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
 
 /// Seed an LV into the simulated world without a state entry: owned
 /// (`Some(volume_id)`) or foreign (`None`) — untracked-LV and
-/// reclaim tests.
+/// reclaim tests. `has_data` pins whether the LV's data area carries
+/// non-zero data (drbdmeta's create-md decision rests on it).
 pub fn seed_lv(
     world: &Arc<Mutex<FakeDrbd>>,
     vg: &str,
     name: &str,
     size_bytes: u64,
     owner: Option<&str>,
+    has_data: bool,
 ) {
     let mut tags = Vec::new();
     if let Some(owner) = owner {
@@ -987,6 +1044,7 @@ pub fn seed_lv(
         FakeLv {
             size: size_bytes,
             tags,
+            has_data,
         },
     );
 }

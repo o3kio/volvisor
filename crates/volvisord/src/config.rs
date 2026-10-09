@@ -282,6 +282,44 @@ impl Config {
                 ));
             }
         }
+        if let Some(user) = &self.ceph_user {
+            // `--name` takes the FULL entity name; a bare id (or a non-client
+            // entity type) is a configuration mistake that would silently
+            // authenticate as the wrong principal.
+            let valid = user.strip_prefix("client.").is_some_and(|id| {
+                !id.is_empty()
+                    && !id.chars().any(char::is_whitespace)
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            });
+            if !valid {
+                return Err(DaemonError::Config(
+                    "ceph_user must be a full client entity name like 'client.volvisor' \
+                     (client. prefix plus a non-empty id of alnum, '-', '_' or '.') when set \
+                     (leave it unset for the documented default)"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.validate_drbd_field_shapes()?;
+        // An explicitly empty token is a configuration mistake: unset means
+        // "fail closed, loopback only", while "" would authenticate an empty
+        // bearer. Reject it at startup instead.
+        if self.admin_token.as_deref().is_some_and(str::is_empty) {
+            return Err(DaemonError::Config(
+                "admin_token must not be empty when set (leave it unset for the loopback-only \
+                 fail-closed mode)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shape checks for optional drbd_* fields (the address and secret
+    /// validators are the provider's own, reused so there is one source
+    /// of truth).
+    fn validate_drbd_field_shapes(&self) -> Result<(), DaemonError> {
         if let Some(vg) = &self.drbd_vg_name {
             if !is_simple_name(vg, 64) {
                 return Err(DaemonError::Config(
@@ -304,35 +342,26 @@ impl Config {
                 "drbd_minor_max must not exceed 4095 (the DRBD kernel minor space)".to_owned(),
             ));
         }
-        if let Some(user) = &self.ceph_user {
-            // `--name` takes the FULL entity name; a bare id (or a non-client
-            // entity type) is a configuration mistake that would silently
-            // authenticate as the wrong principal.
-            let valid = user.strip_prefix("client.").is_some_and(|id| {
-                !id.is_empty()
-                    && !id.chars().any(char::is_whitespace)
-                    && id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            });
-            if !valid {
+        if let Some(address) = &self.drbd_local_address {
+            if !volvisor_drbd::resgen::is_ipv4_literal(address) {
                 return Err(DaemonError::Config(
-                    "ceph_user must be a full client entity name like 'client.volvisor' \
-                     (client. prefix plus a non-empty id of alnum, '-', '_' or '.') when set \
-                     (leave it unset for the documented default)"
-                        .to_owned(),
+                    "drbd_local_address must be an IPv4 dotted quad (e.g. 10.0.0.1)".to_owned(),
                 ));
             }
         }
-        // An explicitly empty token is a configuration mistake: unset means
-        // "fail closed, loopback only", while "" would authenticate an empty
-        // bearer. Reject it at startup instead.
-        if self.admin_token.as_deref().is_some_and(str::is_empty) {
-            return Err(DaemonError::Config(
-                "admin_token must not be empty when set (leave it unset for the loopback-only \
-                 fail-closed mode)"
-                    .to_owned(),
-            ));
+        if let Some(address) = &self.drbd_peer_address {
+            if let Err(e) = volvisor_drbd::provider::split_peer_address(address) {
+                return Err(DaemonError::Config(format!(
+                    "drbd_peer_address is malformed: {e}"
+                )));
+            }
+        }
+        if let Some(secret) = &self.drbd_shared_secret_file {
+            if secret.as_os_str().is_empty() {
+                return Err(DaemonError::Config(
+                    "drbd_shared_secret_file must not be empty when set".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -822,6 +851,34 @@ provider = \"drbd\"
             cfg.validate().is_err(),
             "minor space beyond the DRBD kernel limit"
         );
+    }
+
+    #[test]
+    fn drbd_addresses_are_shape_checked_at_config_load() {
+        // A malformed address is a Config error at load time, not an
+        // INVALID_REQUEST that only surfaces after provider construction.
+        let raw = minimal_drbd_toml().replace(
+            "drbd_local_address = \"10.0.0.1\"",
+            "drbd_local_address = \"host-a\"",
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("must refuse");
+        assert!(
+            error.to_string().contains("drbd_local_address"),
+            "error names the field: {error}"
+        );
+        for bad in ["10.0.0.2", "10.0.0.2:0", "10.0.0.2:abc", "node-b:7100"] {
+            let raw = minimal_drbd_toml().replace(
+                "drbd_peer_address = \"10.0.0.2:7100\"",
+                &format!("drbd_peer_address = \"{bad}\""),
+            );
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg.validate().expect_err("must refuse");
+            assert!(
+                error.to_string().contains("drbd_peer_address"),
+                "error names the field: {error}"
+            );
+        }
     }
 
     #[test]

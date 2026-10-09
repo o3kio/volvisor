@@ -394,6 +394,12 @@ impl DrbdState {
     /// resource file instead). Exhaustion of the operator-declared range
     /// is a typed `NO_SAFE_CAPACITY` refusal, never a silent reuse.
     ///
+    /// The operator-declared range must be **exclusively reserved for
+    /// volvisor**: this allocator never probes the kernel's minor
+    /// space, so a minor already claimed by a foreign resource surfaces
+    /// only later, as a create-time failure that tears the half-created
+    /// volume back down.
+    ///
     /// # Errors
     /// `NO_SAFE_CAPACITY` when the range is exhausted.
     pub fn allocate_minor(&mut self, min: u32, max: u32) -> Result<u32, ApiError> {
