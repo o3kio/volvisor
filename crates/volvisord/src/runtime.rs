@@ -237,8 +237,15 @@ fn drbd_authority(config: &Config) -> Result<Option<AuthorityContext>, DaemonErr
     })?;
     let host_id = HostId::new(node_name.as_str())
         .map_err(|e| DaemonError::Config(format!("drbd_node_name: {e}")))?;
-    let connection =
-        HttpWitnessConnection::new(url, config.witness_token.clone(), WITNESS_REQUEST_TIMEOUT);
+    // W8 (P4b plan §6): this connection authenticates as THIS host.
+    // The shared `witness_token` is read-only on a v2 witness; the
+    // daemon's grant/renew/self-revoke/register calls require the
+    // per-host credential (config refuses a witness_url without it).
+    let connection = HttpWitnessConnection::new(
+        url,
+        config.witness_host_token.clone(),
+        WITNESS_REQUEST_TIMEOUT,
+    );
     let blocking: Arc<dyn BlockingWitnessConnection> = Arc::new(BlockingWitness::new(
         Arc::new(connection),
         tokio::runtime::Handle::current(),
@@ -424,6 +431,7 @@ mod tests {
             max_body_bytes: 1 << 20,
             witness_url: None,
             witness_token: None,
+            witness_host_token: None,
             witness_renewal_interval_secs: None,
         }
     }
@@ -462,6 +470,7 @@ mod tests {
             max_body_bytes: 1 << 20,
             witness_url: None,
             witness_token: None,
+            witness_host_token: None,
             witness_renewal_interval_secs: None,
         }
     }
@@ -597,6 +606,7 @@ mod tests {
             max_body_bytes: 1 << 20,
             witness_url: None,
             witness_token: None,
+            witness_host_token: None,
             witness_renewal_interval_secs: None,
             drbd_vg_name: None,
             drbd_config_dir: None,
@@ -694,6 +704,7 @@ mod tests {
         let config = Config {
             witness_url: Some("http://10.0.0.3:9101".to_owned()),
             witness_token: Some("witness-secret".to_owned()),
+            witness_host_token: Some("host-a-secret".to_owned()),
             witness_renewal_interval_secs: Some(15),
             ..drbd_config(std::path::PathBuf::from("/j"))
         };

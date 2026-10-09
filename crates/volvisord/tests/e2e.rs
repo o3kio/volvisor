@@ -96,6 +96,7 @@ fn e2e_config(dir: &tempfile::TempDir) -> volvisord::Config {
         max_body_bytes: 1 << 20,
         witness_url: None,
         witness_token: None,
+        witness_host_token: None,
         witness_renewal_interval_secs: None,
     }
 }
@@ -228,6 +229,7 @@ async fn daemon_journal_lock_fails_fast_for_second_instance() {
         max_body_bytes: 1 << 20,
         witness_url: None,
         witness_token: None,
+        witness_host_token: None,
         witness_renewal_interval_secs: None,
     };
     // Hold one state (and thus the journal lock) ...

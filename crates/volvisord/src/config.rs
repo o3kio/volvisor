@@ -143,8 +143,18 @@ pub struct Config {
     pub witness_url: Option<String>,
     /// Bearer token for the witness surface; required when
     /// `witness_url` names a non-loopback host (the witness's own
-    /// fail-closed convention). Never logged.
+    /// fail-closed convention). On a v2 witness this shared token is
+    /// **read-only** (inspect/health). Never logged.
     pub witness_token: Option<String>,
+    /// This host's W8 credential: the per-host token the witness maps
+    /// to `drbd_node_name`'s identity. Required whenever
+    /// `witness_url` is set — the witness protocol is v2 and every
+    /// state-mutating call from this daemon (grant/renew/self-revoke/
+    /// register, not only the migration surface) authenticates as this
+    /// host; without the credential attach/detach/renewal would fail
+    /// at runtime, so validation refuses the configuration up front
+    /// (P4b plan §6). Never logged.
+    pub witness_host_token: Option<String>,
     /// Writer lease renewal interval in seconds (required with
     /// `witness_url`; must be positive). The interval must stay under
     /// half the witness's lease TTL — a bound the daemon can only
@@ -281,6 +291,11 @@ impl Config {
                     "witness_token is set without witness_url".to_owned(),
                 ));
             }
+            if self.witness_host_token.is_some() {
+                return Err(DaemonError::Config(
+                    "witness_host_token is set without witness_url".to_owned(),
+                ));
+            }
             return Ok(());
         };
         if self.provider != ProviderKind::Drbd {
@@ -318,6 +333,23 @@ impl Config {
             )));
         }
         self.ensure_witness_failure_domain(&witness_addresses, url)?;
+        // W8 (P4b plan §6), checked last so the more fundamental URL,
+        // colocation and shared-token rules report first: a v2 witness
+        // refuses every mutation from the shared token; this daemon's
+        // grant/renew/self-revoke/register calls authenticate as this
+        // host. Without the credential the daemon would start and fail
+        // at the first attach — refuse the configuration up front
+        // instead.
+        match self.witness_host_token.as_deref() {
+            Some(token) if !token.trim().is_empty() => {}
+            _ => {
+                return Err(DaemonError::Config(
+                    "witness_host_token is required when witness_url is set (the witness \
+                     protocol is v2: this host's credential for grant/renew/revoke/register)"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1106,11 +1138,12 @@ provider = \"drbd\"
     // ---------------------------------------------------------- witness
 
     /// A minimal witness section over the minimal drbd config: a witness
-    /// on a distinct third address, with token and renewal interval.
+    /// on a distinct third address, with tokens and renewal interval.
     fn witness_toml() -> String {
         minimal_drbd_toml()
             + "witness_url = \"http://10.0.0.3:9101\"\n\
                witness_token = \"witness-secret\"\n\
+               witness_host_token = \"host-a-secret\"\n\
                witness_renewal_interval_secs = 15\n"
     }
 
@@ -1119,12 +1152,47 @@ provider = \"drbd\"
         let cfg: Config = toml::from_str(&witness_toml()).expect("parse");
         cfg.validate().expect("a distinct witness is valid");
         assert_eq!(cfg.witness_renewal_interval_secs, Some(15));
+        assert_eq!(
+            cfg.witness_host_token.as_deref(),
+            Some("host-a-secret"),
+            "the host credential parses alongside the shared token"
+        );
+    }
+
+    #[test]
+    fn witness_url_requires_the_host_token() {
+        // A v2 witness refuses mutations from the shared token: the
+        // daemon's own grant/renew/revoke path needs the per-host
+        // credential or it would fail at the first attach.
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("host token is mandatory");
+        assert!(
+            error.to_string().contains("witness_host_token"),
+            "error names the field: {error}"
+        );
+        // An empty host token is no host token.
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_host_token = \"  \"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("empty host token refused");
+        assert!(
+            error.to_string().contains("witness_host_token"),
+            "error names the field: {error}"
+        );
     }
 
     #[test]
     fn witness_fields_without_url_are_refused() {
         for extra in [
             "witness_token = \"t\"\n",
+            "witness_host_token = \"t\"\n",
             "witness_renewal_interval_secs = 15\n",
         ] {
             let cfg: Config = toml::from_str(&(minimal_drbd_toml() + extra)).expect("parse");
@@ -1192,6 +1260,7 @@ provider = \"drbd\"
     fn non_loopback_witness_requires_a_token() {
         let raw = minimal_drbd_toml()
             + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_host_token = \"h\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
         let error = cfg.validate().expect_err("tokenless non-loopback witness");
@@ -1211,6 +1280,7 @@ provider = \"drbd\"
                 + &format!(
                     "witness_url = \"{url}\"\n\
                      witness_token = \"t\"\n\
+                     witness_host_token = \"h\"\n\
                      witness_renewal_interval_secs = 15\n"
                 );
             let cfg: Config = toml::from_str(&raw).expect("parse");
