@@ -41,7 +41,8 @@
 //!   reported there from the pool's own policy
 //!   (`ceph osd pool get <pool> size`), never inferred from capacity
 //!   output;
-//! - **grow-only resize** (`rbd resize --allow-shrink=false`) with the
+//! - **grow-only resize** (`rbd resize`; shrink is impossible by
+//!   construction and rbd refuses it independently) with the
 //!   effective size verified from `rbd info` afterwards;
 //! - **erasure policy**: `Retain` moves the image to the RBD trash
 //!   (recoverable, verified via `rbd trash ls`); `ZeroDiscard` is a typed
@@ -77,7 +78,7 @@ pub mod report;
 pub mod state;
 
 pub use provider::{CephProviderConfig, CephRbdProvider, PROVIDER_NAME};
-pub use state::ReconcileReport;
+pub use state::{ClearedAttachment, ClearedAttachmentReason, ReconcileReport};
 // The command-execution abstraction is shared with the LVM adapter and
 // lives in volvisor-provider; re-exported here for API stability.
 pub use volvisor_provider::runner::{

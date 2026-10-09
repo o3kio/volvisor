@@ -11,7 +11,8 @@
 //! round-trips instead of echoes.
 //!
 //! The simulation mirrors real CLI semantics that matter to the provider:
-//! `rbd map` on an image lacking `exclusive-lock` fails, `rbd create` on
+//! `rbd map` succeeds for any existing image (the exclusive lock is a
+//! first-write mechanism, not a map-time one), `rbd create` on
 //! an existing name fails "already exists", `rbd unmap` on a missing
 //! device fails, `rbd trash move` on a missing image fails, `rbd info`
 //! on a missing image fails ENOENT-style, and `rbd showmapped` reflects
@@ -505,6 +506,16 @@ fn script_rbd_image_meta(world: &mut FakeCeph, args: &[&str]) -> Option<CommandO
 
 /// `rbd resize --allow-shrink=false -s <size>B <pool>/<image>`.
 fn script_rbd_resize(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutput> {
+    // Model the real CLI grammar: `--allow-shrink` is a boost
+    // program_options bool switch, so the `--allow-shrink=false` argv form
+    // is rejected by the option parser before the command even runs
+    // ("the option ... does not take any arguments"). This pins the
+    // provider to forms real `rbd` actually accepts.
+    if args.iter().any(|arg| arg.starts_with("--allow-shrink")) {
+        return Some(CommandOutput::failure(
+            "rbd: the option '--allow-shrink' does not take any arguments",
+        ));
+    }
     let size = arg_after(args, "-s")?;
     let size: u64 = size.trim_end_matches('B').parse().ok()?;
     let spec = *args.last()?;
@@ -515,8 +526,9 @@ fn script_rbd_resize(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutpu
         ))),
         Some(image) => {
             if size < image.size {
+                // Real rbd text (Resize.cc): shrinking requires the flag.
                 return Some(CommandOutput::failure(
-                    "rbd resize: shrinking is not allowed (--allow-shrink=false)",
+                    "rbd resize: shrinking an image is only allowed with the --allow-shrink flag",
                 ));
             }
             if !world.resize_silent {
@@ -529,17 +541,17 @@ fn script_rbd_resize(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutpu
 
 /// `rbd map --image <image> --pool <pool>`.
 fn script_rbd_map(world: &mut FakeCeph, args: &[&str]) -> Option<CommandOutput> {
+    // Real `rbd map` succeeds regardless of image features: the
+    // exclusive lock is acquired lazily on first write, not at map
+    // time, so the fake deliberately does NOT model a feature-based
+    // map refusal (it previously did, pinning a behavior real rbd
+    // does not have).
     let image = arg_after(args, "--image")?;
-    let Some(entry) = world.images.get(image) else {
+    let Some(_entry) = world.images.get(image) else {
         return Some(CommandOutput::failure(format!(
             "rbd: error opening image {POOL}/{image}: (2) No such file or directory"
         )));
     };
-    if !entry.features.iter().any(|f| f == "exclusive-lock") {
-        return Some(CommandOutput::failure(
-            "rbd: failed to lock: image lacks the exclusive-lock feature",
-        ));
-    }
     if world
         .mappings
         .values()

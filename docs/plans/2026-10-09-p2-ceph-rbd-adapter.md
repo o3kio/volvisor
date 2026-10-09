@@ -66,7 +66,10 @@ Out (recorded follow-ups):
 - `rbd info --format json <pool>/<image>` — size/features verification.
 - `rbd ls --pool <pool> --format json`; `rbd ls --pool <pool> --lsv2 --format json`
   where metadata is needed (or `rbd image-meta get/set <pool>/<image> <key>`).
-- `rbd resize --allow-shrink=false -s <size>B <pool>/<image>` (grow-only).
+- `rbd resize -s <size>B <pool>/<image>` (grow-only by construction — the
+  branch runs only when actual < new, and `rbd` independently refuses a
+  shrink; note `--allow-shrink` is a boost bool switch, so the
+  `--allow-shrink=false` argv form is a parse error on real clusters).
 - `rbd trash move` / `rbd trash ls` (Retain erasure).
 - `rbd map --image <image> --pool <pool>` / `rbd unmap <device>` /
   `rbd showmapped --format json`.
@@ -86,8 +89,10 @@ Out (recorded follow-ups):
   reconcile also clears the stale attachment record such a volume may carry
   (the backing it referenced is gone or no longer provably ours — a lingering
   record would wedge detach/delete forever) while never touching an actual
-  device. Images in our pool **without** our metadata are foreign: listed by
-  discovery as foreign, never touched (rule 7).
+  device, and preserves the cleared record (device name, whether a zombie
+  mapping remains) in the reconcile report as the audit trail. Images in our
+  pool **without** our metadata are foreign: listed by discovery
+  as foreign, never touched (rule 7).
 - Volume state keeps `requested_size_bytes` + effective `size_bytes` (RBD
   sizes are byte-granular — no extent rounding — but the requested size is
   still recorded for idempotent-create replay comparison, mirroring LVM).
@@ -119,10 +124,12 @@ Out (recorded follow-ups):
   compare against `max_avail` minus a headroom and reject with typed
   `NO_SAFE_CAPACITY`. RBD quotas are not set in P2.
 - Health: `ceph health detail` mapped OK→`Healthy`, WARN→`Degraded`,
-  ERR→`Failed`; query failure → `Unknown`. Never convert Ceph's health into a
+  ERR→`Unhealthy`; query failure → `Unknown`. Never convert Ceph's health into a
   Volvisor-made durability guarantee (ADR-0005): pool protection is reported
-  from pool stats (`size`/`min_size`/EC profile) as `RemoteProtectionAxis`
-  policy facts, not as replication promises.
+  from the pool policy query (`ceph osd pool get <pool> size`/`min_size`) as
+  `RemoteProtectionAxis` policy facts, not as replication promises;
+  erasure-coded pools are not specially interpreted in P2 (their `size`
+  reflects the EC profile's k+m, and decoding EC semantics is a follow-up).
 
 ## 7. Daemon and config
 

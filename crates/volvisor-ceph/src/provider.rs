@@ -57,8 +57,8 @@ use crate::report::{
     parse_showmapped, parse_trash_list,
 };
 use crate::state::{
-    AttachmentRecord, CephState, StoredVolume, UnverifiableImage, UnverifiableVolume, VolumeEntry,
-    VolumeRuntime, unix_now,
+    AttachmentRecord, CephState, ClearedAttachment, ClearedAttachmentReason, StoredVolume,
+    UnverifiableImage, UnverifiableVolume, VolumeEntry, VolumeRuntime, unix_now,
 };
 use crate::{CommandOutput, CommandRunner, ReconcileReport};
 
@@ -102,9 +102,15 @@ pub const CEPH_HEADROOM_BYTES: u64 = 1 << 30;
 
 /// The image features every volvisor-owned image is created with.
 ///
-/// `exclusive-lock` is the single-writer mechanism (a second `rbd map`
-/// writer is refused by the cluster); `layering` is the standard
-/// snapshot/clone basis. Images without `exclusive-lock` are not adopted.
+/// `exclusive-lock` makes the single-writer mechanism *available* to
+/// clients (it is acquired lazily on first write, not at `rbd map`
+/// time — the cluster does not refuse a second map), and `layering` is
+/// the standard snapshot/clone basis. Volvisor's single-writer
+/// guarantee does not rest on the lock: it comes from the recorded
+/// attachment (a second attach is a typed `WRITER_ALREADY_ACTIVE`
+/// rejection) plus the `showmapped` scan. Verifying that an existing
+/// image actually carries these features before adopting it is a
+/// recorded follow-up, not implemented in P2.
 const IMAGE_FEATURES: &str = "exclusive-lock,layering";
 
 /// The outcome of verifying a state entry against the observed cluster.
@@ -219,6 +225,13 @@ pub struct CephRbdProvider {
     /// Path of the durable JSON state file.
     state_path: PathBuf,
     state: Mutex<CephState>,
+    /// The most recent reconcile report (the startup pass or the last
+    /// explicit [`reconcile`](Self::reconcile) call), kept so the audit
+    /// trail of destructive-looking bookkeeping — e.g. attachment
+    /// records cleared because their backing vanished or turned
+    /// foreign — survives past the state change it describes. Read it
+    /// with [`last_reconcile_report`](Self::last_reconcile_report).
+    last_reconcile: Mutex<Option<ReconcileReport>>,
 }
 
 impl CephRbdProvider {
@@ -247,6 +260,7 @@ impl CephRbdProvider {
             config,
             state_path,
             state: Mutex::new(CephState::default()),
+            last_reconcile: Mutex::new(None),
         };
         provider.verify_startup()?;
         let state = CephState::load(&provider.state_path)?;
@@ -263,6 +277,34 @@ impl CephRbdProvider {
                 "ceph provider state lock poisoned by a previous failure",
             )
         })
+    }
+
+    /// Lock the last-reconcile slot, mapping poisoning to `INTERNAL`.
+    fn lock_last_reconcile(&self) -> Result<MutexGuard<'_, Option<ReconcileReport>>, ApiError> {
+        self.last_reconcile.lock().map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "ceph provider last-reconcile lock poisoned by a previous failure",
+            )
+        })
+    }
+
+    /// The most recent reconcile report: the startup pass performed at
+    /// construction, or the last explicit
+    /// [`reconcile`](Self::reconcile) call.
+    ///
+    /// The startup report is retained precisely because construction
+    /// reconciles before anything can observe it: without this
+    /// accessor, the audit trail of records the startup pass cleared
+    /// (see
+    /// [`ReconcileReport::cleared_attachments`](crate::state::ReconcileReport::cleared_attachments))
+    /// would be lost.
+    ///
+    /// # Errors
+    /// Returns a typed [`ApiError`] (`INTERNAL`) only when the
+    /// reporting slot's lock is poisoned.
+    pub fn last_reconcile_report(&self) -> Result<Option<ReconcileReport>, ApiError> {
+        Ok(self.lock_last_reconcile()?.clone())
     }
 
     // -- Command plumbing (argv arrays; -m and --name on every invocation) --
@@ -537,6 +579,9 @@ impl CephRbdProvider {
         state: &mut CephState,
         id: &VolumeId,
         snapshot: &StoredVolume,
+        mappings: Option<&[MappedDevice]>,
+        reason: ClearedAttachmentReason,
+        report: &mut ReconcileReport,
         changed: &mut bool,
     ) {
         if let Some(volume) = state.volume_mut(id) {
@@ -548,6 +593,21 @@ impl CephRbdProvider {
                 volume.runtime.attachment = None;
                 *changed = true;
             }
+        }
+        // Preserve the cleared record in the report as the audit
+        // trail: the device it named, and whether a live mapping still
+        // exists over the gone/foreign backing (a zombie left for an
+        // operator — never auto-unmapped).
+        if let Some(record) = snapshot.runtime.attachment.as_ref() {
+            report.cleared_attachments.push(ClearedAttachment {
+                volume_id: id.clone(),
+                device: record.device.clone(),
+                zombie_mapping: mappings.map(|maps| {
+                    maps.iter()
+                        .any(|m| m.name.as_deref() == Some(snapshot.entry.image_name.as_str()))
+                }),
+                reason,
+            });
         }
     }
 
@@ -564,7 +624,9 @@ impl CephRbdProvider {
     ///   on the absent device, delete refuses on "must be fully
     ///   detached"; the documented restart remedy now actually works).
     ///   The mapping itself is never auto-unmapped — an actual zombie
-    ///   device, if any, is left to an operator;
+    ///   device, if any, is left to an operator and reported (with the
+    ///   device the record named) in
+    ///   [`ReconcileReport::cleared_attachments`];
     /// - a state entry whose `volvisor.owner` metadata is missing or
     ///   names a different volume is marked `Failed` with its
     ///   attachment record cleared for the same reason (the backing is
@@ -611,7 +673,15 @@ impl CephRbdProvider {
                 // Verifiably absent image: Failed, and the attachment
                 // record (whose backing no longer exists) is cleared so
                 // the volume is not wedged forever.
-                Self::fail_and_clear_attachment(&mut state, &id, &snapshot, &mut changed);
+                Self::fail_and_clear_attachment(
+                    &mut state,
+                    &id,
+                    &snapshot,
+                    mappings.as_deref(),
+                    ClearedAttachmentReason::VanishedImage,
+                    &mut report,
+                    &mut changed,
+                );
                 report.missing_volumes.push(id);
                 continue;
             }
@@ -652,36 +722,15 @@ impl CephRbdProvider {
                         }
                         SizeAgreement::Agree => {}
                     }
-                    let mapped = mappings.as_ref().is_some_and(|maps| {
-                        maps.iter().any(|m| m.name.as_deref() == Some(image_name))
-                    });
-                    if let Some(record) = snapshot.runtime.attachment.as_ref() {
-                        // Record exists: a verifiably absent device means an
-                        // interrupted detach — reconcile forward.
-                        let device_present = mappings.as_ref().is_some_and(|maps| {
-                            maps.iter()
-                                .any(|m| m.device.as_deref() == Some(record.device.as_str()))
-                        });
-                        if mappings.is_some() && !device_present {
-                            if let Some(volume) = state.volume_mut(&id) {
-                                volume.runtime.attachment = None;
-                                if volume.runtime.state == VolumeLifecycle::Attached {
-                                    volume.runtime.state = VolumeLifecycle::Ready;
-                                }
-                                changed = true;
-                            }
-                        }
-                    } else if mapped {
-                        // Stale mapping without an attachment record: visible
-                        // and Failed, never auto-unmapped (destructive).
-                        if snapshot.runtime.state != VolumeLifecycle::Failed {
-                            if let Some(volume) = state.volume_mut(&id) {
-                                volume.runtime.state = VolumeLifecycle::Failed;
-                                changed = true;
-                            }
-                        }
-                        report.stale_mappings.push(id);
-                    }
+                    Self::reconcile_owned_attachment(
+                        &mut state,
+                        &id,
+                        &snapshot,
+                        image_name,
+                        mappings.as_deref(),
+                        &mut report,
+                        &mut changed,
+                    );
                 }
                 Ok(_) => {
                     // Missing or foreign owner metadata: never adopted.
@@ -689,7 +738,15 @@ impl CephRbdProvider {
                     // is no longer provably ours) is cleared so the
                     // volume is not wedged forever; the image itself is
                     // never touched.
-                    Self::fail_and_clear_attachment(&mut state, &id, &snapshot, &mut changed);
+                    Self::fail_and_clear_attachment(
+                        &mut state,
+                        &id,
+                        &snapshot,
+                        mappings.as_deref(),
+                        ClearedAttachmentReason::OwnershipMismatch,
+                        &mut report,
+                        &mut changed,
+                    );
                     report.mismatched_volumes.push(id);
                 }
                 Err(error) => {
@@ -711,7 +768,62 @@ impl CephRbdProvider {
         if changed {
             state.save(&self.state_path)?;
         }
+        // Retain the report (audit trail) before handing it to the
+        // caller: construction's startup pass discards the return
+        // value, and records it cleared must stay observable via
+        // `last_reconcile_report`.
+        *self.lock_last_reconcile()? = Some(report.clone());
         Ok(report)
+    }
+
+    /// The attachment-record pass of [`Self::reconcile`] for a volume
+    /// whose image exists and is verifiably owned.
+    ///
+    /// A record whose device is *verifiably absent* from a successful
+    /// `rbd showmapped` (an interrupted detach: unmap succeeded, the
+    /// state save did not) is cleared and the volume returns to
+    /// `Ready`; a mapping without a record (a stale mapping from a
+    /// previous incarnation) marks the volume `Failed` and is reported
+    /// — never unmapped automatically (destructive).
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_owned_attachment(
+        state: &mut CephState,
+        id: &VolumeId,
+        snapshot: &StoredVolume,
+        image_name: &str,
+        mappings: Option<&[MappedDevice]>,
+        report: &mut ReconcileReport,
+        changed: &mut bool,
+    ) {
+        let mapped =
+            mappings.is_some_and(|maps| maps.iter().any(|m| m.name.as_deref() == Some(image_name)));
+        if let Some(record) = snapshot.runtime.attachment.as_ref() {
+            // Record exists: a verifiably absent device means an
+            // interrupted detach — reconcile forward.
+            let device_present = mappings.is_some_and(|maps| {
+                maps.iter()
+                    .any(|m| m.device.as_deref() == Some(record.device.as_str()))
+            });
+            if mappings.is_some() && !device_present {
+                if let Some(volume) = state.volume_mut(id) {
+                    volume.runtime.attachment = None;
+                    if volume.runtime.state == VolumeLifecycle::Attached {
+                        volume.runtime.state = VolumeLifecycle::Ready;
+                    }
+                    *changed = true;
+                }
+            }
+        } else if mapped {
+            // Stale mapping without an attachment record: visible
+            // and Failed, never auto-unmapped (destructive).
+            if snapshot.runtime.state != VolumeLifecycle::Failed {
+                if let Some(volume) = state.volume_mut(id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                    *changed = true;
+                }
+            }
+            report.stale_mappings.push(id.clone());
+        }
     }
 
     /// The untracked-images pass of [`Self::reconcile`]: classify images
@@ -1520,13 +1632,14 @@ impl CephRbdProvider {
         // size already met the target and the resize was skipped.
         let backing_resized = actual_size < req.new_size_bytes;
         if backing_resized {
-            let output = self.run_rbd(&[
-                "resize",
-                "--allow-shrink=false",
-                "-s",
-                &format!("{}B", req.new_size_bytes),
-                &spec,
-            ])?;
+            // No `--allow-shrink` flag: it is a boost::program_options
+            // bool switch, which rejects the `--allow-shrink=false` argv
+            // form outright ("does not take any arguments"), and shrink is
+            // already impossible here — the branch runs only when
+            // actual < new, and rbd independently refuses a smaller size
+            // without the flag.
+            let output =
+                self.run_rbd(&["resize", "-s", &format!("{}B", req.new_size_bytes), &spec])?;
             if !output.success {
                 return Err(command_failed("rbd resize", &output));
             }
@@ -1654,7 +1767,10 @@ impl CephRbdProvider {
                     ApiErrorCode::ForeignDeviceState,
                     format!(
                         "image {spec} does not carry the ownership record of volume {volume_id}; \
-                         a foreign image is never destroyed by volvisor"
+                         a foreign image is never destroyed by volvisor — restore the image's \
+                         `volvisor.owner` metadata to `{volume_id}` to make the volume operable \
+                         again, or, once you have confirmed the image is truly foreign, remove \
+                         it and the volume's state entry manually (out of band)"
                     ),
                 ));
             }
@@ -2091,6 +2207,7 @@ mod tests {
                 },
                 state_path: std::env::temp_dir().join("unused-ceph-state.json"),
                 state: Mutex::new(CephState::default()),
+                last_reconcile: Mutex::new(None),
             }
         };
         let capabilities = provider.capabilities();

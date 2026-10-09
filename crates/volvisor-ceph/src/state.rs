@@ -133,6 +133,15 @@ pub struct ReconcileReport {
     /// with the attachment record cleared — the backing is no longer
     /// provably ours; never adopted).
     pub mismatched_volumes: Vec<VolumeId>,
+    /// The audit trail for attachment records cleared because their
+    /// backing vanished or is no longer provably ours (see
+    /// [`ClearedAttachment`]). The device each record named is
+    /// preserved here — including whether the image still appeared in
+    /// `rbd showmapped` (a live mapping over a gone/foreign backing is
+    /// a zombie left for an operator; reconcile never unmaps
+    /// anything) — so nothing is lost when the record itself is
+    /// dropped from state.
+    pub cleared_attachments: Vec<ClearedAttachment>,
     /// State entries whose image reports LESS than the recorded size —
     /// the image changed outside volvisor (marked `Failed`; the recorded
     /// size is never healed downward).
@@ -162,6 +171,39 @@ pub struct ReconcileReport {
     /// transient query failure): neither foreign nor ours, counted
     /// honestly instead of guessed.
     pub unverifiable_images: Vec<UnverifiableImage>,
+}
+
+/// An attachment record cleared by reconcile because the backing it
+/// referenced vanished or is no longer provably ours.
+///
+/// The record's details are preserved in the report as the audit
+/// trail: the device it named, and whether the image still showed a
+/// live mapping (a zombie device — never auto-unmapped, left for an
+/// operator to remove with `rbd unmap`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClearedAttachment {
+    /// The volume whose record was cleared.
+    pub volume_id: VolumeId,
+    /// The device the cleared record named.
+    pub device: String,
+    /// Whether the image still appeared in `rbd showmapped` when the
+    /// record was cleared: `Some(true)` is a zombie mapping (present
+    /// over a gone or foreign backing), `Some(false)` means no mapping
+    /// remained, and `None` means the mapping table itself could not
+    /// be queried (an honest unknown).
+    pub zombie_mapping: Option<bool>,
+    /// Why the record was cleared.
+    pub reason: ClearedAttachmentReason,
+}
+
+/// Why reconcile cleared an attachment record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearedAttachmentReason {
+    /// The image is verifiably absent from a successful `rbd ls`.
+    VanishedImage,
+    /// The image exists but its `volvisor.owner` metadata is missing or
+    /// names a different volume (never adopted).
+    OwnershipMismatch,
 }
 
 /// The whole durable provider state.

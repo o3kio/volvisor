@@ -21,7 +21,7 @@ use common::{
     seed_foreign_image, seed_mapping, seed_volume,
 };
 use volvisor_ceph::provider::{CEPH_HEADROOM_BYTES, CephRbdProvider, image_name_for};
-use volvisor_ceph::state::CephState;
+use volvisor_ceph::state::{CephState, ClearedAttachment, ClearedAttachmentReason as ClearReason};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
@@ -1694,11 +1694,46 @@ async fn a_vanished_image_with_a_live_attachment_is_unwedged_by_reconcile() {
     // marks the volume Failed and drops the stale attachment record —
     // the backing it referenced no longer exists.
     let restarted = provider_from(&fixture.state_path, &fixture.world);
+    // The STARTUP pass cleared the record; its audit trail is retained
+    // on the provider (construction discards the return value).
+    let startup = restarted
+        .last_reconcile_report()
+        .expect("report slot")
+        .expect("the startup reconcile report is retained");
+    assert_eq!(
+        startup.missing_volumes,
+        vec![id.clone()],
+        "the volume without an image is reported missing by the startup pass"
+    );
+
+    // The cleared record is preserved in the report as the audit
+    // trail: the device it named, and the live zombie mapping over the
+    // gone backing (left for an operator, never auto-unmapped).
+    assert_eq!(
+        startup.cleared_attachments,
+        vec![ClearedAttachment {
+            volume_id: id.clone(),
+            device: "/dev/rbd0".to_owned(),
+            zombie_mapping: Some(true),
+            reason: ClearReason::VanishedImage,
+        }],
+        "the cleared attachment record is reported with its device and \
+         the zombie mapping over the vanished backing"
+    );
+
+    // A later explicit reconcile still reports the (still absent)
+    // volume; the record itself is long gone, so nothing is cleared
+    // twice.
     let report = restarted.reconcile().expect("reconcile report");
     assert_eq!(
         report.missing_volumes,
         vec![id.clone()],
         "the volume without an image is reported missing"
+    );
+    assert_eq!(
+        report.cleared_attachments,
+        [],
+        "the record was cleared once, by the startup pass"
     );
 
     // Failed, detached, no writer — in the response AND in state.
@@ -1785,12 +1820,33 @@ async fn a_mismatched_image_with_a_live_attachment_is_unwedged_by_reconcile() {
 
     // Restart: reconcile marks the volume Failed, clears the attachment
     // record (its authority claim is void) and never adopts the image.
+    // The STARTUP pass cleared the record; its audit trail is retained
+    // on the provider.
     let restarted = provider_from(&fixture.state_path, &fixture.world);
-    let report = restarted.reconcile().expect("reconcile report");
+    let startup = restarted
+        .last_reconcile_report()
+        .expect("report slot")
+        .expect("the startup reconcile report is retained");
     assert_eq!(
-        report.mismatched_volumes,
+        startup.mismatched_volumes,
         vec![id.clone()],
         "the volume whose image is not owned by it is reported mismatched"
+    );
+
+    // The cleared record is preserved in the report as the audit
+    // trail: the device it named, and the live mapping over the (still
+    // existing) foreign-owned backing — a zombie from volvisor's point
+    // of view, left for an operator.
+    assert_eq!(
+        startup.cleared_attachments,
+        vec![ClearedAttachment {
+            volume_id: id.clone(),
+            device: "/dev/rbd0".to_owned(),
+            zombie_mapping: Some(true),
+            reason: ClearReason::OwnershipMismatch,
+        }],
+        "the cleared attachment record is reported with its device and \
+         the live mapping over the no-longer-owned backing"
     );
     let inspected = restarted
         .inspect_volume(&id)
