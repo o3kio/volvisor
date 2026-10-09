@@ -34,6 +34,16 @@
 //!   claimed `DRBDADM_VERSION=9.29.0` — including the unconditional
 //!   indent-2 `open:` line, reflecting the world's open-devices state —
 //!   and fails "No such resource" for unknown/down resources;
+//! - `drbdsetup suspend-io`/`resume-io` freeze/unfreeze a device's
+//!   data path by MINOR (a bare decimal or `/dev/drbd<N>` — a bare
+//!   resource name is NOT resolvable, mirroring drbdsetup's
+//!   `dt_minor_of_dev`), and a suspended resource carries the verified
+//!   `suspended:user` qualifier on its `drbdsetup status` resource
+//!   line;
+//! - `drbdsetup show-gi <resource> <peer-node-id> <volume>` answers in
+//!   the verified data-generation-identity shape (the ASCII-art
+//!   pretty print over the current/bitmap/history UUID line) from the
+//!   per-resource lineage set assigned at create-md time;
 //! - `blockdev --getsize64` reports the STORED device size (set at `up`
 //!   and `resize` to the minimum of the local and peer backing sizes),
 //!   never a live computation.
@@ -138,6 +148,123 @@ pub struct FakeResource {
     pub peer_node: String,
 }
 
+/// One volume's DRBD data-generation identity set — the content
+/// `drbdsetup show-gi` reports, i.e. the lineage a witness
+/// registration attests. Real DRBD keeps a current UUID, a bitmap
+/// base UUID and history UUIDs per volume (`UI_CURRENT`, `UI_BITMAP`,
+/// `UI_HISTORY_START..=UI_HISTORY_END` — user/v84/linux/drbd.h:338-346,
+/// the only in-tree definition of the enum the v9 build compiles
+/// against); freshly created metadata carries only the current UUID
+/// (`v08_md_initialize`: current = `UUID_JUST_CREATED`, bitmap = 0,
+/// history all 0 — user/shared/drbdmeta.c:2679-2686, v09 equivalent at
+/// 2753).
+///
+/// The fake's values are DETERMINISTIC per resource name. The real
+/// kernel generates a random current UUID when it first uses
+/// just-created metadata (the kernel special-cases
+/// `UUID_JUST_CREATED`, per the comment at drbdmeta.c:1524-1526);
+/// that randomization is kernel-side and not verifiable from the
+/// drbd-utils tree — `ASSUMPTION(unverified)` — which is exactly why
+/// the fake derives stable values instead: adoption verification
+/// compares the UUID set recorded at registration time against a
+/// later reading, so a re-seeded fake world must reproduce
+/// byte-identical output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GiSet {
+    /// The current data generation UUID (`UI_CURRENT`).
+    pub current_uuid: u64,
+    /// The bitmap's base data generation UUID (`UI_BITMAP`); 0 while
+    /// no resync is pending (the create-md initialization).
+    pub bitmap_uuid: u64,
+    /// The history UUIDs (`UI_HISTORY_START..=UI_HISTORY_END`, two
+    /// slots); 0 until the current UUID is rotated.
+    pub history_uuids: [u64; 2],
+}
+
+/// The `UUID_JUST_CREATED` value fresh metadata carries
+/// (user/v84/linux/drbd.h:356).
+const UUID_JUST_CREATED: u64 = 4;
+
+/// FNV-1a 64 — the fake's deterministic derivation (no cryptographic
+/// claim; it only needs to be stable per resource name).
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+impl GiSet {
+    /// The deterministic identity set of a resource: a name-derived
+    /// nonzero current UUID (standing in for the kernel's random
+    /// post-handshake UUID — see the type documentation) over the
+    /// create-md-initialized bitmap and history (all zero,
+    /// drbdmeta.c:2683-2685).
+    #[must_use]
+    pub fn for_resource(resource: &str) -> Self {
+        Self {
+            current_uuid: match fnv1a64(resource.as_bytes()) {
+                0 => UUID_JUST_CREATED,
+                value => value,
+            },
+            bitmap_uuid: 0,
+            history_uuids: [0, 0],
+        }
+    }
+
+    /// The `dt_print_v9_uuids` UUID line (user/v9/drbdtool_common.c:64-87):
+    /// `current:bitmap:history:history:` followed by SEVEN local
+    /// metadata-flag digits and FIVE peer-flag digits, all
+    /// colon-separated. `X64(016)` is `%016lX` — UPPERCASE zero-padded
+    /// hex (user/shared/drbd_endian.h:156,163). The flag digits here
+    /// are the create-md-initialized metadata flags (MDF_AL_CLEAN
+    /// only, drbdmeta.c:2686; digit order per drbdtool_common.c:73-86);
+    /// the live kernel-computed flag values are not verifiable from
+    /// the userspace sources — `ASSUMPTION(unverified)`: a clean,
+    /// freshly created volume reports exactly these digits.
+    #[must_use]
+    pub fn uuid_line(&self) -> String {
+        format!(
+            "{:016X}:{:016X}:{:016X}:{:016X}:0:0:0:0:1:0:0:0:0:0:0:0",
+            self.current_uuid, self.bitmap_uuid, self.history_uuids[0], self.history_uuids[1]
+        )
+    }
+
+    /// The full `drbdsetup show-gi` stdout — VERBATIM the
+    /// `dt_pretty_print_v9_uuids` shape (user/v9/drbdtool_common.c:89-114):
+    /// the ASCII-art UUID header, the `dt_print_v9_uuids` line
+    /// (drbdtool_common.c:64-87) and the flag legend.
+    #[must_use]
+    pub fn show_gi_text(&self) -> String {
+        let mut out = String::new();
+        out.push('\n');
+        out.push_str("       +--<  Current data generation UUID  >-\n");
+        out.push_str("       |               +--<  Bitmap's base data generation UUID  >-\n");
+        out.push_str("       |               |                 +--<  younger history UUID  >-\n");
+        out.push_str("       |               |                 |         +-<  older history  >-\n");
+        out.push_str("       V               V                 V         V\n");
+        out.push_str(&self.uuid_line());
+        out.push('\n');
+        out.push_str("                                                                    ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^\n");
+        out.push_str("                                      -<  Data consistency flag  >--+ | | | | | | | | | | |\n");
+        out.push_str("                             -<  Data was/is currently up-to-date  >--+ | | | | | | | | | |\n");
+        out.push_str("                                  -<  Node was/is currently primary  >--+ | | | | | | | | |\n");
+        out.push_str(" -<  This node was a crashed primary, and has not seen its peer since  >--+ | | | | | | | |\n");
+        out.push_str("             -<  The activity-log was applied, the disk can be attached  >--+ | | | | | |\n");
+        out.push_str("        -<  The activity-log was disabled, peer is completely out of sync  >--+ | | | | |\n");
+        out.push_str("                              -<  This node was primary when it lost quorum  >--+ | | | |\n");
+        out.push_str("                                          -<  Node was/is currently connected  >--+ | | |\n");
+        out.push_str("                              -<  The peer's disk was out-dated or inconsistent  >--+ | | |\n");
+        out.push_str("                                 -<   A fence policy other the dont-care was used  >--+ | |\n");
+        out.push_str("                  -<  Node was in the progress of marking all blocks as out of sync  >--+ |\n");
+        out.push_str("                     -<  At least once we saw this node with a backing device attached >--+\n");
+        out.push('\n');
+        out
+    }
+}
+
 /// The simulated DRBD + LVM world shared between the provider and
 /// assertions.
 pub struct FakeDrbd {
@@ -189,6 +316,21 @@ pub struct FakeDrbd {
     /// Minors whose device is held open (demotion and `down` refuse
     /// with EBUSY-class stderr).
     pub open_devices: BTreeSet<u32>,
+    /// Minors whose data path is frozen by the operator `drbdsetup
+    /// suspend-io` (the self-fencing data-path freeze; cleared by
+    /// `resume-io`). Runtime kernel state, not metadata: it dies with
+    /// `down`. A suspended resource carries the verified
+    /// `suspended:user` qualifier on its `drbdsetup status` resource
+    /// line.
+    pub suspended_minors: BTreeSet<u32>,
+    /// The peer's DRBD node id (the generated resource files pin the
+    /// local node to `node-id 0` and the peer to `node-id 1`; the
+    /// peer-device-context `show-gi` addresses the peer device by it).
+    pub peer_node_id: u32,
+    /// Resource name → data-generation identity set (what `show-gi`
+    /// reports): on-LV metadata content, assigned at create-md,
+    /// surviving `down`, dying with `lvremove`.
+    pub lineage: BTreeMap<String, GiSet>,
     // -- Fault-injection matrix (one bool per scripted failure) --
     /// `lvcreate` fails.
     pub fail_lvcreate: bool,
@@ -242,6 +384,9 @@ impl Default for FakeDrbd {
             peer_overwritten: false,
             resync_completes: true,
             open_devices: BTreeSet::new(),
+            suspended_minors: BTreeSet::new(),
+            peer_node_id: 1,
+            lineage: BTreeMap::new(),
             fail_lvcreate: false,
             fail_lvextend: false,
             fail_primary: false,
@@ -327,13 +472,15 @@ fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
 
 /// The `drbdsetup status` text for one running resource — the verified
 /// grammar of the claimed DRBDADM_VERSION=9.29.0: resource line
-/// (indent 0, `role:`), ONE device line (indent 2) carrying `disk:`
-/// and the UNCONDITIONAL `open:` (kernel >= 9.2.9) — drbdsetup.c's
-/// device_status prints both through the column-oriented wrap_printf,
-/// so they share a line — a peer-node-named connection line
-/// (indent 2), and the peer-device line (indent 4; `replication:`
-/// FIRST with `done:` and no `%` suffix while resyncing, per
-/// drbdsetup.c peer_device_status), trailing blank line.
+/// (indent 0, `role:`, plus the `suspended:` qualifier while any
+/// suspension reason is set), ONE device line (indent 2) carrying
+/// `disk:` and the UNCONDITIONAL `open:` (kernel >= 9.2.9) —
+/// drbdsetup.c's device_status prints both through the
+/// column-oriented wrap_printf, so they share a line — a
+/// peer-node-named connection line (indent 2), and the peer-device
+/// line (indent 4; `replication:` FIRST with `done:` and no `%`
+/// suffix while resyncing, per drbdsetup.c peer_device_status),
+/// trailing blank line.
 fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String {
     // drbdsetup.c: `open:` is printed unconditionally on kernel
     // >= 9.2.9, naming whether the device is currently held open.
@@ -341,6 +488,29 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         "yes"
     } else {
         "no"
+    };
+    // drbdsetup.c resource_status (3070-3076): the `suspended:`
+    // qualifier follows `role:` on the resource line whenever ANY
+    // suspension reason is set; susp_str (2523-2550) composes the
+    // reasons bit-wise and spells the operator `drbdsetup
+    // suspend-io` reason `user` (res_susp, strs[1] at 2526). The
+    // kernel-side mapping DRBD_ADM_SUSPEND_IO → the resource-level
+    // user-suspension flag is kernel code, not in the drbd-utils
+    // tree: ASSUMPTION(unverified) — the vocabulary and the print
+    // condition are the verified parts.
+    //
+    // Wrap budget (user/shared/wrap_printf.c:15-33 — non-tty output
+    // wraps past 80 columns): the qualifier appends "
+    // suspended:user" (15 columns) after " role:<Role>"
+    // (13..15 columns), so names up to 50 columns stay on one line —
+    // every standard `vol-<id>-<hash8>` name does; the 63-column
+    // maximum name would wrap, in the same fail-closed direction as
+    // the P3 `suspended:no-data` analysis
+    // (RESOURCE_NAME_SANITIZED_MAX_CHARS, src/provider.rs).
+    let suspended = if world.suspended_minors.contains(&resource.minor) {
+        " suspended:user"
+    } else {
+        ""
     };
     if world.peer_online {
         // A seeding local (UpToDate) resyncs the fresh peer
@@ -356,7 +526,7 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
             format!("peer-disk:{}", disk_str(&resource.peer_disk))
         };
         format!(
-            "{name} role:{role}\n  disk:{disk} open:{open}\n  {peer} role:{peer_role}\n    \
+            "{name} role:{role}{suspended}\n  disk:{disk} open:{open}\n  {peer} role:{peer_role}\n    \
              {peer_disk_line}\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
@@ -365,7 +535,7 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         )
     } else {
         format!(
-            "{name} role:{role}\n  disk:{disk} open:{open}\n  {peer} connection:WFConnection\n\n",
+            "{name} role:{role}{suspended}\n  disk:{disk} open:{open}\n  {peer} connection:WFConnection\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
             peer = resource.peer_node,
@@ -460,6 +630,16 @@ fn script_drbdadm(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> 
             }
             world.metadata.insert(resource.to_owned());
             world.create_md_ran.insert(resource.to_owned());
+            // create-md (re-)initializes the on-LV metadata, which
+            // includes the data-generation identity set: fresh
+            // metadata carries only the current UUID
+            // (v08_md_initialize — drbdmeta.c:2679-2686; the kernel
+            // then generates the real random UUID on first use). The
+            // fake assigns the resource's deterministic set (see
+            // [`GiSet`]).
+            world
+                .lineage
+                .insert(resource.to_owned(), GiSet::for_resource(resource));
             Some(CommandOutput::success(format!(
                 "initial metadata created for {resource}\n"
             )))
@@ -478,8 +658,12 @@ fn script_drbdadm(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> 
                     )));
                 }
             }
-            // Internal metadata on the LV survives down.
-            world.resources.remove(resource);
+            // Internal metadata on the LV survives down; the user I/O
+            // suspension is runtime kernel state and dies with the
+            // device.
+            if let Some(state) = world.resources.remove(resource) {
+                world.suspended_minors.remove(&state.minor);
+            }
             Some(CommandOutput::success(String::new()))
         }
         Some("primary") => script_drbdadm_primary(world, resource, verbs.contains(&"--force")),
@@ -536,6 +720,13 @@ fn script_drbdadm_up(
         .find(|node| node.name != world.node_name)
         .map_or_else(|| PEER_NODE.to_owned(), |node| node.name.clone());
     let device_size = lv.size.min(world.peer_backing(lv.size));
+    // Materialize the on-LV identity set for resources whose metadata
+    // was seeded straight into the world (same deterministic set
+    // create-md assigns, so both paths agree byte for byte).
+    world
+        .lineage
+        .entry(resource.to_owned())
+        .or_insert_with(|| GiSet::for_resource(resource));
     world.resources.insert(
         resource.to_owned(),
         FakeResource {
@@ -631,13 +822,28 @@ fn script_drbdadm_secondary(world: &mut FakeDrbd, resource: &str) -> Option<Comm
     Some(CommandOutput::success(String::new()))
 }
 
+/// `drbdsetup <verb> ...`: `status <resource>` (the verified text
+/// grammar for a running resource, or the real "No such resource"
+/// failure for a down/unknown one), the minor-context
+/// `suspend-io`/`resume-io <minor>` (the self-fencing data-path
+/// freeze) and the peer-device-context `show-gi <resource>
+/// <peer-node-id> <volume>` (the data-generation identities). Every
+/// argv form mirrors the real drbdsetup argument parsing; see the
+/// per-command citations.
+fn script_drbdsetup(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> {
+    match args.first().copied()? {
+        "status" => script_drbdsetup_status(world, args),
+        "suspend-io" => Some(script_drbdsetup_suspend_io(world, args, true)),
+        "resume-io" => Some(script_drbdsetup_suspend_io(world, args, false)),
+        "show-gi" => Some(script_drbdsetup_show_gi(world, args)),
+        _ => None,
+    }
+}
+
 /// `drbdsetup status <resource>`: the verified text grammar for a
 /// running resource, or the real "No such resource" failure for a
 /// down/unknown one.
-fn script_drbdsetup(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> {
-    if args.first().copied() != Some("status") {
-        return None;
-    }
+fn script_drbdsetup_status(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> {
     let resource: &str = args.get(1)?;
     if world.fail_status {
         // A NON-"No such resource" failure: a transient problem that
@@ -655,6 +861,143 @@ fn script_drbdsetup(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput
             "{resource}: No such resource"
         ))),
     }
+}
+
+/// `dt_minor_of_dev` (user/shared/shared_tool.c:631-674): only a bare
+/// decimal or `/dev/drbd<decimal>` resolves to a minor. The third
+/// real branch — an existing block-device node whose major is the
+/// DRBD major — cannot exist in the simulated world and is not
+/// modeled. Everything else, including a bare RESOURCE NAME (resource
+/// names may contain digits, and interpreting those would be
+/// dangerous — the comment at shared_tool.c:638-650), is
+/// unresolvable.
+fn minor_of_spec(spec: &str) -> Option<u32> {
+    let digits = spec.strip_prefix("/dev/drbd").unwrap_or(spec);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// `drbdsetup suspend-io|resume-io <minor>` — the CTX_MINOR commands
+/// (user/v9/drbdsetup.c:363-366, `DRBD_ADM_SUSPEND_IO`/
+/// `DRBD_ADM_RESUME_IO`, no payload). The single context argument is
+/// resolved through `dt_minor_of_dev` (drbdsetup.c:4695-4703 →
+/// shared_tool.c:631-674): a bare decimal or `/dev/drbd<minor>`;
+/// anything else — a bare resource name, `all` (refused outright for
+/// a CTX_MINOR-only command, drbdsetup.c:4691-4693) — fails with
+/// "Cannot determine minor device number of device '<arg>'"
+/// (drbdsetup.c:4697-4701, exit 20).
+///
+/// A minor with no running resource answers through the netlink
+/// error surface of `_generic_config_cmd` → `check_error`:
+/// "<obj>: Failure: (<code>) <message>" (drbdsetup.c:988-991, exit
+/// 10) with ERR_MINOR_INVALID = 127 "Device minor not allocated"
+/// (drbdsetup.c:512, code from user/v84/linux/drbd.h:137).
+/// ASSUMPTION(unverified): which code the KERNEL picks for an
+/// unknown minor (127 vs ERR_RES_NOT_KNOWN = 158, "Unknown resource",
+/// drbdsetup.c:547) is kernel-side and not in the drbd-utils tree;
+/// 127 is modeled because a CTX_MINOR request fails the minor lookup
+/// first.
+///
+/// Idempotency: `check_error` ignores SS_NOTHING_TO_DO-class replies
+/// (drbdsetup.c:996-997), so a double suspend and a resume of a
+/// non-suspended device both succeed. ASSUMPTION(unverified): that
+/// the kernel actually classifies the no-op case there — kernel-side.
+fn script_drbdsetup_suspend_io(
+    world: &mut FakeDrbd,
+    args: &[&str],
+    suspend: bool,
+) -> CommandOutput {
+    // drbdsetup's context loop demands exactly one argument per
+    // context key (drbdsetup.c:4675-4743): a missing argument is
+    // "Missing argument <n> to command" (4683-4686, exit 20), excess
+    // arguments are "Excess arguments: ..." (1150-1156 →
+    // warn_print_excess_args, 1022-1028).
+    if args.len() < 2 {
+        return CommandOutput::failure("Missing argument 2 to command\n");
+    }
+    if args.len() > 2 {
+        return CommandOutput::failure(format!("Excess arguments: {}", args[2..].join(" ")));
+    }
+    let spec = args[1];
+    if spec == "all" {
+        return CommandOutput::failure("command does not accept argument 'all'");
+    }
+    let Some(minor) = minor_of_spec(spec) else {
+        return CommandOutput::failure(format!(
+            "Cannot determine minor device number of device '{spec}'"
+        ));
+    };
+    if !world.resources.values().any(|state| state.minor == minor) {
+        return CommandOutput::failure(format!(
+            "{spec}: Failure: (127) Device minor not allocated"
+        ));
+    }
+    if suspend {
+        world.suspended_minors.insert(minor);
+    } else {
+        world.suspended_minors.remove(&minor);
+    }
+    CommandOutput::success(String::new())
+}
+
+/// `drbdsetup show-gi <resource> <peer_node_id> <volume>` — the
+/// CTX_PEER_DEVICE form (user/v9/drbdsetup.c:388, lockless): the
+/// context is resource + peer node id + volume, each a mandatory
+/// positional argument (user/v9/drbdsetup.h:53-54; peer node id and
+/// volume parse as numbers, drbdsetup.c:4736-4739 → m_strtoll,
+/// shared_tool.c:532-547).
+///
+/// `show_or_get_gi_cmd` (drbdsetup.c:4146-4203) walks the KERNEL's
+/// peer devices, so a resource that is not up answers
+/// "<resource>: No such peer device" (4164-4165, exit 10) — same for
+/// a peer-node-id/volume that matches no peer device
+/// (peer_device_ctx_match, 4138-4144). An up resource whose local
+/// disk is detached answers "Device has no disk" (4179-4185, exit 1;
+/// the preceding "Device is unconfigured" branch at 4173-4177 needs
+/// an L_OFF peer connection the world does not model). A match prints
+/// the identity set through `dt_pretty_print_v9_uuids` (4196-4198 →
+/// drbdtool_common.c:89-114). Exit codes are modeled only through
+/// the success flag (the runner does not expose them).
+fn script_drbdsetup_show_gi(world: &mut FakeDrbd, args: &[&str]) -> CommandOutput {
+    if args.len() < 4 {
+        return CommandOutput::failure(format!("Missing argument {} to command\n", args.len() + 1));
+    }
+    if args.len() > 4 {
+        return CommandOutput::failure(format!("Excess arguments: {}", args[4..].join(" ")));
+    }
+    let resource = args[1];
+    // m_strtoll (shared_tool.c:532-547): a non-numeric context
+    // argument is "<arg> is not a valid number" (exit 20).
+    let Ok(peer_node_id) = args[2].parse::<u32>() else {
+        return CommandOutput::failure(format!("{} is not a valid number", args[2]));
+    };
+    let Ok(volume) = args[3].parse::<u32>() else {
+        return CommandOutput::failure(format!("{} is not a valid number", args[3]));
+    };
+    let Some(state) = world.resources.get(resource) else {
+        return CommandOutput::failure(format!("{resource}: No such peer device"));
+    };
+    // peer_device_ctx_match (drbdsetup.c:4138-4144) compares resource
+    // name, peer node id AND volume. The generated resource files pin
+    // the peer to node-id 1 and every volvisor resource is
+    // single-volume (volume 0).
+    if peer_node_id != world.peer_node_id || volume != 0 {
+        return CommandOutput::failure(format!("{resource}: No such peer device"));
+    }
+    if state.local_disk == DiskState::Diskless {
+        return CommandOutput::failure("Device has no disk\n");
+    }
+    // The identity set is on-LV metadata: assigned at create-md (see
+    // script_drbdadm), materialized deterministically for resources
+    // seeded straight into the world, stable across down/up.
+    let gi = world
+        .lineage
+        .entry(resource.to_owned())
+        .or_insert_with(|| GiSet::for_resource(resource))
+        .clone();
+    CommandOutput::success(gi.show_gi_text())
 }
 
 /// `blockdev --getsize64 /dev/drbdN`: the STORED device size.
@@ -793,6 +1136,9 @@ fn script_lvremove(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput>
     }
     if let Some((_, lv_name)) = spec.split_once('/') {
         world.metadata.remove(lv_name);
+        // The identity set lives in the LV's internal metadata: it
+        // dies with the LV.
+        world.lineage.remove(lv_name);
     }
     Some(CommandOutput::success(String::new()))
 }
@@ -1014,6 +1360,13 @@ pub fn seed_volume(base: &Path, world: &Arc<Mutex<FakeDrbd>>, volume_id: &str, s
         },
     );
     world.metadata.insert(resource.clone());
+    // The seeded resource's FIXED identity set (deterministic per
+    // resource name — a re-seeded world reproduces it byte for byte,
+    // which is what adoption-time lineage comparison needs; see
+    // [`GiSet`]).
+    world
+        .lineage
+        .insert(resource.clone(), GiSet::for_resource(&resource));
     let local = world.lvs.get(&key).map_or(size_bytes, |lv| lv.size);
     let device = local.min(world.peer_backing(local));
     world.resources.insert(
