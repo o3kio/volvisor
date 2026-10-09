@@ -7,17 +7,32 @@
 //! the lock.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use volvisor_api::{AppState, SharedState, router};
 use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
-use volvisor_drbd::{DrbdProvider, DrbdProviderConfig};
+use volvisor_drbd::{AuthorityContext, DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
 use volvisor_lvm::{LvmProvider, RealRunner};
-use volvisor_provider::AdminSurface;
-use volvisor_types::ApiError;
+use volvisor_provider::{AdminSurface, AdoptionSurface};
+use volvisor_types::{ApiError, HostId};
+use volvisor_witness::client::HttpWitnessConnection;
+use volvisor_witness::{BlockingWitness, BlockingWitnessConnection};
 
 use crate::DaemonError;
 use crate::config::{Config, ProviderKind};
+
+/// The witness request timeout for the blocking adapter: bounds every
+/// control-path witness wait (the engine holds its state lock across
+/// it). The witness's own `lease_grace_secs` must cover this bound
+/// (P4a plan §3's documented timing assumption).
+const WITNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The background renewal task's tick: `renew_leases` itself throttles
+/// actual renewals to the configured interval and checks the W5
+/// deadline on **every** pass, so a passed deadline is caught within
+/// one tick, not within one renewal interval.
+const RENEWAL_TICK: Duration = Duration::from_secs(1);
 
 /// Build the shared server state: open (and replay) the journal, construct
 /// the configured provider and reconcile it.
@@ -59,7 +74,15 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
         }
         ProviderKind::Drbd => {
             let provider = Arc::new(drbd_provider(config)?);
+            // Witness management (P4a plan §6): the background renewal
+            // task enforces the local W5 deadline and renews due
+            // leases; failures surface as events, never crashes.
+            if config.witness_url.is_some() {
+                spawn_renewal_task(&provider);
+            }
+            let adoption: Arc<dyn AdoptionSurface> = provider.clone();
             AppState::new(provider, None, journal, config.admin_token.clone())
+                .with_adoption(adoption)
         }
     };
     Ok(Arc::new(state))
@@ -143,8 +166,9 @@ fn ceph_provider(config: &Config) -> Result<CephRbdProvider, DaemonError> {
 /// verification (toolchain answers, kernel module present, VG exists,
 /// host identity matches, secret readable, config dir usable) and
 /// reconciles observed resource state; any failure refuses the daemon.
-/// No `AdminSurface`: the nearline VG is operator-designated (like the
-/// ceph pool), so admin routes keep their typed 404.
+/// No `AdminSurface` (the nearline VG is operator-designated, like the
+/// ceph pool), but the `AdoptionSurface` is the provider itself (the
+/// `/v2/admin/nearline/{id}/adopt` route).
 fn drbd_provider(config: &Config) -> Result<DrbdProvider, DaemonError> {
     let provider_config = DrbdProviderConfig {
         vg_name: config.drbd_vg_name.clone().ok_or_else(|| {
@@ -174,12 +198,102 @@ fn drbd_provider(config: &Config) -> Result<DrbdProvider, DaemonError> {
         minor_max: config.drbd_minor_max,
         proc_root: config.drbd_proc_root_or_default().clone(),
     };
-    DrbdProvider::new(
-        Arc::new(RealRunner::default()),
-        provider_config,
-        drbd_state_path(config),
-    )
+    let runner = Arc::new(RealRunner::default());
+    let state_path = drbd_state_path(config);
+    match drbd_authority(config)? {
+        Some(authority) => {
+            DrbdProvider::with_authority(runner, provider_config, state_path, authority)
+        }
+        None => DrbdProvider::new(runner, provider_config, state_path),
+    }
     .map_err(|e| DaemonError::Config(format!("drbd provider construction failed: {e}")))
+}
+
+/// Build the writer-authority context from the witness configuration
+/// (P4a plan §6), or `None` for the exact pre-authority P3 behavior.
+///
+/// The blocking adapter captures the current runtime handle (this is
+/// called from the async serve path); every witness wait is bounded by
+/// [`WITNESS_REQUEST_TIMEOUT`]. The renewal interval's fit against the
+/// witness's lease TTL is checked **lazily** against every grant/renew
+/// response — the TTL lives on the witness, so no startup check could
+/// be honest (plan §6).
+///
+/// # Errors
+/// [`DaemonError::Config`] when a required witness field is missing
+/// (validation normally rejects this earlier) or the authority context
+/// refuses the configuration (a zero renewal interval).
+fn drbd_authority(config: &Config) -> Result<Option<AuthorityContext>, DaemonError> {
+    let Some(url) = config.witness_url.clone() else {
+        return Ok(None);
+    };
+    let interval = config.witness_renewal_interval_secs.ok_or_else(|| {
+        DaemonError::Config(
+            "witness_renewal_interval_secs is required when witness_url is set".to_owned(),
+        )
+    })?;
+    let node_name = config.drbd_node_name.clone().ok_or_else(|| {
+        DaemonError::Config("drbd_node_name is required for the drbd provider".to_owned())
+    })?;
+    let host_id = HostId::new(node_name.as_str())
+        .map_err(|e| DaemonError::Config(format!("drbd_node_name: {e}")))?;
+    let connection =
+        HttpWitnessConnection::new(url, config.witness_token.clone(), WITNESS_REQUEST_TIMEOUT);
+    let blocking: Arc<dyn BlockingWitnessConnection> = Arc::new(BlockingWitness::new(
+        Arc::new(connection),
+        tokio::runtime::Handle::current(),
+        WITNESS_REQUEST_TIMEOUT,
+    ));
+    let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(crate::unix_now_secs);
+    AuthorityContext::new(blocking, host_id, interval, clock)
+        .map(Some)
+        .map_err(|e| DaemonError::Config(format!("witness authority construction failed: {e}")))
+}
+
+/// Spawn the background lease-renewal task (P4a plan §6): ticks every
+/// [`RENEWAL_TICK`] — `renew_leases` itself throttles actual renewals
+/// to the configured interval and checks the W5 deadline on every
+/// pass — and surfaces every outcome as a structured event (renewals,
+/// self-fences, deferrals and pass failures), never as a crash.
+fn spawn_renewal_task(provider: &Arc<DrbdProvider>) {
+    let provider = Arc::clone(provider);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RENEWAL_TICK).await;
+            match provider.renew_leases() {
+                Ok(report) => {
+                    for renewed in &report.renewed {
+                        tracing::info!(
+                            kind = "renew_lease",
+                            volume_id = %renewed,
+                            "witness lease renewed"
+                        );
+                    }
+                    for fenced in &report.fenced {
+                        tracing::warn!(
+                            kind = "self_fence",
+                            volume_id = %fenced.volume_id,
+                            demoted = fenced.demoted,
+                            detail = %fenced.reasons.join("; "),
+                            "writer self-fenced"
+                        );
+                    }
+                    for deferred in &report.deferred {
+                        tracing::warn!(
+                            kind = "deferred_renewal",
+                            volume_id = %deferred.volume_id,
+                            deadline_at = deferred.deadline_at,
+                            detail = %deferred.detail,
+                            "witness unreachable; renewal deferred until the local deadline"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(kind = "renew_leases", error = %error, "renewal pass failed");
+                }
+            }
+        }
+    });
 }
 
 /// The durable drbd provider state path: configured, or
@@ -233,7 +347,7 @@ fn ensure_tokened_or_loopback(config: &Config) -> Result<(), DaemonError> {
 }
 
 /// Resolve on SIGTERM (systemd/K8s) or Ctrl-C.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -292,6 +406,9 @@ mod tests {
             drbd_proc_root: None,
             drbd_state_path: None,
             max_body_bytes: 1 << 20,
+            witness_url: None,
+            witness_token: None,
+            witness_renewal_interval_secs: None,
         }
     }
 
@@ -327,6 +444,9 @@ mod tests {
             drbd_proc_root: None,
             drbd_state_path: None,
             max_body_bytes: 1 << 20,
+            witness_url: None,
+            witness_token: None,
+            witness_renewal_interval_secs: None,
         }
     }
 
@@ -459,6 +579,9 @@ mod tests {
             sysfs_root: None,
             admin_token: None,
             max_body_bytes: 1 << 20,
+            witness_url: None,
+            witness_token: None,
+            witness_renewal_interval_secs: None,
             drbd_vg_name: None,
             drbd_config_dir: None,
             drbd_node_name: None,
@@ -539,6 +662,50 @@ mod tests {
         assert!(
             message.contains("drbd provider construction failed"),
             "error must surface the provider construction failure: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn witness_authority_is_built_only_from_a_witness_configuration() {
+        // Without a witness_url the authority is absent: the exact
+        // pre-authority P3 provider.
+        let config = drbd_config(std::path::PathBuf::from("/j"));
+        assert!(drbd_authority(&config).expect("no authority").is_none());
+
+        // With one, the authority context exists (the witness is not
+        // contacted at construction — the provider constructor and the
+        // renewal task do that; here only the wiring is under test).
+        let config = Config {
+            witness_url: Some("http://10.0.0.3:9101".to_owned()),
+            witness_token: Some("witness-secret".to_owned()),
+            witness_renewal_interval_secs: Some(15),
+            ..drbd_config(std::path::PathBuf::from("/j"))
+        };
+        let authority = drbd_authority(&config)
+            .expect("authority construction")
+            .expect("witness-managed");
+        // A renewal pass through the fresh context is a typed witness
+        // failure (nothing listens at 10.0.0.3 here), never a panic or
+        // a silent success.
+        let error = authority
+            .renew_lease(
+                &volvisor_types::VolumeId::new("vol-wiring").expect("id"),
+                &volvisor_drbd::state::VolumeAuthorityBlock {
+                    epoch: volvisor_types::WriterEpoch(1),
+                    lease_id: volvisor_types::LeaseId(1),
+                    lease_proof_ref: 1,
+                    authority_commit_index: 1,
+                    acquired_at: 0,
+                    deadline_at: 0,
+                },
+            )
+            .expect_err("unreachable witness");
+        assert!(
+            matches!(
+                error.code,
+                volvisor_types::ApiErrorCode::UnknownFencingAuthority
+            ),
+            "typed unreachable, not a panic: {error:?}"
         );
     }
 }

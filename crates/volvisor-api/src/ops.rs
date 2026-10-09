@@ -65,6 +65,8 @@ pub(crate) const OP_DELETE_VOLUME: &str = "delete_volume";
 pub(crate) const OP_CLAIM_DEVICE: &str = "claim_device";
 /// Operation kind: release a claimed device (admin surface).
 pub(crate) const OP_RELEASE_DEVICE: &str = "release_device";
+/// Operation kind: adopt-and-promote a nearline volume (admin surface).
+pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
 
 // ---------------------------------------------------------------------------
 // Payload redaction (SPEC-0002 section 9: no secret material at rest in the
@@ -434,4 +436,15 @@ pub(crate) fn admin_payload(
     let device = to_json_value(device_id)?;
     let request = to_json_value(body)?;
     Ok(serde_json::json!({ "device_id": device, "request": request }))
+}
+
+/// Journal payload for a volume-scoped admin operation (adopt): the
+/// target volume identity plus the (redacted) request body.
+pub(crate) fn volume_payload(
+    volume_id: &VolumeId,
+    body: &impl Serialize,
+) -> Result<Value, ApiError> {
+    let volume = to_json_value(volume_id)?;
+    let request = to_json_value(body)?;
+    Ok(serde_json::json!({ "volume_id": volume, "request": request }))
 }

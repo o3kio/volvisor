@@ -17,7 +17,7 @@ use volvisor_types::domain::{
     DeviceRole, Generation, Health, PhysicalDevice, Pool, PoolProtection, VolumeClass,
 };
 
-use volvisor_types::{ApiError, ApiErrorCode, DeviceId, PoolId};
+use volvisor_types::{ApiError, ApiErrorCode, DeviceId, PoolId, VolumeId};
 
 use crate::VolumeProvider;
 
@@ -58,6 +58,36 @@ pub trait AdminSurface: Send + Sync {
         device_id: &DeviceId,
         request: &volvisor_types::ReleaseDeviceRequest,
     ) -> Result<(), ApiError>;
+}
+
+/// Nearline adopt-and-promote surface (P4a plan §5/§6): providers that
+/// support unplanned failover under witness authority implement this;
+/// the daemon wires it to the privileged adopt route. The response
+/// carries the honest promotion classification even on a refusal —
+/// a refused classification is a result, not an error.
+///
+/// The method is a privileged mutation from the API's perspective
+/// (admin token, journaled intent); the implementation itself performs
+/// the full adoption verification and never promotes foreign state.
+#[async_trait]
+pub trait AdoptionSurface: Send + Sync {
+    /// Run the adopt-and-promote flow for `volume_id` on this host
+    /// (P4a plan §5): adoption verification, the witness-side
+    /// authority check, the classification from observed facts, and —
+    /// only for `safe_current` or an authorized `possible_loss` — the
+    /// promotion under a fresh witness epoch.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] for verification failures (typed), an
+    /// unreachable witness (`UNKNOWN_FENCING_AUTHORITY`) and a witness
+    /// still inside its fence-wait window (`FENCE_PENDING`); a
+    /// classification-based refusal is returned as a successful
+    /// response with `volume: None`, never as an error.
+    async fn adopt_volume(
+        &self,
+        volume_id: &VolumeId,
+        allow_loss: bool,
+    ) -> Result<volvisor_types::AdoptVolumeResponse, ApiError>;
 }
 
 /// The single fake device exposed by [`crate::FakeProvider`]'s admin surface.

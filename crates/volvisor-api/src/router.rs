@@ -55,6 +55,13 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             "/v2/admin/devices/{device_id}/release",
             post(handlers::release_device),
         )
+        // Nearline unplanned failover (P4a plan §6): the adopt-and-promote
+        // admin operation. Admin token required; providers without an
+        // adoption surface serve the typed 404.
+        .route(
+            "/v2/admin/nearline/{volume_id}/adopt",
+            post(handlers::adopt_volume),
+        )
         // Liveness is exposed on /healthz (task requirement); the
         // implementation plan section 5.5 also lists /v2/healthz, so both
         // spellings serve the same liveness-only response.

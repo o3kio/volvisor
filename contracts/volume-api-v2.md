@@ -58,6 +58,23 @@ backend_health, evidence_status
 
 A backend may add typed details, but any unsupported status must report `unknown`, not false healthy. For `ceph-rbd`, reflect actual Ceph pool/OSD policy/health; for nearline, expose per-replica progress and data-loss risk; for native, show disk/pool/mirror health.
 
+For nearline volumes under a writer-authority witness, the response carries an
+`authority` section — the **writer-side observation**, never a fabricated one:
+
+```text
+authority: { epoch, lease_state, holder, lease_remaining_secs }
+```
+
+- `epoch` is the writer's recorded writer epoch (`0` = pre-authority, the
+  pre-witness P3 behavior);
+- `lease_state` is evaluated against the writer's local W5 deadline
+  (`live` only while the deadline has not passed — an unreachable witness
+  never turns a live local lease into a fabricated expiry, and a passed
+  deadline never reports `live`);
+- `lease_remaining_secs` is present only while live;
+- volumes of other classes, and nearline volumes without witness
+  management, omit the section entirely.
+
 ## 3. AttachVolume / DetachVolume
 
 ```text
@@ -174,3 +191,68 @@ Physical device claim and Ceph OSD lifecycle use privileged admin authorization 
 4. A local mirror is not a remote replica; an OSD is not an RBD image.
 5. Migration eligibility is the intersection of all attached storage, VM devices, and target capabilities.
 6. There is no invisible downgrade of protection, no implicit destructive adoption, and no success report with unresolved authority.
+
+## 10. Nearline writer authority and adopt-and-promote
+
+Nearline volumes may be managed by a **writer-authority witness** (see the
+[nearline replication contract](nearline-replication-v2.md)): a third-party,
+journal-backed epoch/lease registry. Witness management changes attachment
+admission — every promotion acquires a lease **before** the device becomes
+Primary, a refused or unreachable witness refuses the attach typed — and adds
+one privileged operation:
+
+```text
+POST /v2/admin/nearline/{volume_id}/adopt
+Authorization: Bearer <admin token>
+{ "api_version": "volvisor.volume.v2", "operation_id": <id>,
+  "allow_loss": <bool> }
+```
+
+The adopt-and-promote flow (unplanned failover to the surviving host):
+
+1. **Adoption verification** — the derived resource name, a Secondary role, a
+   definition naming the surviving host, the live DRBD data-generation
+   lineage matching the witness registration, the registered endpoint
+   backing identity, and — for volvisor-created backing — the ownership tag.
+   Foreign state is never adopted (typed `FOREIGN_DEVICE_STATE` /
+   `INVALID_STATE` refusals).
+2. **Authority check** — the witness must show no live lease for the volume;
+   a proof the witness supplies, never one the caller brings.
+3. **Classification** from observed facts only:
+   - `safe_current` — protocol C, local disk `UpToDate`, no live lease **and**
+     a recorded operator barrier (the only evidence that closes the
+     acknowledged-tail question; protocol alone never does);
+   - `possible_loss` — the acknowledged tail is not provably present
+     (`boundary: "unknown"` unless a recorded barrier names it);
+   - `unsafe` — integrity unprovable or a live lease still held.
+4. **Promotion** — only `safe_current`, or a `possible_loss` with the
+   request's explicit `allow_loss`, promotes; under a fresh witness epoch
+   (the durable fencing proof) with `drbdadm primary --force` — the one
+   justified `--force` path for exactly this case, gated on the authority
+   check above, never relied upon as the fence itself.
+
+The response is the classification and, **only on promotion**, the resulting
+volume state:
+
+```json
+{ "classification": <safe_current | possible_loss{boundary, authorized} |
+                     unsafe{reasons}>,
+  "volume": <InspectVolume response | null> }
+```
+
+A classification-based refusal (`unsafe`, or unauthorized `possible_loss`)
+is a **successful** response with `"volume": null`: the classification is
+the result, and the surviving host's state is untouched. Nothing is claimed
+beyond this surface: registration of existing volumes into the witness is an
+explicit, separately authorized operation outside this API's tenant surface,
+and the witness daemon, its deployment as a third failure domain, and the
+lease/fence timing arguments are specified by the nearline replication
+contract.
+
+Operation semantics: admin-token required; journaled like every privileged
+mutation (`operation_id` idempotency, `allow_loss` and the volume id folded
+into the request hash — a changed authorization under the same operation id
+is a typed `IDEMPOTENCY_CONFLICT`); `FENCE_PENDING` while the witness is
+still inside its fence-wait window; `UNKNOWN_FENCING_AUTHORITY` when the
+witness cannot be reached. Replays of a recorded outcome — refusal or
+promotion — are byte-identical.

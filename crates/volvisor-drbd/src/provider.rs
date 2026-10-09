@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use volvisor_provider::VolumeProvider;
+use volvisor_provider::{AdoptionSurface, VolumeProvider};
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health,
     LocalProtectionAxis, Provisioning, RemoteProtectionAxis, VolumeClass,
@@ -338,6 +338,20 @@ pub struct DrbdProvider {
 /// Verified adoption facts (P4a plan §5 step 1): everything the
 /// authority check, the classification and the promotion need,
 /// proven against this host and the witness registration.
+/// The nearline adopt surface (P4a plan §6): the admin route calls the
+/// engine's [`Self::adopt_and_promote`] through the trait object the
+/// daemon wires into the API state.
+#[async_trait::async_trait]
+impl AdoptionSurface for DrbdProvider {
+    async fn adopt_volume(
+        &self,
+        volume_id: &VolumeId,
+        allow_loss: bool,
+    ) -> Result<AdoptVolumeResponse, ApiError> {
+        self.adopt_and_promote(volume_id, allow_loss)
+    }
+}
+
 struct AdoptionFacts {
     /// The derived resource name (the scheme match is part of the
     /// verification).

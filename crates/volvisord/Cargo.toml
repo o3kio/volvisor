@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "volvisord"
 path = "src/main.rs"
 
+[[bin]]
+name = "volvisor-witnessd"
+path = "src/witnessd.rs"
+
 [dependencies]
 volvisor-types = { workspace = true }
 volvisor-journal = { workspace = true }
@@ -25,6 +29,7 @@ volvisor-provider = { workspace = true }
 volvisor-lvm = { workspace = true }
 volvisor-ceph = { workspace = true }
 volvisor-drbd = { workspace = true }
+volvisor-witness = { workspace = true }
 volvisor-api = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
