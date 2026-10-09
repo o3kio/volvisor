@@ -737,6 +737,13 @@ impl DrbdProvider {
         let mut demoted = !is_primary;
         if !demoted {
             let output = self.run_drbdadm("secondary", &entry.resource_name)?;
+            // A busy refusal (the device is still open) is the expected
+            // retry-later case; any OTHER failure is reported by the
+            // caller instead of being folded into the silent skip —
+            // the same distinction `self_fence` itself makes.
+            if !output.success && !is_device_busy(&output.stderr) {
+                return Err(command_failed("drbdadm secondary", &output));
+            }
             demoted = output.success;
         }
         if !demoted {
@@ -1821,12 +1828,20 @@ impl DrbdProvider {
     /// does not stay suspended until a restart (query and completion
     /// failures there are reported, never fatal to the pass).
     ///
+    /// The pass is two-phase: **fences first** (suspension and demotion
+    /// are entirely local — a past-deadline writer's enforcement never
+    /// queues behind another volume's blocking witness call), then
+    /// renewals. A fence that itself fails is reported in
+    /// [`RenewalReport::fence_failures`] and retried by the next pass
+    /// — it never aborts the other volumes' fences or renewals.
+    ///
     /// Pre-authority (P3) mode is a no-op returning an empty report.
     ///
     /// # Errors
-    /// `INTERNAL` when a fence's commands or a state save fail (the
-    /// next pass retries — the suspension is already durable in the
-    /// kernel).
+    /// `INTERNAL` when a renewed lease's state save fails (the next
+    /// pass retries). Fence failures are reported in the report, not
+    /// returned — the suspension is already durable in the kernel
+    /// whenever the suspend itself succeeded.
     pub fn renew_leases(&self) -> Result<RenewalReport, ApiError> {
         let Some(authority) = &self.authority else {
             return Ok(RenewalReport::default());
@@ -1839,8 +1854,17 @@ impl DrbdProvider {
         // looks at it.
         self.complete_pending_fences(&mut state, &mut report);
         let ids: Vec<VolumeId> = state.volumes().keys().cloned().collect();
-        for id in ids {
-            let Some(snapshot) = state.volume(&id).cloned() else {
+        // Phase 1 — fences first, and fence-only: every past-deadline
+        // writer is suspended and demoted BEFORE any blocking witness
+        // call runs. `self_fence` is entirely local (the lease is left
+        // to the witness's own expiry — it is never released here), so
+        // a past-deadline volume's enforcement must not queue behind
+        // another volume's slow renewal: the W7 budget covers response
+        // latency plus the tick, not N × the witness timeout. A fence
+        // that itself fails is reported (and retried next pass)
+        // without aborting the other volumes' fences.
+        for id in &ids {
+            let Some(snapshot) = state.volume(id).cloned() else {
                 continue;
             };
             let Some(block) = snapshot.runtime.authority.clone() else {
@@ -1850,17 +1874,36 @@ impl DrbdProvider {
             // matter why the renewal failed: the deadline is the bound
             // the writer promised (a witness that never answers is not
             // a license to keep writing).
-            if now >= block.deadline_at {
-                let reasons = vec![format!(
-                    "the W5 local deadline {} passed (lease acquired {})",
-                    block.deadline_at, block.acquired_at
-                )];
-                match self.self_fence(&mut state, &id, &snapshot.entry, reasons) {
-                    Ok(fenced) => report.fenced.push(fenced),
-                    Err(error) => {
-                        return Err(error);
-                    }
+            if now < block.deadline_at {
+                continue;
+            }
+            let reasons = vec![format!(
+                "the W5 local deadline {} passed (lease acquired {})",
+                block.deadline_at, block.acquired_at
+            )];
+            match self.self_fence(&mut state, id, &snapshot.entry, reasons) {
+                Ok(fenced) => report.fenced.push(fenced),
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id.clone(),
+                        detail: format!(
+                            "self-fencing {} failed: {}",
+                            snapshot.entry.resource_name, error.detail
+                        ),
+                    });
                 }
+            }
+        }
+        // Phase 2 — renewals (blocking witness calls; a slow witness
+        // can only delay other renewals, never a fence).
+        for id in ids {
+            let Some(snapshot) = state.volume(&id).cloned() else {
+                continue;
+            };
+            let Some(block) = snapshot.runtime.authority.clone() else {
+                continue;
+            };
+            if now >= block.deadline_at {
                 continue;
             }
             // Renewal is due only after a full interval since the last
@@ -1888,7 +1931,13 @@ impl DrbdProvider {
                     match self.self_fence(&mut state, &id, &snapshot.entry, reasons) {
                         Ok(fenced) => report.fenced.push(fenced),
                         Err(error) => {
-                            return Err(error);
+                            report.fence_failures.push(UnverifiableVolume {
+                                volume_id: id.clone(),
+                                detail: format!(
+                                    "self-fencing {} after a stale epoch failed: {}",
+                                    snapshot.entry.resource_name, error.detail
+                                ),
+                            });
                         }
                     }
                 }
@@ -2578,17 +2627,22 @@ impl DrbdProvider {
         );
         match fenced {
             Ok(fenced) => {
+                // A failed adoption stays Failed (a completed
+                // `self_fence` returns the volume to Ready for
+                // reattachment; this is not that) — and the override is
+                // durable BEFORE the release: if this save fails, the
+                // error returns with the lease unreleased (it lapses at
+                // the witness under the W7 window — safe), never a
+                // released lease over an on-disk record that still
+                // claims Ready.
+                if let Some(volume) = state.volume_mut(volume_id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                    state.save(&self.state_path)?;
+                }
                 if fenced.demoted {
                     if let Some(authority) = &self.authority {
                         let _ = authority.release(volume_id, block);
                     }
-                }
-                // A failed adoption stays Failed (a completed
-                // `self_fence` returns the volume to Ready for
-                // reattachment; this is not that).
-                if let Some(volume) = state.volume_mut(volume_id) {
-                    volume.runtime.state = VolumeLifecycle::Failed;
-                    state.save(&self.state_path)?;
                 }
                 Ok(())
             }
@@ -3731,19 +3785,11 @@ impl DrbdProvider {
             )
         };
 
-        // Best-effort lease release before the resource is torn down
-        // (P4a): a failure here is deliberately tolerated — delete must
-        // not be wedged on witness availability — and is safe: the
-        // volume is detached and Secondary at this point (verified
-        // below), the lease lapses at its recorded end (bounded by
-        // W1/W7), and the witness-side record of a deleted lineage is
-        // retained as lineage evidence (witness garbage collection is
-        // out of P4a scope).
-        if let (Some(authority), Some(block)) = (&self.authority, block.as_ref()) {
-            let _ = authority.release(volume_id, block);
-        }
-
-        // A Primary resource is never force-demoted by delete (rule 17).
+        // A Primary resource is never force-demoted by delete (rule 17)
+        // — and this check comes BEFORE the lease release: a
+        // self-release waives the next grant's W7 wait, so it is
+        // earned only once the resource is verifiably not writing
+        // (the same ordering every authority-clearing path follows).
         let status = self.resource_status(&entry.resource_name)?;
         if let Some(status) = &status {
             if status.role == Role::Primary {
@@ -3756,6 +3802,17 @@ impl DrbdProvider {
                     ),
                 ));
             }
+        }
+        // Best-effort lease release before the resource is torn down
+        // (P4a): a failure here is deliberately tolerated — delete must
+        // not be wedged on witness availability — and is safe now: the
+        // volume is detached and verifiably not Primary (the check
+        // above), the lease lapses at its recorded end if the release
+        // fails (bounded by W1/W7), and the witness-side record of a
+        // deleted lineage is retained as lineage evidence (witness
+        // garbage collection is out of P4a scope).
+        if let (Some(authority), Some(block)) = (&self.authority, block.as_ref()) {
+            let _ = authority.release(volume_id, block);
         }
         // Bring the resource down through our own scoped file, then
         // remove the file — but only when it is verifiably ours. A

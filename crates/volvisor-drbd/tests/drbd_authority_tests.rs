@@ -36,8 +36,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{
-    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, config_for_peer, fixture, flip_world_to_peer,
-    provider_from_with_authority, seed_volume, seed_volume_with_protocol,
+    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for, config_for_peer, fixture,
+    flip_world_to_peer, provider_from_with_authority, seed_volume, seed_volume_with_identity,
+    seed_volume_with_protocol,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
@@ -45,7 +46,9 @@ use volvisor_drbd::report::Role;
 use volvisor_drbd::state::{DrbdState, PendingFence, ReplicationMode, UnverifiableVolume};
 use volvisor_drbd::{CommandOutput, CommandRunner, FakeRunner};
 use volvisor_provider::VolumeProvider;
-use volvisor_types::request::{AccessModeRequest, AttachVolumeRequest, DetachVolumeRequest};
+use volvisor_types::request::{
+    AccessModeRequest, AttachVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, ErasurePolicy,
+};
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, DrainProof, HostId, LeaseState, LossBoundary,
     OperationId, PromotionClassification, RecordedBarrier, VolumeId,
@@ -159,6 +162,33 @@ fn authority_for(kit: &WitnessKit, host: &str, renewal_interval: u64) -> Authori
             Duration::from_secs(5),
         ));
     let clock = Arc::clone(&kit.writer_clock);
+    AuthorityContext::new(
+        connection,
+        HostId::new(host).expect("valid host id"),
+        renewal_interval,
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+    )
+    .expect("authority context")
+}
+
+/// An [`AuthorityContext`] against an arbitrary witness URL — used to
+/// point a provider at a deliberately broken witness.
+fn authority_for_url(
+    url: &str,
+    host: &str,
+    renewal_interval: u64,
+    clock: Arc<AtomicU64>,
+) -> AuthorityContext {
+    let connection: Arc<dyn volvisor_witness::BlockingWitnessConnection> =
+        Arc::new(BlockingWitness::new(
+            Arc::new(HttpWitnessConnection::new(
+                url.to_owned(),
+                Some(TOKEN.to_owned()),
+                Duration::from_secs(5),
+            )),
+            tokio::runtime::Handle::current(),
+            Duration::from_secs(5),
+        ));
     AuthorityContext::new(
         connection,
         HostId::new(host).expect("valid host id"),
@@ -1380,4 +1410,210 @@ async fn the_renewal_pass_completes_a_pending_fence_without_a_restart() {
     let entry = disk.volume(&state.volume).expect("volume");
     assert!(entry.runtime.fence.is_none(), "the marker is cleared");
     assert_eq!(entry.runtime.state, volvisor_types::VolumeLifecycle::Ready);
+}
+
+// --------------------------------------------- review-round-3 additions
+
+/// A retain delete request.
+fn delete_req(volume_id: &str, expected_generation: u64) -> DeleteVolumeRequest {
+    DeleteVolumeRequest {
+        api_version: "volvisor.volume.v2".to_owned(),
+        operation_id: OperationId::new(format!("op-delete-{volume_id}")).expect("valid id"),
+        expected_generation,
+        data_erasure_policy: ErasurePolicy::Retain,
+    }
+}
+
+/// A TCP listener that accepts connections and never answers — a
+/// witness that hangs every request for the full client timeout.
+fn hanging_witness() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hanging witness");
+    let addr = listener.local_addr().expect("hanging witness address");
+    std::thread::spawn(move || {
+        // Hold every accepted connection open forever; the client
+        // times out on its own.
+        while let Ok((socket, _)) = listener.accept() {
+            std::mem::forget(socket);
+        }
+    });
+    addr
+}
+
+/// The round-3 ordering invariant: a past-deadline writer's fence is
+/// executed BEFORE any blocking witness call runs — `self_fence` is
+/// entirely local, so one volume's hanging renewal must never delay
+/// another volume's deadline enforcement. (The pass is two-phase:
+/// fences first, then renewals.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_deadline_fences_do_not_queue_behind_a_hanging_renewal() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    // vol-b-dead (deadlines: lease granted at witness-now START, W5
+    // deadline START+TTL) sorts AFTER vol-a-fresh in the pass's
+    // BTreeMap iteration — the exact shape that serialized the fence
+    // behind vol-a's renewal before the phase split.
+    seed_volume_with_identity(
+        &f.base,
+        &f.world,
+        "vol-b-dead",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR,
+        SEED_PORT,
+    );
+    seed_volume_with_identity(
+        &f.base,
+        &f.world,
+        "vol-a-fresh",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR + 1,
+        SEED_PORT + 1,
+    );
+    let vol_a = volume("vol-a-fresh");
+    let vol_b = volume("vol-b-dead");
+    let provider = authority_provider(&kit, &f.state_path, &f.world);
+    provider.register_volume(&vol_b, None).expect("register b");
+    provider.register_volume(&vol_a, None).expect("register a");
+    provider
+        .attach_volume(&vol_b, &attach_req("vol-b-dead", 1))
+        .await
+        .expect("attach b");
+    // vol-a's lease is granted 50s later (both clocks: the W5 deadline
+    // is receipt-anchored in the writer's own clock, so it sits past
+    // vol-b's only when the writer clock advanced too).
+    kit.witness_clock.store(START + 50, Ordering::SeqCst);
+    kit.writer_clock.store(START + 50, Ordering::SeqCst);
+    provider
+        .attach_volume(&vol_a, &attach_req("vol-a-fresh", 1))
+        .await
+        .expect("attach a");
+    // The renewal pass runs on a RESTARTED provider whose witness is a
+    // hanging socket: the resources are demoted for its construction
+    // (so startup validation makes no witness call), then promoted
+    // back out of band — the pass under test sees two live Primaries.
+    {
+        let mut world = f.world.lock().expect("world");
+        for resource in [resource_of("vol-a-fresh"), resource_of("vol-b-dead")] {
+            world.resources.get_mut(&resource).expect("resource").role = Role::Secondary;
+        }
+    }
+    {
+        let mut disk = DrbdState::load(&f.state_path).expect("load state");
+        for vol in [&vol_a, &vol_b] {
+            let entry = disk.volume_mut(vol).expect("volume");
+            entry.runtime.attachment = None;
+            entry.runtime.state = volvisor_types::VolumeLifecycle::Ready;
+        }
+        disk.save(&f.state_path).expect("save state");
+    }
+    let hanging = hanging_witness();
+    let clock = Arc::clone(&kit.writer_clock);
+    let restarted = DrbdProvider::with_authority(
+        FakeDrbd::runner(&f.world),
+        config_for(&f.base),
+        f.state_path.clone(),
+        authority_for_url(&format!("http://{hanging}"), NODE, INTERVAL, clock),
+    )
+    .map(Arc::new)
+    .expect("restarted provider construction");
+    {
+        let mut world = f.world.lock().expect("world");
+        for resource in [resource_of("vol-a-fresh"), resource_of("vol-b-dead")] {
+            world.resources.get_mut(&resource).expect("resource").role = Role::Primary;
+        }
+    }
+    // Writer clock: past vol-b's deadline (START+TTL), before vol-a's
+    // (START+50+TTL) and past vol-a's renewal interval.
+    kit.writer_clock.store(START + TTL + 25, Ordering::SeqCst);
+    let pass_provider = Arc::clone(&restarted);
+    let pass = std::thread::spawn(move || pass_provider.renew_leases());
+    // While vol-a's renewal hangs on the dead socket, vol-b's fence
+    // must already have landed (suspend + demote + resume, authority
+    // cleared) — one second in, with the renewal blocked for the full
+    // five-second client timeout.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-b-dead")),
+        Role::Secondary,
+        "the past-deadline writer is fenced without waiting on any witness call"
+    );
+    assert_eq!(
+        role_of(&f.world, &resource_of("vol-a-fresh")),
+        Role::Primary,
+        "the still-valid writer is untouched while its renewal hangs"
+    );
+    let disk = DrbdState::load(&f.state_path).expect("load state");
+    assert!(
+        disk.volume(&vol_b)
+            .expect("volume")
+            .runtime
+            .authority
+            .is_none(),
+        "the fence cleared vol-b's authority durably"
+    );
+    let report = pass
+        .join()
+        .expect("renewal pass thread")
+        .expect("renewal pass");
+    assert_eq!(report.fenced.len(), 1);
+    assert_eq!(report.fenced[0].volume_id, vol_b);
+    assert_eq!(report.deferred.len(), 1);
+    assert_eq!(report.deferred[0].volume_id, vol_a);
+    // vol-a's lease was never released by the fence path (only the
+    // witness's own expiry can end it).
+    let view = kit.client.inspect(&vol_a).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+}
+
+/// Delete refuses a Primary resource (rule 17) WITHOUT releasing the
+/// lease: a self-release would waive the next grant's W7 wait while
+/// the resource might still be writing. The release is earned only on
+/// the verified-not-Primary path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_refusing_a_primary_resource_releases_no_lease() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-delprim").await;
+    // Roll the record back to the detached shape while the resource
+    // stays Primary out of band: delete is admissible on the record
+    // but must refuse on the role.
+    {
+        let mut disk = DrbdState::load(&state.state_path).expect("load state");
+        let entry = disk.volume_mut(&state.volume).expect("volume");
+        entry.runtime.attachment = None;
+        entry.runtime.state = volvisor_types::VolumeLifecycle::Ready;
+        disk.save(&state.state_path).expect("save state");
+    }
+    // A provider constructed over the rolled-back record (the
+    // attaching provider's in-memory state still carries the
+    // attachment; the restart is the shape an operator would see).
+    let provider = authority_provider(&kit, &state.state_path, &state.world);
+    let error = provider
+        .delete_volume(&state.volume, &delete_req("vol-delprim", 2))
+        .await
+        .expect_err("delete refuses a Primary resource");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(
+        view.lease_state,
+        LeaseState::Live,
+        "no release while the resource may still be writing"
+    );
+    // The resource demotes out of band: delete now proceeds and the
+    // verified-not-Primary path releases.
+    state
+        .world
+        .lock()
+        .expect("world")
+        .resources
+        .get_mut(&state.resource)
+        .expect("resource")
+        .role = Role::Secondary;
+    provider
+        .delete_volume(&state.volume, &delete_req("vol-delprim", 2))
+        .await
+        .expect("delete after the demotion");
+    let view = kit.client.inspect(&state.volume).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Revoked);
 }

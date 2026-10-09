@@ -1490,6 +1490,24 @@ pub fn seed_volume_with_protocol(
     size_bytes: u64,
     protocol: ReplicationMode,
 ) {
+    seed_volume_with_identity(
+        base, world, volume_id, size_bytes, protocol, SEED_MINOR, SEED_PORT,
+    );
+}
+
+/// Seed a volume with an explicit minor/port: multi-volume worlds
+/// need one device identity per seeded resource (the standard
+/// [`seed_volume_with_protocol`] pins the single-volume fixture
+/// identity).
+pub fn seed_volume_with_identity(
+    base: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    volume_id: &str,
+    size_bytes: u64,
+    protocol: ReplicationMode,
+    minor: u32,
+    port: u16,
+) {
     let volume_id = VolumeId::new(volume_id).expect("valid volume id");
     let resource = resource_name_for(&volume_id);
     let state_path = base.join("state.json");
@@ -1501,8 +1519,8 @@ pub fn seed_volume_with_protocol(
                 resource_name: resource.clone(),
                 vg_name: VG.to_owned(),
                 lv_name: resource.clone(),
-                minor: SEED_MINOR,
-                port: SEED_PORT,
+                minor,
+                port,
                 size_bytes,
                 requested_size_bytes: size_bytes,
                 generation: 1,
@@ -1523,10 +1541,10 @@ pub fn seed_volume_with_protocol(
     );
     // Keep the monotonic counters ahead of the seeded resource so a
     // later allocation can never collide with it.
-    state.observe_minor(SEED_MINOR);
-    state.observe_port(SEED_PORT);
+    state.observe_minor(minor);
+    state.observe_port(port);
     state.save(&state_path).expect("seed volume state");
-    seed_definition_with_protocol(&resource, SEED_MINOR, SEED_PORT, protocol)
+    seed_definition_with_protocol(&resource, minor, port, protocol)
         .write(&base.join("drbd.d"))
         .expect("write fixture res file");
     let mut world = world.lock().expect("world");
@@ -1558,7 +1576,7 @@ pub fn seed_volume_with_protocol(
     world.resources.insert(
         resource.clone(),
         FakeResource {
-            minor: SEED_MINOR,
+            minor,
             role: Role::Secondary,
             local_disk: DiskState::UpToDate,
             peer_disk: DiskState::UpToDate,
