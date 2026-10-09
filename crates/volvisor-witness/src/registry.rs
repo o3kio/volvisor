@@ -1121,6 +1121,10 @@ impl WitnessCore {
             current_epoch: vol.current_epoch,
             holder: vol.holder.clone(),
             lease_state,
+            // The live lease's identity (the promote-under-granted-lease
+            // path renews a lease the witness minted for this host, so
+            // it must learn the id from the view; None without a lease).
+            lease_id: vol.lease.as_ref().map(|lease| lease.lease_id),
             lease_remaining_secs,
             commit_index: vol.last_commit,
             registration: Some(vol.registration.clone()),

@@ -213,6 +213,7 @@ impl HandoffDriver for FakeDriver {
             current_epoch: WriterEpoch(state.epoch),
             holder: state.holder.clone(),
             lease_state: state.lease.as_view(),
+            lease_id: None,
             lease_remaining_secs: None,
             commit_index: world.commit_index,
             registration: None,

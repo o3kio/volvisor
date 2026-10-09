@@ -237,6 +237,12 @@ pub struct AuthorityView {
     pub holder: Option<HostId>,
     /// The current lease's state.
     pub lease_state: LeaseState,
+    /// For a live lease: its identity (needed to renew it — a
+    /// promote-under-granted-lease path adopts a lease the witness
+    /// already minted for this host, so it must learn the lease id
+    /// from the view; `None` when no live lease exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<LeaseId>,
     /// For a live lease: its remaining duration **as a
     /// duration-from-response** (plan W5 — a revived writer must never
     /// reconstruct a local deadline from an absolute timestamp).
@@ -311,6 +317,29 @@ pub enum PromotionClassification {
     },
 }
 
+/// Which evidence class justified a `SAFE_CURRENT` classification
+/// (P4b plan §7: "the classifier … records which evidence class
+/// justified the decision in the response").
+///
+/// Additive on the wire: responses written before P4b decode as
+/// [`SafeCurrentEvidence::None`] (they never carried the field), and a
+/// non-`SAFE_CURRENT` classification always carries `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SafeCurrentEvidence {
+    /// The P4a operator-attested registration barrier (protocol C +
+    /// a recorded barrier on the registration).
+    RegistrationBarrier,
+    /// A P4b machine-checked migration barrier (W9-recorded,
+    /// non-voided, full attestations, ordered before the source
+    /// epoch's retirement) — protocol-independent.
+    MigrationBarrier,
+    /// No `SAFE_CURRENT` evidence was present (the classification is
+    /// not `SAFE_CURRENT`, or the promotion predates the field).
+    #[default]
+    None,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +409,62 @@ mod tests {
             serde_json::from_str::<WriterEpoch>("12").expect("deserialize"),
             WriterEpoch(12)
         );
+    }
+
+    #[test]
+    fn safe_current_evidence_wire_format_is_kebab_case() {
+        // The additive-default carrier: a JSON body written before the
+        // field exists.
+        #[derive(Deserialize)]
+        struct Carrier {
+            #[serde(default)]
+            evidence: SafeCurrentEvidence,
+        }
+        // Additive vocabulary: each class has exactly one spelling, and
+        // an absent field decodes as "none" (pre-P4b responses).
+        for (evidence, wire) in [
+            (
+                SafeCurrentEvidence::RegistrationBarrier,
+                "\"registration-barrier\"",
+            ),
+            (
+                SafeCurrentEvidence::MigrationBarrier,
+                "\"migration-barrier\"",
+            ),
+            (SafeCurrentEvidence::None, "\"none\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&evidence).expect("serialize"),
+                wire,
+                "{evidence:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<SafeCurrentEvidence>(wire).expect("deserialize"),
+                evidence
+            );
+        }
+        // A foreign spelling fails to decode, never silently maps.
+        assert!(serde_json::from_str::<SafeCurrentEvidence>("\"migration\"").is_err());
+        let carrier: Carrier = serde_json::from_str("{}").expect("default");
+        assert_eq!(carrier.evidence, SafeCurrentEvidence::None);
+    }
+
+    #[test]
+    fn authority_view_decodes_without_the_additive_lease_id() {
+        // A view written before the field exists must still decode
+        // (lease_id defaults to None).
+        let json = r#"{
+            "volume_id": "vol-1",
+            "current_epoch": 2,
+            "holder": null,
+            "lease_state": "none",
+            "lease_remaining_secs": null,
+            "commit_index": 9,
+            "registration": null
+        }"#;
+        let view: AuthorityView = serde_json::from_str(json).expect("decode");
+        assert_eq!(view.lease_id, None);
+        assert_eq!(view.current_epoch, WriterEpoch(2));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::authority::{AuthoritySummary, PromotionClassification};
+use crate::authority::{AuthoritySummary, PromotionClassification, SafeCurrentEvidence};
 use crate::domain::{
     EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning, VolumeClass,
 };
@@ -529,6 +529,11 @@ impl AdoptVolumeRequest {
 pub struct AdoptVolumeResponse {
     /// The classification computed from observed facts only.
     pub classification: PromotionClassification,
+    /// Which evidence class justified a `SAFE_CURRENT` classification
+    /// (P4b plan §7); `none` for every non-`SAFE_CURRENT` verdict.
+    /// Additive: pre-P4b responses decode with `none`.
+    #[serde(default)]
+    pub evidence: SafeCurrentEvidence,
     /// The recorded volume state after a **successful** adoption;
     /// `None` on refusal — nothing was adopted and this host's state
     /// is unchanged (the resource keeps whatever out-of-band state it

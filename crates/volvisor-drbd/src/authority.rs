@@ -551,6 +551,7 @@ mod tests {
             current_epoch: WriterEpoch(epoch),
             holder: holder.cloned(),
             lease_state: state,
+            lease_id: None,
             lease_remaining_secs: remaining,
             commit_index: 7,
             registration: None,
