@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{HostId, VolumeId};
+use crate::id::{HostId, MigrationId, VolumeId};
 
 /// Monotonic writer epoch of one volume lineage.
 ///
@@ -109,6 +109,84 @@ pub struct RecordedBarrier {
     pub recorded_at: u64,
 }
 
+/// The migration-cut attestation a source host records with the
+/// witness at `BARRIER_DURABLE` (P4b plan W9). Each field is an
+/// independently checkable claim about the source's state at the
+/// moment of recording; the classifier requires **all three true**
+/// before a barrier is `SAFE_CURRENT` evidence.
+///
+/// The truth of these claims lives on the recording host (the same
+/// trust class as the P4a self-release): the witness records them
+/// verbatim under the recorder's W8-bound credential and never
+/// verifies them itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BarrierAttestation {
+    /// The source VM was paused and its in-flight I/O drained before
+    /// the boundary was fixed.
+    pub vm_paused_and_drained: bool,
+    /// The source data path was kernel-suspended (`drbdsetup
+    /// suspend-io`) and the suspension observed before recording.
+    pub data_path_suspended: bool,
+    /// The replication peer reported `UpToDate` with no resync after
+    /// the suspension fixed the boundary.
+    pub peer_up_to_date: bool,
+}
+
+impl BarrierAttestation {
+    /// Whether every attested fact holds (the `SAFE_CURRENT`
+    /// evidence condition; anything less degrades the classification).
+    #[must_use]
+    pub const fn all_true(self) -> bool {
+        self.vm_paused_and_drained && self.data_path_suspended && self.peer_up_to_date
+    }
+}
+
+/// One entry of a volume's witness-held barrier log (P4b plan W9:
+/// `RecordBarrier`/`VoidBarrier` mutations).
+///
+/// The `boundary_commit_index` is an **ordering token** — the witness
+/// commit index of the `RecordBarrier` mutation itself — placing the
+/// barrier in the journal's total order. It carries no claim of being
+/// the epoch's final mutation: renewals after the barrier write no
+/// data and do not invalidate it. The classifier checks that the
+/// barrier precedes the epoch's retirement (or that the epoch is
+/// still current), never terminality.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedMigrationBarrier {
+    /// The host that recorded the barrier (W8-bound to the credential
+    /// that presented it; must be the epoch's holder at recording
+    /// time).
+    pub holder: HostId,
+    /// The writer epoch whose serving boundary the barrier attests.
+    pub epoch: WriterEpoch,
+    /// The witness commit index of the `RecordBarrier` mutation (the
+    /// ordering token).
+    pub boundary_commit_index: u64,
+    /// The attested facts, recorded verbatim.
+    pub attestation: BarrierAttestation,
+    /// The migration transaction this barrier belongs to, when it was
+    /// recorded by a coordinated handoff.
+    pub migration_id: Option<MigrationId>,
+    /// Unix epoch seconds at recording.
+    pub recorded_at: u64,
+    /// Whether the barrier was voided by its recording holder before
+    /// the epoch retired (the abort path's evidence hygiene). A
+    /// voided barrier is never `SAFE_CURRENT` evidence.
+    pub voided: bool,
+}
+
+/// One retired epoch of a volume, with the witness commit index that
+/// durably recorded its retirement (the grant of a newer epoch, or an
+/// explicit revocation). Exposed by `inspect` so the classifier can
+/// order barriers against retirements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochRetirement {
+    /// The epoch that can no longer admit writes.
+    pub epoch: WriterEpoch,
+    /// The commit index of the retirement record.
+    pub commit_index: u64,
+}
+
 /// The registration record a witness holds for a volume (P4a plan §3:
 /// `register`), returned by `inspect` for the adopt flow to compare
 /// against.
@@ -167,6 +245,16 @@ pub struct AuthorityView {
     pub commit_index: u64,
     /// The full registration record, when the volume is registered.
     pub registration: Option<VolumeRegistration>,
+    /// The volume's barrier log (P4b W9), oldest first: every
+    /// `RecordBarrier` mutation with its attestation, recorder,
+    /// ordering token and voided flag.
+    #[serde(default)]
+    pub barriers: Vec<RecordedMigrationBarrier>,
+    /// The volume's retired epochs with the commit index that retired
+    /// each (the classifier's ordering target; the pre-authority
+    /// epoch's implicit retirement by the first grant is included).
+    #[serde(default)]
+    pub retirements: Vec<EpochRetirement>,
 }
 
 /// The tenant/consumer-facing authority summary reported by
