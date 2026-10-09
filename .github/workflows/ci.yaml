@@ -38,6 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
+      # dtolnay/rust-toolchain exports RUSTUP_TOOLCHAIN, which overrides the
+      # rust-toolchain.toml `stable` pin for this job.
       - uses: Swatinem/rust-cache@v2
       # Enforce the declared workspace rust-version (1.85, the edition-2024
       # minimum) against the committed lockfile. If a dependency drifts to a

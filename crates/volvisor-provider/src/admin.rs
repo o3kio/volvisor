@@ -61,6 +61,13 @@ pub trait AdminSurface: Send + Sync {
 }
 
 /// The single fake device exposed by [`crate::FakeProvider`]'s admin surface.
+///
+/// Note on the two-token model: the HTTP `Authorization: Bearer` admin token
+/// authenticates the caller to the API; the request-body `authorization_token`
+/// is the provider's scoped destructive-authorization for the device
+/// operation itself. They are independent credentials. The fake does not
+/// validate the body token (the LVM provider does) — production providers
+/// must compare it against their configured token and never log it.
 pub(crate) const FAKE_DEVICE_ID: &str = "dev-fake-1";
 /// Capacity of the fake device.
 pub(crate) const FAKE_DEVICE_BYTES: u64 = 1 << 40;

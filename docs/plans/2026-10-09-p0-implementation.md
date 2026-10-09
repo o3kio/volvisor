@@ -41,8 +41,8 @@ single-volume API/attachments and provider conformance"* — plus the first vert
 - LVM is driven through a `CommandRunner` trait wrapping `lvm2` CLI
   (JSON output where available); unit tests run against a recorded/fake runner, real-LVM
   integration tests are gated behind `VOLVISOR_TEST_LVM=1` + root + loop devices.
-- CI: fmt --check, clippy -D warnings, test, doc, cargo-audit/deny; MSRV policy = current
-  stable.
+- CI: fmt --check, clippy -D warnings, test, doc, cargo-audit/deny; MSRV 1.85 (the
+  edition-2024 minimum) enforced by a dedicated CI job against the committed lockfile.
 
 ## 4. Workspace layout
 
