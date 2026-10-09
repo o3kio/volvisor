@@ -2,7 +2,7 @@
 
 Status: normative for the P4b phase (this document is the plan of record;
 implementation PRs cite it)
-Date: 2026-10-09 (rev 3 — round-1 and round-2 design review findings
+Date: 2026-10-09 (rev 4 — round-1/2/3 design review findings
 folded in)
 Builds on: [P4a plan](2026-10-09-p4-witness-fencing-authority.md) (merged as PR #7),
 ADR-0004 Decision 3/4, ADR-0007 "Planned Cloud Hypervisor live migration is a
@@ -261,8 +261,13 @@ Design decisions, each with its rule citation:
   `Aborted { reason, at }`. The internal cut progress (`cut:
   Option<CutProgress>` — `Snapshotting | DestroyingVm | Demoting |
   Revoking`) is a sub-field of the record, not a canonical state;
-  externally, any record with an active cut is observed as `IN_DOUBT`
-  with the step as detail (D1a).
+  externally, a record with an active cut is observed as `IN_DOUBT`
+  with the step as detail **only before `DESTINATION_AUTHORIZED`**
+  (D1a) — from `DESTINATION_AUTHORIZED` on, the canonical state is
+  reported with a stall detail, and an unresolvable stall (a dead
+  destination VMM) is observed through the terminal `InDoubt`
+  mapping. The `cut` field guides the forward re-drive through
+  `VM_RESUMED` and is cleared at `Complete`.
 - `MigrationRecord` — one per `MigrationId`:
   `migration_id, vm_id, source_host, target_host, participants[]`
   (each: `volume_id, expected_generation, resource, minor`),
@@ -300,14 +305,17 @@ side-effect/persist boundary can leave it stale.
   — void the recorded barriers (W9), unsuspend every participating
   volume, clear the cut markers, `ch-remote resume` the source VM (if
   paused), discard the target-side preparation, record `Aborted`.
-  Ordering is normative (B-round-2): **an unvoided recorded barrier is
-  a hard gate on any source resume** — the void step must succeed (or
-  the witness must be unreachable in a way that provably could not
-  have journaled anything) before the VM is resumed. A `VoidBarrier`
-  that cannot be journaled fails the whole rollback into `self_fence`
+  Ordering is normative (G5): **an unvoided recorded barrier is a
+  hard gate on any source resume** — every recorded barrier of the
+  epoch must be **confirmed voided** (the `VoidBarrier` journaled and
+  confirmed) before the VM is resumed. A `VoidBarrier` that cannot be
+  journaled — for any reason, including witness unreachability, where
+  a void may have been journaled while the response was lost — fails
+  the whole rollback into `self_fence`
   (the durable `PendingFence` path) with the migration record
-  `InDoubt`-annotated — the source stays paused/suspended, never
-  resumed with a live barrier that could later certify a false
+  `InDoubt`-annotated — the source stays paused/suspended until the
+  witness is reachable again or an operator applies a fencing proof,
+  never resumed with a live barrier that could later certify a false
   `SAFE_CURRENT` (writes acknowledged after the barrier's boundary
   would fall inside its attested window). Fail-closed, never a silent
   resume, never an unmarked suspension.
@@ -340,7 +348,12 @@ side-effect/persist boundary can leave it stale.
   restore (destroying any half-restored destination VM first — the
   re-drive is idempotent), resume, reconcile the source Secondary,
   clear the cut markers, `Complete`.
-- `Complete|Aborted` → nothing.
+- `Complete|Aborted` → nothing. `InDoubt` as a *terminal* record
+  (the pre-cut rollback-failure case) is re-resolved by the retry
+  task once the witness is reachable: it re-attempts the abort path
+  (void must confirm before any resume); it never resumes in the
+  meantime. An in-cut `InDoubt` is not a terminal state — it is the
+  forward re-drive's active observation until the drive lands.
 
 The reconcile is the only writer of `state_history` besides the live
 drive — both go through the same transition function, which is
@@ -484,32 +497,38 @@ host.
 ### Config additions (`volvisord`)
 
 ```toml
-[witness]                                  # existing table
-url = "…"
-host_token = "…"                           # NEW, REQUIRED with url on a v2 witness
-                                           # (this host's W8 credential — the base
-                                           # P4a AuthorityContext uses it for
-                                           # grant/renew/self-revoke/register;
-                                           # the legacy shared token is read-only)
-[migration]
-enabled = true                       # false until the deployment opts in
+# flat witness keys (the existing shape — config.rs uses top-level
+# fields under deny_unknown_fields, not a [witness] table):
+witness_url = "…"                      # existing
+witness_token = "…"                    # existing; legacy, READ-ONLY on a v2
+                                       # witness (inspect/health)
+witness_host_token = "…"               # NEW, REQUIRED with witness_url on a
+                                       # v2 witness: this host's W8 credential.
+                                       # The base P4a AuthorityContext uses it
+                                       # for grant/renew/self-revoke/register.
+witness_renewal_interval_secs = 10     # existing, still required with witness_url
+[migration]                            # new table
+enabled = true                         # false until the deployment opts in
 snapshot_dir = "/var/lib/volvisor/migrations"   # must be shared with the peer for cross-host cutover
 peer_api_url = "http://peer-host:7780"
-peer_api_token = "…"                 # daemon-to-daemon credential (distinct from the witness and consumer tokens)
-[vmm]
+peer_api_token = "…"                   # daemon-to-daemon credential (distinct from the witness and consumer tokens)
+[vmm]                                  # new table
 ch_remote_bin = "/usr/bin/ch-remote"
 api_socket_dir = "/run/volvisor/vms"
 ```
 
-Validation (the `config.rs` discipline): **`witness.host_token` is
-required whenever `witness.url` is set** — the witness protocol is v2
+Validation (the `config.rs` discipline): **`witness_host_token` is
+required whenever `witness_url` is set** — the witness protocol is v2
 as of this phase and every state-mutating call from this daemon
 (including the P4a attach/renew/release path, not only the migration
 surface) authenticates as this host; a v2 witness without the
 credential would break attach/detach/renewal at runtime, so config
-refuses it up front rather than failing mid-operation.
+refuses it up front rather than failing mid-operation. `witness_token`
+remains valid (read-only on a v2 witness; its existing
+non-loopback-required rule is unchanged — deployments keep both
+tokens: the shared read token and this host's mutating credential).
 `migration.enabled` requires the drbd provider + a witness + a set
-`host_token`; the **witness** must remain in a
+`witness_host_token`; the **witness** must remain in a
 failure domain distinct from both replication ends (the existing
 `ensure_witness_failure_domain` check — the peer API is *expected* to
 be colocated with the peer replication end, since the destination
@@ -517,7 +536,7 @@ daemon is the destination VMM's proxy (D6); only the witness is a
 third domain in this topology); `snapshot_dir` must exist locally
 (its cross-host readability is verified at `PREPARED` by the
 destination daemon, with a typed refusal); refuse `enabled` when
-`vmm` is unconfigured. The new credentials (`witness.host_token`,
+`vmm` is unconfigured. The new credentials (`witness_host_token`,
 `peer_api_token`) join the API journal's redaction set (the
 `REDACTED_KEYS` discipline) and are never logged or echoed.
 
@@ -712,7 +731,7 @@ Stage B2 (fake VMM, end-to-end):
 | 21 | API: journaling and idempotency for prepare/transfer/abort (replay byte-identical, hash conflict typed); ObserveHandoff reports the exact canonical states, maps cut-progress to `IN_DOUBT` with step detail, and never collapses the revoke/grant pair; the peer routes resolve intent-without-outcome by inspecting witness/provider state, never a blind re-execution |
 | 22 | One-of-two target promotes failing blocks the VM restore (forward-retried; the VM is never resumed half-migrated) |
 | 23 | The restore's `config.json` disk-path rewrite: matching minors (no-op) and divergent paths (rewrite verified) |
-| 24 | Config validation: witness-third-domain guard, provider requirement, snapshot-dir existence, vmm requirement, `witness.host_token` required whenever `witness.url` is set (v2 witness — the base P4a surface depends on it), credential redaction in journaled payloads |
+| 24 | Config validation: witness-third-domain guard, provider requirement, snapshot-dir existence, vmm requirement, `witness_host_token` required whenever `witness_url` is set (v2 witness — the base P4a surface depends on it), credential redaction in journaled payloads |
 
 Real-host items (env-gated, like the P4a `VOLVISOR_TEST_DRBD` gate;
 no CI claim): `VOLVISOR_TEST_CH=1` runs the adapter against a real
@@ -730,11 +749,13 @@ is explicitly **not** claimed by this plan.
   amendment**: the `IN_DOUBT` wording ("between `SOURCE_REVOKED` and
   `DESTINATION_AUTHORIZED`") is amended to "`IN_DOUBT` is reachable
   once the cut is entered (the durable point of no return, at or
-  after the source-side barrier) and until `DESTINATION_AUTHORIZED`;
-  it must never be reported as a generic `ABORTED`" — the plan's
-  cut-progress states observe `IN_DOUBT` strictly before
-  `SOURCE_REVOKED`, which is the fail-closed direction the contract's
-  spirit intends, and the letter is amended to say so.
+  after the source-side barrier), when a pre-cut rollback cannot
+  complete safely (a failed barrier void — fail-closed, the source is
+  never resumed), and through any post-authorization stall before
+  `COMPLETE` (e.g. a dead destination VMM); it must never be reported
+  as a generic `ABORTED`" — every one of these observations is the
+  fail-closed direction the contract's spirit intends, and the letter
+  is amended to say so.
 - `contracts/nearline-replication-v2.md` §6: the same `IN_DOUBT`
   reachability amendment, plus an implementation-status
   note (the canonical states are now served by volvisor's coordinator;
@@ -755,7 +776,7 @@ every claim in this plan either implemented or explicitly listed in
 §1's out-of-scope table with its reason.
 
 Additionally, these normative invariants are completion gates in
-their own right (the round-1 review's findings — an implementation
+their own right (the design reviews' findings — an implementation
 that deviates from any of them has not delivered this plan):
 
 - **G1 (D1a)**: no crash window between the VM destroy and the
@@ -770,7 +791,13 @@ that deviates from any of them has not delivered this plan):
   adoption's no-live-lease gate against the granted lease.
 - **G4 (D6a)**: the migration-cut marker is durable, honored by the
   provider's startup reconcile (no auto-resume), and cleared only by
-  the coordinator.
+  the coordinator or the fencing-gated clear-cut-marker admin
+  operation (D6a).
+- **G5 (§3/W9, round-2)**: an unvoided recorded barrier is a hard
+  gate on any source resume; a `VoidBarrier` that cannot be
+  journaled — for any reason — fails the rollback into `self_fence`,
+  never a resume. Every barrier of the epoch must be confirmed voided
+  before the source VM resumes.
 
 Production support is **not** claimed: the real-host evidence
 campaign (nearline contract §10) is the next implementation-order
