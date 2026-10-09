@@ -7,6 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Volvisor durable intent journal and idempotency registry"
 
+[features]
+# Test-only journal append fault injection. Never enable in production
+# builds; used by dependent crates' test suites to exercise the
+# outcome-could-not-be-journaled branches honestly.
+test-faults = []
+
 [lints]
 workspace = true
 

@@ -6,6 +6,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "test-faults")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use volvisor_types::{ApiError, ApiErrorCode, OperationId};
 
 use crate::frame;
@@ -77,6 +83,10 @@ pub struct Journal {
     operations: HashMap<OperationId, OperationState>,
     next_sequence: u64,
     record_count: u64,
+    /// Test-fault injection (feature `test-faults`): appends fail once this
+    /// countdown reaches zero. `u64::MAX` (default) never fires.
+    #[cfg(feature = "test-faults")]
+    fail_after_remaining: AtomicU64,
 }
 
 struct Replayed {
@@ -100,16 +110,18 @@ impl Journal {
         // Single-writer enforcement: exclusive, non-blocking flock held for
         // the lifetime of this struct. A second open fails fast.
         let lock_path = dir.join(JOURNAL_LOCK_FILE);
-        let lock_file = OpenOptions::new()
+        let mut lock_opts = OpenOptions::new();
+        lock_opts
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(io_err(&format!(
-                "failed to open journal lock file {}",
-                lock_path.display()
-            )))?;
+            .truncate(false);
+        #[cfg(unix)]
+        lock_opts.mode(0o600);
+        let lock_file = lock_opts.open(&lock_path).map_err(io_err(&format!(
+            "failed to open journal lock file {}",
+            lock_path.display()
+        )))?;
         rustix::fs::flock(
             &lock_file,
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -127,15 +139,14 @@ impl Journal {
 
         let log_path = dir.join(JOURNAL_LOG_FILE);
         let log_created = !log_path.exists();
-        let mut log = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&log_path)
-            .map_err(io_err(&format!(
-                "failed to open journal log {}",
-                log_path.display()
-            )))?;
+        let mut log_opts = OpenOptions::new();
+        log_opts.read(true).append(true).create(true);
+        #[cfg(unix)]
+        log_opts.mode(0o600);
+        let mut log = log_opts.open(&log_path).map_err(io_err(&format!(
+            "failed to open journal log {}",
+            log_path.display()
+        )))?;
 
         if log_created {
             // Make the new log file's directory entry durable before any
@@ -156,7 +167,19 @@ impl Journal {
             operations: replayed.operations,
             next_sequence: replayed.next_sequence,
             record_count: replayed.record_count,
+            #[cfg(feature = "test-faults")]
+            fail_after_remaining: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// Test-only fault injection (feature `test-faults`): let the next `n`
+    /// appends succeed, then fail every subsequent append with a typed
+    /// `INTERNAL` error. Used to exercise the API layer's
+    /// outcome-could-not-be-journaled branches honestly.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn inject_append_failures_after(&self, n: u64) {
+        self.fail_after_remaining.store(n, Ordering::SeqCst);
     }
 
     /// Look up an operation in the replay-derived idempotency registry.
@@ -259,6 +282,20 @@ impl Journal {
     /// Serialize, frame, write and fsync one record. Acknowledged only
     /// after the data reaches stable storage.
     fn append(&mut self, record: JournalRecord) -> Result<(), ApiError> {
+        #[cfg(feature = "test-faults")]
+        {
+            let remaining = self.fail_after_remaining.load(Ordering::SeqCst);
+            if remaining == 0 {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    "injected journal append failure (test-faults)",
+                ));
+            }
+            if remaining != u64::MAX {
+                self.fail_after_remaining
+                    .store(remaining - 1, Ordering::SeqCst);
+            }
+        }
         let envelope = Envelope {
             record_version: RECORD_VERSION,
             record,
@@ -551,5 +588,56 @@ mod tests {
         assert_eq!(pending_entry.request_hash, [4; 32]);
         assert!(!pending_entry.has_outcome);
         assert!(pending_entry.outcome.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_files_are_owner_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+        let op = OperationId::new("op-perms").expect("op");
+        journal
+            .append_intent(op, [1; 32], "create_volume", serde_json::json!({}))
+            .expect("append");
+
+        let mode = |path: std::path::PathBuf| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode(dir.path().join(JOURNAL_LOG_FILE)),
+            0o600,
+            "journal log must not be readable by other local users"
+        );
+        assert_eq!(
+            mode(dir.path().join(JOURNAL_LOCK_FILE)),
+            0o600,
+            "journal lock must not be readable by other local users"
+        );
+    }
+
+    #[cfg(feature = "test-faults")]
+    #[test]
+    fn injected_append_failures_fail_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+        journal.inject_append_failures_after(1);
+
+        let ok = OperationId::new("op-ok").expect("op");
+        journal
+            .append_intent(ok, [1; 32], "create_volume", serde_json::json!({}))
+            .expect("first append succeeds");
+
+        let blocked = OperationId::new("op-blocked").expect("op");
+        let err = journal
+            .append_intent(blocked, [2; 32], "create_volume", serde_json::json!({}))
+            .expect_err("second append fails");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("injected"));
     }
 }

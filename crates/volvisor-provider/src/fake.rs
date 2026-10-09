@@ -43,6 +43,8 @@ struct FakeState {
     creation_payloads: BTreeMap<VolumeId, String>,
     /// Fault injected by [`FakeProvider::set_next_failure`].
     next_failure: Option<ApiError>,
+    /// Whether the fake admin device is claimed (admin-surface tests).
+    admin_device_claimed: bool,
 }
 
 /// Deterministic, thread-safe, fault-injectable in-memory provider.
@@ -119,6 +121,16 @@ impl FakeProvider {
     /// generation) succeeds normally.
     pub async fn set_next_failure(&self, failure: Option<ApiError>) {
         self.state.lock().await.next_failure = failure;
+    }
+
+    /// Admin-surface state: whether the fake device is claimed.
+    pub(crate) async fn admin_device_claimed(&self) -> bool {
+        self.state.lock().await.admin_device_claimed
+    }
+
+    /// Admin-surface state: set the fake device claim flag.
+    pub(crate) async fn set_admin_device_claimed(&self, claimed: bool) {
+        self.state.lock().await.admin_device_claimed = claimed;
     }
 
     /// Test hook: force a volume into an arbitrary lifecycle state,

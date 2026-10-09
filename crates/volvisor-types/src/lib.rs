@@ -24,6 +24,7 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod admin;
 pub mod capability;
 pub mod domain;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod id;
 pub mod request;
 pub mod state;
 
+pub use admin::{ClaimDeviceRequest, DeviceListResponse, ReleaseDeviceRequest};
 pub use capability::{Capability, CapabilitySet};
 pub use domain::{
     AccessMode, Attachment, AttachmentState, DeviceRole, EffectiveProtection, FailureDomain,

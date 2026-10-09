@@ -142,9 +142,12 @@ Dependency direction: `api`, `lvm` → `provider` → `types`; `journal` → `ty
   honestly as not-yet-implemented in `evidence_status`).
 - Grow: `lvextend` (grow-only; shrink requests rejected), verify actual size via
   `lvs`, report `guest_notification_status: NotApplicable` honestly.
-- Delete: only when `Detached` for > drain grace, correct generation, no dependents;
+- Delete: only when fully `Detached`, correct generation, no dependents;
   `lvremove` + ownership reconciliation; foreign/mismatched LVM state → `Quarantined`,
-  never auto-adopted (AGENTS rule 7).
+  never auto-adopted (AGENTS rule 7). A detach drain-grace timer is deferred to the
+  VMM-integration milestone: with `prepared`-only attachments no guest I/O can be in
+  flight, so the contract's fully-detached precondition (API v2 section 4) is exactly
+  satisfied today.
 - Unit tests against a fake command runner; integration tests (env-gated) create a
   loop-backed PV/VG, run the full lifecycle, and simulate crash-replay.
 
@@ -208,3 +211,45 @@ Dependency direction: `api`, `lvm` → `provider` → `types`; `journal` → `ty
 - r12: no production claims; `evidence_status` field exists and reports honestly.
 - r14/§4A: grow-only resize; online-move API surface present but returns
   unsupported for LVM provider until separately qualified.
+
+## 10. Review round 1 (2026-10-09) — findings disposition
+
+Adversarial review of PR #3 produced six findings (F1-F6) and seven nits; all were
+fixed in the same PR:
+
+- F1 extent rounding: LVM rounds LVs up to the physical-extent boundary; create/grow
+  now treat `actual >= requested` as success, persist and report the **effective**
+  (rounded) size, and keep the requested size for idempotent-create replay
+  comparison. No orphaned LVs; conformance fixtures stay extent-aligned.
+- F2 delete of `Failed` volumes: an absent LV is skipped instead of failing
+  `lvremove`, so a `Failed` volume can always be deleted and its pool released.
+- F3 claim/release journaling: device claim/release is exposed as an
+  `AdminSurface` trait routed through the same journal pipeline (durable intent
+  before the destructive `pvcreate`/`vgcreate`); release failure leaves state
+  matching observed reality with a remediation hint instead of error-looping.
+- F4 fail-closed admin auth: mutating endpoints are rejected when no
+  `admin_token` is configured, and non-loopback binds without a token are
+  refused at startup.
+- F5 journal confidentiality: journal, lock and state files are mode 0600, and
+  journaled payloads redact credential-bearing fields (`encryption.key_ref`,
+  `authorization_token`).
+- F6 test realism: the LVM fake now mirrors real LVM behavior (missing-LV
+  `lvremove` failure, name-collision failure, extent rounding); an HTTP-level
+  concurrent same-`operation_id` test, a journal-append fault-injection test
+  (feature `test-faults`) and a proptest state-machine suite were added.
+- Nits: LV names are injective (sanitized id + hash suffix, never dash-leading),
+  LVM commands carry a watchdog timeout, `RealRunner` no longer stalls unbounded,
+  MSRV is CI-enforced, cargo-deny is version-pinned, and the drain-grace deferral
+  is documented in section 5.4.
+
+### Recorded follow-ups (accepted, out of P0 scope)
+
+- **Volume-id ABA**: deleting and re-creating a volume with the same id restarts
+  generation numbering at 1. A stale client certificate from a prior incarnation
+  could match the new one. Mitigation candidate: per-id generation tombstones.
+- **Journal compaction**: the append-only log grows without bound in P0.
+- **Blocking command execution**: LVM commands run on the async runtime threads,
+  bounded by the watchdog timeout; move to `spawn_blocking` when contention is
+  measured.
+- **Admin surface coverage in conformance kit**: claim/release semantics are
+  tested per-provider, not yet by the shared kit.

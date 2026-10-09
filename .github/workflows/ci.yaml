@@ -33,10 +33,23 @@ jobs:
       - name: Run LVM-gated integration tests
         run: sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test -p volvisor-lvm --features integration-lvm
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      # Enforce the declared workspace rust-version (1.85, the edition-2024
+      # minimum) against the committed lockfile. If a dependency drifts to a
+      # version needing a newer compiler, this job fails and the dep must be
+      # pinned back or the MSRV claim raised deliberately.
+      - run: cargo check --workspace --all-targets
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-deny --locked
+      # Pinned for reproducibility; bump deliberately with a lockfile review.
+      - run: cargo install cargo-deny --locked --version 0.18.5
       - run: cargo deny check

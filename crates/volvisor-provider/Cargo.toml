@@ -18,3 +18,6 @@ volvisor-types = { workspace = true }
 
 # tokio (macros + rt) and serde_json are regular dependencies of this crate,
 # so no separate dev-dependency section is required for the in-crate tests.
+
+[dev-dependencies]
+proptest = { workspace = true }

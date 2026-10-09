@@ -26,9 +26,11 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod admin;
 pub mod conformance;
 pub mod fake;
 pub mod provider;
 
+pub use admin::AdminSurface;
 pub use fake::FakeProvider;
 pub use provider::VolumeProvider;
