@@ -63,8 +63,13 @@ mod common;
 
 /// One gibibyte (extent-aligned under the fixture's 4-MiB extents).
 const GIB: u64 = 1 << 30;
-/// The witness auth token both sides share.
+/// The witness auth token both sides share (the legacy read-only
+/// credential on a v2 witness: `kit.client` inspects with it).
 const TOKEN: &str = "authority-test-token";
+/// Per-host witness credentials (W8): each side's daemon mutates with
+/// its own host's token.
+const NODE_TOKEN: &str = "authority-test-node-a-token";
+const PEER_TOKEN: &str = "authority-test-node-b-token";
 /// Deterministic knobs: ttl 100s, grace 5s, budget 5s (the W7 wait
 /// ends 10s past a lease's recorded end), clocks starting at t=1000.
 const TTL: u64 = 100;
@@ -89,9 +94,13 @@ async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
         },
     )
     .expect("witness core opens");
+    let mut host_tokens = std::collections::BTreeMap::new();
+    host_tokens.insert(NODE.to_owned(), NODE_TOKEN.to_owned());
+    host_tokens.insert(PEER_NODE.to_owned(), PEER_TOKEN.to_owned());
     let state = Arc::new(WitnessServerState::with_clock(
         core,
         Some(TOKEN.to_owned()),
+        host_tokens,
         Arc::new(move || clock.load(Ordering::SeqCst)),
     ));
     let app = router(state);
@@ -105,10 +114,22 @@ async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
     Server { addr, handle }
 }
 
+/// The legacy shared-token client (read-only on a v2 witness: used for
+/// witness-side inspection).
 fn client_for(server: &Server) -> HttpWitnessConnection {
     HttpWitnessConnection::new(
         format!("http://{}", server.addr),
         Some(TOKEN.to_owned()),
+        Duration::from_secs(5),
+    )
+}
+
+/// The client presenting `host`'s W8 credential (the mutating surface).
+fn host_client_for(server: &Server, host: &str) -> HttpWitnessConnection {
+    let token = if host == NODE { NODE_TOKEN } else { PEER_TOKEN };
+    HttpWitnessConnection::new(
+        format!("http://{}", server.addr),
+        Some(token.to_owned()),
         Duration::from_secs(5),
     )
 }
@@ -157,7 +178,7 @@ fn resource_of(volume_id: &str) -> String {
 fn authority_for(kit: &WitnessKit, host: &str, renewal_interval: u64) -> AuthorityContext {
     let connection: Arc<dyn volvisor_witness::BlockingWitnessConnection> =
         Arc::new(BlockingWitness::new(
-            Arc::new(client_for(&kit.server)),
+            Arc::new(host_client_for(&kit.server, host)),
             tokio::runtime::Handle::current(),
             Duration::from_secs(5),
         ));
@@ -259,9 +280,10 @@ fn barrier() -> RecordedBarrier {
 }
 
 /// Grant a lease to the PEER host directly at the witness (failover
-/// setup: another writer holds or held authority).
+/// setup: another writer holds or held authority). Presented with the
+/// peer's own W8 credential.
 async fn grant_to_peer(kit: &WitnessKit, volume_id: &VolumeId) {
-    kit.client
+    host_client_for(&kit.server, PEER_NODE)
         .grant(
             volume_id,
             GrantRequest {

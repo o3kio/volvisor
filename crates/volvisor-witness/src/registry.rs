@@ -1239,21 +1239,7 @@ impl WitnessCore {
             Mutation::Register {
                 volume_id,
                 registration,
-            } => {
-                self.volumes.insert(
-                    volume_id.clone(),
-                    VolumeAuthority {
-                        registration: registration.clone(),
-                        current_epoch: WriterEpoch::pre_authority(),
-                        holder: None,
-                        lease: None,
-                        last_proof: None,
-                        barriers: Vec::new(),
-                        retirements: Vec::new(),
-                        last_commit: 0,
-                    },
-                );
-            }
+            } => self.apply_register(volume_id, registration),
             Mutation::Grant {
                 volume_id,
                 host_id,
@@ -1261,125 +1247,203 @@ impl WitnessCore {
                 lease_id,
                 end_secs,
                 proof,
-            } => {
-                if let Some(vol) = self.volumes.get_mut(volume_id) {
-                    // W2: the grant retires every epoch below the
-                    // granted one — recorded with the grant's own
-                    // commit index so barriers can be ordered against
-                    // it (the pre-authority epoch's implicit
-                    // retirement by a first grant is included).
-                    retire_epoch(vol, proof.retired_epoch, commit_index);
-                    vol.current_epoch = *epoch;
-                    vol.holder = Some(host_id.clone());
-                    vol.lease = Some(LeaseRecord {
-                        lease_id: *lease_id,
-                        holder: host_id.clone(),
-                        epoch: *epoch,
-                        end_secs: *end_secs,
-                        revoked: false,
-                        self_released: false,
-                        power_off_attested: false,
-                    });
-                    vol.last_proof = Some(proof.clone());
-                }
-                self.next_lease_id = self.next_lease_id.max(lease_id.0 + 1);
-            }
+            } => self.apply_grant(
+                commit_index,
+                volume_id,
+                host_id,
+                *epoch,
+                *lease_id,
+                *end_secs,
+                proof,
+            ),
             Mutation::Renew {
                 volume_id,
                 lease_id,
                 end_secs,
-            } => {
-                if let Some(vol) = self.volumes.get_mut(volume_id) {
-                    if let Some(lease) = vol.lease.as_mut() {
-                        if lease.lease_id == *lease_id {
-                            lease.end_secs = *end_secs;
-                        }
-                    }
-                }
-            }
+            } => self.apply_renew(volume_id, *lease_id, *end_secs),
             Mutation::Revoke {
                 volume_id,
                 proof,
                 self_released,
                 power_off_attested,
                 ..
-            } => {
-                if let Some(vol) = self.volumes.get_mut(volume_id) {
-                    // The revoked lease's epoch is the current epoch
-                    // (W4 checked it at commit time); the retirement
-                    // is sealed at this mutation's own commit index.
-                    retire_epoch(vol, proof.retired_epoch, commit_index);
-                    if let Some(lease) = vol.lease.as_mut() {
-                        lease.revoked = true;
-                        lease.self_released = *self_released;
-                        lease.power_off_attested = *power_off_attested;
-                    }
-                    vol.last_proof = Some(proof.clone());
-                }
-            }
+            } => self.apply_revoke(
+                commit_index,
+                volume_id,
+                proof,
+                *self_released,
+                *power_off_attested,
+            ),
             Mutation::RecordBarrier { volume_id, barrier } => {
-                if let Some(vol) = self.volumes.get_mut(volume_id) {
-                    vol.barriers.push(barrier.clone());
-                }
+                self.apply_record_barrier(volume_id, barrier);
             }
             Mutation::VoidBarrier {
                 volume_id,
                 holder,
                 epoch,
                 boundary_commit_index,
-            } => {
-                if let Some(vol) = self.volumes.get_mut(volume_id) {
-                    // `(holder, epoch, boundary_commit_index)`
-                    // identifies the entry uniquely (each record
-                    // barrier is its own commit).
-                    if let Some(barrier) = vol.barriers.iter_mut().find(|barrier| {
-                        barrier.holder == *holder
-                            && barrier.epoch == *epoch
-                            && barrier.boundary_commit_index == *boundary_commit_index
-                    }) {
-                        barrier.voided = true;
-                    }
-                }
-            }
-            Mutation::RevokeSet { releases } => {
-                for entry in releases {
-                    let Some(vol) = self.volumes.get_mut(&entry.volume_id) else {
-                        continue;
-                    };
-                    retire_epoch(vol, entry.proof.retired_epoch, commit_index);
-                    if let Some(lease) = vol.lease.as_mut() {
-                        lease.revoked = true;
-                        lease.self_released = entry.self_released;
-                    }
-                    vol.last_proof = Some(entry.proof.clone());
-                }
-            }
-            Mutation::GrantSet { grants } => {
-                for record in grants {
-                    let Some(vol) = self.volumes.get_mut(&record.volume_id) else {
-                        continue;
-                    };
-                    retire_epoch(vol, record.proof.retired_epoch, commit_index);
-                    vol.current_epoch = record.epoch;
-                    vol.holder = Some(record.host_id.clone());
-                    vol.lease = Some(LeaseRecord {
-                        lease_id: record.lease_id,
-                        holder: record.host_id.clone(),
-                        epoch: record.epoch,
-                        end_secs: record.end_secs,
-                        revoked: false,
-                        self_released: false,
-                        power_off_attested: false,
-                    });
-                    vol.last_proof = Some(record.proof.clone());
-                    self.next_lease_id = self.next_lease_id.max(record.lease_id.0 + 1);
-                }
-            }
+            } => self.apply_void_barrier(volume_id, holder, *epoch, *boundary_commit_index),
+            Mutation::RevokeSet { releases } => self.apply_revoke_set(commit_index, releases),
+            Mutation::GrantSet { grants } => self.apply_grant_set(commit_index, grants),
         }
         for volume_id in mutation.volume_ids() {
             if let Some(vol) = self.volumes.get_mut(volume_id) {
                 vol.last_commit = commit_index;
             }
+        }
+    }
+
+    /// `Mutation::Register` fold: a fresh authority at the
+    /// pre-authority epoch with no holder, lease or W9 records.
+    fn apply_register(&mut self, volume_id: &VolumeId, registration: &VolumeRegistration) {
+        self.volumes.insert(
+            volume_id.clone(),
+            VolumeAuthority {
+                registration: registration.clone(),
+                current_epoch: WriterEpoch::pre_authority(),
+                holder: None,
+                lease: None,
+                last_proof: None,
+                barriers: Vec::new(),
+                retirements: Vec::new(),
+                last_commit: 0,
+            },
+        );
+    }
+
+    /// `Mutation::Grant` fold (W2: retires every older epoch, the
+    /// pre-authority epoch's implicit retirement included).
+    fn apply_grant(
+        &mut self,
+        commit_index: u64,
+        volume_id: &VolumeId,
+        host_id: &HostId,
+        epoch: WriterEpoch,
+        lease_id: LeaseId,
+        end_secs: u64,
+        proof: &FencingProof,
+    ) {
+        if let Some(vol) = self.volumes.get_mut(volume_id) {
+            // The grant retires every epoch below the granted one —
+            // recorded with the grant's own commit index so barriers
+            // can be ordered against it.
+            retire_epoch(vol, proof.retired_epoch, commit_index);
+            vol.current_epoch = epoch;
+            vol.holder = Some(host_id.clone());
+            vol.lease = Some(LeaseRecord {
+                lease_id,
+                holder: host_id.clone(),
+                epoch,
+                end_secs,
+                revoked: false,
+                self_released: false,
+                power_off_attested: false,
+            });
+            vol.last_proof = Some(proof.clone());
+        }
+        self.next_lease_id = self.next_lease_id.max(lease_id.0 + 1);
+    }
+
+    /// `Mutation::Renew` fold: extends the named lease's end.
+    fn apply_renew(&mut self, volume_id: &VolumeId, lease_id: LeaseId, end_secs: u64) {
+        if let Some(vol) = self.volumes.get_mut(volume_id) {
+            if let Some(lease) = vol.lease.as_mut() {
+                if lease.lease_id == lease_id {
+                    lease.end_secs = end_secs;
+                }
+            }
+        }
+    }
+
+    /// `Mutation::Revoke` fold: the revoked lease's epoch is the
+    /// current epoch (W4 checked it at commit time); the retirement is
+    /// sealed at this mutation's own commit index.
+    fn apply_revoke(
+        &mut self,
+        commit_index: u64,
+        volume_id: &VolumeId,
+        proof: &FencingProof,
+        self_released: bool,
+        power_off_attested: bool,
+    ) {
+        if let Some(vol) = self.volumes.get_mut(volume_id) {
+            retire_epoch(vol, proof.retired_epoch, commit_index);
+            if let Some(lease) = vol.lease.as_mut() {
+                lease.revoked = true;
+                lease.self_released = self_released;
+                lease.power_off_attested = power_off_attested;
+            }
+            vol.last_proof = Some(proof.clone());
+        }
+    }
+
+    /// `Mutation::RecordBarrier` fold (W9): appends the stamped entry.
+    fn apply_record_barrier(&mut self, volume_id: &VolumeId, barrier: &RecordedMigrationBarrier) {
+        if let Some(vol) = self.volumes.get_mut(volume_id) {
+            vol.barriers.push(barrier.clone());
+        }
+    }
+
+    /// `Mutation::VoidBarrier` fold (W9): `(holder, epoch,
+    /// boundary_commit_index)` identifies the entry uniquely (each
+    /// record barrier is its own commit).
+    fn apply_void_barrier(
+        &mut self,
+        volume_id: &VolumeId,
+        holder: &HostId,
+        epoch: WriterEpoch,
+        boundary_commit_index: u64,
+    ) {
+        if let Some(vol) = self.volumes.get_mut(volume_id) {
+            if let Some(barrier) = vol.barriers.iter_mut().find(|barrier| {
+                barrier.holder == *holder
+                    && barrier.epoch == epoch
+                    && barrier.boundary_commit_index == boundary_commit_index
+            }) {
+                barrier.voided = true;
+            }
+        }
+    }
+
+    /// `Mutation::RevokeSet` fold (W10): every member lease flipped by
+    /// the one batch mutation, all retirements sharing its commit
+    /// index.
+    fn apply_revoke_set(&mut self, commit_index: u64, releases: &[RevokeSetEntry]) {
+        for entry in releases {
+            let Some(vol) = self.volumes.get_mut(&entry.volume_id) else {
+                continue;
+            };
+            retire_epoch(vol, entry.proof.retired_epoch, commit_index);
+            if let Some(lease) = vol.lease.as_mut() {
+                lease.revoked = true;
+                lease.self_released = entry.self_released;
+            }
+            vol.last_proof = Some(entry.proof.clone());
+        }
+    }
+
+    /// `Mutation::GrantSet` fold (W10): every member grant applied by
+    /// the one batch mutation, all retirements sharing its commit
+    /// index.
+    fn apply_grant_set(&mut self, commit_index: u64, grants: &[GrantRecord]) {
+        for record in grants {
+            let Some(vol) = self.volumes.get_mut(&record.volume_id) else {
+                continue;
+            };
+            retire_epoch(vol, record.proof.retired_epoch, commit_index);
+            vol.current_epoch = record.epoch;
+            vol.holder = Some(record.host_id.clone());
+            vol.lease = Some(LeaseRecord {
+                lease_id: record.lease_id,
+                holder: record.host_id.clone(),
+                epoch: record.epoch,
+                end_secs: record.end_secs,
+                revoked: false,
+                self_released: false,
+                power_off_attested: false,
+            });
+            vol.last_proof = Some(record.proof.clone());
+            self.next_lease_id = self.next_lease_id.max(record.lease_id.0 + 1);
         }
     }
 }
@@ -2658,7 +2722,7 @@ mod tests {
     // ------------------------------------------------------ P4b W10
 
     #[test]
-    fn w10_revoke_set_is_all_or_nothing_with_one_bump() {
+    fn w10_revoke_set_refusals_journal_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = registered_pair(dir.path());
         core.grant(&volume(1), &grant_request(2, 1), 1_000, &caller(1))
@@ -2729,6 +2793,18 @@ mod tests {
             .expect_err("duplicate member refused"),
             WitnessError::InvalidRequest(_)
         ));
+        assert_eq!(core.commit_index(), commit, "nothing journaled");
+    }
+
+    #[test]
+    fn w10_revoke_set_is_all_or_nothing_with_one_bump() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = registered_pair(dir.path());
+        core.grant(&volume(1), &grant_request(2, 1), 1_000, &caller(1))
+            .expect("grant vol-1");
+        core.grant(&volume(2), &grant_request(3, 1), 1_000, &caller(1))
+            .expect("grant vol-2");
+        let commit = core.commit_index();
 
         // The good batch: every member's proof shares the single new
         // commit index; one bump for the set.
@@ -2803,7 +2879,7 @@ mod tests {
             .retirements
             .iter()
             .find(|retired| retired.epoch == WriterEpoch(1))
-            .cloned()
+            .copied()
             .map(|retired| (retired.commit_index, retired.epoch))
             .expect("recorded retirement");
         let commit = core.commit_index();
@@ -2851,14 +2927,15 @@ mod tests {
     }
 
     #[test]
-    fn w10_grant_set_is_all_or_nothing_and_retires_lingering_epochs() {
+    fn w10_grant_set_refusals_journal_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut core = registered_pair(dir.path());
         core.grant(&volume(1), &grant_request(2, 1), 1_000, &caller(1))
             .expect("grant vol-1");
         core.grant(&volume(2), &grant_request(3, 1), 1_000, &caller(1))
             .expect("grant vol-2");
-        // The source self-releases both (waives the W7 wait).
+        // The source self-releases both (waives the W7 wait) so a
+        // member's live lease is not what refuses the batch first.
         core.revoke_set(
             &revoke_set_request(
                 4,
@@ -2901,7 +2978,36 @@ mod tests {
             }
         );
         assert_eq!(core.commit_index(), commit + 1, "only the single grant");
-        // Undo vol-2's live lease so the batch can proceed.
+    }
+
+    #[test]
+    fn w10_grant_set_is_all_or_nothing_and_retires_lingering_epochs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = registered_pair(dir.path());
+        core.grant(&volume(1), &grant_request(2, 1), 1_000, &caller(1))
+            .expect("grant vol-1");
+        core.grant(&volume(2), &grant_request(3, 1), 1_000, &caller(1))
+            .expect("grant vol-2");
+        // The source self-releases both (waives the W7 wait).
+        core.revoke_set(
+            &revoke_set_request(
+                4,
+                1,
+                vec![
+                    batch_release(1, WriterEpoch(1)),
+                    batch_release(2, WriterEpoch(1)),
+                ],
+            ),
+            1_050,
+            &caller(1),
+        )
+        .expect("revoke-set");
+        let commit = core.commit_index();
+
+        // vol-2 passes through a grant/release cycle for the W1 check;
+        // undo its live lease so the batch can proceed.
+        core.grant(&volume(2), &grant_request(6, 2), 1_060, &caller(2))
+            .expect("live grant on vol-2");
         core.revoke(
             &volume(2),
             &revoke_request(8, 2, WriterEpoch(2)),
@@ -2956,7 +3062,7 @@ mod tests {
                 .retirements
                 .iter()
                 .find(|retired| retired.epoch == *retired_epoch)
-                .cloned()
+                .copied()
                 .expect("previous epoch retired");
             assert!(sealed.commit_index < shared);
         }
