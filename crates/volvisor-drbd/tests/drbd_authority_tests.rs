@@ -42,12 +42,13 @@ use common::{
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
 use volvisor_drbd::report::Role;
-use volvisor_drbd::state::{DrbdState, PendingFence, ReplicationMode};
+use volvisor_drbd::state::{DrbdState, PendingFence, ReplicationMode, UnverifiableVolume};
+use volvisor_drbd::{CommandOutput, CommandRunner, FakeRunner};
 use volvisor_provider::VolumeProvider;
 use volvisor_types::request::{AccessModeRequest, AttachVolumeRequest, DetachVolumeRequest};
 use volvisor_types::{
-    ApiErrorCode, AttachmentId, DrainProof, HostId, LeaseState, LossBoundary, OperationId,
-    PromotionClassification, RecordedBarrier, VolumeId,
+    ApiError, ApiErrorCode, AttachmentId, DrainProof, HostId, LeaseState, LossBoundary,
+    OperationId, PromotionClassification, RecordedBarrier, VolumeId,
 };
 use volvisor_witness::BlockingWitness;
 use volvisor_witness::client::{HttpWitnessConnection, WitnessConnection};
@@ -1224,4 +1225,159 @@ async fn a_crash_mid_fence_is_completed_by_the_reconciler() {
         .await
         .expect("inspect");
     assert_eq!(inspect.state, volvisor_types::VolumeLifecycle::Ready);
+}
+
+// --------------------------------------------- review-round-2 additions
+
+/// A runner wrapper for fault injection: `drbdsetup status` for the
+/// given resource FAILS TO EXECUTE once the resource is actually
+/// Primary — the post-promotion verification path cannot observe the
+/// role. Everything else forwards verbatim to the real fake surface.
+struct StatusBlindWhenPrimary {
+    inner: Arc<FakeRunner>,
+    world: Arc<Mutex<FakeDrbd>>,
+    resource: String,
+}
+
+impl CommandRunner for StatusBlindWhenPrimary {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ApiError> {
+        if program == "drbdsetup"
+            && args.first().copied() == Some("status")
+            && args.get(1).copied() == Some(self.resource.as_str())
+        {
+            let primary = self
+                .world
+                .lock()
+                .expect("world")
+                .resources
+                .get(&self.resource)
+                .is_some_and(|state| state.role == Role::Primary);
+            if primary {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    "drbdsetup status: simulated verification blindness",
+                ));
+            }
+        }
+        self.inner.run(program, args)
+    }
+}
+
+/// The F1 invariant: when a promotion cannot be VERIFIED (the status
+/// query fails with the resource actually Primary), the unwind fences
+/// the residue but does NOT release the lease — a self-release would
+/// waive the next grant's W7 wait while a writer might still be
+/// serving. The lease stays live at the witness; the next grant waits
+/// out the window keyed on its recorded end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unverifiable_promotion_never_releases_the_lease() {
+    let kit = witness_kit().await;
+    let f = fixture();
+    seed_volume_with_protocol(&f.base, &f.world, "vol-blind", GIB, ReplicationMode::A);
+    let vol = volume("vol-blind");
+    let primary = authority_provider(&kit, &f.state_path, &f.world);
+    primary.register_volume(&vol, None).expect("register");
+    flip_world_to_peer(&f.world);
+    let peer = DrbdProvider::with_authority(
+        Arc::new(StatusBlindWhenPrimary {
+            inner: FakeDrbd::runner(&f.world),
+            world: Arc::clone(&f.world),
+            resource: resource_of("vol-blind"),
+        }),
+        common::config_for_peer(&f.base),
+        f.base.join("state-peer.json"),
+        authority_for(&kit, PEER_NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("peer provider construction");
+    let error = peer
+        .adopt_and_promote(&vol, true)
+        .expect_err("the promotion cannot be verified");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    // The residue is fenced and tracked: suspended, marker durable,
+    // Failed — never an untracked Primary.
+    let resource = resource_of("vol-blind");
+    assert_eq!(role_of(&f.world, &resource), Role::Primary);
+    assert!(suspended(&f.world, SEED_MINOR));
+    let disk = DrbdState::load(&f.base.join("state-peer.json")).expect("load state");
+    let entry = disk.volume(&vol).expect("tracked volume");
+    assert!(entry.runtime.fence.is_some(), "the fence marker is durable");
+    assert_eq!(entry.runtime.state, volvisor_types::VolumeLifecycle::Failed);
+    // The F1 core: the lease is NOT released (a release here would
+    // waive the W7 wait for the next grant while the suspended device
+    // is still Primary).
+    let view = kit.client.inspect(&vol).await.expect("view");
+    assert_eq!(view.lease_state, LeaseState::Live);
+    // A restart with a healthy runner completes the fence (demote,
+    // resume, clear) — and the lease still holds until it lapses.
+    let healed = DrbdProvider::with_authority(
+        FakeDrbd::runner(&f.world),
+        common::config_for_peer(&f.base),
+        f.base.join("state-peer.json"),
+        authority_for(&kit, PEER_NODE, INTERVAL),
+    )
+    .map(Arc::new)
+    .expect("healed provider construction");
+    let report = healed
+        .last_reconcile_report()
+        .expect("report lock")
+        .expect("startup report");
+    assert!(report.completed_fences.contains(&vol));
+    assert_eq!(role_of(&f.world, &resource), Role::Secondary);
+    assert!(!suspended(&f.world, SEED_MINOR));
+    let view = kit.client.inspect(&vol).await.expect("view");
+    assert_eq!(
+        view.lease_state,
+        LeaseState::Live,
+        "the lease lapses on its own; it is never released un-demoted"
+    );
+}
+
+/// The renewal pass's fence lane (F3): a busy-device fence is completed
+/// by the NEXT renewal pass once the device closes — no restart
+/// required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_renewal_pass_completes_a_pending_fence_without_a_restart() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-lane").await;
+    // The VM holds the device open: the fence suspends I/O but the
+    // kernel refuses the demotion — the marker stays.
+    state
+        .world
+        .lock()
+        .expect("world")
+        .open_devices
+        .insert(SEED_MINOR);
+    kit.witness_clock
+        .store(START + TTL + 5 + 5 + 1, Ordering::SeqCst);
+    grant_to_peer(&kit, &state.volume).await;
+    kit.writer_clock
+        .store(START + INTERVAL + 1, Ordering::SeqCst);
+    let report = state.provider.renew_leases().expect("first pass");
+    assert_eq!(report.fenced.len(), 1);
+    assert!(
+        !report.fenced[0].demoted,
+        "the open device refuses demotion"
+    );
+    assert!(suspended(&state.world, SEED_MINOR));
+    // The device closes; the next renewal pass (not a restart)
+    // completes the fence through the lane.
+    state
+        .world
+        .lock()
+        .expect("world")
+        .open_devices
+        .remove(&SEED_MINOR);
+    let report = state.provider.renew_leases().expect("second pass");
+    assert_eq!(report.completed_fences, vec![state.volume.clone()]);
+    assert_eq!(report.fence_failures, Vec::<UnverifiableVolume>::new());
+    assert!(
+        !suspended(&state.world, SEED_MINOR),
+        "the fence completion lifts the suspension"
+    );
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    let disk = DrbdState::load(&state.state_path).expect("load state");
+    let entry = disk.volume(&state.volume).expect("volume");
+    assert!(entry.runtime.fence.is_none(), "the marker is cleared");
+    assert_eq!(entry.runtime.state, volvisor_types::VolumeLifecycle::Ready);
 }

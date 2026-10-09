@@ -83,6 +83,9 @@ pub fn router(state: Arc<WitnessServerState>) -> Router {
         .route("/v1/volumes/{volume_id}/revoke", post(revoke_handler))
         .route("/v1/volumes/{volume_id}", get(inspect_handler))
         .route("/healthz", get(healthz_handler))
+        // An explicit, small body limit (the witness payloads are tiny;
+        // the default would silently accept megabytes).
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
 

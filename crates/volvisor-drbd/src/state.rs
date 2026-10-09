@@ -334,6 +334,14 @@ pub struct RenewalReport {
     /// until its W5 local deadline, which is carried here — the honest
     /// bound, never a guess.
     pub deferred: Vec<DeferredRenewal>,
+    /// Pending fences completed this pass (a marked resource's device
+    /// closed and the shared completion demoted, resumed and cleared
+    /// it) — the renewal pass's fence lane, so a busy-device fence
+    /// does not stay suspended until a restart.
+    pub completed_fences: Vec<VolumeId>,
+    /// Fence-completion failures this pass (reported, never hidden;
+    /// retried by the next pass).
+    pub fence_failures: Vec<UnverifiableVolume>,
 }
 
 /// A renewal that failed without proving authority lost.

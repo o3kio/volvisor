@@ -710,8 +710,106 @@ impl DrbdProvider {
     ///
     /// # Errors
     /// `INTERNAL` when a command or the state save fails (the fence is
-    /// then retried by the next pass — the suspended state is already
-    /// durable in the kernel).
+    /// then retried by the next renewal pass and, after a restart, by
+    /// the startup reconcile — the suspension is already durable in
+    /// the kernel whenever the suspend itself succeeded; a suspended
+    /// data path is guaranteed only while the local `drbdsetup` path
+    /// is healthy, and the witness's W7 window — keyed on the lease's
+    /// recorded end — is the bound that covers a suspension that is
+    /// slow or failing).
+    /// The fence-completion core shared by the startup reconcile and
+    /// the renewal pass's fence lane: demote a still-Primary marked
+    /// resource (a busy refusal returns `Ok(false)` — the device is
+    /// still open, retried by the next pass), lift the suspension once
+    /// demoted, clear the marker and return the volume to `Ready`.
+    /// Never a silent resume. The caller owns the state save and the
+    /// reporting.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the demotion or the resume command fails.
+    fn try_complete_fence(
+        &self,
+        state: &mut DrbdState,
+        id: &VolumeId,
+        entry: &VolumeEntry,
+        is_primary: bool,
+    ) -> Result<bool, ApiError> {
+        let mut demoted = !is_primary;
+        if !demoted {
+            let output = self.run_drbdadm("secondary", &entry.resource_name)?;
+            demoted = output.success;
+        }
+        if !demoted {
+            return Ok(false);
+        }
+        self.resume_io(entry.minor)?;
+        if let Some(volume) = state.volume_mut(id) {
+            volume.runtime.fence = None;
+            volume.runtime.state = VolumeLifecycle::Ready;
+        }
+        Ok(true)
+    }
+
+    /// The renewal pass's fence lane: for every entry carrying a
+    /// [`PendingFence`] marker, attempt the shared completion (demote
+    /// if the device closed, resume, clear, `Ready`). Query and
+    /// completion failures are reported (never hidden) and retried by
+    /// the next pass; they never abort the renewal pass — the lease
+    /// deadlines of the other volumes must not depend on one stuck
+    /// fence. Without this lane, a busy-device fence would stay
+    /// suspended until a restart. A downed resource is left to the
+    /// startup reconcile's downed-volume handling.
+    fn complete_pending_fences(&self, state: &mut DrbdState, report: &mut RenewalReport) {
+        let ids: Vec<VolumeId> = state.volumes().keys().cloned().collect();
+        for id in ids {
+            let Some(snapshot) = state.volume(&id).cloned() else {
+                continue;
+            };
+            if snapshot.runtime.fence.is_none() {
+                continue;
+            }
+            let entry = snapshot.entry;
+            let status = match self.resource_status(&entry.resource_name) {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id,
+                        detail: format!(
+                            "querying {} for fence completion failed: {}",
+                            entry.resource_name, error.detail
+                        ),
+                    });
+                    continue;
+                }
+            };
+            match self.try_complete_fence(state, &id, &entry, status.role == Role::Primary) {
+                Ok(true) => match state.save(&self.state_path) {
+                    Ok(()) => report.completed_fences.push(id),
+                    Err(error) => {
+                        report.fence_failures.push(UnverifiableVolume {
+                            volume_id: id,
+                            detail: format!(
+                                "saving the completed fence of {} failed: {}",
+                                entry.resource_name, error.detail
+                            ),
+                        });
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id,
+                        detail: format!(
+                            "completing the fence of {} failed: {}",
+                            entry.resource_name, error.detail
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     fn self_fence(
         &self,
         state: &mut DrbdState,
@@ -725,12 +823,17 @@ impl DrbdProvider {
         // this point leaves the marker that routes the restart through
         // reconcile's fence-completion path (which demotes, resumes and
         // clears it) — never a suspended Secondary that nothing resumes
-        // while the state claims it is healthy.
+        // while the state claims it is healthy. A failed marker save
+        // does NOT stop the fence: the suspension is already durable
+        // in the kernel and the demotion is safe regardless of what
+        // the on-disk record says; the save error is returned at the
+        // end so the caller reports it.
         let fenced = FencedVolume {
             volume_id: volume_id.clone(),
             reasons,
             demoted: false,
         };
+        let mut save_error = None;
         if let Some(volume) = state.volume_mut(volume_id) {
             volume.runtime.attachment = None;
             volume.runtime.authority = None;
@@ -744,7 +847,9 @@ impl DrbdProvider {
             });
             volume.runtime.state = VolumeLifecycle::Failed;
             volume.entry.generation += 1;
-            state.save(&self.state_path)?;
+            if let Err(error) = state.save(&self.state_path) {
+                save_error = Some(error);
+            }
         }
         let demoted = match self.resource_status(&entry.resource_name)? {
             Some(status) if status.role == Role::Primary => {
@@ -764,8 +869,9 @@ impl DrbdProvider {
         // Lift the suspension once the demotion completed: the writer
         // is provably gone and a suspended Secondary would silently
         // freeze the next attachment's I/O. A failed resume keeps the
-        // pending-fence marker (reconcile retries the completion) —
-        // never a silent freeze, never a silent resume.
+        // pending-fence marker (the renewal pass and the startup
+        // reconcile retry the completion) — never a silent freeze,
+        // never a silent resume.
         let mut resume_error = None;
         if demoted {
             if let Err(error) = self.resume_io(entry.minor) {
@@ -780,10 +886,15 @@ impl DrbdProvider {
             if let Some(volume) = state.volume_mut(volume_id) {
                 volume.runtime.fence = None;
                 volume.runtime.state = VolumeLifecycle::Ready;
-                state.save(&self.state_path)?;
+                if let Err(error) = state.save(&self.state_path) {
+                    save_error = save_error.or(Some(error));
+                }
             }
         }
         let fenced = FencedVolume { demoted, ..fenced };
+        if let Some(error) = save_error {
+            return Err(error);
+        }
         if let Some(error) = resume_error {
             return Err(error);
         }
@@ -1396,43 +1507,25 @@ impl DrbdProvider {
             //    suspension this host imposed is lifted with it); a
             //    resource carrying the marker is never confused with a
             //    foreign zombie promotion (which is never
-            //    auto-demoted, rule 17). Never a silent resume.
+            //    auto-demoted, rule 17). Never a silent resume. The
+            //    completion core is shared with the renewal pass's
+            //    fence lane ([`Self::try_complete_fence`]).
             if snapshot.runtime.fence.is_some() {
-                let mut demoted = status.role == Role::Secondary;
-                if !demoted {
-                    match self.run_drbdadm("secondary", &entry.resource_name) {
-                        Ok(output) => demoted = output.success,
-                        Err(error) => {
-                            report.unverifiable_volumes.push(UnverifiableVolume {
-                                volume_id: id,
-                                detail: format!(
-                                    "completing the fence of {} failed: {}",
-                                    entry.resource_name, error.detail
-                                ),
-                            });
-                            continue;
-                        }
+                match self.try_complete_fence(&mut state, &id, &entry, status.role == Role::Primary)
+                {
+                    Ok(true) => {
+                        changed = true;
+                        report.completed_fences.push(id);
                     }
-                }
-                if demoted {
-                    match self.resume_io(entry.minor) {
-                        Ok(()) => {
-                            if let Some(volume) = state.volume_mut(&id) {
-                                volume.runtime.fence = None;
-                                volume.runtime.state = VolumeLifecycle::Ready;
-                            }
-                            changed = true;
-                            report.completed_fences.push(id);
-                        }
-                        Err(error) => {
-                            report.unverifiable_volumes.push(UnverifiableVolume {
-                                volume_id: id,
-                                detail: format!(
-                                    "resuming the fenced {} failed: {}",
-                                    entry.resource_name, error.detail
-                                ),
-                            });
-                        }
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.unverifiable_volumes.push(UnverifiableVolume {
+                            volume_id: id,
+                            detail: format!(
+                                "completing the fence of {} failed: {}",
+                                entry.resource_name, error.detail
+                            ),
+                        });
                     }
                 }
                 continue;
@@ -1721,6 +1814,13 @@ impl DrbdProvider {
     /// `suspend_budget_secs` must cover response latency plus the
     /// tick).
     ///
+    /// Each pass also runs the **fence lane** (a private
+    /// completion pass shared with the startup reconcile's step 4):
+    /// pending self-fences are
+    /// completed when their device has closed, so a busy-device fence
+    /// does not stay suspended until a restart (query and completion
+    /// failures there are reported, never fatal to the pass).
+    ///
     /// Pre-authority (P3) mode is a no-op returning an empty report.
     ///
     /// # Errors
@@ -1734,6 +1834,10 @@ impl DrbdProvider {
         let now = authority.now_secs();
         let mut state = self.lock_state()?;
         let mut report = RenewalReport::default();
+        // The fence lane first: completing a fence can free the device
+        // (and the volume's authority residue) before the lease logic
+        // looks at it.
+        self.complete_pending_fences(&mut state, &mut report);
         let ids: Vec<VolumeId> = state.volumes().keys().cloned().collect();
         for id in ids {
             let Some(snapshot) = state.volume(&id).cloned() else {
@@ -2391,9 +2495,13 @@ impl DrbdProvider {
         state.observe_minor(facts.minor);
         state.observe_port(facts.port);
         if let Err(error) = state.save(&self.state_path) {
-            // No durable record: release the just-granted lease
-            // best-effort so a failed save does not hold authority
-            // hostage until the lease lapses.
+            // The durable record is absent: drop the in-memory entry
+            // so the renewal loop cannot keep renewing a lease for a
+            // volume this host does not durably hold, then release the
+            // just-granted lease best-effort (the save precedes the
+            // promotion, so the resource is provably Secondary and the
+            // self-release is safe).
+            state.remove_volume(volume_id);
             let _ = authority.release(volume_id, &block);
             return Err(error);
         }
@@ -2408,15 +2516,27 @@ impl DrbdProvider {
             })
             .and_then(|()| self.verify_promotion(&entry));
         if let Err(error) = promoted {
-            self.unwind_failed_adoption(&mut state, volume_id, &block)?;
+            let detail = error.detail.clone();
+            self.unwind_failed_adoption(&mut state, volume_id, &entry, &block, &detail)?;
             return Err(error);
         }
-        let stored = state.volume(volume_id).ok_or_else(|| {
-            ApiError::new(
+        let Some(stored) = state.volume(volume_id) else {
+            // Structurally unreachable (the lock is held and the entry
+            // was saved above), but if the invariant ever broke, the
+            // residue is fenced and released exactly like a failed
+            // promotion — never left serving.
+            self.unwind_failed_adoption(
+                &mut state,
+                volume_id,
+                &entry,
+                &block,
+                "the adoption record vanished mid-operation",
+            )?;
+            return Err(ApiError::new(
                 ApiErrorCode::Internal,
                 format!("the adoption record for {volume_id} vanished mid-operation"),
-            )
-        })?;
+            ));
+        };
         let response = self.verified_inspect_response(volume_id, stored)?;
         Ok(AdoptVolumeResponse {
             classification,
@@ -2425,37 +2545,66 @@ impl DrbdProvider {
     }
 
     /// Unwind an adoption whose promotion failed after the durable
-    /// record: the volume stays **tracked and `Failed`** (reconcile
-    /// owns any suspended or Primary residue — the entry is never
-    /// silently removed, because a Primary residue with no record is
-    /// exactly the untracked-writer hole the pre-promotion save exists
-    /// to prevent), and the just-granted lease is released best-effort
-    /// so a failed adopt does not hold authority hostage until the
-    /// lease lapses.
+    /// record: the volume is **fenced first** (suspend, durable
+    /// pending-fence marker, demote, resume — [`Self::self_fence`]),
+    /// because the resource may still be Primary. The just-granted
+    /// lease is released **only on a completed fence**: a
+    /// proven-demoted holder self-releasing waives the next grant's
+    /// W7 wait safely, while an incomplete fence (a busy device)
+    /// leaves the lease to expire at the witness, where the W7 window
+    /// then guards the next grant — never a release while a writer
+    /// might still be serving. The entry stays tracked and `Failed`
+    /// (reconcile and the renewal pass own the residue; the entry is
+    /// never silently removed, because an untracked Primary is exactly
+    /// the hole the pre-promotion save exists to prevent).
     ///
     /// # Errors
-    /// `INTERNAL` when the state save fails (the witness lease is
-    /// already released or lapses on its own; the operator sees the
-    /// error and the tracked `Failed` entry).
+    /// The fence error itself, or `INTERNAL` from the final state
+    /// save. The witness lease is only ever released after a completed
+    /// fence.
     fn unwind_failed_adoption(
         &self,
         state: &mut DrbdState,
         volume_id: &VolumeId,
+        entry: &VolumeEntry,
         block: &VolumeAuthorityBlock,
+        detail: &str,
     ) -> Result<(), ApiError> {
-        if let Some(authority) = &self.authority {
-            // Best-effort: the witness may be unreachable and the
-            // lease may already be superseded — both leave the lease
-            // to lapse at the witness, which only delays the next
-            // adopt past the fence window.
-            let _ = authority.release(volume_id, block);
+        let fenced = self.self_fence(
+            state,
+            volume_id,
+            entry,
+            vec![format!("the adoption promotion failed: {detail}")],
+        );
+        match fenced {
+            Ok(fenced) => {
+                if fenced.demoted {
+                    if let Some(authority) = &self.authority {
+                        let _ = authority.release(volume_id, block);
+                    }
+                }
+                // A failed adoption stays Failed (a completed
+                // `self_fence` returns the volume to Ready for
+                // reattachment; this is not that).
+                if let Some(volume) = state.volume_mut(volume_id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                    state.save(&self.state_path)?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // The fence itself failed: the marker (when its save
+                // succeeded) routes the restart through completion,
+                // and the unreleased lease expires at the witness
+                // under the W7 window. The failure is recorded
+                // honestly; the lease is never released un-demoted.
+                if let Some(volume) = state.volume_mut(volume_id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                }
+                let _ = state.save(&self.state_path);
+                Err(error)
+            }
         }
-        if let Some(volume) = state.volume_mut(volume_id) {
-            volume.runtime.state = VolumeLifecycle::Failed;
-            volume.runtime.authority = None;
-            volume.entry.generation += 1;
-        }
-        state.save(&self.state_path)
     }
 
     /// Build the inspect response for one stored volume, verifying the

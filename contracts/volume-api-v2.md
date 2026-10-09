@@ -258,3 +258,13 @@ is a typed `IDEMPOTENCY_CONFLICT`); `FENCE_PENDING` while the witness is
 still inside its fence-wait window; `UNKNOWN_FENCING_AUTHORITY` when the
 witness cannot be reached. Replays of a recorded outcome — refusal or
 promotion — are byte-identical.
+
+An adoption whose promotion *fails after the grant* (a refused or failed
+`primary --force`, a failed verification) is a typed `INTERNAL` error that
+leaves a **tracked `failed` volume** on the surviving host — never an
+untracked Primary holding a live lease. The residue is fenced (suspended,
+demoted when possible, the lease released only after a proven demotion — an
+incomplete fence leaves the lease to expire at the witness under its fence
+window), and the tracked entry is resolved through volume management (a
+retry adopt is the typed `INVALID_STATE` "already exists" refusal until the
+failed entry is deleted); there is no invisible re-adoption.

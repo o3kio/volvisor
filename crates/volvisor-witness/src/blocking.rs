@@ -143,6 +143,12 @@ where
         T: Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
+        // Spawn failure is not a shape tokio exposes (`Handle::spawn`
+        // returns a `JoinHandle`, never an error); the relevant
+        // failure mode is a runtime shut down mid-wait, which drops
+        // the task without polling it — the sender drops with it and
+        // the `Disconnected` arm below answers immediately, so the
+        // caller never burns the blocking bound on a dead runtime.
         self.handle.spawn(async move {
             // A send failure only means the caller gave up waiting; the
             // result is then simply dropped.

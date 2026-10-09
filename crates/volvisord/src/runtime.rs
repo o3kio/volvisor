@@ -287,9 +287,24 @@ fn spawn_renewal_task(provider: &Arc<DrbdProvider>) {
                             "witness unreachable; renewal deferred until the local deadline"
                         );
                     }
+                    for completed in &report.completed_fences {
+                        tracing::info!(
+                            kind = "fence_completed",
+                            volume_id = %completed,
+                            "pending self-fence completed (device closed)"
+                        );
+                    }
+                    for failure in &report.fence_failures {
+                        tracing::error!(
+                            kind = "fence_completion_failed",
+                            volume_id = %failure.volume_id,
+                            detail = %failure.detail,
+                            "completing a pending self-fence failed; retried next pass"
+                        );
+                    }
                 }
                 Err(error) => {
-                    tracing::warn!(kind = "renew_leases", error = %error, "renewal pass failed");
+                    tracing::error!(kind = "renew_leases", error = %error, "renewal pass failed");
                 }
             }
         }
