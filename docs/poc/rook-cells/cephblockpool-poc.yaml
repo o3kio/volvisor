@@ -1,0 +1,11 @@
+# EXPERIMENTAL. Requires three OSDs on distinct PHYSICAL hosts.
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: volvisor-poc-rbd
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true

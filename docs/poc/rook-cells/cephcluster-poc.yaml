@@ -1,0 +1,68 @@
+# EXPERIMENTAL EXAMPLE ONLY. Requires a qualified operator, 3 independent PHYSICAL
+# hosts, verified guest-visible by-id paths, and pinned compatible Rook/Ceph versions.
+# DO NOT APPLY UNEDITED: Rook OSD preparation can overwrite selected disks.
+# Rook operator runs on separate Kubernetes control/management worker nodes.
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v19.2.3 # illustrative pinned Squid tag; qualify/re-pin
+    allowUnsupported: false
+  dataDirHostPath: /var/lib/rook # persists inside EACH cell guest, never on Ceph RBD
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  mgr:
+    count: 2
+  # POC-0: omit network.provider to use the default Kubernetes pod network.
+  # Validate host networking in a distinct/fresh experiment, not by ad-hoc
+  # provider switching on the running cluster.
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+    - name: volvisor-cell-a
+      devices:
+      - name: /dev/disk/by-id/nvme-REPLACE_WITH_GUEST_A_DEVICE_ID
+    - name: volvisor-cell-b
+      devices:
+      - name: /dev/disk/by-id/nvme-REPLACE_WITH_GUEST_B_DEVICE_ID
+    - name: volvisor-cell-c
+      devices:
+      - name: /dev/disk/by-id/nvme-REPLACE_WITH_GUEST_C_DEVICE_ID
+  placement:
+    all:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: volvisor.io/node-role
+              operator: In
+              values: [storage-cell]
+      tolerations:
+      - key: volvisor.io/storage-only
+        operator: Equal
+        value: rook
+        effect: NoSchedule
+  resources:
+    osd:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        memory: 4Gi
+    mon:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+    mgr:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 2Gi

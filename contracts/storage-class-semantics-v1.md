@@ -1,7 +1,10 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** The current proposed architecture is [ADR-0003](../docs/adr/0003-tiered-volume-virtualization.md), [ADR-0004](../docs/adr/0004-nearline-replication-and-mobility.md), and [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md). Do not interpret v1 storage-class or provider contracts as compatible aliases for v2.
+
 # Volvisor storage-class semantics v1
 
 Status: Proposed  
 Version: 1
+Superseded-by: [ADR-0003](../docs/adr/0003-tiered-volume-virtualization.md), [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md) and [Volume API contract v2](volume-api-v2.md) (class semantics)
 
 This contract defines what the three v0 storage classes mean to O3K/CellHV
 callers. Performance numbers are not part of the class identity; failure and

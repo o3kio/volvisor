@@ -1,8 +1,11 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** The current proposed architecture is [ADR-0003](../docs/adr/0003-tiered-volume-virtualization.md), [ADR-0004](../docs/adr/0004-nearline-replication-and-mobility.md), and [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md). Do not interpret v1 storage-class or provider contracts as compatible aliases for v2.
+
 # Volvisor provider contract v1
 
 Status: Proposed  
 Version: 1  
 Applies to: Volvisor Storage Cell v0
+Superseded-by: [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md) (pool/device ownership and lifecycle) and [Volume API v2](volume-api-v2.md); v1 operational invariants not restated there remain binding per SPEC-0002 section 13
 
 Related:
 

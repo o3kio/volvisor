@@ -1,42 +1,47 @@
-# AGENTS.md
+# AGENTS.md — Volvisor contributor and agent rules
 
-Guidance for code agents working in Volvisor.
+## Read first (current v2 direction)
 
-## Read first
+1. docs/adr/0003-tiered-volume-virtualization.md
+2. docs/adr/0004-nearline-replication-and-mobility.md
+3. docs/adr/0005-ceph-rbd-and-managed-osds.md
+4. docs/adr/0006-online-resize-and-live-local-block-relocation.md
+5. docs/adr/0007-drbd9-nearline-replication-provider.md
+6. docs/adr/0008-rook-only-hyperconverged-cells.md
+7. docs/specs/SPEC-0002-volvisor-volume-virtualization.md
+8. contracts/volume-api-v2.md
+9. contracts/nearline-replication-v2.md
+10. contracts/rook-cell-experimental-v0.md
+11. docs/reviews/2026-10-09-volume-architecture-review.md
 
-Normative documents:
+ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented proposals**; keep for lineage. When an old draft contradicts v2, v2 is authoritative. Where v2 is silent, v1 operational invariants (storage backplane transport, control-plane outage behavior, peer authentication and secrets, endpoint isolation, observability truthfulness) continue to bind — see SPEC-0002 section 13. Each v2 ADR records its acceptance status in its header; do not treat a pending ADR as an accepted decision. Do not quietly map legacy class names to incompatible new semantics.
 
-1. docs/adr/0001-volvisor-storage-cell-architecture.md
-2. docs/adr/0002-replicated-async-local-endpoint-and-migration.md
-3. docs/specs/SPEC-0001-storage-cell-v0.md
-4. contracts/volvisor-provider-v1.md
-5. contracts/storage-class-semantics-v1.md
-6. contracts/replicated-async-v1.md
+## Non-negotiable rules
 
-The R&D document does not override a contract.
+1. A disk, pool, logical volume, replica, VM attachment and PCI passthrough lease are distinct resources with independent identity, generations, and ownership.
+2. One native host disk may supply many logical volumes; `native-local` must never be reduced to whole-controller VFIO.
+3. A local mirror does **not** count as a remote host replica; remote async replication does not ensure preservation of the latest ACKed writes on host loss.
+4. Never weaken single-writer fencing, quorum or error reporting to make a test pass.
+5. An `IN_DOUBT` handoff after source revocation must not be 'fixed' by blindly restarting source writes.
+6. Migration eligibility is VM-wide, across all attached volumes and VMM devices; do not assert storage-safe handoff from memory migration success.
+7. Discovery is always read-only, hardware identity is never solely `/dev/nvmeXnY` or BDF, and no destructive adoption of foreign state occurs.
+8. Every privileged mutation journals intent and must be idempotent/fail-closed on stale generation and replay conflicts.
+9. A Ceph OSD uses physical devices; VM block volumes are RBD images. Do not create an OSD per volume or implement a replacement Ceph engine.
+10. Storage Cells are not on the native-local foreground I/O path in v2; placing one there requires a separately accepted design. Do not introduce a second mandatory tenant-facing control plane.
+11. Strong guest flush/FUA, crash consistency, media failure and thin pool exhaustion must be tested explicitly.
+12. Match every production-support claim to exact implementation source, hardware, VMM/backend versions and real-host failure evidence.
+13. Do not reuse or translate third-party source without explicit provenance/license review; prefer existing DRBD/Ceph components before new engines.
+14. Keep *online capacity growth*, *same-host backing relocation* and *cross-host VM live migration* separate. Native LV online growth does not require a block-copy job; no generic live cross-pool copy is implied by LVM pvmove.
+15. Do not put an additional QSD/userspace proxy on all native foreground I/O solely to make it movable. Treat QSD/vhost-user-blk mirror/pivot as an optional, version-pinned, crash-tested backend.
+16. DRBD Protocol A/B/C are distinct durability contracts; quorum/witness is not data replication. Do not claim zero RPO for asynchronous acknowledgements.
+17. DRBD single-primary demotion requires releasing an in-use source block device. Temporary dual-primary for VM live migration is **not automatically permitted**; it requires a separate accepted fenced migration proof and contract amendment.
+18. In `rook-cell-experimental` the cell is a **Kubernetes worker VM**, not a general-purpose tenant-pod runtime. Rook operator and Kubernetes API must remain independently bootable. Allow essential kube-system pods, but refuse arbitrary tenant pods with admission beyond taints.
+19. Volvisor owns PCI/VFIO claims, vCPU/RAM fixed reservation, guest root/state and Node↔Host mapping; Rook owns the Ceph OSD/MON/MGR workloads. No device is implicitly adopted or reformatted.
+20. Three storage microVMs on one physical host are not three Ceph failure domains. Real VFIO, CRUSH physical-host placement, memory pressure and host loss require three-physical-host evidence.
+21. Do not patch or fork Rook unless the unmodified upstream POC demonstrates a reproducible missing capability and a separate accepted decision authorizes it.
 
-## Hard rules
+## Implementation order
 
-1. Never weaken ownership or fencing to make a test pass.
-2. Never identify a disk only by /dev/nvmeXnY or PCI BDF.
-3. Discovery is read-only. It never implies permission to format or wipe.
-4. Foreign or ambiguous storage state fails closed.
-5. local-direct has no Storage Cell foreground data path.
-6. replicated-async steady-state is not RPO=0.
-7. A successful planned replicated-async migration must pass the durable target
-   barrier and single-writer transfer.
-8. cluster-durable is Ceph-backed; do not implement a new Ceph replacement
-   under that class.
-9. A device never has two owners.
-10. Do not copy or translate third-party storage source code without explicit
-    provenance and license review. Public designs may be used as references for
-    a clean implementation.
+Stable identity/volume contract -> native logical volumes -> external Ceph RBD adapter -> DRBD nearline baseline -> witness/fencing and full VMM/storage handoff -> aggressive failure campaign -> consider standalone Mayastor/clean io_uring/SPDK only with measured justification -> separately designed managed OSD infrastructure.
 
-## Evidence honesty
-
-A benchmark is not a durability proof.
-
-A successful happy-path migration is not a fencing proof.
-
-No class is called production-supported until its exact implementation passes
-the failure and evidence requirements in SPEC-0001 and the relevant contract.
+A benchmark is not a durability proof. A happy-path migration is not a split-brain proof. No class is called production-supported until its exact implementation passes the failure and evidence requirements in SPEC-0002 and the relevant v2 contract.

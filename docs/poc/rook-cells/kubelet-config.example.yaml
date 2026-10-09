@@ -1,0 +1,23 @@
+# EXPERIMENTAL KubeletConfiguration for a cell VM with fixed 6 vCPU / 16Gi.
+# Place on guest via a pinned appliance image; test against the chosen K8s release.
+# OS and containerd units need separate cgroup accounting and runtime setup.
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+maxPods: 20
+failSwapOn: true
+systemReserved:
+  cpu: 500m
+  memory: 1Gi
+kubeReserved:
+  cpu: 500m
+  memory: 1Gi
+  # kubeReserved supports local ephemeral storage; systemReserved does not
+  # (cpu/memory only), so it is deliberately omitted there.
+  ephemeral-storage: 2Gi
+evictionHard:
+  memory.available: 1Gi
+  nodefs.available: "10%"
+  imagefs.available: "15%"
+enforceNodeAllocatable:
+- pods

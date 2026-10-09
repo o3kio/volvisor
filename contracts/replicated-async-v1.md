@@ -1,8 +1,11 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** The current proposed architecture is [ADR-0003](../docs/adr/0003-tiered-volume-virtualization.md), [ADR-0004](../docs/adr/0004-nearline-replication-and-mobility.md), and [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md). Do not interpret v1 storage-class or provider contracts as compatible aliases for v2.
+
 # Volvisor replicated-async contract v1
 
 Status: Proposed  
 Version: 1  
 Implementation engine: deliberately unresolved / R&D-gated
+Superseded-by: [Nearline replication and migration contract v2](nearline-replication-v2.md)
 
 Related:
 

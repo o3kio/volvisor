@@ -1,10 +1,12 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** Superseded for replication, migration handoff and failure handling by [ADR-0004](0004-nearline-replication-and-mobility.md); see also [ADR-0003](0003-tiered-volume-virtualization.md) and [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md). Do not interpret v1 storage-class or provider contracts as compatible aliases for v2.
+
 # ADR-0002 — Replicated-async local endpoint and migration barrier
 
 Status: Proposed  
 Date: 2026-10-05  
 Decision-accepted: pending  
 Supersedes: none  
-Superseded-by: none
+Superseded-by: ADR-0004 (replication, migration handoff and failure handling where inconsistent)
 
 Related:
 
