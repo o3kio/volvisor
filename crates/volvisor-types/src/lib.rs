@@ -35,8 +35,9 @@ pub mod state;
 
 pub use admin::{ClaimDeviceRequest, DeviceListResponse, ReleaseDeviceRequest};
 pub use authority::{
-    AuthoritySummary, AuthorityView, EndpointBacking, FencingProof, LeaseId, LeaseState,
-    LossBoundary, PromotionClassification, RecordedBarrier, VolumeRegistration, WriterEpoch,
+    AuthoritySummary, AuthorityView, BarrierAttestation, EndpointBacking, EpochRetirement,
+    FencingProof, LeaseId, LeaseState, LossBoundary, PromotionClassification, RecordedBarrier,
+    RecordedMigrationBarrier, VolumeRegistration, WriterEpoch,
 };
 pub use capability::{Capability, CapabilitySet};
 pub use domain::{

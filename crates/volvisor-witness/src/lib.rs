@@ -6,7 +6,8 @@
 //! arbiter that linearizes writer epochs and leases for a volume lineage;
 //! it never touches tenant data.
 //!
-//! ## Correctness model (P4a plan §2, invariants W1–W7)
+//! ## Correctness model (P4a plan §2, invariants W1–W7; P4b plan §4,
+//! invariants W8–W10)
 //!
 //! - **W1** at most one live lease per volume at any time (`LEASE_HELD`
 //!   otherwise);
@@ -32,6 +33,24 @@
 //!   alive-but-partitioned writer serves until its local deadline no
 //!   matter how often it retries renewal. A holder's own self-release
 //!   starts no wait.
+//! - **W8** (P4b plan §4) every mutating call requires the per-host
+//!   credential bound to the holder the request asserts; the legacy
+//!   shared token is read-only (inspect/health). There is no
+//!   shared-token path that could forge a holder assertion — a legacy
+//!   caller, or a host credential asserting a different host, is refused
+//!   with the typed `FORBIDDEN` refusal;
+//! - **W9** (P4b plan §4) `RecordBarrier` journals a migration
+//!   barrier's attestation verbatim, stamped with the witness commit
+//!   index as an **ordering token** (never a terminality claim); only
+//!   the current epoch's live holder may record, and `VoidBarrier`
+//!   (only the recording holder, only before the epoch retires) is the
+//!   abort path's evidence-hygiene step — a voided barrier is never
+//!   `SAFE_CURRENT` evidence;
+//! - **W10** (P4b plan §4) `RevokeSet`/`GrantSet` are single journaled
+//!   batch mutations: every member is pre-checked before anything is
+//!   journaled (a partial failure rejects the whole batch typed), one
+//!   commit-index bump covers the set, and every member's fencing
+//!   proof shares that index.
 //!
 //! ## Layout
 //!

@@ -18,6 +18,7 @@
 //! - `STALE_EPOCH` — detail `witness epoch retired; current_epoch=N`
 //! - `FENCE_PENDING` — detail `witness fence window active;
 //!   retry_after_secs=N`
+//! - `FORBIDDEN` — W8 identity refusal (403; detail is prose)
 //!
 //! The `key=value` suffixes are a **stable machine-readable sub-format**
 //! inside the human detail: [`WitnessError::from_wire`] parses them back
@@ -29,12 +30,60 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use volvisor_types::error::{ApiError, ApiErrorBody, ApiErrorCode};
 use volvisor_types::{
-    EndpointBacking, FencingProof, HostId, LeaseId, OperationId, RecordedBarrier, VolumeId,
-    WriterEpoch,
+    BarrierAttestation, EndpointBacking, FencingProof, HostId, LeaseId, MigrationId, OperationId,
+    RecordedBarrier, RecordedMigrationBarrier, VolumeId, WriterEpoch,
 };
 
 /// Current witness protocol version.
-pub const WITNESS_PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 (P4b plan §4) adds the W8 caller-identity binding (host
+/// credentials for every mutation; the legacy shared token is
+/// read-only), the W9 barrier routes and the W10 batch mutations. A
+/// version-1 peer cannot mutate a version-2 witness: the authn change
+/// is the point of the bump, deployed with the migration feature that
+/// cannot function without it.
+pub const WITNESS_PROTOCOL_VERSION: u32 = 2;
+
+/// The identity a witness call is authenticated as (P4b plan §4 W8).
+///
+/// Resolved **server-side** from the presented bearer token: a match
+/// against the configured per-host credential map yields
+/// [`CallerIdentity::Host`], the legacy shared token yields
+/// [`CallerIdentity::Legacy`], and anything else fails the transport
+/// authentication (401) before a core call is made. The identity is
+/// what the authority core checks holder assertions against — a
+/// mutation is accepted only when a `Host` identity matches the host
+/// the request asserts; `Legacy` may only read (inspect/health).
+///
+/// The witness records the bound identity implicitly: every journaled
+/// mutation passed a `require_holder` check against this identity, so
+/// the recorder of a barrier or the self-releaser of a lease is
+/// accountable to the credential, not to a shared secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallerIdentity {
+    /// The legacy shared admin token: read-only on a v2 witness.
+    Legacy,
+    /// The named host's credential from the witness's host-token map.
+    Host(HostId),
+}
+
+impl CallerIdentity {
+    /// W8 enforcement for every mutating core call: the caller must be
+    /// the host the request asserts. A `Legacy` caller (shared token)
+    /// and a `Host` caller asserting a different host are both refused
+    /// with the typed [`WitnessError::IdentityRequired`] — there is no
+    /// shared-token path that could forge a holder assertion.
+    ///
+    /// # Errors
+    /// [`WitnessError::IdentityRequired`] unless this identity is
+    /// `Host(asserted)`.
+    pub fn require_holder(&self, asserted: &HostId) -> Result<(), WitnessError> {
+        match self {
+            Self::Host(host) if host == asserted => Ok(()),
+            Self::Host(_) | Self::Legacy => Err(WitnessError::IdentityRequired),
+        }
+    }
+}
 
 /// Client-supplied registration content (the witness stamps identity and
 /// time; it never invents content).
@@ -189,6 +238,177 @@ pub struct RevokeResponse {
     pub fencing_proof: FencingProof,
 }
 
+/// `record-barrier` request body (P4b plan §4 W9).
+///
+/// The witness stamps the boundary commit index and the recording
+/// time; it never invents attestation content. The attestation's truth
+/// lives on the recording host — the witness records it verbatim under
+/// the W8-bound credential of the epoch's holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordBarrierRequest {
+    /// Caller's protocol version; must equal [`WITNESS_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Idempotency key for the barrier recording.
+    pub operation_id: OperationId,
+    /// The holder recording the barrier (W8: must match the caller's
+    /// credential and the current lease's holder).
+    pub host_id: HostId,
+    /// The writer epoch whose serving boundary the barrier attests
+    /// (must be the volume's current epoch, held live by `host_id`).
+    pub epoch: WriterEpoch,
+    /// The attested facts, recorded verbatim.
+    pub attestation: BarrierAttestation,
+    /// The migration transaction this barrier belongs to, when it was
+    /// recorded by a coordinated handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<MigrationId>,
+}
+
+/// `record-barrier` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordBarrierResponse {
+    /// The recorded barrier, with the witness-stamped boundary commit
+    /// index (an ordering token in the journal's total order) and
+    /// recording time.
+    pub barrier: RecordedMigrationBarrier,
+}
+
+/// `void-barrier` request body (P4b plan §4 W9): the abort path's
+/// evidence-hygiene step. Only the recording holder, only before the
+/// epoch retires — a voided barrier can never surface as
+/// `SAFE_CURRENT` evidence for a later retirement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoidBarrierRequest {
+    /// Caller's protocol version; must equal [`WITNESS_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Idempotency key for the void.
+    pub operation_id: OperationId,
+    /// The holder that recorded the barrier (W8: must match the
+    /// caller's credential).
+    pub host_id: HostId,
+    /// The epoch whose barrier is being voided.
+    pub epoch: WriterEpoch,
+    /// The migration transaction the barrier belongs to; when present,
+    /// only that migration's barrier is voided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<MigrationId>,
+}
+
+/// `void-barrier` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoidBarrierResponse {
+    /// The voided barrier entry (with `voided: true`).
+    pub barrier: RecordedMigrationBarrier,
+}
+
+/// One member of a batch self-release (P4b plan §4 W10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRelease {
+    /// The volume being released.
+    pub volume_id: VolumeId,
+    /// The epoch being released (W4 check against the volume's
+    /// current epoch).
+    pub epoch: WriterEpoch,
+}
+
+/// `revoke-set` request body: a batch of **self-releases** by one host
+/// (the migration source), journaled as one mutation so the set is
+/// atomic — a single member's refusal rejects the whole batch and
+/// nothing is journaled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeSetRequest {
+    /// Caller's protocol version; must equal [`WITNESS_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Idempotency key for the batch.
+    pub operation_id: OperationId,
+    /// The releasing host (W8: must match the caller's credential and
+    /// every member lease's holder).
+    pub host_id: HostId,
+    /// The migration transaction this batch belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<MigrationId>,
+    /// The member releases; non-empty, no duplicate volumes.
+    pub releases: Vec<BatchRelease>,
+}
+
+/// One member outcome of a `revoke-set`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRevokeOutcome {
+    /// The released volume.
+    pub volume_id: VolumeId,
+    /// Durable proof of the member's retirement.
+    pub fencing_proof: FencingProof,
+}
+
+/// `revoke-set` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeSetResponse {
+    /// One outcome per requested release, in request order.
+    pub releases: Vec<BatchRevokeOutcome>,
+}
+
+/// One member of a batch grant (P4b plan §4 W10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGrantVolume {
+    /// The volume to grant writer authority for.
+    pub volume_id: VolumeId,
+}
+
+/// `grant-set` request body: a batch of grants by one host (the
+/// migration destination), journaled as one mutation — every member
+/// passes the single-grant W1/W7 checks or the whole batch is refused
+/// and nothing is journaled. Each member mints its own epoch; all
+/// proofs share the batch's commit index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantSetRequest {
+    /// Caller's protocol version; must equal [`WITNESS_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Idempotency key for the batch.
+    pub operation_id: OperationId,
+    /// The acquiring host (W8: must match the caller's credential).
+    pub host_id: HostId,
+    /// The migration transaction this batch belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<MigrationId>,
+    /// The member volumes; non-empty, no duplicates.
+    pub requests: Vec<BatchGrantVolume>,
+}
+
+/// One member outcome of a `grant-set`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGrantOutcome {
+    /// The granted volume.
+    pub volume_id: VolumeId,
+    /// The granted epoch (the member's current epoch + 1).
+    pub epoch: WriterEpoch,
+    /// The granted lease.
+    pub lease_id: LeaseId,
+    /// The lease TTL in seconds — a duration from the response (W5).
+    pub lease_ttl_secs: u64,
+    /// Durable proof that the member's previous epoch was retired by
+    /// this grant (W2), at the batch's shared commit index.
+    pub fencing_proof: FencingProof,
+}
+
+/// `grant-set` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantSetResponse {
+    /// One outcome per requested volume, in request order.
+    pub grants: Vec<BatchGrantOutcome>,
+}
+
 /// Typed witness outcome vocabulary: every refusal a caller can receive,
 /// in one place, independent of transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +439,10 @@ pub enum WitnessError {
     InvalidRequest(String),
     /// `operation_id` reused with a different request payload.
     IdempotencyConflict,
+    /// W8: the caller's identity is not permitted for this mutation —
+    /// a legacy (shared-token) caller attempted a mutating call, or a
+    /// host credential asserted a holder it is not bound to.
+    IdentityRequired,
     /// Transport-level authentication failure (401).
     Unauthorized,
     /// The witness could not be reached / did not answer in time. Never
@@ -240,6 +464,7 @@ impl WitnessError {
             Self::AlreadyRegistered => ApiErrorCode::InvalidState,
             Self::InvalidRequest(_) => ApiErrorCode::InvalidRequest,
             Self::IdempotencyConflict => ApiErrorCode::IdempotencyConflict,
+            Self::IdentityRequired => ApiErrorCode::Forbidden,
             // The server produces the raw UNAUTHORIZED transport body
             // itself; this mapping exists so a leaked conversion stays
             // honest (internal-class, no state claim).
@@ -269,6 +494,11 @@ impl WitnessError {
             Self::InvalidRequest(detail) => format!("invalid witness request: {detail}"),
             Self::IdempotencyConflict => {
                 "operation_id reused with a different request payload".to_owned()
+            }
+            Self::IdentityRequired => {
+                "witness mutation requires the host credential bound to the asserted \
+                 holder (the legacy shared token is read-only)"
+                    .to_owned()
             }
             Self::Unauthorized => "witness authentication failed".to_owned(),
             Self::Unreachable(detail) => format!("witness unreachable: {detail}"),
@@ -305,6 +535,7 @@ impl WitnessError {
             "INVALID_STATE" => Self::AlreadyRegistered,
             "INVALID_REQUEST" => Self::InvalidRequest(body.message.clone()),
             "IDEMPOTENCY_CONFLICT" => Self::IdempotencyConflict,
+            "FORBIDDEN" => Self::IdentityRequired,
             _ => Self::Internal(format!("unexpected witness error body: {}", body.code)),
         }
     }
@@ -352,6 +583,32 @@ pub(crate) fn request_hash(
     hasher.update(op.as_bytes());
     hasher.update(b":");
     hasher.update(volume_id.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(operation_id.as_str().as_bytes());
+    hasher.update(b":");
+    let body = serde_json::to_vec(body).unwrap_or_default();
+    hasher.update(&body);
+    hasher.finalize().into()
+}
+
+/// Compute the idempotency request hash for a **batch** witness
+/// operation (W10: `revoke-set`/`grant-set`).
+///
+/// The same domain-separated SHA-256 discipline as [`request_hash`],
+/// with its own separator and **without the volume component** — batch
+/// routes are not volume-scoped (there is no volume in the URL path;
+/// the member volumes are part of the hashed body, so a batch replay
+/// with a different member set is still a typed conflict). Retries
+/// must send byte-identical request bodies; a reused `operation_id`
+/// with a different body is a typed conflict.
+pub(crate) fn request_hash_batch(
+    op: &str,
+    operation_id: &OperationId,
+    body: &impl Serialize,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"volvisor.witness.v1.batch:");
+    hasher.update(op.as_bytes());
     hasher.update(b":");
     hasher.update(operation_id.as_str().as_bytes());
     hasher.update(b":");
@@ -412,6 +669,68 @@ mod tests {
             WitnessError::from_wire(false, &body),
             WitnessError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn identity_required_round_trips_as_forbidden() {
+        let body = ApiErrorBody::from(WitnessError::IdentityRequired.to_api_error());
+        assert_eq!(body.code, "FORBIDDEN");
+        assert_eq!(
+            WitnessError::from_wire(false, &body),
+            WitnessError::IdentityRequired
+        );
+        assert_eq!(
+            WitnessError::IdentityRequired.to_api_error().http_status(),
+            403
+        );
+    }
+
+    #[test]
+    fn caller_identity_binds_only_the_asserted_host() {
+        let host = HostId::new("node-a").expect("valid host");
+        let other = HostId::new("node-b").expect("valid host");
+        assert!(
+            CallerIdentity::Host(host.clone())
+                .require_holder(&host)
+                .is_ok()
+        );
+        assert_eq!(
+            CallerIdentity::Host(host.clone()).require_holder(&other),
+            Err(WitnessError::IdentityRequired)
+        );
+        assert_eq!(
+            CallerIdentity::Legacy.require_holder(&host),
+            Err(WitnessError::IdentityRequired)
+        );
+    }
+
+    #[test]
+    fn batch_request_hash_is_deterministic_and_discriminating() {
+        let op = OperationId::new("op-1").expect("valid id");
+        let host = HostId::new("node-a").expect("valid host");
+        let request = RevokeSetRequest {
+            protocol_version: WITNESS_PROTOCOL_VERSION,
+            operation_id: op.clone(),
+            host_id: host,
+            migration_id: None,
+            releases: vec![BatchRelease {
+                volume_id: VolumeId::new("vol-1").expect("valid id"),
+                epoch: WriterEpoch(1),
+            }],
+        };
+        let first = request_hash_batch("revoke-set", &op, &request);
+        assert_eq!(first, request_hash_batch("revoke-set", &op, &request));
+        // A different member set under the same operation id is a
+        // conflict, never a replay of the recorded batch outcome.
+        let mut diverging = request.clone();
+        diverging.releases.push(BatchRelease {
+            volume_id: VolumeId::new("vol-2").expect("valid id"),
+            epoch: WriterEpoch(1),
+        });
+        assert_ne!(first, request_hash_batch("revoke-set", &op, &diverging));
+        // The batch domain is distinct from the volume-scoped one.
+        let volume = VolumeId::new("vol-1").expect("valid id");
+        assert_ne!(first, request_hash("revoke-set", &volume, &op, &request));
     }
 
     #[test]

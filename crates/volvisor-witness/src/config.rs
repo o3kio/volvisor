@@ -6,10 +6,12 @@
 //! configures them — a storage daemon never duplicates these values, it
 //! validates its renewal interval against the TTL the witness reports.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use volvisor_types::HostId;
 use volvisor_types::error::ApiError;
 
 /// Default lease TTL (seconds). Conservative; deployments tune it.
@@ -38,9 +40,17 @@ pub struct WitnessConfig {
     /// Directory holding the witness journal and lock file.
     pub state_dir: PathBuf,
     /// Bearer token protecting the witness surface; required for
-    /// non-loopback binds. Never logged.
+    /// non-loopback binds. Never logged. On a v2 witness this legacy
+    /// token is **read-only** (inspect/health) — every mutation
+    /// requires a host credential from `host_tokens` (W8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Per-host credentials (P4b plan §4 W8): a TOML table mapping a
+    /// host id to that host's bearer token. A mutation is accepted
+    /// only when the presented token resolves (server-side) to the
+    /// host the request asserts. Never logged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_tokens: BTreeMap<String, String>,
     /// Lease time-to-live in seconds (W5/W7).
     #[serde(default = "default_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
@@ -90,6 +100,41 @@ impl WitnessConfig {
                 "witness auth_token is required for non-loopback binds",
             ));
         }
+        self.validate_host_tokens()?;
+        Ok(())
+    }
+
+    /// Validate the per-host credential map (W8): every key must parse
+    /// as a [`HostId`], every value must be non-empty, and no token
+    /// value may be reused — neither by another host nor as the admin
+    /// token — because identity resolution would be ambiguous (the
+    /// same presented string must resolve to exactly one identity).
+    fn validate_host_tokens(&self) -> Result<(), ApiError> {
+        let mut seen_tokens = std::collections::BTreeSet::new();
+        for (host, token) in &self.host_tokens {
+            if HostId::new(host).is_err() {
+                return Err(ApiError::invalid_request(format!(
+                    "witness host_tokens key {host:?} is not a valid host id"
+                )));
+            }
+            if token.trim().is_empty() {
+                return Err(ApiError::invalid_request(format!(
+                    "witness host_tokens key {host:?} requires a non-empty token"
+                )));
+            }
+            if !seen_tokens.insert(token.as_str()) {
+                return Err(ApiError::invalid_request(format!(
+                    "witness host_tokens reuses a token value (host {host:?}); identity \
+                     resolution must be unambiguous"
+                )));
+            }
+            if self.auth_token.as_deref() == Some(token.as_str()) {
+                return Err(ApiError::invalid_request(format!(
+                    "witness host_tokens key {host:?} reuses the auth_token value; identity \
+                     resolution must be unambiguous"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -113,6 +158,7 @@ mod tests {
             listen: listen.parse().expect("socket addr"),
             state_dir: PathBuf::from("/tmp/opencode/witness-state"),
             auth_token: None,
+            host_tokens: BTreeMap::new(),
             lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
             lease_grace_secs: DEFAULT_LEASE_GRACE_SECS,
             suspend_budget_secs: DEFAULT_SUSPEND_BUDGET_SECS,
@@ -156,6 +202,7 @@ state_dir = "/tmp/opencode/witness-state"
         assert_eq!(parsed.lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
         assert_eq!(parsed.lease_grace_secs, DEFAULT_LEASE_GRACE_SECS);
         assert_eq!(parsed.suspend_budget_secs, DEFAULT_SUSPEND_BUDGET_SECS);
+        assert!(parsed.host_tokens.is_empty());
         assert!(parsed.validate().is_ok());
         // Unknown fields are rejected, never silently ignored.
         let foreign = r#"
@@ -164,5 +211,57 @@ state_dir = "/tmp/opencode/witness-state"
 mystery = true
 "#;
         assert!(toml::from_str::<WitnessConfig>(foreign).is_err());
+    }
+
+    #[test]
+    fn host_tokens_parse_and_round_trip() {
+        let toml_source = r#"
+listen = "127.0.0.1:9101"
+state_dir = "/tmp/opencode/witness-state"
+
+[host_tokens]
+node-a = "token-a"
+node-b = "token-b"
+"#;
+        let parsed: WitnessConfig = toml::from_str(toml_source).expect("parse");
+        assert_eq!(
+            parsed.host_tokens.get("node-a").map(String::as_str),
+            Some("token-a")
+        );
+        assert!(parsed.validate().is_ok(), "{parsed:?}");
+        // Round trip: the table serializes back.
+        let serialized = toml::to_string(&parsed).expect("serialize");
+        let reparsed: WitnessConfig = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn host_tokens_validation_is_fail_closed() {
+        // A key that is not a valid host id.
+        let mut cfg = config("127.0.0.1:9101");
+        cfg.host_tokens
+            .insert("not/a/host".to_owned(), "t".to_owned());
+        assert!(cfg.validate().is_err());
+        // An empty token value.
+        let mut cfg = config("127.0.0.1:9101");
+        cfg.host_tokens.insert("node-a".to_owned(), "  ".to_owned());
+        assert!(cfg.validate().is_err());
+        // Two hosts sharing one token: ambiguous identity resolution.
+        let mut cfg = config("127.0.0.1:9101");
+        cfg.host_tokens
+            .insert("node-a".to_owned(), "same".to_owned());
+        cfg.host_tokens
+            .insert("node-b".to_owned(), "same".to_owned());
+        assert!(cfg.validate().is_err());
+        // A host token that equals the admin token.
+        let mut cfg = config("127.0.0.1:9101");
+        cfg.auth_token = Some("admin".to_owned());
+        cfg.host_tokens
+            .insert("node-a".to_owned(), "admin".to_owned());
+        assert!(cfg.validate().is_err());
+        // Distinct tokens for distinct hosts: valid.
+        cfg.host_tokens
+            .insert("node-a".to_owned(), "host-a".to_owned());
+        assert!(cfg.validate().is_ok(), "{cfg:?}");
     }
 }

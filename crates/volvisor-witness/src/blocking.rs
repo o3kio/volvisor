@@ -40,8 +40,10 @@ use volvisor_types::{AuthorityView, VolumeId};
 
 use crate::client::WitnessConnection;
 use crate::proto::{
-    GrantRequest, GrantResponse, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
-    RevokeRequest, RevokeResponse, WitnessError,
+    GrantRequest, GrantResponse, GrantSetRequest, GrantSetResponse, RecordBarrierRequest,
+    RecordBarrierResponse, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
+    RevokeRequest, RevokeResponse, RevokeSetRequest, RevokeSetResponse, VoidBarrierRequest,
+    VoidBarrierResponse, WitnessError,
 };
 
 /// Extra wait granted beyond the wrapped connection's per-request
@@ -101,6 +103,47 @@ pub trait BlockingWitnessConnection: Send + Sync {
         volume_id: &VolumeId,
         request: RevokeRequest,
     ) -> Result<RevokeResponse, WitnessError>;
+
+    /// Record a migration barrier (P4b plan §4 W9; W8 identity is
+    /// resolved server-side from the wrapped connection's token).
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    fn record_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: RecordBarrierRequest,
+    ) -> Result<RecordBarrierResponse, WitnessError>;
+
+    /// Void a recorded barrier (P4b plan §4 W9).
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    fn void_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: VoidBarrierRequest,
+    ) -> Result<VoidBarrierResponse, WitnessError>;
+
+    /// Batch self-release (P4b plan §4 W10 `revoke-set`).
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    fn revoke_set(&self, request: RevokeSetRequest) -> Result<RevokeSetResponse, WitnessError>;
+
+    /// Batch grant (P4b plan §4 W10 `grant-set`).
+    ///
+    /// # Errors
+    /// Typed witness refusals (including
+    /// [`WitnessError::IdentityRequired`]), or
+    /// [`WitnessError::Unreachable`] on transport failure.
+    fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError>;
 
     /// Read the authority view.
     ///
@@ -212,6 +255,36 @@ where
         self.wait(async move { inner.revoke(&volume_id, request).await })
     }
 
+    fn record_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: RecordBarrierRequest,
+    ) -> Result<RecordBarrierResponse, WitnessError> {
+        let inner = Arc::clone(&self.inner);
+        let volume_id = volume_id.clone();
+        self.wait(async move { inner.record_barrier(&volume_id, request).await })
+    }
+
+    fn void_barrier(
+        &self,
+        volume_id: &VolumeId,
+        request: VoidBarrierRequest,
+    ) -> Result<VoidBarrierResponse, WitnessError> {
+        let inner = Arc::clone(&self.inner);
+        let volume_id = volume_id.clone();
+        self.wait(async move { inner.void_barrier(&volume_id, request).await })
+    }
+
+    fn revoke_set(&self, request: RevokeSetRequest) -> Result<RevokeSetResponse, WitnessError> {
+        let inner = Arc::clone(&self.inner);
+        self.wait(async move { inner.revoke_set(request).await })
+    }
+
+    fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError> {
+        let inner = Arc::clone(&self.inner);
+        self.wait(async move { inner.grant_set(request).await })
+    }
+
     fn inspect(&self, volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {
         let inner = Arc::clone(&self.inner);
         let volume_id = volume_id.clone();
@@ -262,7 +335,32 @@ mod tests {
         ) -> Result<RevokeResponse, WitnessError> {
             std::future::pending().await
         }
-
+        async fn record_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: RecordBarrierRequest,
+        ) -> Result<RecordBarrierResponse, WitnessError> {
+            std::future::pending().await
+        }
+        async fn void_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: VoidBarrierRequest,
+        ) -> Result<VoidBarrierResponse, WitnessError> {
+            std::future::pending().await
+        }
+        async fn revoke_set(
+            &self,
+            _request: RevokeSetRequest,
+        ) -> Result<RevokeSetResponse, WitnessError> {
+            std::future::pending().await
+        }
+        async fn grant_set(
+            &self,
+            _request: GrantSetRequest,
+        ) -> Result<GrantSetResponse, WitnessError> {
+            std::future::pending().await
+        }
         async fn inspect(&self, _volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {
             std::future::pending().await
         }
@@ -339,6 +437,32 @@ mod tests {
             ) -> Result<RevokeResponse, WitnessError> {
                 Err(WitnessError::Unauthorized)
             }
+            async fn record_barrier(
+                &self,
+                _volume_id: &VolumeId,
+                _request: RecordBarrierRequest,
+            ) -> Result<RecordBarrierResponse, WitnessError> {
+                Err(WitnessError::IdentityRequired)
+            }
+            async fn void_barrier(
+                &self,
+                _volume_id: &VolumeId,
+                _request: VoidBarrierRequest,
+            ) -> Result<VoidBarrierResponse, WitnessError> {
+                Err(WitnessError::IdentityRequired)
+            }
+            async fn revoke_set(
+                &self,
+                _request: RevokeSetRequest,
+            ) -> Result<RevokeSetResponse, WitnessError> {
+                Err(WitnessError::IdentityRequired)
+            }
+            async fn grant_set(
+                &self,
+                _request: GrantSetRequest,
+            ) -> Result<GrantSetResponse, WitnessError> {
+                Err(WitnessError::IdentityRequired)
+            }
             async fn inspect(&self, _volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {
                 Err(WitnessError::Unreachable("peer reset".to_owned()))
             }
@@ -388,6 +512,19 @@ mod tests {
                 )
                 .unwrap_err(),
             WitnessError::Unauthorized
+        );
+        // The P4b surface passes through typed as well (W8 refusal).
+        assert_eq!(
+            blocking
+                .revoke_set(RevokeSetRequest {
+                    protocol_version: WITNESS_PROTOCOL_VERSION,
+                    operation_id: volvisor_types::OperationId::new("op-4").expect("valid op id"),
+                    host_id: HostId::new("node-a").expect("valid host id"),
+                    migration_id: None,
+                    releases: Vec::new(),
+                })
+                .unwrap_err(),
+            WitnessError::IdentityRequired
         );
     }
 }

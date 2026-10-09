@@ -26,7 +26,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// Used to reconstruct the HTTP status of a *replayed failure outcome*: the
 /// journal persists the error body (not the status), and a replay must be
 /// status- and byte-compatible with the first caller's response.
-const ALL_CODES: [ApiErrorCode; 19] = [
+const ALL_CODES: [ApiErrorCode; 20] = [
     ApiErrorCode::UnsupportedClassOrPolicy,
     ApiErrorCode::InsufficientFailureDomains,
     ApiErrorCode::NoSafeCapacity,
@@ -45,6 +45,7 @@ const ALL_CODES: [ApiErrorCode; 19] = [
     ApiErrorCode::NotFound,
     ApiErrorCode::InvalidState,
     ApiErrorCode::IdempotencyConflict,
+    ApiErrorCode::Forbidden,
     ApiErrorCode::Internal,
 ];
 
