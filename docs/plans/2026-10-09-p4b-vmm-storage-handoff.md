@@ -157,6 +157,12 @@ COMPLETE: source reconciled Secondary,
   cleared
 ```
 
+Diagram footnote: `[IN_DOUBT window ends]` marks the *normal* window
+(cut entered → `DESTINATION_AUTHORIZED`). `IN_DOUBT` is additionally
+reachable on a failed pre-cut void and on an unresolvable
+post-authorization stall (dead destination VMM) — §3's observation
+mapping and the terminal `InDoubt` state define those cases.
+
 Design decisions, each with its rule citation:
 
 - **D1 — snapshot/delete/restore, not live-migration.** The source VM
@@ -724,6 +730,7 @@ Stage B2 (fake VMM, end-to-end):
 | 15 | Crash injection between every pair of cut steps (the store dropped mid-drive): reconcile lands forward-only in the correct resolution; specifically crash between delete and demote, and between demote and revoke — the states the round-1 review identified — resolve forward, never to the abort path |
 | 16 | Abort before the cut: source VM resumed, barriers voided, volumes unsuspended, target discarded, record `Aborted`; abort after the cut began: typed refusal. The void-failure path specifically: a rollback whose `VoidBarrier` cannot be journaled (witness unreachable) leaves the source **not resumed** and routes through `self_fence` — the unvoided barrier is a hard gate on resume |
 | 16a | The clear-cut-marker admin operation: refuses while the volume is Primary/writer; clears + reconciles when Secondary or fencing-proven; journaled |
+| 16b | Terminal-`InDoubt` recovery: a record stalled by a failed void re-attempts the abort once the witness is reachable → `Aborted`, source resumed (after void confirmation); never resumes while the witness is down |
 | 17 | Dead source inside the window: the destination adopts (P4a path) and the recorded barrier yields `SAFE_CURRENT` — D5 convergence |
 | 18 | Half-restored destination: a crashed restore is re-driven by destroying the partial VM first; a dead destination VMM stalls in `IN_DOUBT` with a typed detail |
 | 19 | Snapshot-dir unreadable at the destination: `PREPARED` refuses typed (peer health check) |
@@ -751,8 +758,10 @@ is explicitly **not** claimed by this plan.
   once the cut is entered (the durable point of no return, at or
   after the source-side barrier), when a pre-cut rollback cannot
   complete safely (a failed barrier void — fail-closed, the source is
-  never resumed), and through any post-authorization stall before
-  `COMPLETE` (e.g. a dead destination VMM); it must never be reported
+  never resumed), and through any unresolvable post-authorization
+  stall before `COMPLETE` (e.g. a dead destination VMM; a resolvable
+  stall is reported as the canonical state plus a stall detail); it
+  must never be reported
   as a generic `ABORTED`" — every one of these observations is the
   fail-closed direction the contract's spirit intends, and the letter
   is amended to say so.
