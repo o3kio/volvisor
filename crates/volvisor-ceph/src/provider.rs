@@ -225,8 +225,10 @@ pub struct CephRbdProvider {
     /// Path of the durable JSON state file.
     state_path: PathBuf,
     state: Mutex<CephState>,
-    /// The most recent reconcile report (the startup pass or the last
-    /// explicit [`reconcile`](Self::reconcile) call), kept so the audit
+    /// The most recent successful reconcile report (the startup pass or
+    /// the last explicit [`reconcile`](Self::reconcile) call that
+    /// returned `Ok`; a failed pass leaves the previous report in
+    /// place), kept so the audit
     /// trail of destructive-looking bookkeeping — e.g. attachment
     /// records cleared because their backing vanished or turned
     /// foreign — survives past the state change it describes. Read it
@@ -289,9 +291,11 @@ impl CephRbdProvider {
         })
     }
 
-    /// The most recent reconcile report: the startup pass performed at
-    /// construction, or the last explicit
-    /// [`reconcile`](Self::reconcile) call.
+    /// The most recent *successful* reconcile report: the startup pass
+    /// performed at construction, or the last explicit
+    /// [`reconcile`](Self::reconcile) call that returned `Ok`. A failed
+    /// pass leaves the previous report in place (its caller sees the
+    /// error; the slot preserves the last audit trail).
     ///
     /// The startup report is retained precisely because construction
     /// reconciles before anything can observe it: without this
@@ -575,10 +579,12 @@ impl CephRbdProvider {
     /// is dropped — the mapping itself is never auto-unmapped, an
     /// actual zombie device is left to an operator. The caller persists
     /// when `changed` says something moved.
+    #[allow(clippy::too_many_arguments)]
     fn fail_and_clear_attachment(
         state: &mut CephState,
         id: &VolumeId,
         snapshot: &StoredVolume,
+        spec: &str,
         mappings: Option<&[MappedDevice]>,
         reason: ClearedAttachmentReason,
         report: &mut ReconcileReport,
@@ -597,14 +603,16 @@ impl CephRbdProvider {
         // Preserve the cleared record in the report as the audit
         // trail: the device it named, and whether a live mapping still
         // exists over the gone/foreign backing (a zombie left for an
-        // operator — never auto-unmapped).
+        // operator — never auto-unmapped). The match is on the full
+        // pool/image spec: a same-named image mapped from a different
+        // pool is not this volume's mapping.
         if let Some(record) = snapshot.runtime.attachment.as_ref() {
             report.cleared_attachments.push(ClearedAttachment {
                 volume_id: id.clone(),
                 device: record.device.clone(),
                 zombie_mapping: mappings.map(|maps| {
                     maps.iter()
-                        .any(|m| m.name.as_deref() == Some(snapshot.entry.image_name.as_str()))
+                        .any(|m| m.pool_slash_image().as_deref() == Some(spec))
                 }),
                 reason,
             });
@@ -669,6 +677,7 @@ impl CephRbdProvider {
                 continue;
             };
             let image_name = snapshot.entry.image_name.as_str();
+            let spec = self.image_spec(image_name);
             if !listed.iter().any(|name| name == image_name) {
                 // Verifiably absent image: Failed, and the attachment
                 // record (whose backing no longer exists) is cleared so
@@ -677,6 +686,7 @@ impl CephRbdProvider {
                     &mut state,
                     &id,
                     &snapshot,
+                    &spec,
                     mappings.as_deref(),
                     ClearedAttachmentReason::VanishedImage,
                     &mut report,
@@ -726,7 +736,7 @@ impl CephRbdProvider {
                         &mut state,
                         &id,
                         &snapshot,
-                        image_name,
+                        &spec,
                         mappings.as_deref(),
                         &mut report,
                         &mut changed,
@@ -742,6 +752,7 @@ impl CephRbdProvider {
                         &mut state,
                         &id,
                         &snapshot,
+                        &spec,
                         mappings.as_deref(),
                         ClearedAttachmentReason::OwnershipMismatch,
                         &mut report,
@@ -790,13 +801,18 @@ impl CephRbdProvider {
         state: &mut CephState,
         id: &VolumeId,
         snapshot: &StoredVolume,
-        image_name: &str,
+        spec: &str,
         mappings: Option<&[MappedDevice]>,
         report: &mut ReconcileReport,
         changed: &mut bool,
     ) {
-        let mapped =
-            mappings.is_some_and(|maps| maps.iter().any(|m| m.name.as_deref() == Some(image_name)));
+        // The match is on the full pool/image spec, mirroring the
+        // attach path's `ensure_not_mapped`: a same-named image mapped
+        // from a different pool is not this volume's mapping.
+        let mapped = mappings.is_some_and(|maps| {
+            maps.iter()
+                .any(|m| m.pool_slash_image().as_deref() == Some(spec))
+        });
         if let Some(record) = snapshot.runtime.attachment.as_ref() {
             // Record exists: a verifiably absent device means an
             // interrupted detach — reconcile forward.
@@ -1613,7 +1629,10 @@ impl CephRbdProvider {
         // durability claim here.
         let capacity = self.pool_stats()?;
         let delta = req.new_size_bytes.saturating_sub(actual_size);
-        if delta.saturating_add(CEPH_HEADROOM_BYTES) > capacity.max_avail {
+        // Only a grow that actually needs new bytes consumes capacity:
+        // a target already met (delta == 0) must not be refused on a
+        // near-full pool — it allocates nothing.
+        if delta > 0 && delta.saturating_add(CEPH_HEADROOM_BYTES) > capacity.max_avail {
             return Err(ApiError::new(
                 ApiErrorCode::NoSafeCapacity,
                 format!(
@@ -1767,10 +1786,12 @@ impl CephRbdProvider {
                     ApiErrorCode::ForeignDeviceState,
                     format!(
                         "image {spec} does not carry the ownership record of volume {volume_id}; \
-                         a foreign image is never destroyed by volvisor — restore the image's \
-                         `volvisor.owner` metadata to `{volume_id}` to make the volume operable \
-                         again, or, once you have confirmed the image is truly foreign, remove \
-                         it and the volume's state entry manually (out of band)"
+                         a foreign image is never destroyed by volvisor — restoring the image's \
+                         `volvisor.owner` metadata to `{volume_id}` makes an in-band delete \
+                         possible (the reconciled lifecycle stays `Failed`; there is no in-band \
+                         repair back to `Ready`), or, once you have confirmed the image is \
+                         truly foreign, remove it and the volume's state entry manually (out \
+                         of band)"
                     ),
                 ));
             }

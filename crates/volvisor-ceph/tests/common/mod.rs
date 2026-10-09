@@ -56,6 +56,9 @@ pub const FSID: &str = "f340f0d0-feed-4000-8000-000000000001";
 pub const MON_HOSTS: &[&str] = &["mon-a:6789", "mon-b:6789"];
 /// The pool the fixture provider operates on.
 pub const POOL: &str = "volvisortest";
+/// The pool `foreign_pool_mappings` are reported under (any pool other
+/// than [`POOL`] exercises the identity rule).
+pub const FOREIGN_POOL: &str = "some-other-pool";
 /// The Ceph user the fixture provider authenticates as (the FULL entity
 /// name, passed via `--name` and pinned by the fake's dispatch check).
 pub const USER: &str = "client.volvisor";
@@ -126,6 +129,12 @@ pub struct FakeCeph {
     pub trash: Vec<String>,
     /// Mapped device path (`/dev/rbdN`) → image name.
     pub mappings: BTreeMap<String, String>,
+    /// Mappings reported by `rbd showmapped` under a DIFFERENT pool
+    /// than the configured one (device → image name): same-named
+    /// images mapped from foreign pools. Pins that reconcile
+    /// classifies mappings by the full pool/image identity, never by
+    /// image name alone.
+    pub foreign_pool_mappings: BTreeMap<String, String>,
     /// Counter for the next `/dev/rbdN` device number.
     pub next_device: u64,
     /// When true, `rbd create` fails.
@@ -172,6 +181,7 @@ impl Default for FakeCeph {
             images: BTreeMap::new(),
             trash: Vec::new(),
             mappings: BTreeMap::new(),
+            foreign_pool_mappings: BTreeMap::new(),
             next_device: 0,
             fail_rbd_create: false,
             fail_map: false,
@@ -235,19 +245,25 @@ fn ceph_df_body(world: &FakeCeph) -> String {
 /// object with a `devices` array (each entry carrying the device id,
 /// pool, image name, snapshot and device path).
 fn showmapped_body(world: &FakeCeph) -> String {
-    let devices: Vec<serde_json::Value> = world
-        .mappings
-        .iter()
-        .map(|(device, image)| {
-            serde_json::json!({
-                "id": device.trim_start_matches("/dev/rbd"),
-                "pool": POOL,
-                "name": image,
-                "snap": "-",
-                "device": device,
-            })
+    let ours = world.mappings.iter().map(|(device, image)| {
+        serde_json::json!({
+            "id": device.trim_start_matches("/dev/rbd"),
+            "pool": POOL,
+            "name": image,
+            "snap": "-",
+            "device": device,
         })
-        .collect();
+    });
+    let foreign = world.foreign_pool_mappings.iter().map(|(device, image)| {
+        serde_json::json!({
+            "id": device.trim_start_matches("/dev/rbd"),
+            "pool": FOREIGN_POOL,
+            "name": image,
+            "snap": "-",
+            "device": device,
+        })
+    });
+    let devices: Vec<serde_json::Value> = ours.chain(foreign).collect();
     serde_json::json!({ "devices": devices }).to_string()
 }
 

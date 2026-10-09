@@ -685,6 +685,85 @@ async fn grow_capacity_check_is_typed() {
 }
 
 #[tokio::test]
+async fn a_zero_delta_grow_needs_no_capacity() {
+    let fixture = fixture();
+    let id = volume_id("grow-zero-delta");
+    let created = fixture
+        .provider
+        .create_volume(&create_request("grow-zero-delta", GIB))
+        .await
+        .expect("create");
+
+    // The image was grown out of band to 3 GiB (the crash window after
+    // an unrecorded resize), and the pool is nearly full: the derived
+    // max_avail is far below the headroom. A grow whose target (2 GiB)
+    // is already met allocates NOTHING and must not be refused.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world
+            .images
+            .get_mut(&image_name_for(&id))
+            .expect("image")
+            .size = 3 * GIB;
+        world.pool_max_avail = CEPH_HEADROOM_BYTES / 2;
+    }
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request("grow-zero-delta", 2 * GIB, created.generation),
+        )
+        .await
+        .expect("a grow that allocates zero bytes is not a capacity refusal");
+
+    // No resize ran; the honest effective size is the actual 3 GiB.
+    assert!(!grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 3 * GIB);
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(inspected.provisioned_bytes, 3 * GIB);
+}
+
+#[tokio::test]
+async fn a_same_named_foreign_pool_mapping_is_not_a_stale_mapping() {
+    let fixture = fixture();
+    let id = volume_id("foreign-pool-map");
+    let image_name = image_name_for(&id);
+    fixture
+        .provider
+        .create_volume(&create_request("foreign-pool-map", MIB))
+        .await
+        .expect("create");
+
+    // A mapping exists whose image NAME matches this volume's image,
+    // but under a different pool. It is not this volume's mapping:
+    // reconcile must not classify the (detached) volume as carrying a
+    // stale mapping.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .foreign_pool_mappings
+        .insert("/dev/rbd9".to_owned(), image_name.clone());
+
+    let report = fixture.provider.reconcile().expect("reconcile report");
+    assert_eq!(
+        report.stale_mappings,
+        [],
+        "a foreign-pool mapping of a same-named image is not ours"
+    );
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after reconcile");
+    assert_eq!(
+        inspected.state,
+        VolumeLifecycle::Ready,
+        "the volume is not Failed over someone else's mapping"
+    );
+}
+
+#[tokio::test]
 async fn an_unrecorded_grow_is_healed_not_wedged() {
     let fixture = fixture();
     let id = volume_id("heal-vol");

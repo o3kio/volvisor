@@ -63,7 +63,8 @@ Out (recorded follow-ups):
 - `ceph health detail --format json` — health reflection.
 - `ceph df --format json` — pool usable/RAW statistics for capacity.
 - `rbd create --image-feature exclusive-lock,layering -s <size>B <pool>/<image>`
-- `rbd info --format json <pool>/<image>` — size/features verification.
+- `rbd info --format json <pool>/<image>` — size verification (feature
+  verification on adoption is a recorded follow-up, not part of P2).
 - `rbd ls --pool <pool> --format json`; `rbd ls --pool <pool> --lsv2 --format json`
   where metadata is needed (or `rbd image-meta get/set <pool>/<image> <key>`).
 - `rbd resize -s <size>B <pool>/<image>` (grow-only by construction — the
@@ -99,8 +100,10 @@ Out (recorded follow-ups):
 
 ## 5. Single writer and attach (contract §3)
 
-- Every volvisor-owned image is created with `exclusive-lock`; images without
-  it are not adopted.
+- Every volvisor-owned image is created with `exclusive-lock`; verifying
+  that an existing image carries the feature before adopting it is a
+  recorded follow-up (adoption is decided by ownership metadata alone in
+  P2).
 - Attach: verify ownership → `rbd map` → verify the device appears in
   `rbd showmapped` for exactly this image → record the mapping as the
   host-scoped ephemeral handle with `prepared` state (no VMM integration in
