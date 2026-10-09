@@ -60,9 +60,11 @@ In (P4a):
   state; a `renew_leases` entry point; reconcile and **startup** fail-closed
   self-fencing; adoption + classification + promotion for unplanned
   failover on the surviving host.
-- `volvisord`: witness configuration (endpoint, token, lease TTL, renewal
-  interval, fence grace, fence quarantine), a background lease-renewal
-  task, and admin endpoints for authority observation and adopt/promote.
+- `volvisord`: witness configuration (endpoint, token, renewal interval —
+  the lease TTL, grace and fence-wait knobs live on the **witness**, §3,
+  because the witness is what enforces them), a background lease-renewal
+  task, and admin endpoints for authority observation and
+  adopt/promote.
 - `volvisor-api`: the nearline inspect response gains an `authority`
   section (observed epoch/lease state — contract §1 observability); an
   admin adopt/promote endpoint. Volume API v2 contract text updated to
@@ -159,10 +161,10 @@ Out (recorded follow-ups; each maps to P4b or later):
   **duration from the response**, and the writer's local deadline is
   `response_received_locally + duration`. The residual skew term is
   therefore bounded by the response latency (network + processing), not by
-  free-running clock drift — and that bound is exactly the configurable
-  `fence_grace_secs` used in the window analysis below. The documented
-  assumption is that response latency stays under that bound (operator
-  network responsibility, stated in config docs).
+  free-running clock drift — and that bound is exactly the witness's
+  configurable `lease_grace_secs` used in the window analysis below. The
+  documented assumption is that response latency stays under that bound
+  (operator network responsibility, stated in the witness config docs).
 - **W6 (forced revocation is recorded)**: revoking a **live** lease (the
   manual STONITH path against an alive-but-partitioned source) requires an
   explicit authorization record (operator identity + reason) journaled with
@@ -178,12 +180,18 @@ Out (recorded follow-ups; each maps to P4b or later):
   W6's own scenario is an alive-but-**partitioned** source that cannot
   reach the witness — it serves until its local deadline no matter how
   often it tries to renew, so only the lease's end bounds it. A
-  power-off STONITH attestation may shorten the wait: the forced-revoke
-  authorization can record that the source host is provably powered off,
-  in which case there is nothing to wait out — recorded, never assumed.)
+  power-off STONITH attestation may shorten the wait — recorded as an
+  operator-attested `ASSUMPTION(unverified)` per §7: the attestation
+  must be a **positive power-off confirmation distinct from the W6
+  authorization record** (e.g. fence-device/BMC evidence), and a false
+  attestation re-opens the dual-write window in exactly the
+  partitioned-source case — stated, never papered over.)
   A grant requested inside the window is a typed `FENCE_PENDING`
   refusal carrying a retry-after duration — the candidate retries;
-  nothing blocks.
+  nothing blocks. A holder's **own self-release** (detach, §4) starts no
+  wait: the releasing host demoted itself, so no other writer can be
+  unaware of the release; the time-based wait exists only for expiry
+  and revocations, where a writer might be partitioned.
 
 ### Dual-write window analysis (the honest fence boundary)
 
@@ -231,8 +239,11 @@ runs `primary --force` outside the two justified paths in §5.
   `inspect(volume_id) → AuthorityView` where `AuthorityView` carries not
   only the epoch/holder/lease-state/commit-index but also the **full
   registration record** (lineage UUID set, both endpoints' backing
-  identities, any recorded barrier) — the adopt flow of §5 reads back
-  exactly what it must compare against, through this one operation.
+  identities, any recorded barrier) and, for a live lease, its
+  **remaining duration as a duration-from-response** (per W5 — a revived
+  writer must never reconstruct a local deadline from an absolute
+  timestamp) — the adopt flow of §5 reads back exactly what it must
+  compare against, through this one operation.
 - Deployment: `volvisor-witnessd` on a **third failure domain**, with its
   own config: `listen`, `state_dir`, `auth_token`, `lease_ttl_secs`,
   `lease_grace_secs` (the response-latency bound W7 assumes — the one
@@ -290,7 +301,11 @@ runs `primary --force` outside the two justified paths in §5.
   attachment; it is still an unvalidated writer). I/O is suspended
   before the API surface starts, the lease is validated via
   `inspect`, and the device is resumed only on a live lease for our
-  epoch. An unreachable witness leaves it suspended — a restarted daemon
+  epoch **whose remaining duration (returned per W5) covers the renewal
+  margin** — a live-but-nearly-expired lease is not a safe resume, since
+  the writer would hold no W5-conformant local deadline until its first
+  renewal response. An unreachable witness leaves it suspended — a
+  restarted daemon
   never silently resumes a writer it cannot prove (rule 5). This subsumes
   the P3 zombie-primary case safely: the zombie is reported exactly as
   before (never auto-demoted) and additionally suspended when it holds
@@ -392,13 +407,17 @@ model), so failover is an **adopt-and-promote** admin operation:
 - `volvisord` config: `witness_url`, `witness_token`,
    `renewal_interval_secs`. The lease TTL, grace and the W7 wait live on
    the **witness** (§3) — they are enforced there, so they are configured
-   there; the writer daemon validates `renewal_interval < ttl / 2`
-   against the TTL the witness reports in its responses (fail-closed
-   startup refusal on violation), rather than duplicating the value.
-   Token is required for non-loopback witness URLs, plus the §3
-   two-sided failure-domain guard. A background tokio task runs
-   `renew_leases` every renewal interval; failures surface as events,
-   not crashes.
+   there. The writer daemon checks `renewal_interval < ttl / 2`
+   **lazily and continuously**, against the TTL every grant/renew
+   response carries, refusing attach/promotion on violation — not at
+   startup, where no response exists yet. That check is an
+   **availability guard, not a fence**: fencing correctness never
+   depends on it (the W7 wait is computed from the lease's recorded end
+   at the witness regardless); it only prevents a writer from renewing
+   so rarely that its lease lapses between renewals. Token is required
+   for non-loopback witness URLs, plus the §3 two-sided
+   failure-domain guard. A background tokio task runs `renew_leases`
+   every renewal interval; failures surface as events, not crashes.
 - `volvisor-api`: `GET /v2/volumes/{id}` (nearline) reports the
    `authority` section; `POST /v2/admin/nearline/{id}/adopt` runs §5 with
    body `{allow_loss: bool}` and responds with the classification and
@@ -423,6 +442,13 @@ model), so failover is an **adopt-and-promote** admin operation:
   configuration can see (§3 two-sided guard); volvisor cannot verify
   physical placement — documented. A witness rebuild degrades lineage
   checks to operator attestation — also documented.
+- The power-off STONITH shortening of the W7 wait is an operator-attested
+  `ASSUMPTION(unverified)`: it requires a **positive power-off
+  confirmation distinct from the W6 authorization record** (fence-device
+  or BMC evidence), and a false attestation re-opens the dual-write
+  window in exactly the alive-but-partitioned-source case. The same
+  honesty treatment the barrier attestation gets: the trust consequence
+  is stated, never papered over.
 
 ## 8. Test matrix
 
