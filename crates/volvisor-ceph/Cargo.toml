@@ -1,0 +1,29 @@
+[package]
+name = "volvisor-ceph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor external Ceph RBD provider (adapter to an existing cluster, P2 slice)"
+
+[lints]
+workspace = true
+
+[features]
+# Real-cluster integration tests against an externally operated Ceph;
+# additionally gated at runtime by VOLVISOR_TEST_CEPH=1 (requires a reachable
+# cluster configured through VOLVISOR_CEPH_* environment variables).
+integration-ceph = []
+
+[dependencies]
+volvisor-types = { workspace = true }
+volvisor-provider = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
