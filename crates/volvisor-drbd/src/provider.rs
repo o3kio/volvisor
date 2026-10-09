@@ -2938,6 +2938,10 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
             .map(|a| a.id.clone()),
         backend_health: Health::Unknown,
         evidence_status: EvidenceStatus::PrototypeOnly,
+        // Filled by `verified_inspect_response` from witness facts for
+        // witness-managed volumes; `None` (pre-authority/P3-era) is the
+        // honest value — never a fabricated authority claim.
+        authority: None,
     }
 }
 

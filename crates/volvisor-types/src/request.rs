@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::authority::AuthoritySummary;
 use crate::domain::{
     EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning, VolumeClass,
 };
@@ -461,6 +462,11 @@ pub struct InspectVolumeResponse {
     pub backend_health: Health,
     /// Honest evidence status.
     pub evidence_status: EvidenceStatus,
+    /// Writer-authority summary (nearline volumes with a witness; `None`
+    /// for classes without remote authority — never a fabricated
+    /// authority claim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<AuthoritySummary>,
 }
 
 /// ListVolumes response.

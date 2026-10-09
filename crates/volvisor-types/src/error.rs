@@ -32,6 +32,15 @@ pub enum ApiErrorCode {
     StaleGeneration,
     /// Another writable attachment is already active.
     WriterAlreadyActive,
+    /// The witness holds a live lease for the volume; the competing grant
+    /// is refused (witness invariant W1).
+    LeaseHeld,
+    /// The renewal targets a retired epoch; the writer learns it is fenced
+    /// (witness invariant W4).
+    StaleEpoch,
+    /// A grant is inside the witness's fence-wait window; retry after the
+    /// carried duration (witness invariant W7).
+    FencePending,
     /// Fencing authority cannot be established.
     UnknownFencingAuthority,
     /// A replica required for the requested guarantee is not durable.
@@ -70,6 +79,9 @@ impl ApiErrorCode {
             Self::ForeignDeviceState => "FOREIGN_DEVICE_STATE",
             Self::StaleGeneration => "STALE_GENERATION",
             Self::WriterAlreadyActive => "WRITER_ALREADY_ACTIVE",
+            Self::LeaseHeld => "LEASE_HELD",
+            Self::StaleEpoch => "STALE_EPOCH",
+            Self::FencePending => "FENCE_PENDING",
             Self::UnknownFencingAuthority => "UNKNOWN_FENCING_AUTHORITY",
             Self::ReplicaNotDurable => "REPLICA_NOT_DURABLE",
             Self::MigrationUnsupportedLocalStorage => "MIGRATION_UNSUPPORTED_LOCAL_STORAGE",
@@ -102,6 +114,9 @@ impl ApiErrorCode {
             | Self::ForeignDeviceState
             | Self::StaleGeneration
             | Self::WriterAlreadyActive
+            | Self::LeaseHeld
+            | Self::StaleEpoch
+            | Self::FencePending
             | Self::UnknownFencingAuthority
             | Self::ReplicaNotDurable
             | Self::OperationInDoubt
@@ -206,6 +221,9 @@ mod tests {
             ApiErrorCode::ForeignDeviceState,
             ApiErrorCode::StaleGeneration,
             ApiErrorCode::WriterAlreadyActive,
+            ApiErrorCode::LeaseHeld,
+            ApiErrorCode::StaleEpoch,
+            ApiErrorCode::FencePending,
             ApiErrorCode::UnknownFencingAuthority,
             ApiErrorCode::ReplicaNotDurable,
             ApiErrorCode::MigrationUnsupportedLocalStorage,
