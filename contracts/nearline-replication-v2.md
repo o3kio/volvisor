@@ -136,7 +136,7 @@ The serving workload host consumes the active local replica via an isolated fron
 
 ## 9A. Replication provider and modes (ADR-0007)
 
-The first qualified implementation candidate is DRBD 9. Define engine-neutral provider methods for create, attach, status, resync, configure policy, fence, promote/demote, migrate preparation and recover. The actual provider must expose **effective**, not merely requested, mode/replica/quorum state. LINSTOR is a management/control plane for DRBD resources, not an independent replication protocol.
+The first qualified implementation candidate is DRBD 9. Define engine-neutral provider methods for create, attach, status, resync, configure policy, fence, promote/demote, migrate preparation and recover (illustrative responsibilities; the candidate interface surface is the `ReplicationProvider` list in ADR-0007). The actual provider must expose **effective**, not merely requested, mode/replica/quorum state. LINSTOR is a management/control plane for DRBD resources, not an independent replication protocol.
 
 `replication.mode=async` maps to DRBD Protocol A (local disk and TCP send-buffer ACK) and remains the v2 nearline default. `semi-sync` maps to Protocol B (remote memory arrival) and `sync` to Protocol C (local and remote disk completion), **only when supported and validated on the pinned driver/frontends**. Section 4 describes required local ACK minimum for the default async mode; stronger remote completion is required for the corresponding configured mode. Synchronous protection must fail closed or explicitly enter a user-authorized degraded policy when remote media is unavailable; never keep advertising the former guaranteed profile while serving locally.
 

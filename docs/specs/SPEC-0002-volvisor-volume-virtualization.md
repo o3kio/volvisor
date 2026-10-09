@@ -174,7 +174,7 @@ The v2 documents fix semantics, **not implementation evidence**. Nothing here is
 
 Supersession is scoped: v2 replaces v1 class semantics, storage-class names, provider/replication contracts and migration authority. The following v1 operational requirements **remain binding** where this SPEC and the v2 contracts do not explicitly replace them:
 
-- **Storage backplane and transport** (SPEC-0001 section 13): TCP is the minimum portable transport; RDMA/RoCE and dedicated trusted underlays are optional optimizations; control and data traffic remain distinguishable; underlay encryption policy is explicit and never silently disabled.
+- **Storage backplane** (SPEC-0001 section 13): TCP is the minimum portable transport; RDMA/RoCE and dedicated trusted underlays are optional optimizations; control and data traffic remain distinguishable; underlay encryption policy is explicit and never silently disabled.
 - **Control-plane outage behavior** (volvisor-provider-v1 section 12, ADR-0001 section 5): loss of O3K/CellHV connectivity alone must not detach healthy established volumes, revoke a valid writer, stop a healthy Storage Cell or reinitialize devices; new allocations and authority-changing operations may fail closed until authority returns.
 - **Peer authentication and secret handling** (volvisor-provider-v1 section 13), **endpoint isolation** (section 15) and **observability truthfulness** (section 17).
 

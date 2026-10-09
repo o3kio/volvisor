@@ -41,7 +41,7 @@ DRBD may use multiple peers, but never confuse the number of configured DRBD nod
 ```text
 host A                                             host B
 VM -> CHV virtio-blk                                no guest writer
-          |                                         
+          |
      /dev/drbd100 (Primary) --- DRBD protocol A --> /dev/drbd100 (Secondary)
           |                                              |
      local LV on NVMe A                             local LV on NVMe B
@@ -105,7 +105,7 @@ Auto-promotion is a DRBD capability, not a permission for uninstructed VM launch
 
 ## Planned Cloud Hypervisor live migration is a separate hard gate
 
-A key restriction: DRBD single-primary cannot ordinarily be demoted while a VMM has the DRBD device open. QEMU/KVM DRBD live-migration guidance often enables **temporary dual-primary** (Protocol C with fencing) so both endpoints can open the shared block device during handoff. Dual-primary is not equivalent to safe multi-writer data semantics; it is **prohibited by default** by Volvisor's current v2 contract.
+A key restriction: DRBD single-primary cannot ordinarily be demoted while a VMM has the DRBD device open. DRBD virtualization live-migration guidance (with QEMU/KVM) often enables **temporary dual-primary** (Protocol C with fencing) so both endpoints can open the shared block device during handoff. Dual-primary is not equivalent to safe multi-writer data semantics; it is **prohibited by default** by Volvisor's current v2 contract.
 
 First evaluate a strict single-primary handoff with a VMM API/integration that can:
 1. Prepare B's local replica and VM memory state without opening B's disk writable.

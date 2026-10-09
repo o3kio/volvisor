@@ -5,7 +5,7 @@ kind: RookCellPlan
 metadata:
   name: three-host-rook-cell-poc
 spec:
-  featureGate: rook-cell-experimental
+  featureGate: rook-cell-experimental # illustrative plan token; canonical gate name is ceph_deployment_mode=rook-cell-experimental and may differ in the versioned plan API
   kubernetes:
     controlPlane: existing-independent-control-plane
     workerNodeNamePrefix: volvisor-cell-
