@@ -1,0 +1,37 @@
+[package]
+name = "volvisor-witness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Third-party writer-authority witness for nearline-replicated volumes (nearline contract v2 section 2)"
+
+[lints]
+workspace = true
+
+[dependencies]
+volvisor-types = { workspace = true }
+volvisor-journal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+axum = { workspace = true }
+tokio = { workspace = true }
+sha2 = "0.10"
+bytes = "1"
+hyper = { version = "1", default-features = false, features = ["http1", "client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+# TOML parsing for the config round-trip test (the witnessd binary in the
+# volvisord crate owns production TOML loading; the lib only serde-models).
+toml = "0.9"
+# Journal fault injection (`Journal::inject_append_failures_after`) for the
+# outcome-could-not-be-journaled fault test; the feature is never enabled
+# for the library itself or for downstream consumers (resolver v3 keeps
+# dev-dep features out of normal builds).
+volvisor-journal = { workspace = true, features = ["test-faults"] }

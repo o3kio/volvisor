@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use volvisor_journal::Journal;
-use volvisor_provider::{AdminSurface, VolumeProvider};
+use volvisor_provider::{AdminSurface, AdoptionSurface, VolumeProvider};
 
 use crate::metrics::Metrics;
 
@@ -26,6 +26,9 @@ pub struct AppState {
     /// Privileged device-enrollment surface, when the provider implements
     /// one. `None` serves `404` on the `/v2/admin` routes.
     pub(crate) admin: Option<Arc<dyn AdminSurface>>,
+    /// Nearline adopt-and-promote surface (P4a), when the provider
+    /// implements one. `None` serves the typed 404 on the adopt route.
+    pub(crate) adoption: Option<Arc<dyn AdoptionSurface>>,
     /// Durable intent journal (idempotency registry + journal-before-mutate).
     pub(crate) journal: std::sync::Mutex<Journal>,
     /// Prometheus-format counters served on `/metrics`.
@@ -51,9 +54,20 @@ impl AppState {
         Self {
             provider,
             admin,
+            adoption: None,
             journal: std::sync::Mutex::new(journal),
             metrics: Arc::new(Metrics::new()),
             admin_token,
         }
+    }
+
+    /// Attach the nearline adopt-and-promote surface (P4a plan §6): the
+    /// provider must also be the volume provider of this state — the
+    /// adopt route operates on the same engine that serves the volume
+    /// operations.
+    #[must_use]
+    pub fn with_adoption(mut self, adoption: Arc<dyn AdoptionSurface>) -> Self {
+        self.adoption = Some(adoption);
+        self
     }
 }

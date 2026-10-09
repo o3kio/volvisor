@@ -771,6 +771,7 @@ fn inspect_response(vol: &Volume) -> InspectVolumeResponse {
         current_writer: vol.current_writer.clone(),
         backend_health: Health::Unknown,
         evidence_status: vol.evidence_status,
+        authority: None,
     }
 }
 

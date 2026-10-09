@@ -25,6 +25,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod admin;
+pub mod authority;
 pub mod capability;
 pub mod domain;
 pub mod error;
@@ -33,6 +34,10 @@ pub mod request;
 pub mod state;
 
 pub use admin::{ClaimDeviceRequest, DeviceListResponse, ReleaseDeviceRequest};
+pub use authority::{
+    AuthoritySummary, AuthorityView, EndpointBacking, FencingProof, LeaseId, LeaseState,
+    LossBoundary, PromotionClassification, RecordedBarrier, VolumeRegistration, WriterEpoch,
+};
 pub use capability::{Capability, CapabilitySet};
 pub use domain::{
     AccessMode, Attachment, AttachmentState, DeviceRole, EffectiveProtection, FailureDomain,
@@ -45,9 +50,9 @@ pub use id::{
     VolumeId,
 };
 pub use request::{
-    AccessModeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
-    ErasurePolicy, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
-    ListVolumesResponse, PROVIDER_API_VERSION,
+    AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse, CreateVolumeRequest,
+    DeleteVolumeRequest, DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest,
+    GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, PROVIDER_API_VERSION,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 

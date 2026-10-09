@@ -20,8 +20,8 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
-    AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
-    GrowVolumeRequest, ListVolumesResponse,
+    AdoptVolumeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
+    DetachVolumeRequest, DrainProof, GrowVolumeRequest, ListVolumesResponse,
 };
 use volvisor_types::{
     ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, ProjectId, ReleaseDeviceRequest,
@@ -258,6 +258,12 @@ fn admin_surface_unavailable() -> ApiError {
     ApiError::not_found("admin surface not available for this provider")
 }
 
+/// The typed 404 for the adopt route on providers without an adoption
+/// surface (every non-witness-managed class).
+fn adoption_surface_unavailable() -> ApiError {
+    ApiError::not_found("adoption surface not available for this provider")
+}
+
 /// `GET /v2/admin/devices` — read-only device discovery.
 ///
 /// Privileged (admin token required even though it is a read): the device
@@ -352,6 +358,50 @@ pub(crate) async fn release_device(
                 released: device_id.clone(),
             })
         },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/admin/nearline/{volume_id}/adopt` — the adopt-and-promote
+/// admin operation (P4a plan §5/§6).
+///
+/// Routed through the journal pipeline like every privileged mutation:
+/// the (redacted) intent is durable before the provider call, and the
+/// volume id plus `allow_loss` are folded into the request hash — a
+/// replay with a different `allow_loss` for the same operation id is an
+/// `IDEMPOTENCY_CONFLICT`, never a silent second attempt. The
+/// classification-based refusals (`unsafe`, unauthorized
+/// `possible_loss`) are *successful* journaled responses with
+/// `volume: null`, so they replay exactly like promotions.
+pub(crate) async fn adopt_volume(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(volume_id): Path<String>,
+    ValidJson(req): ValidJson<AdoptVolumeRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first (see `claim_device`).
+    let adoption = state
+        .adoption
+        .clone()
+        .ok_or_else(|| ApiErrorReply(adoption_surface_unavailable()))?;
+    req.validate()?;
+    let volume_id = parse_volume_id(&volume_id)?;
+    tracing::info!(
+        kind = ops::OP_ADOPT_VOLUME,
+        operation_id = %req.operation_id,
+        volume_id = %volume_id,
+        allow_loss = req.allow_loss,
+        "accepting adopt_volume"
+    );
+    let payload = ops::volume_payload(&volume_id, &req)?;
+    ops::execute(
+        &state,
+        ops::OP_ADOPT_VOLUME,
+        req.operation_id.clone(),
+        req.request_hash(&volume_id),
+        payload,
+        move || async move { adoption.adopt_volume(&volume_id, req.allow_loss).await },
     )
     .await
     .map_err(ApiErrorReply::from)

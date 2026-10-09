@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::authority::{AuthoritySummary, PromotionClassification};
 use crate::domain::{
     EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning, VolumeClass,
 };
@@ -461,6 +462,11 @@ pub struct InspectVolumeResponse {
     pub backend_health: Health,
     /// Honest evidence status.
     pub evidence_status: EvidenceStatus,
+    /// Writer-authority summary (nearline volumes with a witness; `None`
+    /// for classes without remote authority — never a fabricated
+    /// authority claim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<AuthoritySummary>,
 }
 
 /// ListVolumes response.
@@ -468,6 +474,68 @@ pub struct InspectVolumeResponse {
 pub struct ListVolumesResponse {
     /// Volumes visible in the request scope.
     pub volumes: Vec<InspectVolumeResponse>,
+}
+
+/// Adopt-and-promote request (P4a plan §5/§6, contract section 8): the
+/// operator-driven unplanned failover of a nearline volume to the
+/// surviving host. A privileged mutation — journaled like every other
+/// one (rule 8), with the volume id and `allow_loss` folded into the
+/// request hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptVolumeRequest {
+    /// Must equal `volvisor.volume.v2`.
+    pub api_version: String,
+    /// Idempotency key.
+    pub operation_id: OperationId,
+    /// The explicit loss authorization for a `possible_loss`
+    /// classification (recorded with the exposure evidence). It is
+    /// never sufficient for `unsafe` and never required for
+    /// `safe_current`.
+    pub allow_loss: bool,
+}
+
+impl AdoptVolumeRequest {
+    /// Validate the envelope.
+    ///
+    /// # Errors
+    /// `INVALID_REQUEST` when `api_version` is not the contract's.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        crate::validate_api_version(&self.api_version)?;
+        Ok(())
+    }
+
+    /// Canonical request hash for idempotency: the target volume and the
+    /// request body (the operation id is the journal key, never part of
+    /// the hash).
+    #[must_use]
+    pub fn request_hash(&self, volume_id: &VolumeId) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"volvisor.volume.v2:adopt:");
+        hasher.update(volume_id.as_str().as_bytes());
+        hasher.update(b":");
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        hasher.update(&body);
+        hasher.finalize().into()
+    }
+}
+
+/// Adopt-and-promote response (P4a plan §5/§6): the honest promotion
+/// classification — including a refused one (`unsafe`, or
+/// `possible_loss` without the recorded `allow_loss` authorization) —
+/// and the resulting volume state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptVolumeResponse {
+    /// The classification computed from observed facts only.
+    pub classification: PromotionClassification,
+    /// The recorded volume state after a **successful** adoption;
+    /// `None` on refusal — nothing was adopted and this host's state
+    /// is unchanged (the resource keeps whatever out-of-band state it
+    /// had; nothing is fabricated for a volume this host does not
+    /// hold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<InspectVolumeResponse>,
 }
 
 /// AttachVolume response: a host-scoped, ephemeral backend handle, never raw

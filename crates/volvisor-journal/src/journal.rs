@@ -105,6 +105,7 @@ struct Replayed {
     operations: HashMap<OperationId, OperationState>,
     next_sequence: u64,
     record_count: u64,
+    records: Vec<JournalRecord>,
 }
 
 impl Journal {
@@ -116,6 +117,28 @@ impl Journal {
     /// any file operation fails. A torn trailing record is *not* an error:
     /// the log is truncated to the last valid record.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, ApiError> {
+        Self::open_inner(dir, false).map(|(journal, _)| journal)
+    }
+
+    /// Open like [`Journal::open`], additionally returning every valid
+    /// record in journal order (the same record set replay derived state
+    /// from, torn tails excluded).
+    ///
+    /// For consumers that derive their own state by folding the log (the
+    /// witness registry): they get the one-time snapshot at open and track
+    /// subsequent appends themselves, so the journal keeps no per-record
+    /// retention for regular users.
+    pub fn open_with_records(
+        dir: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<JournalRecord>), ApiError> {
+        Self::open_inner(dir, true)
+    }
+
+    /// Shared open path; `collect_records` retains the replayed records.
+    fn open_inner(
+        dir: impl AsRef<Path>,
+        collect_records: bool,
+    ) -> Result<(Self, Vec<JournalRecord>), ApiError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(io_err("failed to create journal directory"))?;
 
@@ -170,9 +193,9 @@ impl Journal {
                 ))?;
         }
 
-        let replayed = replay(&mut log)?;
+        let replayed = replay(&mut log, collect_records)?;
 
-        Ok(Self {
+        let journal = Self {
             lock_file,
             log,
             log_path,
@@ -181,7 +204,8 @@ impl Journal {
             record_count: replayed.record_count,
             #[cfg(feature = "test-faults")]
             fail_after_remaining: AtomicU64::new(u64::MAX),
-        })
+        };
+        Ok((journal, replayed.records))
     }
 
     /// Test-only fault injection (feature `test-faults`): let the next `n`
@@ -344,7 +368,7 @@ impl Drop for Journal {
 
 /// Replay the log file, rebuilding the idempotency registry and truncating
 /// any torn tail.
-fn replay(log: &mut File) -> Result<Replayed, ApiError> {
+fn replay(log: &mut File, collect_records: bool) -> Result<Replayed, ApiError> {
     log.seek(SeekFrom::Start(0))
         .map_err(io_err("failed to seek journal log for replay"))?;
     let mut data = Vec::new();
@@ -355,6 +379,7 @@ fn replay(log: &mut File) -> Result<Replayed, ApiError> {
         operations: HashMap::new(),
         next_sequence: 1,
         record_count: 0,
+        records: Vec::new(),
     };
     let mut offset = 0usize;
     while let Some(raw) = frame::decode_at(&data, offset, replayed.next_sequence) {
@@ -366,6 +391,9 @@ fn replay(log: &mut File) -> Result<Replayed, ApiError> {
             // tail. Stop replay at this frame boundary.
             break;
         };
+        if collect_records {
+            replayed.records.push(envelope.record.clone());
+        }
         apply_record(&mut replayed, envelope.record);
         replayed.next_sequence = raw.sequence + 1;
         replayed.record_count += 1;

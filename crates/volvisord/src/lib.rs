@@ -19,8 +19,10 @@
 
 pub mod config;
 pub mod runtime;
+pub mod witness;
 
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use config::Config;
 
@@ -38,6 +40,19 @@ pub enum DaemonError {
 /// Parsed bind address for the API surface.
 #[derive(Debug, Clone, Copy)]
 pub struct BindAddress(pub SocketAddr);
+
+/// Wall-clock unix seconds for the witness-side clocks (lease expiry,
+/// fence windows) and the writer's W5 deadline anchoring.
+///
+/// The witness's `lease_grace_secs` exists precisely to absorb the
+/// skew and latency this clock introduces (P4a plan §3's documented
+/// timing assumption); a monotonic clock cannot be used because lease
+/// deadlines must survive process restarts.
+pub(crate) fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
 
 #[cfg(test)]
 mod tests {

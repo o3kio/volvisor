@@ -1463,3 +1463,192 @@ async fn invalid_grow_envelope_is_rejected_without_journaling() {
     let (status, body) = send(&app, json_request(Method::POST, grow_uri, &corrected)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Adopt-and-promote (P4a plan §6): the nearline admin route
+// ---------------------------------------------------------------------------
+
+/// A scripted adoption surface: returns a canned classification and
+/// records the calls (the classification itself is engine behavior,
+/// covered by the drbd authority tests; here only the route contract
+/// matters — auth, availability, validation and journal idempotency).
+struct FakeAdoption {
+    calls: std::sync::Mutex<Vec<(volvisor_types::VolumeId, bool)>>,
+}
+
+impl FakeAdoption {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl volvisor_provider::AdoptionSurface for FakeAdoption {
+    async fn adopt_volume(
+        &self,
+        volume_id: &volvisor_types::VolumeId,
+        allow_loss: bool,
+    ) -> Result<volvisor_types::AdoptVolumeResponse, ApiError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push((volume_id.clone(), allow_loss));
+        Ok(volvisor_types::AdoptVolumeResponse {
+            classification: volvisor_types::PromotionClassification::PossibleLoss {
+                boundary: volvisor_types::LossBoundary::Unknown,
+                authorized: allow_loss,
+            },
+            volume: None,
+        })
+    }
+}
+
+/// Setup with the adoption surface wired (the drbd daemon wiring, in
+/// miniature): the state's provider is still the `FakeProvider`.
+fn setup_with_adoption() -> (SharedState, Arc<FakeAdoption>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let adoption = Arc::new(FakeAdoption::new());
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_adoption(adoption.clone()),
+    );
+    (state, adoption, dir)
+}
+
+fn adopt_body(operation_id: &str, allow_loss: bool) -> Value {
+    serde_json::json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": operation_id,
+        "allow_loss": allow_loss,
+    })
+}
+
+#[tokio::test]
+async fn adopt_runs_through_the_journal_and_replays() {
+    let (state, adoption, _dir) = setup_with_adoption();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-adopt-1/adopt";
+
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &adopt_body("op-adopt-1", true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["classification"],
+        json!({"possible_loss": {"boundary": "unknown", "authorized": true}})
+    );
+    assert_eq!(body["volume"], Value::Null, "a refusal carries no volume");
+    // The surface saw exactly one execution with the authorization.
+    assert_eq!(
+        *adoption.calls.lock().expect("calls"),
+        vec![(
+            volvisor_types::VolumeId::new("vol-adopt-1").expect("id"),
+            true
+        )]
+    );
+
+    // The SAME operation id replays the recorded outcome byte-for-byte
+    // without a second execution.
+    let (status, replayed) = send_json(
+        &app,
+        json_request(Method::POST, uri, &adopt_body("op-adopt-1", true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(body, replayed);
+    assert_eq!(
+        adoption.calls.lock().expect("calls").len(),
+        1,
+        "replays never re-execute"
+    );
+}
+
+#[tokio::test]
+async fn adopt_conflicts_when_the_same_operation_changes_authorization() {
+    let (state, _adoption, _dir) = setup_with_adoption();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-adopt-2/adopt";
+
+    let (status, _body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &adopt_body("op-adopt-2", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // allow_loss is part of the request hash: a different authorization
+    // under the same operation id is an idempotency conflict, never a
+    // silent second attempt.
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &adopt_body("op-adopt-2", true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("IDEMPOTENCY_CONFLICT"));
+}
+
+#[tokio::test]
+async fn adopt_requires_the_admin_token() {
+    let (state, _adoption, _dir) = setup_with_adoption();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request_without_auth(
+            Method::POST,
+            "/v2/admin/nearline/vol-adopt-3/adopt",
+            &adopt_body("op-adopt-3", false),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], json!("UNAUTHORIZED"));
+}
+
+#[tokio::test]
+async fn adopt_validates_the_envelope() {
+    let (state, _adoption, _dir) = setup_with_adoption();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-adopt-4/adopt";
+
+    // A wrong api_version is a typed invalid request (nothing journaled).
+    let mut wrong_version = adopt_body("op-adopt-4", false);
+    wrong_version["api_version"] = json!("volvisor.volume.v1");
+    let (status, body) = send_json(&app, json_request(Method::POST, uri, &wrong_version)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["code"],
+        json!("UNSUPPORTED_CLASS_OR_POLICY"),
+        "a foreign api_version is the unsupported-policy refusal, before anything is journaled"
+    );
+    assert_eq!(journal_record_count(&state), 0, "nothing is journaled");
+}
+
+#[tokio::test]
+async fn adopt_serves_the_typed_404_without_an_adoption_surface() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/admin/nearline/vol-adopt-5/adopt",
+            &adopt_body("op-adopt-5", false),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+    assert_eq!(
+        body["message"],
+        json!("adoption surface not available for this provider")
+    );
+}

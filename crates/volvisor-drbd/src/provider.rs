@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use volvisor_provider::VolumeProvider;
+use volvisor_provider::{AdoptionSurface, VolumeProvider};
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health,
     LocalProtectionAxis, Provisioning, RemoteProtectionAxis, VolumeClass,
@@ -66,23 +66,28 @@ use volvisor_types::request::{
     ReplicationModeRequest,
 };
 use volvisor_types::{
-    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, ProjectId,
-    VolumeId, VolumeLifecycle, validate_api_version,
+    AdoptVolumeResponse, ApiError, ApiErrorCode, AttachmentId, AttachmentState, AuthoritySummary,
+    AuthorityView, Capability, CapabilitySet, EndpointBacking, HostId, LeaseState, LossBoundary,
+    ProjectId, PromotionClassification, RecordedBarrier, VolumeId, VolumeLifecycle,
+    validate_api_version,
 };
 
+use crate::authority::{AuthorityContext, LeaseValidity, witness_error};
 use crate::report::{
-    DiskState, LvRow, ResourceStatus, Role, VgRow, parse_blockdev_size, parse_drbdsetup_status,
-    parse_report,
+    DiskState, LvRow, ResourceStatus, Role, VgRow, parse_blockdev_size, parse_drbdsetup_show_gi,
+    parse_drbdsetup_status, parse_report,
 };
 use crate::resgen::{
-    ParsedNode, ResourceDefinition, is_ipv4_literal, parse_resource_file, read_shared_secret,
-    res_file_path,
+    ParsedNode, ParsedResource, ResourceDefinition, is_ipv4_literal, parse_resource_file,
+    read_shared_secret, res_file_path,
 };
 use crate::state::{
-    AttachmentRecord, ClearedAttachment, ClearedAttachmentReason, DrbdState, ReconcileReport,
-    ReplicationMode, StoredVolume, UnverifiableVolume, VolumeEntry, VolumeRuntime, unix_now,
+    AttachmentRecord, ClearedAttachment, ClearedAttachmentReason, DeferredRenewal, DrbdState,
+    FencedVolume, PendingFence, ReconcileReport, RenewalReport, ReplicationMode, StoredVolume,
+    UnverifiableVolume, VolumeAuthorityBlock, VolumeEntry, VolumeRuntime, unix_now,
 };
 use crate::{CommandOutput, CommandRunner};
+use volvisor_witness::proto::{RegisterResponse, RegistrationContent, WitnessError};
 
 /// Stable provider name for diagnostics (never a secret).
 pub const PROVIDER_NAME: &str = "drbd9-nearline-prototype";
@@ -324,18 +329,106 @@ pub struct DrbdProvider {
     /// past the state change it describes. Read it with
     /// [`last_reconcile_report`](Self::last_reconcile_report).
     last_reconcile: Mutex<Option<ReconcileReport>>,
+    /// The writer-authority context (P4a), when this deployment is
+    /// witness-managed. `None` keeps exactly the P3 behavior
+    /// (pre-authority, epoch 0) for every code path below.
+    authority: Option<AuthorityContext>,
+}
+
+/// Verified adoption facts (P4a plan §5 step 1): everything the
+/// authority check, the classification and the promotion need,
+/// proven against this host and the witness registration.
+/// The nearline adopt surface (P4a plan §6): the admin route calls the
+/// engine's [`Self::adopt_and_promote`] through the trait object the
+/// daemon wires into the API state.
+#[async_trait::async_trait]
+impl AdoptionSurface for DrbdProvider {
+    async fn adopt_volume(
+        &self,
+        volume_id: &VolumeId,
+        allow_loss: bool,
+    ) -> Result<AdoptVolumeResponse, ApiError> {
+        self.adopt_and_promote(volume_id, allow_loss)
+    }
+}
+
+struct AdoptionFacts {
+    /// The derived resource name (the scheme match is part of the
+    /// verification).
+    resource: String,
+    /// The backing LV's volume group (from the definition's disk
+    /// path).
+    vg_name: String,
+    /// The backing LV's name.
+    lv_name: String,
+    /// The resource's DRBD minor (from the definition).
+    minor: u32,
+    /// This host's replication port (from the definition's own
+    /// on-node address).
+    port: u16,
+    /// The replication protocol re-verified from the definition
+    /// (the classification branches on it).
+    replication_mode: ReplicationMode,
+    /// The observed local disk state.
+    local_disk: DiskState,
+    /// The operator-attested barrier, when the registration
+    /// recorded one.
+    barrier: Option<RecordedBarrier>,
+    /// The witness view (authority check + registration).
+    view: AuthorityView,
 }
 
 impl DrbdProvider {
-    /// Construct the provider.
+    /// Construct the provider in pre-authority (P3) mode: no witness,
+    /// no leases — every authority field stays `None` and the zombie
+    /// and reconciliation rules behave exactly as in P3.
     ///
-    /// Fail-closed startup verification first (plan §8): `drbdadm
-    /// --version` must answer, `<proc_root>/drbd` must be readable
-    /// (the kernel module is loaded), `vgs` must report the configured
-    /// VG, `uname -n` must equal `config.node_name`, the shared secret
-    /// file must be readable and non-empty, and `config_dir` must
-    /// exist. Only then is the durable state loaded and reconciled; on
-    /// any failure nothing is written.
+    /// See [`Self::with_authority`] for the witness-managed mode and
+    /// `Self::construct` for the shared fail-closed startup
+    /// sequence.
+    ///
+    /// # Errors
+    /// See `Self::construct`.
+    pub fn new(
+        runner: Arc<dyn CommandRunner>,
+        config: DrbdProviderConfig,
+        state_path: PathBuf,
+    ) -> Result<Self, ApiError> {
+        Self::construct(runner, config, state_path, None)
+    }
+
+    /// Construct the provider in witness-managed mode (P4a plan §4):
+    /// every promotion must hold a lease acquired from the witness
+    /// first, renewal runs on the daemon's cadence against W5 local
+    /// deadlines, and the startup reconciliation fail-closes on any
+    /// Primary whose lease cannot be proven live (suspended, never
+    /// silently resumed).
+    ///
+    /// The context must have been built inside the runtime that will
+    /// serve the witness connection (the blocking adapter captured its
+    /// handle at construction).
+    ///
+    /// # Errors
+    /// See `Self::construct`; additionally, the startup
+    /// reconciliation now validates witness-managed primaries, so an
+    /// unreachable witness can fail construction with a typed error
+    /// naming the volumes that stayed suspended.
+    pub fn with_authority(
+        runner: Arc<dyn CommandRunner>,
+        config: DrbdProviderConfig,
+        state_path: PathBuf,
+        authority: AuthorityContext,
+    ) -> Result<Self, ApiError> {
+        Self::construct(runner, config, state_path, Some(authority))
+    }
+
+    /// The shared fail-closed construction sequence (plan §8):
+    /// `drbdadm --version` must answer, `<proc_root>/drbd` must be
+    /// readable (the kernel module is loaded), `vgs` must report the
+    /// configured VG, `uname -n` must equal `config.node_name`, the
+    /// shared secret file must be readable and non-empty, and
+    /// `config_dir` must exist. Only then is the durable state loaded
+    /// and reconciled; on any failure nothing is written.
     ///
     /// # Errors
     /// Returns a typed [`ApiError`]: `INTERNAL` when the toolchain or
@@ -344,10 +437,11 @@ impl DrbdProvider {
     /// would be running on the wrong host), `INVALID_REQUEST` on an
     /// unusable secret file or config directory, plus whatever the
     /// initial reconciliation surfaces.
-    pub fn new(
+    fn construct(
         runner: Arc<dyn CommandRunner>,
         config: DrbdProviderConfig,
         state_path: PathBuf,
+        authority: Option<AuthorityContext>,
     ) -> Result<Self, ApiError> {
         config.validate()?;
         let provider = Self {
@@ -356,6 +450,7 @@ impl DrbdProvider {
             state_path,
             state: Mutex::new(DrbdState::default()),
             last_reconcile: Mutex::new(None),
+            authority,
         };
         provider.verify_startup()?;
         let state = DrbdState::load(&provider.state_path)?;
@@ -555,6 +650,262 @@ impl DrbdProvider {
             return Err(command_failed("blockdev --getsize64", &output));
         }
         parse_blockdev_size(&output.stdout)
+    }
+
+    // -- Writer-authority self-fencing (P4a plan §4) --
+
+    /// Suspend I/O on the resource's device: `drbdsetup suspend-io
+    /// /dev/drbd<minor>`.
+    ///
+    /// The argv form is verified against the drbd-utils 9.29.0 sources
+    /// (suspend-io is a CTX_MINOR command; a bare resource name is not
+    /// resolvable, the device node is — see
+    /// `tests/drbd_authority_shapes.rs`). Suspension freezes the data
+    /// path — the enforcement point a bypassing guest cannot escape;
+    /// only root on the host can, which is the documented residual.
+    /// Idempotent in the kernel (suspending a suspended resource is a
+    /// no-op).
+    ///
+    /// # Errors
+    /// `INTERNAL` when the command fails.
+    fn suspend_io(&self, minor: u32) -> Result<(), ApiError> {
+        let device = format!("/dev/drbd{minor}");
+        let output = self.runner.run("drbdsetup", &["suspend-io", &device])?;
+        if !output.success {
+            return Err(command_failed("drbdsetup suspend-io", &output));
+        }
+        Ok(())
+    }
+
+    /// Resume I/O on the resource's device (`drbdsetup resume-io
+    /// /dev/drbd<minor>`) — the counterpart of [`Self::suspend_io`],
+    /// used only on the validated-resume path (a live lease for our
+    /// epoch covering the renewal margin); never on the fence path.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the command fails.
+    fn resume_io(&self, minor: u32) -> Result<(), ApiError> {
+        let device = format!("/dev/drbd{minor}");
+        let output = self.runner.run("drbdsetup", &["resume-io", &device])?;
+        if !output.success {
+            return Err(command_failed("drbdsetup resume-io", &output));
+        }
+        Ok(())
+    }
+
+    /// Self-fence a witness-managed volume (plan §4): suspend I/O, then
+    /// attempt the demotion. The pending-fence marker is durably
+    /// recorded **before** the demotion is attempted, so a crash
+    /// between the two routes the restart through reconcile's
+    /// fence-completion path instead of leaving a suspended Secondary
+    /// nothing resumes. A busy device (the kernel refuses demotion
+    /// while open — the P3 rule) stays suspended with the attachment
+    /// record cleared, the [`PendingFence`] marker recorded and the
+    /// lifecycle `Failed`; reconcile completes the demotion once the
+    /// device closes. A clean demotion returns the volume to `Ready`.
+    /// Never a silent resume.
+    ///
+    /// The lease block is always cleared: authority is provably lost
+    /// and must never be renewed again.
+    ///
+    /// # Errors
+    /// `INTERNAL` when a command or the state save fails (the fence is
+    /// then retried by the next renewal pass and, after a restart, by
+    /// the startup reconcile — the suspension is already durable in
+    /// the kernel whenever the suspend itself succeeded; a suspended
+    /// data path is guaranteed only while the local `drbdsetup` path
+    /// is healthy, and the witness's W7 window — keyed on the lease's
+    /// recorded end — is the bound that covers a suspension that is
+    /// slow or failing).
+    /// The fence-completion core shared by the startup reconcile and
+    /// the renewal pass's fence lane: demote a still-Primary marked
+    /// resource (a busy refusal returns `Ok(false)` — the device is
+    /// still open, retried by the next pass), lift the suspension once
+    /// demoted, clear the marker and return the volume to `Ready`.
+    /// Never a silent resume. The caller owns the state save and the
+    /// reporting.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the demotion or the resume command fails.
+    fn try_complete_fence(
+        &self,
+        state: &mut DrbdState,
+        id: &VolumeId,
+        entry: &VolumeEntry,
+        is_primary: bool,
+    ) -> Result<bool, ApiError> {
+        let mut demoted = !is_primary;
+        if !demoted {
+            let output = self.run_drbdadm("secondary", &entry.resource_name)?;
+            // A busy refusal (the device is still open) is the expected
+            // retry-later case; any OTHER failure is reported by the
+            // caller instead of being folded into the silent skip —
+            // the same distinction `self_fence` itself makes.
+            if !output.success && !is_device_busy(&output.stderr) {
+                return Err(command_failed("drbdadm secondary", &output));
+            }
+            demoted = output.success;
+        }
+        if !demoted {
+            return Ok(false);
+        }
+        self.resume_io(entry.minor)?;
+        if let Some(volume) = state.volume_mut(id) {
+            volume.runtime.fence = None;
+            volume.runtime.state = VolumeLifecycle::Ready;
+        }
+        Ok(true)
+    }
+
+    /// The renewal pass's fence lane: for every entry carrying a
+    /// [`PendingFence`] marker, attempt the shared completion (demote
+    /// if the device closed, resume, clear, `Ready`). Query and
+    /// completion failures are reported (never hidden) and retried by
+    /// the next pass; they never abort the renewal pass — the lease
+    /// deadlines of the other volumes must not depend on one stuck
+    /// fence. Without this lane, a busy-device fence would stay
+    /// suspended until a restart. A downed resource is left to the
+    /// startup reconcile's downed-volume handling.
+    fn complete_pending_fences(&self, state: &mut DrbdState, report: &mut RenewalReport) {
+        let ids: Vec<VolumeId> = state.volumes().keys().cloned().collect();
+        for id in ids {
+            let Some(snapshot) = state.volume(&id).cloned() else {
+                continue;
+            };
+            if snapshot.runtime.fence.is_none() {
+                continue;
+            }
+            let entry = snapshot.entry;
+            let status = match self.resource_status(&entry.resource_name) {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id,
+                        detail: format!(
+                            "querying {} for fence completion failed: {}",
+                            entry.resource_name, error.detail
+                        ),
+                    });
+                    continue;
+                }
+            };
+            match self.try_complete_fence(state, &id, &entry, status.role == Role::Primary) {
+                Ok(true) => match state.save(&self.state_path) {
+                    Ok(()) => report.completed_fences.push(id),
+                    Err(error) => {
+                        report.fence_failures.push(UnverifiableVolume {
+                            volume_id: id,
+                            detail: format!(
+                                "saving the completed fence of {} failed: {}",
+                                entry.resource_name, error.detail
+                            ),
+                        });
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id,
+                        detail: format!(
+                            "completing the fence of {} failed: {}",
+                            entry.resource_name, error.detail
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    fn self_fence(
+        &self,
+        state: &mut DrbdState,
+        volume_id: &VolumeId,
+        entry: &VolumeEntry,
+        reasons: Vec<String>,
+    ) -> Result<FencedVolume, ApiError> {
+        self.suspend_io(entry.minor)?;
+        // The fence marker is durable BEFORE the demotion is attempted
+        // (the plan's crash-window discipline): a crash anywhere past
+        // this point leaves the marker that routes the restart through
+        // reconcile's fence-completion path (which demotes, resumes and
+        // clears it) — never a suspended Secondary that nothing resumes
+        // while the state claims it is healthy. A failed marker save
+        // does NOT stop the fence: the suspension is already durable
+        // in the kernel and the demotion is safe regardless of what
+        // the on-disk record says; the save error is returned at the
+        // end so the caller reports it.
+        let fenced = FencedVolume {
+            volume_id: volume_id.clone(),
+            reasons,
+            demoted: false,
+        };
+        let mut save_error = None;
+        if let Some(volume) = state.volume_mut(volume_id) {
+            volume.runtime.attachment = None;
+            volume.runtime.authority = None;
+            volume.runtime.fence = Some(PendingFence {
+                reason: fenced
+                    .reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "writer authority lost".to_owned()),
+                fenced_at: unix_now(),
+            });
+            volume.runtime.state = VolumeLifecycle::Failed;
+            volume.entry.generation += 1;
+            if let Err(error) = state.save(&self.state_path) {
+                save_error = Some(error);
+            }
+        }
+        let demoted = match self.resource_status(&entry.resource_name)? {
+            Some(status) if status.role == Role::Primary => {
+                let output = self.run_drbdadm("secondary", &entry.resource_name)?;
+                if output.success {
+                    true
+                } else if is_device_busy(&output.stderr) {
+                    false
+                } else {
+                    return Err(command_failed("drbdadm secondary", &output));
+                }
+            }
+            // Already Secondary (e.g. an interrupted detach caught by
+            // the renewal loop) or down: the fence needs no demotion.
+            _ => true,
+        };
+        // Lift the suspension once the demotion completed: the writer
+        // is provably gone and a suspended Secondary would silently
+        // freeze the next attachment's I/O. A failed resume keeps the
+        // pending-fence marker (the renewal pass and the startup
+        // reconcile retry the completion) — never a silent freeze,
+        // never a silent resume.
+        let mut resume_error = None;
+        if demoted {
+            if let Err(error) = self.resume_io(entry.minor) {
+                resume_error = Some(error);
+            }
+        }
+        let complete = demoted && resume_error.is_none();
+        if complete {
+            // The fence finished: clear the durable marker. (A crash
+            // before this save leaves the marker set — reconcile
+            // re-runs the idempotent completion.)
+            if let Some(volume) = state.volume_mut(volume_id) {
+                volume.runtime.fence = None;
+                volume.runtime.state = VolumeLifecycle::Ready;
+                if let Err(error) = state.save(&self.state_path) {
+                    save_error = save_error.or(Some(error));
+                }
+            }
+        }
+        let fenced = FencedVolume { demoted, ..fenced };
+        if let Some(error) = save_error {
+            return Err(error);
+        }
+        if let Some(error) = resume_error {
+            return Err(error);
+        }
+        Ok(fenced)
     }
 
     // -- Ownership verification --
@@ -1004,6 +1355,17 @@ impl DrbdProvider {
         changed: &mut bool,
     ) {
         Self::fail_volume(state, id, snapshot, changed);
+        // The lease block is cleared too: the resource is verifiably
+        // gone (backing vanished/foreign or the resource down), so its
+        // writer is not serving; an orphaned lease would only be
+        // renewed pointlessly. It lapses at its recorded end, bounded
+        // harmlessly by W1/W7.
+        if snapshot.runtime.authority.is_some() {
+            if let Some(volume) = state.volume_mut(id) {
+                volume.runtime.authority = None;
+            }
+            *changed = true;
+        }
         if let Some(record) = snapshot.runtime.attachment.as_ref() {
             if let Some(volume) = state.volume_mut(id) {
                 volume.runtime.attachment = None;
@@ -1145,19 +1507,192 @@ impl DrbdProvider {
                 report.downed_volumes.push(id);
                 continue;
             };
-            // 4. A zombie promotion is reported and Failed, never
-            //    auto-demoted.
+            // 4. Complete a pending self-fence (P4a plan §4): the
+            //    resource is volvisor's own suspended device — the
+            //    demotion was refused only because it was still open.
+            //    It completes once the device closes (and the
+            //    suspension this host imposed is lifted with it); a
+            //    resource carrying the marker is never confused with a
+            //    foreign zombie promotion (which is never
+            //    auto-demoted, rule 17). Never a silent resume. The
+            //    completion core is shared with the renewal pass's
+            //    fence lane ([`Self::try_complete_fence`]).
+            if snapshot.runtime.fence.is_some() {
+                match self.try_complete_fence(&mut state, &id, &entry, status.role == Role::Primary)
+                {
+                    Ok(true) => {
+                        changed = true;
+                        report.completed_fences.push(id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.unverifiable_volumes.push(UnverifiableVolume {
+                            volume_id: id,
+                            detail: format!(
+                                "completing the fence of {} failed: {}",
+                                entry.resource_name, error.detail
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
+            // 5. Writer-authority validation (P4a plan §4): in
+            //    witness-managed mode every Primary found on this host
+            //    is unproven until validated — keyed on the role and
+            //    the lease, NOT the attachment record (a crash between
+            //    promote and record save leaves a Primary with no
+            //    record; it is still an unvalidated writer). I/O is
+            //    suspended first (fail-closed ordering: a stalled
+            //    witness must leave the writer frozen, never serving),
+            //    the lease is validated via inspect, and the device is
+            //    resumed only on a live lease for our epoch whose
+            //    remaining duration covers the renewal margin.
+            //    Pre-authority (P3) mode keeps exactly the P3 rules.
+            if status.role == Role::Primary {
+                if let Some(authority) = &self.authority {
+                    if let Err(error) = self.suspend_io(entry.minor) {
+                        report.unverifiable_volumes.push(UnverifiableVolume {
+                            volume_id: id,
+                            detail: format!(
+                                "suspending the primary {} failed: {}",
+                                entry.resource_name, error.detail
+                            ),
+                        });
+                        continue;
+                    }
+                    match snapshot.runtime.authority.as_ref() {
+                        Some(block) => match authority.validate(&id, block) {
+                            Ok(LeaseValidity::Valid { .. }) => {
+                                // Proven: resume. A volume that a previous
+                                // pass failed only because the witness was
+                                // unreachable heals back to Attached (its
+                                // attachment record survived); a valid
+                                // Primary without an attachment record
+                                // falls through to the zombie report
+                                // below — reported exactly as in P3,
+                                // never auto-demoted, serving under its
+                                // live lease.
+                                if let Err(error) = self.resume_io(entry.minor) {
+                                    report.unverifiable_volumes.push(UnverifiableVolume {
+                                        volume_id: id,
+                                        detail: format!(
+                                            "resuming the validated primary {} failed: {}",
+                                            entry.resource_name, error.detail
+                                        ),
+                                    });
+                                    continue;
+                                }
+                                if snapshot.runtime.attachment.is_some()
+                                    && snapshot.runtime.state == VolumeLifecycle::Failed
+                                {
+                                    if let Some(volume) = state.volume_mut(&id) {
+                                        volume.runtime.state = VolumeLifecycle::Attached;
+                                    }
+                                    changed = true;
+                                }
+                            }
+                            Ok(LeaseValidity::Invalid { reasons }) => {
+                                match self.self_fence(&mut state, &id, &entry, reasons) {
+                                    Ok(fenced) => report.fenced_volumes.push(fenced),
+                                    Err(error) => {
+                                        report.unverifiable_volumes.push(UnverifiableVolume {
+                                            volume_id: id,
+                                            detail: format!(
+                                                "self-fencing {} failed: {}",
+                                                entry.resource_name, error.detail
+                                            ),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                // Unreachable or otherwise unvalidatable
+                                // witness: stay suspended, fail-closed. The
+                                // attachment record is KEPT (the writer
+                                // resumes once the witness answers again);
+                                // the lifecycle records the refusal.
+                                Self::fail_volume(&mut state, &id, &snapshot, &mut changed);
+                                report.unvalidated_primaries.push(UnverifiableVolume {
+                                    volume_id: id,
+                                    detail: error.detail,
+                                });
+                                continue;
+                            }
+                        },
+                        None => {
+                            // A Primary with no persisted lease on a
+                            // witness-managed host: unproven. The witness
+                            // decides which kind: an UNREGISTERED volume
+                            // is pre-authority (P3-era) and keeps exactly
+                            // its P3 handling; a registered volume without
+                            // a block (e.g. a rolled-back state file)
+                            // stays suspended — its writer cannot renew
+                            // or prove anything.
+                            match authority.inspect(&id) {
+                                // Unregistered (UnknownVolume is mapped
+                                // to INVALID_STATE): pre-authority.
+                                Err(error) if error.code == ApiErrorCode::InvalidState => {
+                                    if let Err(error) = self.resume_io(entry.minor) {
+                                        report.unverifiable_volumes.push(UnverifiableVolume {
+                                            volume_id: id,
+                                            detail: format!(
+                                                "resuming the pre-authority primary {} \
+                                                 failed: {}",
+                                                entry.resource_name, error.detail
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                }
+                                // Registered: suspended zombie, reported
+                                // with the reason.
+                                Ok(_) => {
+                                    Self::fail_volume(&mut state, &id, &snapshot, &mut changed);
+                                    report.zombie_primaries.push(id.clone());
+                                    report.unvalidated_primaries.push(UnverifiableVolume {
+                                        volume_id: id,
+                                        detail: format!(
+                                            "primary {} holds no persisted authority block \
+                                             on a witness-registered volume: suspended as \
+                                             unproven; re-acquire authority out of band",
+                                            entry.resource_name
+                                        ),
+                                    });
+                                    continue;
+                                }
+                                // Unreachable witness: stay suspended.
+                                Err(error) => {
+                                    Self::fail_volume(&mut state, &id, &snapshot, &mut changed);
+                                    report.unvalidated_primaries.push(UnverifiableVolume {
+                                        volume_id: id,
+                                        detail: error.detail,
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 6. A zombie promotion is reported and Failed, never
+            //    auto-demoted (pre-authority volumes, unregistered
+            //    primaries and pre-authority mode).
             if status.role == Role::Primary && snapshot.runtime.attachment.is_none() {
                 Self::fail_volume(&mut state, &id, &snapshot, &mut changed);
                 report.zombie_primaries.push(id);
                 continue;
             }
-            // 5. An interrupted detach: the demotion succeeded but the
-            //    state save did not. Clear the record, return to Ready,
-            //    and keep reconciling the (now detached) volume.
+            // 7. An interrupted detach: the demotion succeeded but the
+            //    state save did not. Clear the record (and any orphaned
+            //    lease block — the lease lapses at its recorded end,
+            //    bounded harmlessly by W1/W7), return to Ready, and
+            //    keep reconciling the (now detached) volume.
             if snapshot.runtime.attachment.is_some() && status.role == Role::Secondary {
                 if let Some(volume) = state.volume_mut(&id) {
                     volume.runtime.attachment = None;
+                    volume.runtime.authority = None;
                     if volume.runtime.state == VolumeLifecycle::Attached {
                         volume.runtime.state = VolumeLifecycle::Ready;
                     }
@@ -1269,6 +1804,868 @@ impl DrbdProvider {
         Ok(report)
     }
 
+    /// One writer-authority renewal pass (P4a plan §4): for every
+    /// volume holding a lease — attached or not, `Failed` included —
+    /// fence writers past their W5 local deadline, renew due leases,
+    /// and defer failures that do not prove authority lost (an
+    /// unreachable witness: keep serving until the local deadline, the
+    /// honest bound). The renewal predicate is deliberately "holds an
+    /// authority block", not "is Attached": the lease is never dropped
+    /// unilaterally — a `Failed` or zombie volume keeps renewing until
+    /// the WITNESS ends the lease (expiry after a failed renewal, a
+    /// recorded W6 forced revocation, or W4 epoch retirement), because
+    /// a deliberately lapped lease would auto-demote a zombie, which
+    /// P3's rules forbid, and the witness is the arbiter.
+    ///
+    /// The daemon's background task calls this on its renewal cadence.
+    /// The deadline check runs on **every** call, so the task may (and
+    /// should) tick faster than the renewal interval — the plan's §2
+    /// timing analysis assumes the fence lands within the grace
+    /// budget, which requires a small enforcement granularity (e.g. a
+    /// one-second tick; the witness's `lease_grace_secs` +
+    /// `suspend_budget_secs` must cover response latency plus the
+    /// tick).
+    ///
+    /// Each pass also runs the **fence lane** (a private
+    /// completion pass shared with the startup reconcile's step 4):
+    /// pending self-fences are
+    /// completed when their device has closed, so a busy-device fence
+    /// does not stay suspended until a restart (query and completion
+    /// failures there are reported, never fatal to the pass).
+    ///
+    /// The pass is two-phase: **fences first** (suspension and demotion
+    /// are entirely local — a past-deadline writer's enforcement never
+    /// queues behind another volume's blocking witness call), then
+    /// renewals. A fence that itself fails is reported in
+    /// [`RenewalReport::fence_failures`] and retried by the next pass
+    /// — it never aborts the other volumes' fences or renewals.
+    ///
+    /// Pre-authority (P3) mode is a no-op returning an empty report.
+    ///
+    /// # Errors
+    /// `INTERNAL` when a renewed lease's state save fails (the next
+    /// pass retries). Fence failures are reported in the report, not
+    /// returned — the suspension is already durable in the kernel
+    /// whenever the suspend itself succeeded.
+    pub fn renew_leases(&self) -> Result<RenewalReport, ApiError> {
+        let Some(authority) = &self.authority else {
+            return Ok(RenewalReport::default());
+        };
+        let now = authority.now_secs();
+        let mut state = self.lock_state()?;
+        let mut report = RenewalReport::default();
+        // The fence lane first: completing a fence can free the device
+        // (and the volume's authority residue) before the lease logic
+        // looks at it.
+        self.complete_pending_fences(&mut state, &mut report);
+        let ids: Vec<VolumeId> = state.volumes().keys().cloned().collect();
+        // Phase 1 — fences first, and fence-only: every past-deadline
+        // writer is suspended and demoted BEFORE any blocking witness
+        // call runs. `self_fence` is entirely local (the lease is left
+        // to the witness's own expiry — it is never released here), so
+        // a past-deadline volume's enforcement must not queue behind
+        // another volume's slow renewal: the W7 budget covers response
+        // latency plus the tick, not N × the witness timeout. A fence
+        // that itself fails is reported (and retried next pass)
+        // without aborting the other volumes' fences.
+        for id in &ids {
+            let Some(snapshot) = state.volume(id).cloned() else {
+                continue;
+            };
+            let Some(block) = snapshot.runtime.authority.clone() else {
+                continue;
+            };
+            // Past the W5 local deadline the writer self-fences no
+            // matter why the renewal failed: the deadline is the bound
+            // the writer promised (a witness that never answers is not
+            // a license to keep writing).
+            if now < block.deadline_at {
+                continue;
+            }
+            let reasons = vec![format!(
+                "the W5 local deadline {} passed (lease acquired {})",
+                block.deadline_at, block.acquired_at
+            )];
+            match self.self_fence(&mut state, id, &snapshot.entry, reasons) {
+                Ok(fenced) => report.fenced.push(fenced),
+                Err(error) => {
+                    report.fence_failures.push(UnverifiableVolume {
+                        volume_id: id.clone(),
+                        detail: format!(
+                            "self-fencing {} failed: {}",
+                            snapshot.entry.resource_name, error.detail
+                        ),
+                    });
+                }
+            }
+        }
+        // Phase 2 — renewals (blocking witness calls; a slow witness
+        // can only delay other renewals, never a fence).
+        for id in ids {
+            let Some(snapshot) = state.volume(&id).cloned() else {
+                continue;
+            };
+            let Some(block) = snapshot.runtime.authority.clone() else {
+                continue;
+            };
+            if now >= block.deadline_at {
+                continue;
+            }
+            // Renewal is due only after a full interval since the last
+            // response-anchored acquisition (a fast-ticking task must
+            // not hammer the witness).
+            if now
+                < block
+                    .acquired_at
+                    .saturating_add(authority.renewal_interval_secs())
+            {
+                continue;
+            }
+            match authority.renew_lease(&id, &block) {
+                Ok(refreshed) => {
+                    if let Some(volume) = state.volume_mut(&id) {
+                        volume.runtime.authority = Some(refreshed);
+                    }
+                    state.save(&self.state_path)?;
+                    report.renewed.push(id);
+                }
+                Err(err) if err.code == ApiErrorCode::StaleEpoch => {
+                    // The witness retired the epoch: this writer is
+                    // fenced, provably (W4).
+                    let reasons = vec![format!("the witness retired the lease: {}", err.detail)];
+                    match self.self_fence(&mut state, &id, &snapshot.entry, reasons) {
+                        Ok(fenced) => report.fenced.push(fenced),
+                        Err(error) => {
+                            report.fence_failures.push(UnverifiableVolume {
+                                volume_id: id.clone(),
+                                detail: format!(
+                                    "self-fencing {} after a stale epoch failed: {}",
+                                    snapshot.entry.resource_name, error.detail
+                                ),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Not proven lost: keep serving until the deadline
+                    // — the deferred entry carries the bound.
+                    report.deferred.push(DeferredRenewal {
+                        volume_id: id,
+                        detail: err.detail,
+                        deadline_at: block.deadline_at,
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    // -- Registration and unplanned promotion (P4a plan §3/§5) --
+
+    /// Read and parse the resource's own definition file. The caller
+    /// is expected to have verified the file matches the record
+    /// ([`Self::check_res_file`]) where a record exists.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the file cannot be read or parsed.
+    fn parsed_definition(&self, resource: &str) -> Result<ParsedResource, ApiError> {
+        let path = res_file_path(&self.config.config_dir, resource);
+        let content = fs::read_to_string(&path).map_err(|error| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "failed to read the resource file {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        parse_resource_file(&content)
+    }
+
+    /// The definition's backing disk path — the P3 operator model
+    /// deploys the identical single-volume definition on both hosts,
+    /// so exactly one distinct path may appear; anything else is not a
+    /// volvisor resource and is never guessed.
+    ///
+    /// # Errors
+    /// `INTERNAL` when no disk path is present or several distinct
+    /// paths appear.
+    fn definition_disk(resource: &str, definition: &ParsedResource) -> Result<String, ApiError> {
+        let disk = definition.disks.first().cloned().ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("the resource definition for {resource} carries no disk path"),
+            )
+        })?;
+        if definition.disks.iter().any(|path| *path != disk) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the resource definition for {resource} carries several distinct disk \
+                     paths: not the single-volume operator model"
+                ),
+            ));
+        }
+        Ok(disk)
+    }
+
+    /// The resource's live data-generation identifiers
+    /// (`drbdsetup show-gi <resource> <peer-node-id> 0` — a
+    /// CTX_PEER_DEVICE command; the argv and output shapes are pinned
+    /// by `tests/drbd_authority_shapes.rs`). The peer node id comes
+    /// from the resource definition's peer section — never guessed.
+    /// Returned sorted and deduplicated (the registration's set form).
+    ///
+    /// # Errors
+    /// `INTERNAL` when the definition carries no peer `node-id`, the
+    /// command fails or the output has no UUID line — the lineage is
+    /// never guessed.
+    fn lineage_uuids(&self, resource: &str) -> Result<Vec<String>, ApiError> {
+        let definition = self.parsed_definition(resource)?;
+        let peer_node_id = definition
+            .nodes
+            .iter()
+            .find(|node| node.name != self.config.node_name)
+            .and_then(|node| node.node_id)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("resource definition for {resource} carries no peer node-id"),
+                )
+            })?;
+        let peer_node_id = peer_node_id.to_string();
+        // Every volvisor resource is single-volume (volume 0).
+        let output = self
+            .runner
+            .run("drbdsetup", &["show-gi", resource, &peer_node_id, "0"])?;
+        if !output.success {
+            return Err(command_failed("drbdsetup show-gi", &output));
+        }
+        let mut uuids = parse_drbdsetup_show_gi(&output.stdout)?.lineage_uuids;
+        uuids.sort();
+        uuids.dedup();
+        Ok(uuids)
+    }
+
+    /// Register a volume lineage with the witness (P4a plan §3): the
+    /// explicit, out-of-band provisioning step that makes a volume
+    /// witness-managed (nothing registers automatically — the optional
+    /// operator-attested barrier is an operator decision, and an
+    /// auto-registration without one would permanently foreclose
+    /// `SAFE_CURRENT` for that lineage). Verifies the volume is ours
+    /// first (rule 7: never register foreign state), then records the
+    /// live lineage identifiers and both endpoints' backing identities
+    /// as derived from the resource definition — the same definition
+    /// file is deployed on both hosts (the P3 operator model), so the
+    /// adopt flow on the surviving host can compare them verbatim
+    /// after losing the primary entirely.
+    ///
+    /// # Errors
+    /// `INVALID_STATE` in pre-authority mode or for an unknown
+    /// volume; typed ownership/resource verification failures; the
+    /// witness's own refusals (content-identical re-registration is
+    /// idempotent; divergence is refused typed).
+    pub fn register_volume(
+        &self,
+        volume_id: &VolumeId,
+        barrier: Option<RecordedBarrier>,
+    ) -> Result<RegisterResponse, ApiError> {
+        let Some(authority) = &self.authority else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                "this provider is not witness-managed (no authority context)",
+            ));
+        };
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        let entry = stored.entry.clone();
+        // Ownership proofs before anything is attested to the witness.
+        self.require_owned_backing(&entry, volume_id, ApiErrorCode::InvalidState)?;
+        self.require_entry_res_file(&entry, volume_id)?;
+        let lineage = self.lineage_uuids(&entry.resource_name)?;
+        let definition = self.parsed_definition(&entry.resource_name)?;
+        let disk = Self::definition_disk(&entry.resource_name, &definition)?;
+        authority.register(
+            volume_id,
+            RegistrationContent {
+                lineage_uuids: lineage,
+                endpoints: vec![
+                    EndpointBacking {
+                        host_id: host_id_of(&self.config.node_name)?,
+                        backing: endpoint_backing_identity(
+                            &self.config.node_name,
+                            &entry.resource_name,
+                            &disk,
+                        ),
+                        volvisor_created: true,
+                    },
+                    EndpointBacking {
+                        host_id: host_id_of(&self.config.peer_name)?,
+                        backing: endpoint_backing_identity(
+                            &self.config.peer_name,
+                            &entry.resource_name,
+                            &disk,
+                        ),
+                        volvisor_created: false,
+                    },
+                ],
+                barrier,
+            },
+        )
+    }
+
+    /// The adopt-and-promote admin operation (P4a plan §5): the
+    /// surviving host takes over a volume it does **not** hold in its
+    /// state after an unplanned failover. Adoption verification first
+    /// (rule 7 — never adopt foreign state), then the witness-side
+    /// authority check, then the honest classification from observed
+    /// facts; only `safe_current`, or an explicitly authorized
+    /// `possible_loss`, promotes — under a fresh witness epoch, with
+    /// `drbdadm primary --force` (the second and last justified
+    /// `--force` path: the kernel's unforced promotion gate is
+    /// expected to refuse promotion against a `DUnknown`/`Outdated`
+    /// peer, and this is exactly that case; the gate is never relied
+    /// upon as the fence). Refusals return the classification with no
+    /// adoption.
+    ///
+    /// # Errors
+    /// Typed verification failures (`INVALID_STATE`,
+    /// `FOREIGN_DEVICE_STATE`), `UNKNOWN_FENCING_AUTHORITY` when the
+    /// witness is unreachable, `FENCE_PENDING` while the witness is
+    /// still inside the W7 fence-wait window for the retired lease.
+    /// Adoption verification, host side (P4a plan §5 step 1): the
+    /// derived resource name must name an up Secondary resource whose
+    /// definition file names this host — never someone's live writer.
+    ///
+    /// # Errors
+    /// `INVALID_STATE` when the resource is down, Primary, or not this
+    /// host's; `INTERNAL` when the definition cannot be parsed.
+    fn verify_adoption_resource(
+        &self,
+        volume_id: &VolumeId,
+    ) -> Result<(String, ParsedResource, DiskState), ApiError> {
+        let resource = resource_name_for(volume_id);
+        let status = self.resource_status(&resource)?.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!("resource {resource} is down; a downed resource cannot be adopted"),
+            )
+        })?;
+        if status.role != Role::Secondary {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} is {:?}; adoption requires a Secondary resource \
+                     (a Primary one is someone's live writer)",
+                    status.role
+                ),
+            ));
+        }
+        let definition = self.parsed_definition(&resource)?;
+        if !definition
+            .nodes
+            .iter()
+            .any(|node| node.name == self.config.node_name)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the resource definition for {resource} does not name this host ({}); \
+                     it is not this volume's resource",
+                    self.config.node_name
+                ),
+            ));
+        }
+        Ok((resource, definition, status.local_disk))
+    }
+
+    /// Adoption verification (P4a plan §5 step 1, rule 7 — never adopt
+    /// foreign state): the backing LV must exist, the live lineage
+    /// must match the registration (this closes the recreated-volume
+    /// hole), the registration's endpoint for this host must match the
+    /// resource-definition identity verbatim, and — in the
+    /// volvisor-created branch — the LV must carry the ownership tag.
+    ///
+    /// # Errors
+    /// Typed verification failures (`INVALID_STATE`,
+    /// `FOREIGN_DEVICE_STATE`); witness errors (an unregistered volume
+    /// is `INVALID_STATE`, an unreachable witness
+    /// `UNKNOWN_FENCING_AUTHORITY`).
+    // One linear proof chain over the same facts; the extraction
+    // boundary would cross seven locals (same convention as
+    // `attach_volume_inner`).
+    #[allow(clippy::too_many_lines)]
+    fn verify_adoption(
+        &self,
+        authority: &AuthorityContext,
+        volume_id: &VolumeId,
+    ) -> Result<AdoptionFacts, ApiError> {
+        let (resource, definition, local_disk) = self.verify_adoption_resource(volume_id)?;
+        let disk = Self::definition_disk(&resource, &definition)?;
+        let (vg_name, lv_name) = disk
+            .strip_prefix("/dev/")
+            .and_then(|path| path.split_once('/'))
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the resource definition for {resource} names an unusable backing \
+                         path {disk:?}"
+                    ),
+                )
+            })?;
+        let (vg_name, lv_name) = (vg_name.to_owned(), lv_name.to_owned());
+        // The backing LV must exist (its tag matters only in the
+        // volvisor-created branch below).
+        let rows = self.list_lvs()?;
+        let backing_row = rows.iter().find(|row| {
+            row.vg_name.as_deref() == Some(vg_name.as_str())
+                && row.lv_name.as_deref() == Some(lv_name.as_str())
+        });
+        if backing_row.is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!("the backing LV {vg_name}/{lv_name} of {resource} does not exist"),
+            ));
+        }
+        let replication_mode = match definition.protocol.as_deref() {
+            Some("A") => ReplicationMode::A,
+            Some("B") => ReplicationMode::B,
+            Some("C") => ReplicationMode::C,
+            other => {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "the resource definition for {resource} carries an unusable protocol \
+                         {other:?}: the replication contract is never guessed"
+                    ),
+                ));
+            }
+        };
+        let live_lineage = self.lineage_uuids(&resource)?;
+        // The witness must hold a registration for the volume (an
+        // unregistered volume is pre-authority: not adoptable under
+        // this flow — the authority check has nothing to compare).
+        let view = authority.inspect(volume_id)?;
+        let registration = view.registration.as_ref().ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the witness holds no registration for {volume_id}; an unregistered \
+                     (pre-authority) volume is not adoptable through the authority flow"
+                ),
+            )
+        })?;
+        let mut registered_lineage = registration.lineage_uuids.clone();
+        registered_lineage.sort();
+        registered_lineage.dedup();
+        if registered_lineage != live_lineage {
+            return Err(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                format!(
+                    "the live lineage of {resource} does not match the registered lineage \
+                     of {volume_id}: the resource is not the registered lineage (a recreated \
+                     same-named volume is exactly this refusal)"
+                ),
+            ));
+        }
+        let our_host = host_id_of(&self.config.node_name)?;
+        let our_endpoint = registration
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host_id == our_host)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the registration of {volume_id} has no endpoint for this host \
+                         ({}); this host is not a replication end of the registered lineage",
+                        self.config.node_name
+                    ),
+                )
+            })?;
+        if our_endpoint.backing
+            != endpoint_backing_identity(&self.config.node_name, &resource, &disk)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                "the registered endpoint identity for this host does not match the \
+                 resource definition: the backing is not the registered one"
+                    .to_owned(),
+            ));
+        }
+        let minor = definition.minor.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("the resource definition for {resource} carries no minor"),
+            )
+        })?;
+        let port = definition
+            .nodes
+            .iter()
+            .find(|node| node.name == self.config.node_name)
+            .and_then(ParsedNode::port)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "the resource definition for {resource} carries no address port \
+                         for this host"
+                    ),
+                )
+            })?;
+        // The volvisor-created branch: the surviving host's own LV must
+        // carry the matching ownership tag. The operator-provisioned
+        // branch (the P3 peer side) carries its rule-7 weight through
+        // the lineage match and the endpoint identity above.
+        if our_endpoint.volvisor_created {
+            let tag = backing_row.and_then(|row| row.tag(OWNER_TAG));
+            if tag.as_deref() != Some(volume_id.as_str()) {
+                return Err(ApiError::new(
+                    ApiErrorCode::ForeignDeviceState,
+                    format!(
+                        "the backing LV {vg_name}/{lv_name} does not carry the \
+                         volvisor.owner tag of {volume_id}; foreign backing is never adopted"
+                    ),
+                ));
+            }
+        }
+        Ok(AdoptionFacts {
+            resource,
+            vg_name,
+            lv_name,
+            minor,
+            port,
+            replication_mode,
+            local_disk,
+            barrier: registration.barrier.clone(),
+            view,
+        })
+    }
+
+    /// The plan §5 classification from observed facts only.
+    /// `SAFE_CURRENT` is evidence-gated, never protocol-gated: the
+    /// only P4a evidence is a recorded barrier whose attestation
+    /// covers the last-acknowledged-boundary property (over protocol
+    /// C's synchronous completion). Every non-`SAFE_CURRENT` row
+    /// reports `POSSIBLE_LOSS` with an **unknown** boundary — a
+    /// recorded barrier names no provable boundary for a volume that
+    /// kept serving past it (the plan's table mandates `Unknown` for
+    /// all four cells; `Known` boundaries arrive only with P4b's
+    /// `BARRIER_DURABLE`, never from a registration-time attestation).
+    fn classify_adoption(
+        local_disk: DiskState,
+        replication_mode: ReplicationMode,
+        barrier: Option<&RecordedBarrier>,
+        allow_loss: bool,
+    ) -> PromotionClassification {
+        match local_disk {
+            DiskState::UpToDate if replication_mode == ReplicationMode::C && barrier.is_some() => {
+                PromotionClassification::SafeCurrent
+            }
+            DiskState::UpToDate | DiskState::Consistent | DiskState::Outdated => {
+                PromotionClassification::PossibleLoss {
+                    boundary: LossBoundary::Unknown,
+                    authorized: allow_loss,
+                }
+            }
+            other => PromotionClassification::Unsafe {
+                reasons: vec![format!(
+                    "the local disk is {other:?}: integrity is unprovable (mid-resync \
+                     loss); never a partial promotion"
+                )],
+            },
+        }
+    }
+
+    /// The state entry a successful adoption records: identity from
+    /// the verified facts, sizes from the device itself, the adopt
+    /// classification as the creation payload (the honest provenance
+    /// of this entry), and the reserved `adopted` project grouping
+    /// (the original project identity died with the lost host's state
+    /// and is never invented).
+    ///
+    /// # Errors
+    /// `INTERNAL` when the reserved project id is rejected.
+    fn adopted_volume_entry(
+        facts: &AdoptionFacts,
+        classification: &PromotionClassification,
+        allow_loss: bool,
+        size: u64,
+    ) -> Result<VolumeEntry, ApiError> {
+        let project_id = ProjectId::new("adopted").map_err(|error| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("reserved project id: {error}"),
+            )
+        })?;
+        Ok(VolumeEntry {
+            resource_name: facts.resource.clone(),
+            vg_name: facts.vg_name.clone(),
+            lv_name: facts.lv_name.clone(),
+            minor: facts.minor,
+            port: facts.port,
+            size_bytes: size,
+            requested_size_bytes: size,
+            generation: 1,
+            project_id,
+            block_size: 4096,
+            replication_mode: facts.replication_mode,
+            creation_payload: format!(
+                "{{\"adopted\":true,\"classification\":{classification:?},\"allow_loss\":{allow_loss}}}"
+            ),
+            created_at: unix_now(),
+        })
+    }
+
+    /// The adopt-and-promote admin operation (P4a plan §5): the
+    /// surviving host takes over a volume it does **not** hold in its
+    /// state after an unplanned failover. Adoption verification first
+    /// (rule 7 — never adopt foreign state), then the witness-side
+    /// authority check, then the honest classification from observed
+    /// facts; only `safe_current`, or an explicitly authorized
+    /// `possible_loss`, promotes — under a fresh witness epoch, with
+    /// `drbdadm primary --force` (the second and last justified
+    /// `--force` path: the kernel's unforced promotion gate is
+    /// expected to refuse promotion against a `DUnknown`/`Outdated`
+    /// peer, and this is exactly that case; the gate is never relied
+    /// upon as the fence). Refusals return the classification with no
+    /// adoption.
+    ///
+    /// # Errors
+    /// Typed verification failures (`INVALID_STATE`,
+    /// `FOREIGN_DEVICE_STATE`), `UNKNOWN_FENCING_AUTHORITY` when the
+    /// witness is unreachable, `FENCE_PENDING` while the witness is
+    /// still inside the W7 fence-wait window for the retired lease.
+    // Adopt is a fail-closed promotion sequence like attach
+    // (verification → authority check → classification gate → grant →
+    // durable record → promote → verify → unwind); splitting it would
+    // scatter the crash-window invariants.
+    #[allow(clippy::too_many_lines)]
+    pub fn adopt_and_promote(
+        &self,
+        volume_id: &VolumeId,
+        allow_loss: bool,
+    ) -> Result<AdoptVolumeResponse, ApiError> {
+        let Some(authority) = &self.authority else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                "this provider is not witness-managed (no authority context)",
+            ));
+        };
+        let mut state = self.lock_state()?;
+        if state.volume(volume_id).is_some() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} already exists in this host's state; adoption is for \
+                     volumes the surviving host does not hold (plan §5)"
+                ),
+            ));
+        }
+        // 1. Adoption verification (rule 7).
+        let facts = self.verify_adoption(authority, volume_id)?;
+        // 2. Authority check: the witness must show no live lease — a
+        //    proof the witness supplies, never one the caller brings.
+        if facts.view.lease_state == LeaseState::Live {
+            let holder = facts.view.holder.as_ref().map_or_else(
+                || "no holder".to_owned(),
+                |holder| holder.as_str().to_owned(),
+            );
+            return Ok(AdoptVolumeResponse {
+                classification: PromotionClassification::Unsafe {
+                    reasons: vec![format!(
+                        "the witness holds a live lease for epoch {} (holder {holder}); \
+                         the old authority may still write",
+                        facts.view.current_epoch.0
+                    )],
+                },
+                volume: None,
+            });
+        }
+        // 3. Classification from observed facts only (plan §5 table).
+        let classification = Self::classify_adoption(
+            facts.local_disk.clone(),
+            facts.replication_mode,
+            facts.barrier.as_ref(),
+            allow_loss,
+        );
+        // 4. Promotion gate: UNSAFE never promotes; POSSIBLE_LOSS
+        //    requires the explicit recorded authorization.
+        let authorized = match &classification {
+            PromotionClassification::Unsafe { .. } => {
+                return Ok(AdoptVolumeResponse {
+                    classification,
+                    volume: None,
+                });
+            }
+            PromotionClassification::PossibleLoss { authorized, .. } => *authorized,
+            PromotionClassification::SafeCurrent => true,
+        };
+        if !authorized {
+            return Ok(AdoptVolumeResponse {
+                classification,
+                volume: None,
+            });
+        }
+        // Promotion: a fresh epoch from the witness (the grant record
+        // is the durable FencingProof that retired the old epoch — W2;
+        // W7 has already waited out the fence window or the grant
+        // itself refuses with FENCE_PENDING), then the durable
+        // adoption record, then `primary --force` (see the method
+        // docs), then verification. The record is persisted BEFORE the
+        // promotion — the same crash-window discipline as attach: a
+        // crash between the two leaves a TRACKED volume the
+        // reconciler validates or fences, never an untracked Primary
+        // holding a live lease outside every fence path.
+        let size = self.device_size(facts.minor)?;
+        if size == 0 {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "blockdev reports a zero-sized device for {}",
+                    facts.resource
+                ),
+            ));
+        }
+        let entry = Self::adopted_volume_entry(&facts, &classification, allow_loss, size)?;
+        let block = authority.acquire(volume_id, None)?;
+        let stored = StoredVolume {
+            entry,
+            runtime: VolumeRuntime {
+                state: VolumeLifecycle::Ready,
+                attachment: None,
+                seeded: true,
+                authority: Some(block.clone()),
+                fence: None,
+            },
+        };
+        let entry = stored.entry.clone();
+        state.insert_volume(volume_id.clone(), stored);
+        // Keep the monotonic allocators ahead of the adopted resource
+        // so a later allocation can never collide with it.
+        state.observe_minor(facts.minor);
+        state.observe_port(facts.port);
+        if let Err(error) = state.save(&self.state_path) {
+            // The durable record is absent: drop the in-memory entry
+            // so the renewal loop cannot keep renewing a lease for a
+            // volume this host does not durably hold, then release the
+            // just-granted lease best-effort (the save precedes the
+            // promotion, so the resource is provably Secondary and the
+            // self-release is safe).
+            state.remove_volume(volume_id);
+            let _ = authority.release(volume_id, &block);
+            return Err(error);
+        }
+        let promoted = self
+            .run_drbdadm_seed(&facts.resource)
+            .and_then(|output| {
+                if output.success {
+                    Ok(())
+                } else {
+                    Err(command_failed("drbdadm primary --force", &output))
+                }
+            })
+            .and_then(|()| self.verify_promotion(&entry));
+        if let Err(error) = promoted {
+            let detail = error.detail.clone();
+            self.unwind_failed_adoption(&mut state, volume_id, &entry, &block, &detail)?;
+            return Err(error);
+        }
+        let Some(stored) = state.volume(volume_id) else {
+            // Structurally unreachable (the lock is held and the entry
+            // was saved above), but if the invariant ever broke, the
+            // residue is fenced and released exactly like a failed
+            // promotion — never left serving.
+            self.unwind_failed_adoption(
+                &mut state,
+                volume_id,
+                &entry,
+                &block,
+                "the adoption record vanished mid-operation",
+            )?;
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!("the adoption record for {volume_id} vanished mid-operation"),
+            ));
+        };
+        let response = self.verified_inspect_response(volume_id, stored)?;
+        Ok(AdoptVolumeResponse {
+            classification,
+            volume: Some(response),
+        })
+    }
+
+    /// Unwind an adoption whose promotion failed after the durable
+    /// record: the volume is **fenced first** (suspend, durable
+    /// pending-fence marker, demote, resume — [`Self::self_fence`]),
+    /// because the resource may still be Primary. The just-granted
+    /// lease is released **only on a completed fence**: a
+    /// proven-demoted holder self-releasing waives the next grant's
+    /// W7 wait safely, while an incomplete fence (a busy device)
+    /// leaves the lease to expire at the witness, where the W7 window
+    /// then guards the next grant — never a release while a writer
+    /// might still be serving. The entry stays tracked and `Failed`
+    /// (reconcile and the renewal pass own the residue; the entry is
+    /// never silently removed, because an untracked Primary is exactly
+    /// the hole the pre-promotion save exists to prevent).
+    ///
+    /// # Errors
+    /// The fence error itself, or `INTERNAL` from the final state
+    /// save. The witness lease is only ever released after a completed
+    /// fence.
+    fn unwind_failed_adoption(
+        &self,
+        state: &mut DrbdState,
+        volume_id: &VolumeId,
+        entry: &VolumeEntry,
+        block: &VolumeAuthorityBlock,
+        detail: &str,
+    ) -> Result<(), ApiError> {
+        let fenced = self.self_fence(
+            state,
+            volume_id,
+            entry,
+            vec![format!("the adoption promotion failed: {detail}")],
+        );
+        match fenced {
+            Ok(fenced) => {
+                // A failed adoption stays Failed (a completed
+                // `self_fence` returns the volume to Ready for
+                // reattachment; this is not that) — and the override is
+                // durable BEFORE the release: if this save fails, the
+                // error returns with the lease unreleased (it lapses at
+                // the witness under the W7 window — safe), never a
+                // released lease over an on-disk record that still
+                // claims Ready.
+                if let Some(volume) = state.volume_mut(volume_id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                    state.save(&self.state_path)?;
+                }
+                if fenced.demoted {
+                    if let Some(authority) = &self.authority {
+                        let _ = authority.release(volume_id, block);
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // The fence itself failed: the marker (when its save
+                // succeeded) routes the restart through completion,
+                // and the unreleased lease expires at the witness
+                // under the W7 window. The failure is recorded
+                // honestly; the lease is never released un-demoted.
+                if let Some(volume) = state.volume_mut(volume_id) {
+                    volume.runtime.state = VolumeLifecycle::Failed;
+                }
+                let _ = state.save(&self.state_path);
+                Err(error)
+            }
+        }
+    }
+
     /// Build the inspect response for one stored volume, verifying the
     /// backing LV, the resource and the device, and reflecting **observed
     /// facts only**.
@@ -1295,6 +2692,28 @@ impl DrbdProvider {
         stored: &StoredVolume,
     ) -> Result<InspectVolumeResponse, ApiError> {
         let mut response = inspect_response(volume_id, stored);
+        // The authority section is the WRITER's observation, not a
+        // witness claim: the last response-anchored W5 deadline,
+        // evaluated at the local clock. `Live` means "within the
+        // deadline the writer promised to fence by", never "the
+        // witness currently agrees" (an inspect against the witness is
+        // a separate, explicit operation).
+        if let Some(authority) = &self.authority {
+            if let Some(block) = stored.runtime.authority.as_ref() {
+                let now = authority.now_secs();
+                let live = now < block.deadline_at;
+                response.authority = Some(AuthoritySummary {
+                    epoch: block.epoch,
+                    lease_state: if live {
+                        LeaseState::Live
+                    } else {
+                        LeaseState::Expired
+                    },
+                    holder: Some(authority.host_id().clone()),
+                    lease_remaining_secs: live.then(|| block.deadline_at - now),
+                });
+            }
+        }
         if stored.runtime.state == VolumeLifecycle::Failed {
             response.health = Health::Unhealthy;
             response.backend_health = Health::Unhealthy;
@@ -1728,6 +3147,8 @@ impl DrbdProvider {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
                 seeded,
+                authority: None,
+                fence: None,
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
@@ -1738,6 +3159,33 @@ impl DrbdProvider {
     /// Verify a promotion really took: the role re-read from
     /// `drbdsetup status` must be Primary. On contradiction the resource
     /// is demoted back best-effort (no orphaned writer is left behind)
+    /// Release the writer's lease after a demotion (P4a plan §4
+    /// detach): the witness starts no W7 wait. A lease that is already
+    /// retired (`STALE_EPOCH` — authority was superseded earlier) is
+    /// released in effect; any other failure is returned typed and
+    /// leaves the record in place (the demotion is durable, the
+    /// interrupted-detach reconciliation completes the transition, and
+    /// the lease lapses at its recorded end, bounded harmlessly by
+    /// W1/W7) — never a silent skip.
+    ///
+    /// # Errors
+    /// The typed witness refusal, for the caller to report.
+    fn release_after_demote(
+        &self,
+        volume_id: &VolumeId,
+        stored: &StoredVolume,
+    ) -> Result<(), ApiError> {
+        if let (Some(authority), Some(block)) = (&self.authority, stored.runtime.authority.as_ref())
+        {
+            if let Err(err) = authority.release(volume_id, block) {
+                if !matches!(err, WitnessError::StaleEpoch { .. }) {
+                    return Err(witness_error(err));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// and an `INTERNAL` error names the inconsistency.
     fn verify_promotion(&self, entry: &VolumeEntry) -> Result<(), ApiError> {
         let status = self.resource_status(&entry.resource_name)?;
@@ -1849,8 +3297,13 @@ impl DrbdProvider {
         self.require_entry_res_file(&entry, volume_id)?;
         // The resource must be up and Secondary. A Primary without a
         // record is a zombie promotion — never adopted, never demoted
-        // here (rule 17).
+        // here (rule 17) — with one P4a exception: a Primary this host
+        // holds a recorded lease for is our own promoted volume (an
+        // adopted volume awaiting its attachment, or a crash between
+        // promote and record save); the acquisition below re-validates
+        // the lease before anything is served.
         let status = self.resource_status(&entry.resource_name)?;
+        let mut suspended = false;
         match status {
             None => {
                 return Err(ApiError::new(
@@ -1862,17 +3315,75 @@ impl DrbdProvider {
                 ));
             }
             Some(status) if status.role == Role::Primary => {
-                return Err(ApiError::new(
-                    ApiErrorCode::InvalidState,
-                    format!(
-                        "resource {} is Primary without a recorded attachment (a zombie \
-                         promotion from a previous life); demote it out of band and restart \
-                         the daemon so reconciliation records the state",
-                        entry.resource_name
-                    ),
-                ));
+                if self.authority.is_none() || stored.runtime.authority.is_none() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidState,
+                        format!(
+                            "resource {} is Primary without a recorded attachment (a zombie \
+                             promotion from a previous life); demote it out of band and restart \
+                             the daemon so reconciliation records the state",
+                            entry.resource_name
+                        ),
+                    ));
+                }
+                // Our own suspended promoted volume (e.g. the startup
+                // validation froze it and the witness came back): it
+                // resumes only after a fresh lease is proven below.
+                suspended = status.suspended.is_some();
             }
+            // A Secondary resource — including one an operator suspended
+            // by hand — keeps exactly its P3 handling: this provider
+            // never suspends a Secondary and never silently undoes an
+            // operator suspension.
             Some(_) => {}
+        }
+
+        // Writer authority before promotion (P4a plan §4): acquire (or
+        // renew) the lease, persist the authority block, and only then
+        // promote — a new writer is never admitted without authority.
+        // The block is saved BEFORE the promotion so an interrupted
+        // attach resumes through the renewal path with a fresh W5
+        // deadline instead of replaying a stale grant response. A
+        // witness refusal is typed; an unreachable witness is
+        // `UNKNOWN_FENCING_AUTHORITY`.
+        if let Some(authority) = &self.authority {
+            let prior_authority = stored.runtime.authority.clone();
+            let block = authority.acquire(volume_id, prior_authority.as_ref())?;
+            let acquired = block.clone();
+            {
+                // The save needs the state exclusively, so the record
+                // borrow ends here and the tail re-acquires it.
+                let volume = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                volume.runtime.authority = Some(block);
+            }
+            if let Err(error) = state.save(&self.state_path) {
+                // A failed save leaves no durable record of a
+                // NEW-EPOCH grant (a fresh grant, or a grant that
+                // superseded a stale recorded block): release it
+                // best-effort so a retry is not refused with
+                // LEASE_HELD against our own orphan lease (the adopt
+                // path's discipline), and restore the in-memory record
+                // to the durable state's value (the save never
+                // landed). Only the provably-not-writing case
+                // releases: a plain renewal still matches the durable
+                // record (same epoch, extended end) and self-heals on
+                // the next renewal save, and a suspended Primary must
+                // never have its lease released from under it — the
+                // next grant's W7 wait would be waived while the
+                // device is only kernel-suspended.
+                let new_epoch = prior_authority
+                    .as_ref()
+                    .is_none_or(|prior| prior.epoch != acquired.epoch);
+                if new_epoch && !suspended {
+                    let _ = authority.release(volume_id, &acquired);
+                    if let Some(volume) = state.volume_mut(volume_id) {
+                        volume.runtime.authority = prior_authority;
+                    }
+                }
+                return Err(error);
+            }
         }
 
         let output = self.run_drbdadm("primary", &entry.resource_name)?;
@@ -1884,6 +3395,11 @@ impl DrbdProvider {
         // A successful exit status is not evidence: verify the role,
         // then the device itself.
         self.verify_promotion(&entry)?;
+        // A suspended resource resumes only now that authority is
+        // proven (the startup validation left it frozen).
+        if suspended {
+            self.resume_io(entry.minor)?;
+        }
         let device = format!("/dev/drbd{}", entry.minor);
         let device_size = self.device_size(entry.minor)?;
         if device_size == 0 {
@@ -1904,6 +3420,11 @@ impl DrbdProvider {
             access_mode: mode,
             device,
         };
+        // Re-acquire the record: the authority acquisition above ended
+        // the earlier borrow when it saved the block.
+        let stored = state
+            .volume_mut(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
         stored.runtime.attachment = Some(record.clone());
         stored.runtime.state = VolumeLifecycle::Attached;
         stored.entry.generation += 1;
@@ -2016,7 +3537,12 @@ impl DrbdProvider {
             }
         }
 
+        // Release the writer's lease after the durable demotion (the
+        // helper reports every failure that is not already-released).
+        self.release_after_demote(volume_id, stored)?;
+
         stored.runtime.attachment = None;
+        stored.runtime.authority = None;
         if stored.runtime.state == VolumeLifecycle::Attached {
             stored.runtime.state = VolumeLifecycle::Ready;
         }
@@ -2231,7 +3757,7 @@ impl DrbdProvider {
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
         let mut state = self.lock_state()?;
-        let (entry, volume_state) = {
+        let (entry, volume_state, block) = {
             let stored = state
                 .volume_mut(volume_id)
                 .ok_or_else(|| not_found(volume_id))?;
@@ -2283,10 +3809,18 @@ impl DrbdProvider {
                 }
                 ErasurePolicy::Retain => {}
             }
-            (stored.entry.clone(), stored.runtime.state)
+            (
+                stored.entry.clone(),
+                stored.runtime.state,
+                stored.runtime.authority.clone(),
+            )
         };
 
-        // A Primary resource is never force-demoted by delete (rule 17).
+        // A Primary resource is never force-demoted by delete (rule 17)
+        // — and this check comes BEFORE the lease release: a
+        // self-release waives the next grant's W7 wait, so it is
+        // earned only once the resource is verifiably not writing
+        // (the same ordering every authority-clearing path follows).
         let status = self.resource_status(&entry.resource_name)?;
         if let Some(status) = &status {
             if status.role == Role::Primary {
@@ -2299,6 +3833,17 @@ impl DrbdProvider {
                     ),
                 ));
             }
+        }
+        // Best-effort lease release before the resource is torn down
+        // (P4a): a failure here is deliberately tolerated — delete must
+        // not be wedged on witness availability — and is safe now: the
+        // volume is detached and verifiably not Primary (the check
+        // above), the lease lapses at its recorded end if the release
+        // fails (bounded by W1/W7), and the witness-side record of a
+        // deleted lineage is retained as lineage evidence (witness
+        // garbage collection is out of P4a scope).
+        if let (Some(authority), Some(block)) = (&self.authority, block.as_ref()) {
+            let _ = authority.release(volume_id, block);
         }
         // Bring the resource down through our own scoped file, then
         // remove the file — but only when it is verifiably ours. A
@@ -2720,6 +4265,28 @@ pub fn resource_name_for(volume_id: &VolumeId) -> String {
     format!("vol-{sanitized}-{}", hex_prefix(&digest, 4))
 }
 
+/// Build a [`HostId`] from a node name (the endpoint identities use
+/// the resource-definition node names, which `verify_startup` proves
+/// name real hosts).
+fn host_id_of(node: &str) -> Result<HostId, ApiError> {
+    HostId::new(node).map_err(|error| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!("node name {node:?} is not a valid host identity: {error}"),
+        )
+    })
+}
+
+/// The endpoint backing identity recorded at registration and compared
+/// verbatim by the adopt flow (P4a plan §5): derived from the resource
+/// definition alone — host, resource, backing disk path — so the
+/// surviving host can reconstruct it after losing the primary host
+/// (and its state) entirely. The same definition file is deployed on
+/// both ends (the P3 operator model).
+fn endpoint_backing_identity(host: &str, resource: &str, disk: &str) -> String {
+    format!("host={host};resource={resource};disk={disk}")
+}
+
 /// The first `bytes * 2` hex characters of a digest, without `format!`.
 fn hex_prefix(digest: &[u8], bytes: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -2938,6 +4505,10 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
             .map(|a| a.id.clone()),
         backend_health: Health::Unknown,
         evidence_status: EvidenceStatus::PrototypeOnly,
+        // Filled by `verified_inspect_response` from witness facts for
+        // witness-managed volumes; `None` (pre-authority/P3-era) is the
+        // honest value — never a fabricated authority claim.
+        authority: None,
     }
 }
 
@@ -3127,6 +4698,7 @@ mod tests {
             state_path: std::env::temp_dir().join("unused-drbd-state.json"),
             state: Mutex::new(DrbdState::default()),
             last_reconcile: Mutex::new(None),
+            authority: None,
         };
         let capabilities = provider.capabilities();
         assert!(capabilities.contains(Capability::Create));

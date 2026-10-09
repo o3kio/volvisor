@@ -590,6 +590,56 @@ impl LvRow {
     }
 }
 
+/// The parsed `drbdsetup show-gi` report (the verified v9 shape: the
+/// ASCII header, the `dt_print_v9_uuids` line and the flag legend —
+/// see the test fixture's `GiSet` documentation for the byte-level
+/// provenance).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GiReport {
+    /// The non-zero data-generation UUIDs of the reported set (current,
+    /// bitmap base, history slots), as zero-padded uppercase 16-hex
+    /// digits — the lineage identifiers the registration records and
+    /// the adopt flow compares as a set.
+    pub lineage_uuids: Vec<String>,
+}
+
+/// Parse `drbdsetup show-gi <resource> <peer-node-id> <volume>` output.
+///
+/// Only the `dt_print_v9_uuids` line is structural for volvisor: four
+/// 16-hex-digit UUID fields (`current:bitmap:history:history`),
+/// zero meaning "unset". The twelve flag digits that follow are
+/// kernel-computed and carry no identity — ignored here.
+///
+/// # Errors
+/// `INTERNAL` when no UUID line is present — the lineage is never
+/// guessed.
+pub fn parse_drbdsetup_show_gi(stdout: &str) -> Result<GiReport, ApiError> {
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.trim().split(':').collect();
+        if fields.len() < 16 {
+            continue;
+        }
+        let uuids = &fields[..4];
+        if uuids.iter().all(|field| {
+            field.len() == 16
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+        }) {
+            let lineage_uuids = uuids
+                .iter()
+                .filter(|field| field.bytes().any(|byte| byte != b'0'))
+                .map(|field| (*field).to_owned())
+                .collect();
+            return Ok(GiReport { lineage_uuids });
+        }
+    }
+    Err(ApiError::new(
+        ApiErrorCode::Internal,
+        "failed to parse `drbdsetup show-gi` output: no data-generation UUID line".to_owned(),
+    ))
+}
+
 /// Parse the decimal-bytes output of `blockdev --getsize64 <dev>`
 /// (a single decimal number followed by a newline).
 ///
@@ -857,5 +907,29 @@ mod tests {
         assert_eq!(parse_blockdev_size("2147483648\n").expect("size"), 2 << 30);
         assert!(parse_blockdev_size("").is_err());
         assert!(parse_blockdev_size("not a number").is_err());
+    }
+
+    #[test]
+    fn show_gi_parser_extracts_nonzero_uuids_from_the_verified_shape() {
+        // The verbatim v9 UUID line (dt_print_v9_uuids,
+        // drbdtool_common.c:64-87): four 16-hex-digit fields over the
+        // twelve flag digits.
+        let text = "\n       +--<  Current data generation UUID  >-\n\
+       V               V                 V         V\n\
+4B3BDA92B09E4EC7:0000000000000000:0A1B2C3D4E5F6071:0000000000000000:0:0:0:0:1:0:0:0:0:0:0:0\n\
+                                                                    ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^\n";
+        let report = parse_drbdsetup_show_gi(text).expect("parse");
+        assert_eq!(
+            report.lineage_uuids,
+            vec!["4B3BDA92B09E4EC7".to_owned(), "0A1B2C3D4E5F6071".to_owned()]
+        );
+        // No UUID line: never guessed.
+        assert!(parse_drbdsetup_show_gi("no header\nonly legend\n").is_err());
+        // Lowercase hex is not the verified shape (X64(016) is
+        // %016lX — uppercase): refused rather than mapped.
+        assert!(parse_drbdsetup_show_gi(
+            "4b3bda92b09e4ec7:0000000000000000:0000000000000000:0000000000000000:0:0:0:0:1:0:0:0:0:0:0:0\n"
+        )
+        .is_err());
     }
 }

@@ -31,7 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use volvisor_types::{
-    AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, ProjectId, VolumeId, VolumeLifecycle,
+    AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, LeaseId, ProjectId, VolumeId,
+    VolumeLifecycle, WriterEpoch,
 };
 
 /// The DRBD replication protocol of a resource, fixed at create time.
@@ -129,6 +130,62 @@ pub struct VolumeRuntime {
     /// provably-fresh local disk). An unseeded volume cannot attach: its
     /// replica is not established.
     pub seeded: bool,
+    /// The writer-authority lease this host holds for the volume, if
+    /// any (P4a). `None` for pre-authority (P3-era) volumes and for any
+    /// volume whose lease was released or fenced. Persisted **before**
+    /// promotion, so an interrupted attach resumes through the renewal
+    /// path with a fresh W5 deadline instead of replaying a stale grant
+    /// response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<VolumeAuthorityBlock>,
+    /// A self-fence that suspended I/O but could not finish demoting
+    /// the resource (the device was still open — the kernel refuses
+    /// demotion of an open device). Reconcile completes the demotion
+    /// once the device closes and clears this marker; a resource
+    /// carrying it is **volvisor's own suspended resource**, distinct
+    /// from a foreign zombie promotion (which is never auto-demoted,
+    /// AGENTS rule 17). Never a silent resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<PendingFence>,
+}
+
+/// A recorded, incomplete self-fence (see
+/// [`VolumeRuntime::fence`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFence {
+    /// Why the writer fenced (stale epoch, local deadline passed,
+    /// failed validation) — recorded, never inferred later.
+    pub reason: String,
+    /// Local unix time the fence started (diagnostics).
+    pub fenced_at: u64,
+}
+
+/// The persisted writer-authority block (contract §1's required durable
+/// authority state; P4a plan §4): everything needed to recover a
+/// writer's authority bookkeeping after a crash — and nothing that
+/// would let a restarted writer *infer* authority it cannot prove (the
+/// lease itself is validated against the witness, never trusted from
+/// this record).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeAuthorityBlock {
+    /// The granted writer epoch (never 0: a block exists only for a
+    /// witnessed lease).
+    pub epoch: WriterEpoch,
+    /// The granted lease identity (needed to renew; W4-checked).
+    pub lease_id: LeaseId,
+    /// The witness commit index that durably recorded the grant — the
+    /// lease proof reference (W2).
+    pub lease_proof_ref: u64,
+    /// The authority commit index of the grant (`authority_commit_index`
+    /// in contract §1; equal to [`Self::lease_proof_ref`] in P4a, where
+    /// only the grant establishes the recorded authority).
+    pub authority_commit_index: u64,
+    /// Local unix time the lease response was received — the W5 anchor.
+    pub acquired_at: u64,
+    /// Local unix deadline (`acquired_at` + the duration the lease
+    /// response carried). The writer self-fences at this deadline; it
+    /// never re-derives deadlines from absolute witness timestamps.
+    pub deadline_at: u64,
 }
 
 /// A volume as stored in provider state: durable entry + runtime.
@@ -237,6 +294,66 @@ pub struct ReconcileReport {
     /// crash between `lvcreate` and the state save). Reported, never
     /// adopted.
     pub untracked_owned_lvs: Vec<String>,
+    /// Witness-managed volumes found Primary that could not be
+    /// validated because the witness was unreachable: left **suspended**
+    /// (fail-closed — a restarted daemon never silently resumes a writer
+    /// it cannot prove, P4a plan §4).
+    pub unvalidated_primaries: Vec<UnverifiableVolume>,
+    /// Witness-managed volumes whose self-fence this pass completed
+    /// (the suspended resource finished demoting once its device
+    /// closed).
+    pub completed_fences: Vec<VolumeId>,
+    /// Leases self-fenced this pass (stale epoch, local deadline
+    /// passed, or a failed validation) — see [`FencedVolume`].
+    pub fenced_volumes: Vec<FencedVolume>,
+}
+
+/// A lease this host self-fenced (writer authority provably lost).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FencedVolume {
+    /// The volume whose writer was fenced.
+    pub volume_id: VolumeId,
+    /// Why (stale epoch, local deadline passed, failed validation) —
+    /// recorded, never inferred.
+    pub reasons: Vec<String>,
+    /// Whether the resource finished demoting (`false` = still
+    /// suspended, demotion completes once the device closes).
+    pub demoted: bool,
+}
+
+/// Result of one `renew_leases` pass (P4a plan §4): every outcome is
+/// reported; nothing is silently dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenewalReport {
+    /// Volumes whose lease was renewed this pass.
+    pub renewed: Vec<VolumeId>,
+    /// Volumes that self-fenced this pass, with reasons.
+    pub fenced: Vec<FencedVolume>,
+    /// Volumes whose renewal failed *without* proving authority lost
+    /// (e.g. the witness is unreachable): the writer keeps serving
+    /// until its W5 local deadline, which is carried here — the honest
+    /// bound, never a guess.
+    pub deferred: Vec<DeferredRenewal>,
+    /// Pending fences completed this pass (a marked resource's device
+    /// closed and the shared completion demoted, resumed and cleared
+    /// it) — the renewal pass's fence lane, so a busy-device fence
+    /// does not stay suspended until a restart.
+    pub completed_fences: Vec<VolumeId>,
+    /// Fence-completion failures this pass (reported, never hidden;
+    /// retried by the next pass).
+    pub fence_failures: Vec<UnverifiableVolume>,
+}
+
+/// A renewal that failed without proving authority lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredRenewal {
+    /// The volume whose renewal failed.
+    pub volume_id: VolumeId,
+    /// The summarized failure (reported, never hidden).
+    pub detail: String,
+    /// The W5 local deadline (unix seconds) after which the writer
+    /// self-fences even if the witness stays unreachable.
+    pub deadline_at: u64,
 }
 
 /// An attachment record cleared by reconcile.
@@ -525,6 +642,8 @@ mod tests {
                 runtime: VolumeRuntime {
                     state: VolumeLifecycle::Attached,
                     seeded: true,
+                    authority: None,
+                    fence: None,
                     attachment: Some(AttachmentRecord {
                         id: AttachmentId::new("att-1").expect("valid id"),
                         vm_id: "vm-1".to_owned(),

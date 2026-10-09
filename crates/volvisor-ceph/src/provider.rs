@@ -2153,6 +2153,7 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
             .map(|a| a.id.clone()),
         backend_health: Health::Unknown,
         evidence_status: EvidenceStatus::PrototypeOnly,
+        authority: None,
     }
 }
 

@@ -131,6 +131,27 @@ pub struct Config {
     /// Maximum request body size in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Base URL of the writer-authority witness (drbd provider only,
+    /// e.g. `http://10.0.0.3:9101`). When set, the provider is
+    /// witness-managed: every promotion acquires a lease first, a
+    /// background task renews leases and enforces the local W5
+    /// deadline, and startup/reconcile fail closed on unproven
+    /// primaries. Absent — or a provider other than drbd — keeps the
+    /// exact pre-authority behavior. The witness must be a **third
+    /// failure domain**: the guard in `Config::validate` refuses an
+    /// endpoint colocated with either replication end.
+    pub witness_url: Option<String>,
+    /// Bearer token for the witness surface; required when
+    /// `witness_url` names a non-loopback host (the witness's own
+    /// fail-closed convention). Never logged.
+    pub witness_token: Option<String>,
+    /// Writer lease renewal interval in seconds (required with
+    /// `witness_url`; must be positive). The interval must stay under
+    /// half the witness's lease TTL — a bound the daemon can only
+    /// check lazily against every grant/renew response, because the
+    /// TTL lives on the witness (P4a plan §6); a violating response is
+    /// refused there.
+    pub witness_renewal_interval_secs: Option<u64>,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -151,6 +172,61 @@ fn default_drbd_minor_min() -> u32 {
 
 fn default_drbd_minor_max() -> u32 {
     999
+}
+
+/// Resolve a witness URL's host to the addresses it names (P4a plan
+/// §3): a literal IP maps to itself; a **name** resolves through the
+/// system resolver with every returned address counting. The witness
+/// surface is plain HTTP in P4a, so only the `http://` scheme is
+/// accepted.
+///
+/// # Errors
+/// [`DaemonError::Config`] for a non-HTTP scheme, an unparseable or
+/// empty host, or a name that cannot be resolved — the guard treats
+/// ambiguity as colocation and refuses, and a witness the daemon
+/// cannot resolve is unusable anyway.
+fn witness_host(url: &str) -> Result<Vec<std::net::IpAddr>, DaemonError> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        DaemonError::Config(format!(
+            "witness_url {url} must use the http:// scheme (the witness surface is plain \
+             HTTP in P4a)"
+        ))
+    })?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // `host:port` (IPv6 literals are bracketed, as in `[::1]:9101`).
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "witness_url {url} carries no host"
+        )));
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let resolved: Vec<std::net::IpAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:80"))
+            .map_err(|err| {
+                DaemonError::Config(format!(
+                    "witness_url {url} host {host} cannot be resolved (the failure-domain \
+                     guard treats ambiguity as colocation): {err}"
+                ))
+            })?
+            .map(|socket| socket.ip())
+            .collect();
+    if resolved.is_empty() {
+        return Err(DaemonError::Config(format!(
+            "witness_url {url} host {host} resolves to no address"
+        )));
+    }
+    Ok(resolved)
+}
+
+/// The host portion of a configured `<host>:<port>` peer address.
+fn host_of(address: &str) -> &str {
+    address.rsplit_once(':').map_or(address, |(host, _)| host)
 }
 
 impl Config {
@@ -179,7 +255,106 @@ impl Config {
         if self.provider == ProviderKind::Drbd {
             self.validate_drbd_fields()?;
         }
+        self.validate_witness_fields()?;
         self.validate_field_shapes()
+    }
+
+    /// Witness fields (P4a plan §3/§6): witness management applies only
+    /// to the drbd provider, requires a renewal interval, follows the
+    /// witness's fail-closed token convention for non-loopback
+    /// endpoints, and is refused outright when the endpoint shares a
+    /// failure domain with either replication end (a colocated witness
+    /// is indistinguishable, from the fence's perspective, from no
+    /// witness at all).
+    fn validate_witness_fields(&self) -> Result<(), DaemonError> {
+        let Some(url) = &self.witness_url else {
+            // Absent witness: pre-authority mode. None of the other
+            // witness fields may be set — they would silently imply a
+            // configuration the daemon does not follow.
+            if self.witness_renewal_interval_secs.is_some() {
+                return Err(DaemonError::Config(
+                    "witness_renewal_interval_secs is set without witness_url".to_owned(),
+                ));
+            }
+            if self.witness_token.is_some() {
+                return Err(DaemonError::Config(
+                    "witness_token is set without witness_url".to_owned(),
+                ));
+            }
+            return Ok(());
+        };
+        if self.provider != ProviderKind::Drbd {
+            return Err(DaemonError::Config(
+                "witness_url applies to the drbd provider only (the other classes have no \
+                 remote writer authority)"
+                    .to_owned(),
+            ));
+        }
+        let interval = self.witness_renewal_interval_secs.ok_or_else(|| {
+            DaemonError::Config(
+                "witness_renewal_interval_secs is required when witness_url is set".to_owned(),
+            )
+        })?;
+        if interval == 0 {
+            return Err(DaemonError::Config(
+                "witness_renewal_interval_secs must be > 0".to_owned(),
+            ));
+        }
+        let witness_addresses = witness_host(url)?;
+        if witness_addresses.iter().any(std::net::IpAddr::is_loopback) {
+            return Err(DaemonError::Config(format!(
+                "witness_url {url} is loopback: the witness would run on this storage host, \
+                 not a third failure domain (P4a plan §3); colocation is refused"
+            )));
+        }
+        if self
+            .witness_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(DaemonError::Config(format!(
+                "witness_token is required for the non-loopback witness_url {url} (the \
+                 witness's own fail-closed convention)"
+            )));
+        }
+        self.ensure_witness_failure_domain(&witness_addresses, url)?;
+        Ok(())
+    }
+
+    /// The two-sided failure-domain guard (P4a plan §3): the witness
+    /// host must share no address with this host's replication address
+    /// or the configured peer address. Name-vs-literal resolution is
+    /// conservative: a witness named by DNS counts every resolved
+    /// address, and an unresolvable name refuses startup (ambiguity is
+    /// treated as colocation). Volvisor cannot verify physical
+    /// placement — deployment remains an operator responsibility,
+    /// documented in the plan's honesty section.
+    fn ensure_witness_failure_domain(
+        &self,
+        witness_addresses: &[std::net::IpAddr],
+        url: &str,
+    ) -> Result<(), DaemonError> {
+        let Some(local) = &self.drbd_local_address else {
+            return Ok(());
+        };
+        let Some(peer) = &self.drbd_peer_address else {
+            return Ok(());
+        };
+        for (side, configured) in [("local", local.as_str()), ("peer", host_of(peer))] {
+            let Ok(side_ip) = configured.parse::<std::net::IpAddr>() else {
+                // validate_drbd_field_shapes rejects these shapes
+                // elsewhere; nothing to compare here.
+                continue;
+            };
+            if witness_addresses.contains(&side_ip) {
+                return Err(DaemonError::Config(format!(
+                    "witness_url {url} resolves into the {side} replication end's address \
+                     ({configured}); a witness on a data host defeats the failure-domain \
+                     claim (P4a plan §3)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Fields required only when the lvm provider is selected.
@@ -926,5 +1101,190 @@ provider = \"drbd\"
             + "ceph_pool = \"volvisor\"\nlvm_state_path = \"/j/lvm-state.json\"\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert!(cfg.validate().is_ok());
+    }
+
+    // ---------------------------------------------------------- witness
+
+    /// A minimal witness section over the minimal drbd config: a witness
+    /// on a distinct third address, with token and renewal interval.
+    fn witness_toml() -> String {
+        minimal_drbd_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_token = \"witness-secret\"\n\
+               witness_renewal_interval_secs = 15\n"
+    }
+
+    #[test]
+    fn parses_and_accepts_a_third_domain_witness() {
+        let cfg: Config = toml::from_str(&witness_toml()).expect("parse");
+        cfg.validate().expect("a distinct witness is valid");
+        assert_eq!(cfg.witness_renewal_interval_secs, Some(15));
+    }
+
+    #[test]
+    fn witness_fields_without_url_are_refused() {
+        for extra in [
+            "witness_token = \"t\"\n",
+            "witness_renewal_interval_secs = 15\n",
+        ] {
+            let cfg: Config = toml::from_str(&(minimal_drbd_toml() + extra)).expect("parse");
+            let error = cfg.validate().expect_err("orphan witness field");
+            assert!(
+                error.to_string().contains("without witness_url"),
+                "error names the rule: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn witness_url_requires_the_drbd_provider() {
+        let raw = minimal_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("lvm has no witness");
+        assert!(
+            error.to_string().contains("drbd provider only"),
+            "error names the rule: {error}"
+        );
+    }
+
+    #[test]
+    fn witness_requires_a_positive_renewal_interval() {
+        for interval in [None, Some(0)] {
+            let raw = minimal_drbd_toml()
+                + "witness_url = \"http://10.0.0.3:9101\"\n\
+                   witness_token = \"t\"\n"
+                + &interval.map_or(String::new(), |i| {
+                    format!("witness_renewal_interval_secs = {i}\n")
+                });
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg
+                .validate()
+                .expect_err("the renewal interval is mandatory and positive");
+            assert!(
+                error.to_string().contains("witness_renewal_interval_secs"),
+                "error names the field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_witness_is_refused_as_colocation() {
+        for url in ["http://127.0.0.1:9101", "http://[::1]:9101"] {
+            let raw = minimal_drbd_toml()
+                + &format!(
+                    "witness_url = \"{url}\"\n\
+                     witness_token = \"t\"\n\
+                     witness_renewal_interval_secs = 15\n"
+                );
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg.validate().expect_err("loopback witness");
+            assert!(
+                error.to_string().contains("third failure domain"),
+                "error explains the colocation refusal: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_witness_requires_a_token() {
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("tokenless non-loopback witness");
+        assert!(
+            error.to_string().contains("witness_token is required"),
+            "error names the rule: {error}"
+        );
+    }
+
+    #[test]
+    fn witness_colocated_with_either_replication_end_is_refused() {
+        for (url, side) in [
+            ("http://10.0.0.1:9101", "local"),
+            ("http://10.0.0.2:9101", "peer"),
+        ] {
+            let raw = minimal_drbd_toml()
+                + &format!(
+                    "witness_url = \"{url}\"\n\
+                     witness_token = \"t\"\n\
+                     witness_renewal_interval_secs = 15\n"
+                );
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg.validate().expect_err("colocated witness");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{side} replication end")),
+                "error names the side ({side}): {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn witness_url_must_be_plain_http() {
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("https witness");
+        assert!(
+            error.to_string().contains("http://"),
+            "error names the scheme rule: {error}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_witness_names_refuse_startup() {
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"http://witness.invalid:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("unresolvable witness");
+        assert!(
+            error.to_string().contains("cannot be resolved"),
+            "ambiguity is treated as colocation: {error}"
+        );
+    }
+
+    #[test]
+    fn resolvable_witness_names_count_every_address() {
+        // `localhost` resolves to loopback on every POSIX host: the
+        // name-based resolution path must catch what a literal
+        // comparison alone would miss.
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"http://localhost:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("loopback via name");
+        assert!(
+            error.to_string().contains("third failure domain"),
+            "the resolved loopback is caught: {error}"
+        );
+    }
+
+    #[test]
+    fn witness_host_parses_urls_with_ports_and_paths() {
+        let addresses =
+            witness_host("http://10.0.0.3:9101/v1").expect("literal with port and path");
+        let expected: std::net::IpAddr = "10.0.0.3".parse().expect("ip");
+        assert_eq!(addresses, vec![expected]);
+        let addresses = witness_host("http://10.0.0.3").expect("literal without port");
+        assert_eq!(addresses, vec![expected]);
+        assert!(witness_host("http://10.0.0.3:9101").is_ok());
+        assert!(witness_host("http://").is_err(), "no host");
+        assert!(witness_host("ftp://10.0.0.3").is_err(), "wrong scheme");
+    }
+
+    #[test]
+    fn host_of_strips_the_port() {
+        assert_eq!(host_of("10.0.0.2:7100"), "10.0.0.2");
+        assert_eq!(host_of("10.0.0.2"), "10.0.0.2");
     }
 }
