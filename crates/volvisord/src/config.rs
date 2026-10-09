@@ -349,6 +349,24 @@ impl Config {
                 ));
             }
         }
+        // Node names beyond the drbdsetup status connection-line wrap
+        // budget are rejected here (mirroring the provider's own
+        // validation) so the daemon fails at config load, not at the
+        // first status parse.
+        for (field, value) in [
+            ("drbd_node_name", &self.drbd_node_name),
+            ("drbd_peer_name", &self.drbd_peer_name),
+        ] {
+            if let Some(name) = value {
+                if name.chars().count() > volvisor_drbd::provider::NODE_NAME_MAX_CHARS {
+                    return Err(DaemonError::Config(format!(
+                        "{field} must not exceed {} characters (the drbdsetup status \
+                         connection-line wrap budget)",
+                        volvisor_drbd::provider::NODE_NAME_MAX_CHARS
+                    )));
+                }
+            }
+        }
         if let Some(address) = &self.drbd_peer_address {
             if let Err(e) = volvisor_drbd::provider::split_peer_address(address) {
                 return Err(DaemonError::Config(format!(
@@ -876,6 +894,27 @@ provider = \"drbd\"
             let error = cfg.validate().expect_err("must refuse");
             assert!(
                 error.to_string().contains("drbd_peer_address"),
+                "error names the field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn drbd_node_names_beyond_the_status_wrap_budget_are_refused_at_config_load() {
+        // drbdsetup status wraps piped output at 80 columns; a peer
+        // node name beyond the budget would push the connection line's
+        // role/connection token onto a continuation line the status
+        // parser rejects. Refuse it at config load, naming the field.
+        let too_long = "h".repeat(volvisor_drbd::provider::NODE_NAME_MAX_CHARS + 1);
+        for (field, original) in [("drbd_node_name", "host-a"), ("drbd_peer_name", "host-b")] {
+            let raw = minimal_drbd_toml().replace(
+                &format!("{field} = \"{original}\""),
+                &format!("{field} = \"{too_long}\""),
+            );
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg.validate().expect_err("must refuse");
+            assert!(
+                error.to_string().contains(field),
                 "error names the field: {error}"
             );
         }

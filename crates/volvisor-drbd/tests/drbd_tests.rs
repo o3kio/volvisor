@@ -1353,6 +1353,88 @@ async fn reconcile_fails_a_foreign_peer_on_an_unseeded_volume() {
 }
 
 #[tokio::test]
+async fn reconcile_adopts_a_crashed_seed_while_the_resync_is_in_flight() {
+    // The round-2 grammar defect, end to end: a predecessor crashed in
+    // the window between `primary --force` and the state save. Its
+    // resource is up MID-RESYNC — local UpToDate, peer Inconsistent —
+    // so `drbdsetup status` answers with the real replication-first
+    // peer-device line (`replication:SyncSource peer-disk:Inconsistent
+    // done:37.50`). The parser must read that line (the pre-fix
+    // order-reversed parser silently dropped peer_disk from it), the
+    // startup/reconcile pass must adopt the seed from the data-holding
+    // local disk, and health must tell the truth: Degraded overall
+    // while the replica is still catching up, Healthy once it did.
+    let fixture = fixture();
+    let volume_id = VolumeId::new("crash-seed").expect("id");
+    seed_volume(&fixture.base, &fixture.world, "crash-seed", GIB);
+
+    // Reconstruct the crash-time state: the seed resync is still
+    // running (peer Inconsistent mid-resync — the fake emits the real
+    // replication-first line for exactly this state), and the
+    // predecessor died before the seeded flag was saved.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let resource = world
+            .resources
+            .get_mut(&resource_of("crash-seed"))
+            .expect("resource");
+        resource.peer_disk = DiskState::Inconsistent;
+        resource.resyncing = true;
+    }
+    {
+        let mut state = DrbdState::load(&fixture.state_path).expect("load state");
+        state
+            .volume_mut(&volume_id)
+            .expect("stored volume")
+            .runtime
+            .seeded = false;
+        state.save(&fixture.state_path).expect("save state");
+    }
+
+    // A fresh provider boots over the crashed state: its startup
+    // reconcile reads the real status line and adopts the seed — the
+    // data-holding local disk proves the predecessor's `primary
+    // --force` ran. No foreign verdict, no failure, no re-force.
+    let provider = provider_from(&fixture.state_path, &fixture.world);
+    let stored_volume = stored(&fixture, "crash-seed");
+    assert_eq!(stored_volume.runtime.state, VolumeLifecycle::Ready);
+    assert!(stored_volume.runtime.seeded);
+
+    // The steady-state pass is quiet (idempotent: nothing left to
+    // heal, nothing to fail).
+    let report = provider.reconcile().expect("reconcile");
+    assert_eq!(report.foreign_peer_volumes, Vec::<VolumeId>::new());
+    assert_eq!(report.missing_volumes, Vec::<VolumeId>::new());
+    assert_eq!(report.downed_volumes, Vec::<VolumeId>::new());
+    assert_eq!(report.zombie_primaries, Vec::<VolumeId>::new());
+    assert_eq!(report.seeded_volumes, Vec::<VolumeId>::new());
+
+    // While the resync runs, health is honest: Degraded overall (the
+    // replica is not caught up), Healthy on the local backend axis.
+    let inspected = provider.inspect_volume(&volume_id).await.expect("inspect");
+    assert_eq!(inspected.health, volvisor_types::domain::Health::Degraded);
+    assert_eq!(
+        inspected.backend_health,
+        volvisor_types::domain::Health::Healthy
+    );
+
+    // Once the peer catches up (resync completed out of band), the
+    // same status grammar — now without the replication token —
+    // reports the volume Healthy.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let resource = world
+            .resources
+            .get_mut(&resource_of("crash-seed"))
+            .expect("resource");
+        resource.peer_disk = DiskState::UpToDate;
+        resource.resyncing = false;
+    }
+    let inspected = provider.inspect_volume(&volume_id).await.expect("inspect");
+    assert_eq!(inspected.health, volvisor_types::domain::Health::Healthy);
+}
+
+#[tokio::test]
 async fn reconcile_heals_an_unrecorded_grow() {
     let fixture = fixture();
     seed_volume(&fixture.base, &fixture.world, "heal-grow", GIB);

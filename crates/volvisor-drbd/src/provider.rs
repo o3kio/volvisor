@@ -236,6 +236,12 @@ impl DrbdProviderConfig {
         if self.node_name.trim().is_empty() {
             return Err(ApiError::invalid_request("node_name must not be empty"));
         }
+        if self.node_name.chars().count() > NODE_NAME_MAX_CHARS {
+            return Err(ApiError::invalid_request(format!(
+                "node_name must not exceed {NODE_NAME_MAX_CHARS} characters (the \
+                 drbdsetup status connection-line wrap budget)"
+            )));
+        }
         if !is_ipv4_literal(&self.local_address) {
             return Err(ApiError::invalid_request(
                 "local_address must be an IPv4 dotted quad (e.g. 10.0.0.1)",
@@ -243,6 +249,12 @@ impl DrbdProviderConfig {
         }
         if self.peer_name.trim().is_empty() {
             return Err(ApiError::invalid_request("peer_name must not be empty"));
+        }
+        if self.peer_name.chars().count() > NODE_NAME_MAX_CHARS {
+            return Err(ApiError::invalid_request(format!(
+                "peer_name must not exceed {NODE_NAME_MAX_CHARS} characters (the \
+                 drbdsetup status connection-line wrap budget)"
+            )));
         }
         split_peer_address(&self.peer_address)?;
         if self.shared_secret_file.as_os_str().is_empty() {
@@ -2639,27 +2651,53 @@ fn extent_rounded(size: u64, extent: u64) -> u64 {
 /// The maximum length of the sanitized identity segment of a resource
 /// (and LV) name.
 ///
-/// Capping the sanitized segment at 100 keeps the full name (`vol-` +
-/// segment + `-` + 8 hex) at 113 characters even for a maximum-length
-/// (128-byte) volume id — the same budget the LVM and Ceph providers
-/// use, so the scheme is identical across backends.
-const RESOURCE_NAME_SANITIZED_MAX_CHARS: usize = 100;
+/// The cap exists for a DRBD-specific reason: `drbdsetup status`
+/// renders through the column-oriented `wrap_printf`, which wraps any
+/// line past 80 columns when piped (non-tty). The resource line is
+/// `<name> role:<Secondary>` — 15 characters past the name — so a
+/// name longer than 65 would push `role:` onto a wrapped continuation
+/// line the status parser (correctly) rejects. Capping the sanitized
+/// segment at 50 keeps the full name (`vol-` + segment + `-` + 8 hex)
+/// at 63 characters, 2 under that wrap budget. This is deliberately
+/// NOT the LVM/Ceph providers' 113-character budget: those backends
+/// have no status-line width constraint, DRBD does.
+///
+/// The remaining wrap exposure is operator-intervention-only (e.g. an
+/// out-of-band `drbdsetup suspend-io` appending `suspended:<reasons>`
+/// to a near-max-length resource line); if that wraps, the status
+/// parse fails closed (`INTERNAL`, the volume is left untouched and
+/// reported unverifiable) — never mis-parsed.
+const RESOURCE_NAME_SANITIZED_MAX_CHARS: usize = 50;
+
+/// The maximum length of a node name (`on <host>` in the generated
+/// resource file, `node_name`/`peer_name` in the provider config).
+///
+/// Same `wrap_printf` budget as the resource-name cap
+/// (`RESOURCE_NAME_SANITIZED_MAX_CHARS`, private to this module),
+/// applied to the connection
+/// line: `  <peer> connection:<State>` — 2 indent + name + up to 26
+/// characters for the longest real connection state
+/// (`connection:WFReportParams`) — wraps past 80 columns when the
+/// name exceeds 52. Both the local and the peer node name are bound:
+/// each appears as the peer-line prefix on the *other* node's status
+/// output.
+pub const NODE_NAME_MAX_CHARS: usize = 52;
 
 /// The DRBD resource (and backing LV) name for a volume identity.
 ///
-/// This mirrors the LVM provider's `lv_name_for` scheme exactly (the two
-/// are deliberately duplicated, not factored out, so each crate stays
+/// This mirrors the LVM provider's `lv_name_for` scheme (the two are
+/// deliberately duplicated, not factored out, so each crate stays
 /// independently reviewable): `.` and `:` are replaced with `-` (the ID
 /// charset otherwise consists of `[A-Za-z0-9_.:-]`), the sanitized
-/// segment is truncated to 100 characters
-/// (`RESOURCE_NAME_SANITIZED_MAX_CHARS`, private to this module), and the
-/// first 8 hex
+/// segment is truncated to 50 characters
+/// (`RESOURCE_NAME_SANITIZED_MAX_CHARS`, private to this module — the
+/// DRBD status-line wrap budget, see there), and the first 8 hex
 /// characters of SHA-256 over the **full** volume id are appended.
 /// Sanitization alone is **not injective** (`vol.a`, `vol:a` and `vol-a`
 /// all map to `vol-a`), so uniqueness rests on the 32-bit hash suffix
 /// (collision probability <= 2^-32 per distinct pair). The `vol-` prefix
 /// guarantees the name is never dash-leading, and the full name is at
-/// most `4 + 100 + 1 + 8 = 113` characters. Ownership is *additionally*
+/// most `4 + 50 + 1 + 8 = 63` characters. Ownership is *additionally*
 /// proven by the `volvisor.owner` LV tag before every mutation — the
 /// name alone is never the ownership proof.
 #[must_use]
@@ -2724,11 +2762,21 @@ fn peer_freshness(status: &ResourceStatus) -> PeerFreshness {
         Some(DiskState::UpToDate | DiskState::Consistent | DiskState::Outdated) => {
             PeerFreshness::Foreign
         }
-        // Diskless/DUnknown peers have nothing to seed against yet;
-        // an unrecognized spelling is never treated as fresh
-        // (fail-closed against overwriting data it might describe).
-        Some(DiskState::Diskless | DiskState::DUnknown) => PeerFreshness::Absent,
-        _ => PeerFreshness::Foreign,
+        // Diskless/DUnknown peers — and a connected peer whose
+        // peer-disk line is not printed at all — have nothing to seed
+        // against yet. Real drbdsetup omits the entire peer-device
+        // block while the peer's device state is un-exchanged
+        // (replication Off + DUnknown), a transient during connection
+        // establishment: `None` here means "not yet observable", never
+        // "peer holds data", so it must wait (`Absent`), not destroy
+        // (`Foreign` would tear a fresh resource down on that false
+        // verdict). An unrecognized spelling is likewise never treated
+        // as fresh (fail-closed against overwriting data it might
+        // describe).
+        Some(DiskState::Diskless | DiskState::DUnknown) | None => PeerFreshness::Absent,
+        // Failed/unknown-spelling peer disks conservatively count as
+        // data-holding: never seeded over.
+        Some(DiskState::Failed | DiskState::Other(_)) => PeerFreshness::Foreign,
     }
 }
 
@@ -2933,19 +2981,22 @@ mod tests {
     }
 
     #[test]
-    fn resource_names_for_max_length_ids_fit_the_113_char_budget() {
+    fn resource_names_for_max_length_ids_fit_the_status_wrap_budget() {
         let long_id = volume_id(&"v".repeat(128));
         let name = resource_name_for(&long_id);
-        assert!(name.chars().count() <= 113, "{name} is too long");
+        // 63 = `vol-` + 50 sanitized + `-` + 8 hex; the resource line
+        // `name role:Secondary` must stay within wrap_printf's 80-column
+        // line budget on piped `drbdsetup status` output (63 + 15 <= 80).
+        assert!(name.chars().count() <= 63, "{name} is too long");
         assert!(name.starts_with("vol-"));
         assert!(!name.starts_with('-'));
 
-        // Two distinct 128-char ids sharing a 100-char sanitized prefix
+        // Two distinct 128-char ids sharing a 50-char sanitized prefix
         // still produce distinct names: uniqueness rests on the hash
         // suffix computed over the FULL volume id.
-        let shared_prefix = "p".repeat(100);
-        let first = resource_name_for(&volume_id(&format!("{shared_prefix}{}", "a".repeat(28))));
-        let second = resource_name_for(&volume_id(&format!("{shared_prefix}{}", "b".repeat(28))));
+        let shared_prefix = "p".repeat(50);
+        let first = resource_name_for(&volume_id(&format!("{shared_prefix}{}", "a".repeat(78))));
+        let second = resource_name_for(&volume_id(&format!("{shared_prefix}{}", "b".repeat(78))));
         assert_ne!(first, second);
         let (first_prefix, _) = first.rsplit_once('-').expect("hash suffix delimited");
         let (second_prefix, _) = second.rsplit_once('-').expect("hash suffix delimited");
@@ -2988,6 +3039,13 @@ mod tests {
         config.node_name = String::new();
         assert!(config.validate().is_err());
 
+        // Node names beyond the drbdsetup status connection-line wrap
+        // budget are rejected at validation time, not discovered as
+        // status parse failures at runtime.
+        let mut config = base.clone();
+        config.node_name = "n".repeat(NODE_NAME_MAX_CHARS + 1);
+        assert!(config.validate().is_err());
+
         let mut config = base.clone();
         config.local_address = "10.0.0".to_owned();
         assert!(config.validate().is_err());
@@ -2998,6 +3056,10 @@ mod tests {
 
         let mut config = base.clone();
         config.peer_name = String::new();
+        assert!(config.validate().is_err());
+
+        let mut config = base.clone();
+        config.peer_name = "p".repeat(NODE_NAME_MAX_CHARS + 1);
         assert!(config.validate().is_err());
 
         let mut config = base.clone();
@@ -3475,6 +3537,34 @@ mod tests {
                 Some(Role::Secondary)
             )),
             PeerFreshness::Absent
+        );
+        // Absent: connected but no peer-disk line at all — real
+        // drbdsetup omits the peer-device block while the peer's
+        // device state is un-exchanged (replication Off + DUnknown,
+        // the transient during connection establishment). This must
+        // wait, never classify as Foreign (which would tear a fresh
+        // resource down on a false "peer holds data" verdict).
+        assert_eq!(
+            peer_freshness(&status(
+                DiskState::Inconsistent,
+                true,
+                None,
+                None,
+                Some(Role::Secondary)
+            )),
+            PeerFreshness::Absent
+        );
+        // Foreign: a Failed peer disk conservatively counts as
+        // data-holding (never seeded over).
+        assert_eq!(
+            peer_freshness(&status(
+                DiskState::Inconsistent,
+                true,
+                Some(DiskState::Failed),
+                None,
+                Some(Role::Secondary)
+            )),
+            PeerFreshness::Foreign
         );
     }
 

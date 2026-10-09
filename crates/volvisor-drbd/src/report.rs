@@ -47,7 +47,13 @@
 //! any suspension reason is set (the operator `drbdsetup
 //! suspend-io`, fencing, quorum, or the kernel's no-data-access
 //! suspension after local data-access loss); `force-io-failures:` is
-//! printed when the resource is configured to fail local I/O.
+//! printed when the resource is configured to fail local I/O. The
+//! disk-failure observation path additionally depends on the
+//! **device-line** `client:` marker: a local disk that failed and
+//! detached renders as `disk:Diskless client:no`, so rejecting that
+//! token would turn every disk-failure verdict into an INTERNAL
+//! parse failure — the exact wrong direction for the unhealthiest
+//! observable state.
 //!
 //! The connection is named by the **peer node name** (the mesh `on
 //! <host>` configuration names connections after the peer host);
