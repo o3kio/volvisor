@@ -35,9 +35,12 @@ pub mod admin;
 pub mod discover;
 pub mod provider;
 pub mod report;
-pub mod runner;
 pub mod state;
 
 pub use admin::ReconcileReport;
 pub use provider::{LvmProvider, PROVIDER_NAME};
-pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
+// The command-execution abstraction is shared with the Ceph adapter and
+// lives in volvisor-provider; re-exported here for API stability.
+pub use volvisor_provider::runner::{
+    CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner,
+};

@@ -5,7 +5,7 @@
 //! `lvcreate` on volume groups established by an explicit
 //! [`claim_device`](crate::admin) under a destructive-authorization token.
 //! Every LVM interaction goes through the shell-free
-//! [`CommandRunner`](crate::runner); every mutation is persisted to the
+//! [`CommandRunner`](crate::CommandRunner); every mutation is persisted to the
 //! durable JSON state after the backend confirmed it, and effective sizes
 //! are always verified against `lvs` output — a successful exit status
 //! alone is never trusted as evidence (honest reporting).
@@ -43,8 +43,8 @@ use volvisor_types::{
 };
 
 use crate::report::{LvRow, VgRow};
-use crate::runner::{CommandOutput, CommandRunner};
 use crate::state::{AttachmentRecord, LvmState, StoredVolume, VolumeEntry, VolumeRuntime};
+use crate::{CommandOutput, CommandRunner};
 
 /// Stable provider name for diagnostics (never a secret).
 pub const PROVIDER_NAME: &str = "lvm-native-local";
