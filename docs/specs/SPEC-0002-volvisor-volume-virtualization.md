@@ -76,18 +76,7 @@ Required operations: create primary and replicas, seed, attach, disallow simulta
 
 No claim of RPO=0 during asynchronous steady state. In particular, an extra local mirror can protect an SSD failure but cannot prevent loss of the unreplicated tail after complete host loss.
 
-## 6. Ceph-RBD provider
-
-Tenant block volumes are **RBD images**. OSDs are infrastructure daemons on physical devices. Mapping:
-`VolumeId -> {cluster_fsid, pool_id/name, optional namespace, image_id, image_generation}` with ownership proof. Do not treat one OSD as one tenant volume.
-
-Phase A: existing external Ceph cluster adapter. Validate cluster FSID, auth/key storage, pool policies, RBD image lifecycle, exclusive-lock/attachment discipline, RBD client mapping to the host frontend and monitoring. Respect backend min_size/replica or EC parameters and Ceph health.
-
-Phase B (separate acceptance): Volvisor-managed OSD placement in Storage Cells, including MON/MGR quorum location, CRUSH failure domains, upgrades, device state, bootstrap/recovery and independent management of cluster shared infrastructure. Managed Ceph cannot be claimed production-ready on two OSD disks or one host.
-
-Never double-replicate under an OSD by default. Existing Ceph clusters do not require OSDs to move into Storage Cell VMs. RBD snapshots, clones and resize are conditional on safe backend-validated workflows, not automatically shared API guarantees.
-
-## 6B. DRBD nearline reference provider and synchronous option
+## 5A. DRBD nearline reference provider and synchronous option
 
 [ADR-0007](../adr/0007-drbd9-nearline-replication-provider.md) selects DRBD 9 as **first prototype backend**, with an engine-neutral ReplicationProvider adapter. Initial host-kernel DRBD can export /dev/drbdN backed by a local LV straight to Cloud Hypervisor (no extra Storage Cell/QSD hop). A Storage-Cell-contained DRBD instance with private host-local frontend is an alternate topology that must be measured and tested separately.
 
@@ -96,6 +85,17 @@ Per-volume policy shall distinguish `replication.engine=drbd9` and `replication.
 DRBD provides bitmap resync, peer state, role and quorum; Volvisor owns storage allocation, policy, VM attachments, same-host local protection and **the coordinated VM/storage migration transaction**. A DRBD diskless witness is a quorum voter, not another durable copy. The production topology must specify no-quorum I/O behavior, enforcement/fencing, degraded write admission and promotion permission.
 
 **Cross-host live migration hard gate:** a single-primary DRBD resource usually cannot demote while Cloud Hypervisor still holds its block device open. Prove safe CHV release at the VM pause/cutover and new-primary activation **before** claiming migration. DRBD/KVM setups sometimes use temporary dual-primary with protocol C; Volvisor must not enable that under the default single-writer contract without a separate accepted design and crash/partition proof. Verify multi-volume atomic cutover.
+
+## 6. Ceph-RBD provider
+
+Tenant block volumes are **RBD images**. OSDs are infrastructure daemons on physical devices. Mapping:
+`VolumeId -> {cluster_fsid, pool_id/name, optional namespace, image_id, image_generation}` with ownership proof. Do not treat one OSD as one tenant volume.
+
+Phase A: existing external Ceph cluster adapter. Validate cluster FSID, auth/key storage, pool policies, RBD image lifecycle, exclusive-lock/attachment discipline, RBD client mapping to the host frontend and monitoring. Respect backend min_size/replica or EC parameters and Ceph health.
+
+Phase B (separate acceptance): Volvisor-managed OSD placement in Storage Cells, including MON/MGR quorum location, CRUSH failure domains, upgrades, device state, bootstrap/recovery and independent management of cluster shared infrastructure. Managed Ceph cannot be claimed production-ready on two OSD disks or one host. The experimental Rook worker-cell deployment variant (`ceph_deployment_mode=rook-cell-experimental`, disabled by default) is specified in [ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md) with its own [POC go/no-go](../poc/rook-cells/README.md); it changes only how OSDs are operated, not the `ceph-rbd` volume class semantics.
+
+Never double-replicate under an OSD by default. Existing Ceph clusters do not require OSDs to move into Storage Cell VMs. RBD snapshots, clones and resize are conditional on safe backend-validated workflows, not automatically shared API guarantees.
 
 ## 7. Consumer API and operation states
 

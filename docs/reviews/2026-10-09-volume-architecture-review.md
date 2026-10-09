@@ -2,6 +2,7 @@
 
 Status: Design review and v2 proposal; no implementation or real-host evidence
 Provenance: self-review recorded by the PR author before independent review. The verdict below is a recommendation to maintainers, not an independent approval; findings F01-F15 should be re-verified by a reviewer who did not author the v2 documents.
+Scope: covers the v2 core (ADR-0003/0004/0005, SPEC-0002, volume-api-v2, nearline-replication-v2) as of 2026-10-09. ADR-0006 (online resize/relocation), ADR-0007 (DRBD 9 provider) and ADR-0008 (Rook cells) were added after this review and are NOT covered by findings F01-F15.
 Reviewed repository: `o3kio/volvisor`, `main` at `d8e25b7782571f89382d2adc12ed0010e68d6fe4`
 Reviewed files: README, AGENTS, ADR-0001/0002, SPEC-0001, three v1 contracts, engineering design, replicated-async R&D, previous review
 Revisions: ADR-0003/0004/0005, SPEC-0002, v2 contracts

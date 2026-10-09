@@ -7,10 +7,11 @@
 3. docs/adr/0005-ceph-rbd-and-managed-osds.md
 4. docs/adr/0006-online-resize-and-live-local-block-relocation.md
 5. docs/adr/0007-drbd9-nearline-replication-provider.md
-6. docs/specs/SPEC-0002-volvisor-volume-virtualization.md
-7. contracts/volume-api-v2.md
-8. contracts/nearline-replication-v2.md
-9. docs/reviews/2026-10-09-volume-architecture-review.md
+6. docs/adr/0008-rook-only-hyperconverged-cells.md
+7. docs/specs/SPEC-0002-volvisor-volume-virtualization.md
+8. contracts/volume-api-v2.md
+9. contracts/nearline-replication-v2.md
+10. docs/reviews/2026-10-09-volume-architecture-review.md
 
 ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented proposals**; keep for lineage. When an old draft contradicts v2, v2 is authoritative. Where v2 is silent, v1 operational invariants (storage backplane transport, control-plane outage behavior, peer authentication and secrets, endpoint isolation, observability truthfulness) continue to bind — see SPEC-0002 section 13. Each v2 ADR records its acceptance status in its header; do not treat a pending ADR as an accepted decision. Do not quietly map legacy class names to incompatible new semantics.
 
@@ -31,12 +32,11 @@ ADR-0001/0002, SPEC-0001 and v1 contracts are **superseded, unimplemented propos
 13. Do not reuse or translate third-party source without explicit provenance/license review; prefer existing DRBD/Ceph components before new engines.
 14. Keep *online capacity growth*, *same-host backing relocation* and *cross-host VM live migration* separate. Native LV online growth does not require a block-copy job; no generic live cross-pool copy is implied by LVM pvmove.
 15. Do not put an additional QSD/userspace proxy on all native foreground I/O solely to make it movable. Treat QSD/vhost-user-blk mirror/pivot as an optional, version-pinned, crash-tested backend.
+16. DRBD Protocol A/B/C are distinct durability contracts; quorum/witness is not data replication. Do not claim zero RPO for asynchronous acknowledgements.
+17. DRBD single-primary demotion requires releasing an in-use source block device. Temporary dual-primary for VM live migration is **not automatically permitted**; it requires a separate accepted fenced migration proof and contract amendment.
 
 ## Implementation order
 
 Stable identity/volume contract -> native logical volumes -> external Ceph RBD adapter -> DRBD nearline baseline -> witness/fencing and full VMM/storage handoff -> aggressive failure campaign -> consider standalone Mayastor/clean io_uring/SPDK only with measured justification -> separately designed managed OSD infrastructure.
 
 A benchmark is not a durability proof. A happy-path migration is not a split-brain proof. No class is called production-supported until its exact implementation passes the failure and evidence requirements in SPEC-0002 and the relevant v2 contract.
-
-16. DRBD Protocol A/B/C are distinct durability contracts; quorum/witness is not data replication. Do not claim zero RPO for asynchronous acknowledgements.
-17. DRBD single-primary demotion requires releasing an in-use source block device. Temporary dual-primary for VM live migration is **not automatically permitted**; it requires a separate accepted fenced migration proof and contract amendment.

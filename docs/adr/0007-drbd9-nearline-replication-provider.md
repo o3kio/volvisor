@@ -1,6 +1,7 @@
 # ADR-0007 — DRBD 9 as nearline reference replication backend
 
 Status: Proposed / prototype selection, NOT production acceptance
+Decision-accepted: pending (record acceptance date and accepting authority here)
 Date: 2026-10-09
 Related: [ADR-0003](0003-tiered-volume-virtualization.md), [ADR-0004](0004-nearline-replication-and-mobility.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [nearline v2 contract](../../contracts/nearline-replication-v2.md), [R&D comparison](../research/replicated-async-rnd.md)
 
@@ -68,7 +69,7 @@ The v2 spec's default depiction of a nearline Storage Cell is **one deployment c
 
 ## DRBD replication profiles
 
-The canonical v2 `replication.mode` field is `async | semi-sync | sync`; `async-local` and `sync-durable` below are descriptive profile labels, **not additional wire enum values**. `replication.engine=drbd9` selects this adapter. 
+The canonical v2 `replication.mode` field is `async | semi-sync | sync`; `async-local` and `sync-durable` below are descriptive profile labels, **not additional wire enum values**. `replication.engine=drbd9` selects this adapter.
 
 | Public profile | DRBD protocol | Guest write ACK semantics | Typical role |
 |---|---|---|---|

@@ -36,6 +36,7 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 - [ADR-0005 — Ceph RBD versus OSD lifecycle](docs/adr/0005-ceph-rbd-and-managed-osds.md)
 - [ADR-0006 — online resize and live local block relocation](docs/adr/0006-online-resize-and-live-local-block-relocation.md)
 - [ADR-0007 — DRBD 9 nearline replication backend](docs/adr/0007-drbd9-nearline-replication-provider.md)
+- [ADR-0008 — experimental Rook-only hyperconverged cells](docs/adr/0008-rook-only-hyperconverged-cells.md)
 - [SPEC-0002 — v2 implementation specification](docs/specs/SPEC-0002-volvisor-volume-virtualization.md)
 - [Volume API contract v2](contracts/volume-api-v2.md)
 - [Nearline replication contract v2](contracts/nearline-replication-v2.md)

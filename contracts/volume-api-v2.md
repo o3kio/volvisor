@@ -42,7 +42,7 @@ Accepted fields are schema-versioned. Unsupported policies/field combinations fa
 
 Valid nearline `replication.mode` values are `async` (DRBD A), `semi-sync` (DRBD B), and `sync` (DRBD C), subject to advertised provider capabilities; `async` remains default. `replication.engine` selects a qualified backend, initially `drbd9`; the engine choice must never alter volume protection silently. See [ADR-0007](../docs/adr/0007-drbd9-nearline-replication-provider.md). Quorum witness nodes do not count toward `remote_replicas`.
 
-Field spellings in this contract are canonical (`replication.mode`, `replication.remote_replicas`, `local_protection.mode`). Prose in the ADRs may abbreviate them (for example `replication_mode=async`); the abbreviated and canonical forms denote the same field and must not diverge.
+Field spellings in this contract are canonical (`replication.engine`, `replication.mode`, `replication.remote_replicas`, `local_protection.mode`). Prose in the ADRs may abbreviate them (for example `replication_mode=async`); the abbreviated and canonical forms denote the same field and must not diverge.
 
 The provider must validate security context, quota, supported block alignment, capacity headroom including local thin-pool metadata and mirror legs, failure-domain constraints, encryption capability and current pool ownership. It returns requested vs effective policy, not merely requested policy.
 
@@ -157,6 +157,8 @@ Versioned provider capabilities:
 `encryption`, `replicate`, `live_migrate`, `offline_copy`,
 `same_vg_extent_move`, `same_host_live_backing_move`,
 `rbd_cluster_adapter`, `managed_ceph_osd`, `pci_passthrough`.
+`managed_ceph_osd` includes the separately gated, disabled-by-default
+experimental `rook-cell` deployment mode ([ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)); it is not a fourth volume class.
 
 Capabilities must be tied to implementation/VMM version and **evidence**, not inferred from a backend product name. No class is production-supported before its exact-SHA conformance and real-host failure evidence gates.
 
