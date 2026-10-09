@@ -164,9 +164,13 @@ pub(crate) async fn detach_volume(
 
 /// `POST /v2/volumes/{volume_id}/grow` — GrowVolume.
 ///
-/// The grow-only check needs the current size, so a read-only inspect
-/// precedes the journal; the provider re-validates under its own lock, so a
-/// concurrent change between the two cannot slip through.
+/// No pre-inspect happens here: the grow-only check needs the current
+/// size, and validating it against a read taken *before* the journal
+/// lookup would break replay-safety (a replayed grow after later grows
+/// or after deletion would be rejected as a shrink/404 instead of
+/// replaying the recorded outcome). The provider re-validates grow-only
+/// authoritatively under its own lock; a rejection is then journaled and
+/// replays byte-compatibly, exactly like every other endpoint.
 pub(crate) async fn grow_volume(
     State(state): State<SharedState>,
     _admin: RequireAdmin,
@@ -174,8 +178,6 @@ pub(crate) async fn grow_volume(
     ValidJson(req): ValidJson<GrowVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
     let volume_id = parse_volume_id(&volume_id)?;
-    let current = state.provider.inspect_volume(&volume_id).await?;
-    req.validate(current.provisioned_bytes)?;
     tracing::info!(
         kind = ops::OP_GROW_VOLUME,
         operation_id = %req.operation_id,

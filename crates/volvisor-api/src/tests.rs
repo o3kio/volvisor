@@ -364,6 +364,78 @@ async fn idempotent_create_replays_the_recorded_response() {
     assert!(metrics.contains("operations_total{kind=\"create_volume\",outcome=\"replayed\"} 1"));
 }
 
+/// A replayed grow must return the RECORDED outcome — not a fresh
+/// validation against current state. Grow is the one endpoint where a
+/// pre-journal validation against current state would corrupt replay
+/// semantics: after later grows (or after deletion), replaying an earlier
+/// grow must still return its recorded 200 byte-identically, never a
+/// shrink rejection, stale-generation 409 or 404. The provider's own
+/// grow-only check runs only on real executions, under its lock.
+#[tokio::test]
+async fn grow_replays_the_recorded_response_across_later_grows_and_deletion() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-grow-replay", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let grow = |operation_id: &str, new_size: u64, generation: u64| {
+        serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": operation_id,
+            "new_size_bytes": new_size,
+            "expected_generation": generation,
+        })
+    };
+    let grow_uri = "/v2/volumes/vol-grow-replay/grow";
+
+    let first = grow("op-grow-1", 2 * GIB, 1);
+    let (status, first_body) = send(&app, json_request(Method::POST, grow_uri, &first)).await;
+    assert_eq!(status, StatusCode::OK, "first grow: {first_body}");
+
+    let (status, _) = send(
+        &app,
+        json_request(Method::POST, grow_uri, &grow("op-grow-2", 4 * GIB, 2)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Replay the FIRST grow byte-identically: the volume is now 4 GiB, so
+    // a validation against current state would reject 2 GiB as a shrink
+    // (and the stale generation as a 409) — the journal replay must return
+    // the recorded 200 instead.
+    let (status, replay_body) = send(&app, json_request(Method::POST, grow_uri, &first)).await;
+    assert_eq!(status, StatusCode::OK, "grow replay: {replay_body}");
+    assert_eq!(first_body, replay_body, "replay must be byte-compatible");
+
+    // Even after deletion the recorded outcome replays (never a 404).
+    let delete = serde_json::to_value(fixture_delete_request("vol-grow-replay", 3))
+        .expect("serialize delete fixture");
+    let (status, _) = send(
+        &app,
+        json_request(Method::DELETE, "/v2/volumes/vol-grow-replay", &delete),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, replay_body) = send(&app, json_request(Method::POST, grow_uri, &first)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-delete grow replay: {replay_body}"
+    );
+    assert_eq!(
+        first_body, replay_body,
+        "post-delete replay must be byte-compatible"
+    );
+
+    // Two real executions, two replays, nothing else.
+    let metrics = state.metrics.render();
+    assert!(metrics.contains("operations_total{kind=\"grow_volume\",outcome=\"success\"} 2"));
+    assert!(metrics.contains("operations_total{kind=\"grow_volume\",outcome=\"replayed\"} 2"));
+}
+
 #[tokio::test]
 async fn same_operation_id_with_different_payload_is_a_conflict() {
     let (state, _provider, _dir) = setup();
@@ -586,7 +658,9 @@ async fn concurrent_same_operation_id_creates_exactly_once() {
 /// recorded outcome inside `append_intent`, and the ones that looked the
 /// operation up after the outcome was journaled — must receive the SAME
 /// 507 with byte-identical bodies. A 200 wrapping the recorded error body
-/// (the round-2 review bug) or an in-doubt 409 are both regressions here.
+/// (the round-2 review bug) is a regression here; an in-doubt 409 is legal
+/// for callers that resolve the operation inside the executor's
+/// intent-to-outcome window.
 #[tokio::test]
 async fn concurrent_failed_operation_replays_status_compatible() {
     const CALLERS: usize = 8;
