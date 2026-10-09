@@ -1,0 +1,585 @@
+//! LVM-specific provider tests beyond the generic conformance kit.
+//!
+//! Covers the semantics unique to the native-local backend: device
+//! claiming under a destructive-authorization token, foreign-PV refusal,
+//! honest size verification on create/grow, erasure-policy handling on
+//! delete, startup reconciliation, and crash-replay attach idempotency.
+//!
+//! Test-kit code: `expect`/`unwrap` are allowed here by convention.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+mod common;
+
+use common::{fixture, unclaimed_fixture};
+use volvisor_provider::VolumeProvider;
+use volvisor_provider::conformance::{
+    fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
+    fixture_grow_request,
+};
+use volvisor_types::request::ErasurePolicy;
+use volvisor_types::{ApiErrorCode, DeviceId, VolumeId, VolumeLifecycle};
+
+const GIB: u64 = 1 << 30;
+
+fn volume_id(raw: &str) -> VolumeId {
+    VolumeId::new(raw).expect("valid fixture volume id")
+}
+
+// ---------------------------------------------------------------------------
+// Device claiming / release
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_requires_the_destructive_authorization_token() {
+    let fixture = unclaimed_fixture();
+    let devices = fixture.provider.discover().expect("discover");
+    let device = devices.first().expect("a discovered disk");
+    let err = fixture
+        .provider
+        .claim_device(&device.id, "wrong-token")
+        .expect_err("claim with a bad token");
+    assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy);
+    // The token value never appears in the error detail.
+    assert!(!err.detail.contains("wrong-token"));
+    assert!(!err.detail.contains(common::AUTH_TOKEN));
+
+    // Nothing was mutated.
+    let report = fixture.provider.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty() && report.foreign_lvs.is_empty());
+}
+
+#[test]
+fn claim_rejects_a_device_hosting_a_foreign_pv() {
+    let fixture = unclaimed_fixture();
+    let devices = fixture.provider.discover().expect("discover");
+    let device = devices.first().expect("a discovered disk").clone();
+
+    // Foreign LVM state already sits on the discovered path.
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .pvs
+        .push("/dev/sda".to_owned());
+
+    let err = fixture
+        .provider
+        .claim_device(&device.id, common::AUTH_TOKEN)
+        .expect_err("claim over a foreign PV");
+    assert_eq!(err.code, ApiErrorCode::ForeignDeviceState);
+    assert!(!err.detail.contains("adopted-quietly"));
+
+    // No pvcreate/vgcreate was ever attempted.
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .pvs
+            .iter()
+            .any(|pv| pv.contains("by-id"))
+    );
+}
+
+#[tokio::test]
+async fn claim_creates_pool_and_release_requires_empty_vg() {
+    let fixture = unclaimed_fixture();
+    let devices = fixture.provider.discover().expect("discover");
+    let device = devices.first().expect("a discovered disk").clone();
+
+    let pool = fixture
+        .provider
+        .claim_device(&device.id, common::AUTH_TOKEN)
+        .expect("claim");
+    assert!(pool.id.as_str().starts_with("pool-"));
+    assert_eq!(
+        pool.backend_class,
+        volvisor_types::domain::VolumeClass::NativeLocal
+    );
+    assert_eq!(pool.device_ids, vec![device.id.clone()]);
+    assert_eq!(pool.host_or_ceph_cluster, "local");
+    assert_eq!(pool.health, volvisor_types::domain::Health::Unknown);
+    assert!(
+        pool.allocatable_bytes < pool.capacity_bytes,
+        "headroom is withheld from allocatable capacity"
+    );
+
+    // The claim is durable: a restarted provider over the same state and
+    // world sees the device and no missing volumes.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty() && report.foreign_lvs.is_empty());
+
+    // Re-claiming an already-claimed device is rejected.
+    let err = fixture
+        .provider
+        .claim_device(&device.id, common::AUTH_TOKEN)
+        .expect_err("double claim");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+
+    // A volume in the VG blocks release.
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("claim-vol", GIB))
+        .await
+        .expect("create");
+    let err = fixture
+        .provider
+        .release_device(&device.id, common::AUTH_TOKEN)
+        .expect_err("release with volumes present");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+
+    // After deleting the volume, release succeeds with the right token.
+    fixture
+        .provider
+        .delete_volume(
+            &created.volume_id,
+            &fixture_delete_request("claim-vol", created.generation),
+        )
+        .await
+        .expect("delete");
+    fixture
+        .provider
+        .release_device(&device.id, common::AUTH_TOKEN)
+        .expect("release");
+}
+
+#[test]
+fn release_requires_the_destructive_authorization_token() {
+    let fixture = fixture();
+    let device = DeviceId::new(common::CLAIMED_DEVICE).expect("device id");
+    let err = fixture
+        .provider
+        .release_device(&device, "wrong-token")
+        .expect_err("release with a bad token");
+    assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy);
+    assert!(!err.detail.contains("wrong-token"));
+    assert!(!err.detail.contains(common::AUTH_TOKEN));
+}
+
+#[test]
+fn claim_of_an_undiscovered_device_is_not_found() {
+    let fixture = unclaimed_fixture();
+    let unknown = DeviceId::new("dev-ffffffffffffffffffffffffffffffff").expect("valid id shape");
+    let err = fixture
+        .provider
+        .claim_device(&unknown, common::AUTH_TOKEN)
+        .expect_err("claim of unknown device");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// Volume lifecycle specifics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_without_a_claimed_pool_is_no_safe_capacity() {
+    let fixture = unclaimed_fixture();
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("nopool-vol", GIB))
+        .await
+        .expect_err("create without a pool");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity);
+}
+
+#[tokio::test]
+async fn create_beyond_free_space_is_no_safe_capacity() {
+    let fixture = fixture();
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("toobig-vol", common::POOL_BYTES))
+        .await
+        .expect_err("create beyond free space");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity);
+}
+
+#[tokio::test]
+async fn create_verifies_the_lv_against_lvs_and_fails_honestly() {
+    let fixture = fixture();
+    // lvcreate "succeeds" but the LV never shows up in lvs.
+    fixture.world.lock().expect("world").lvcreate_silent = true;
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("silent-vol", GIB))
+        .await
+        .expect_err("unverifiable create");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("lvs does not list"), "{err}");
+
+    // Nothing was persisted.
+    let listed = fixture.provider.list_volumes(None).await.expect("list");
+    assert!(listed.is_empty());
+}
+
+#[tokio::test]
+async fn grow_verifies_the_effective_size_from_lvm() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("grow-verify", GIB))
+        .await
+        .expect("create");
+
+    // lvextend "succeeds" but lvs still reports the old size.
+    fixture.world.lock().expect("world").lvextend_silent = true;
+    let err = fixture
+        .provider
+        .grow_volume(
+            &created.volume_id,
+            &fixture_grow_request("grow-verify", 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("unverifiable grow");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("LVM reports"), "{err}");
+
+    // State is unchanged: size and generation stayed put.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.generation, created.generation);
+    assert_eq!(inspected.provisioned_bytes, GIB);
+}
+
+#[tokio::test]
+async fn grow_reports_retry_required_while_attached() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("grow-attached", GIB))
+        .await
+        .expect("create");
+    let attached = fixture
+        .provider
+        .attach_volume(
+            &created.volume_id,
+            &fixture_attach_request("grow-attached", "grow-attached-att", 1),
+        )
+        .await
+        .expect("attach");
+    let grown = fixture
+        .provider
+        .grow_volume(
+            &created.volume_id,
+            &fixture_grow_request("grow-attached", 2 * GIB, attached.volume_generation),
+        )
+        .await
+        .expect("grow while attached");
+    assert!(grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    // No VMM integration exists: the notification honestly stays pending.
+    assert_eq!(
+        grown.guest_notification_status,
+        volvisor_types::request::GrowGuestNotification::RetryRequired
+    );
+}
+
+#[tokio::test]
+async fn delete_with_an_attachment_is_invalid_state() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("del-attached", GIB))
+        .await
+        .expect("create");
+    let attached = fixture
+        .provider
+        .attach_volume(
+            &created.volume_id,
+            &fixture_attach_request("del-attached", "del-attached-att", 1),
+        )
+        .await
+        .expect("attach");
+
+    let err = fixture
+        .provider
+        .delete_volume(
+            &created.volume_id,
+            &fixture_delete_request("del-attached", attached.volume_generation),
+        )
+        .await
+        .expect_err("delete while attached");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+
+    // The volume and its LV both survive.
+    fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("volume survives");
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "del-attached"))
+    );
+}
+
+#[tokio::test]
+async fn delete_with_zero_discard_stops_before_lvremove_on_failure() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("discard-vol", GIB))
+        .await
+        .expect("create");
+
+    // blkdiscard fails; the provider must not fall through to lvremove
+    // and pretend success.
+    fixture.world.lock().expect("world").fail_blkdiscard = true;
+    let mut request = fixture_delete_request("discard-vol", created.generation);
+    request.data_erasure_policy = ErasurePolicy::ZeroDiscard;
+    let err = fixture
+        .provider
+        .delete_volume(&created.volume_id, &request)
+        .await
+        .expect_err("failed discard must surface");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("blkdiscard"), "{err}");
+
+    // The LV was NOT removed after the failed discard.
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "discard-vol"))
+    );
+    fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("volume persists");
+}
+
+#[tokio::test]
+async fn delete_with_zero_discard_discards_then_removes() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("discard-ok", GIB))
+        .await
+        .expect("create");
+    let mut request = fixture_delete_request("discard-ok", created.generation);
+    request.data_erasure_policy = ErasurePolicy::ZeroDiscard;
+    fixture
+        .provider
+        .delete_volume(&created.volume_id, &request)
+        .await
+        .expect("delete with discard");
+
+    // The LV is gone from the simulated world.
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&format!("{}/{}", common::CLAIMED_VG, "discard-ok"))
+    );
+}
+
+#[tokio::test]
+async fn delete_with_cryptographic_erasure_fails_closed() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("crypto-vol", GIB))
+        .await
+        .expect("create");
+    let mut request = fixture_delete_request("crypto-vol", created.generation);
+    request.data_erasure_policy = ErasurePolicy::Cryptographic;
+    let err = fixture
+        .provider
+        .delete_volume(&created.volume_id, &request)
+        .await
+        .expect_err("cryptographic erasure");
+    assert_eq!(err.code, ApiErrorCode::UnsupportedClassOrPolicy);
+    fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("volume persists");
+}
+
+#[tokio::test]
+async fn attach_replay_never_fabricates_a_second_attachment() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("replay-vol", GIB))
+        .await
+        .expect("create");
+    let request = fixture_attach_request("replay-vol", "replay-att", 1);
+    let first = fixture
+        .provider
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("attach");
+
+    // Crash replay carries the original (now stale) expected generation.
+    let replayed = fixture
+        .provider
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("idempotent attach replay");
+    assert_eq!(replayed.attachment_id, first.attachment_id);
+    assert_eq!(replayed.attachment_generation, first.attachment_generation);
+
+    let inspected = fixture
+        .provider
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.attachment_ids.len(), 1);
+    assert_eq!(inspected.generation, first.volume_generation);
+
+    // The same attachment id for a different VM is a conflict.
+    let mut conflicting = fixture_attach_request("replay-vol", "replay-att", 1);
+    conflicting.vm_id = "another-vm".to_owned();
+    let err = fixture
+        .provider
+        .attach_volume(&created.volume_id, &conflicting)
+        .await
+        .expect_err("attachment id reuse");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
+async fn attach_replay_survives_a_provider_restart() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("restart-vol", GIB))
+        .await
+        .expect("create");
+    let request = fixture_attach_request("restart-vol", "restart-att", 1);
+    let first = fixture
+        .provider
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("attach");
+
+    // A fresh provider over the same state file must not fabricate a
+    // second attachment when the request is replayed.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let replayed = restarted
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("replay across restart");
+    assert_eq!(replayed.attachment_id, first.attachment_id);
+
+    let inspected = restarted
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.attachment_ids.len(), 1);
+
+    // Detach with the recorded generation still works after the restart.
+    restarted
+        .detach_volume(
+            &created.volume_id,
+            &first.attachment_id,
+            &fixture_detach_request("restart-att", first.attachment_generation),
+        )
+        .await
+        .expect("detach after restart");
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn startup_reconcile_marks_missing_lvs_failed_and_reports_foreign() {
+    // State claims one volume, but the simulated LVM does not have its LV
+    // and instead holds a foreign LV under our VG.
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = std::sync::Arc::new(std::sync::Mutex::new(common::FakeLvm::with_claimed_pool()));
+    world
+        .lock()
+        .expect("world")
+        .lvs
+        .insert(format!("{}/foreign-lv", common::CLAIMED_VG), GIB);
+
+    // A provider start with a state volume whose LV is gone marks it
+    // Failed (persisted) and reports the foreign LV without touching it.
+    common::seed_volume(&state_path, "ghost-vol", common::CLAIMED_VG, GIB);
+    let provider = common::provider_from(&state_path, &world);
+
+    let report = provider.reconcile_report().expect("report");
+    assert_eq!(
+        report.missing_volumes,
+        vec![volume_id("ghost-vol")],
+        "the volume without an LV is reported missing"
+    );
+    assert_eq!(
+        report.foreign_lvs,
+        vec![format!("{}/foreign-lv", common::CLAIMED_VG)],
+        "the unknown LV under our VG is reported foreign"
+    );
+
+    // The volume was honestly marked Failed in state.
+    let state = volvisor_lvm::state::LvmState::load(&state_path).expect("state");
+    let ghost = state.volume(&volume_id("ghost-vol")).expect("ghost entry");
+    assert_eq!(ghost.runtime.state, VolumeLifecycle::Failed);
+
+    // The foreign LV was left untouched.
+    assert!(
+        world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&format!("{}/foreign-lv", common::CLAIMED_VG))
+    );
+}
+
+#[tokio::test]
+async fn failed_volume_cannot_attach_but_can_be_deleted() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("failed-vol", GIB))
+        .await
+        .expect("create");
+
+    // Make the LV vanish behind the provider's back, then restart: the
+    // constructor reconciles the volume to Failed.
+    fixture.world.lock().expect("world").lvs.remove(&format!(
+        "{}/{}",
+        common::CLAIMED_VG,
+        "failed-vol"
+    ));
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect");
+    assert_eq!(inspected.state, VolumeLifecycle::Failed);
+
+    let err = restarted
+        .attach_volume(
+            &created.volume_id,
+            &fixture_attach_request("failed-vol", "failed-att", inspected.generation),
+        )
+        .await
+        .expect_err("attach to a Failed volume");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+
+    // Delete of a Failed volume is allowed (its data is already gone).
+    restarted
+        .delete_volume(
+            &created.volume_id,
+            &fixture_delete_request("failed-vol", inspected.generation),
+        )
+        .await
+        .expect("delete failed volume");
+}
