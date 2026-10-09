@@ -537,8 +537,8 @@ mod tests {
         let runner = RealRunner::default();
         let out = runner.run("true", &[]).expect("fast command succeeds");
         assert!(out.success);
-        assert!(out.stdout.is_empty());
-        assert!(out.stderr.is_empty());
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
     }
 
     #[test]

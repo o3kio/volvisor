@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(sda.health, Health::Unknown);
         assert_eq!(sda.owner_role, None);
         assert_eq!(sda.owner_generation, Generation(0));
-        assert!(sda.namespace_ids.is_empty());
+        assert_eq!(sda.namespace_ids, Vec::<String>::new());
 
         // The by-id path was resolved for pv operations (internal detail).
         let scanned = scan(&runner(), root.path()).expect("scan");

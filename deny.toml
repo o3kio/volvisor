@@ -1,5 +1,5 @@
 [licenses]
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
 # Note: `r-efi` is "MIT OR Apache-2.0 OR LGPL-2.1-or-later" and passes via the
 # MIT alternative; the LGPL alternative never applies to our build.

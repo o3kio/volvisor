@@ -890,7 +890,7 @@ mod tests {
         let inspected = provider.inspect_volume(&vid).await.expect("inspect");
         assert_eq!(inspected.state, VolumeLifecycle::Ready);
         assert_eq!(inspected.generation, 1);
-        assert!(inspected.attachment_ids.is_empty());
+        assert_eq!(inspected.attachment_ids, []);
         assert_eq!(provider.attachment_count().await, 0);
 
         // The fault cleared: the retried mutation succeeds.
@@ -1011,7 +1011,7 @@ mod tests {
             .await
             .expect("detach reader 2");
         assert_eq!(detached.state, VolumeLifecycle::Ready);
-        assert!(detached.attachment_ids.is_empty());
+        assert_eq!(detached.attachment_ids, []);
 
         // With the readers gone, the writer is admitted and then excludes
         // both other writers and new readers.

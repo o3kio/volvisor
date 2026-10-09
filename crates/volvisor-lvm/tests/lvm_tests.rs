@@ -215,7 +215,7 @@ async fn create_verifies_the_lv_against_lvs_and_fails_honestly() {
 
     // Nothing was persisted.
     let listed = fixture.provider.list_volumes(None).await.expect("list");
-    assert!(listed.is_empty());
+    assert_eq!(listed, []);
 }
 
 #[tokio::test]
@@ -803,7 +803,7 @@ async fn create_capacity_check_is_extent_rounded() {
 
     // Nothing was created or persisted.
     let listed = fixture.provider.list_volumes(None).await.expect("list");
-    assert!(listed.is_empty());
+    assert_eq!(listed, []);
 }
 
 #[tokio::test]
@@ -946,7 +946,10 @@ fn claim_vgcreate_failure_undoes_the_pvcreate() {
 
     // The pvcreate was undone: no PV remains on the device path (the
     // fixture's discovery resolves the disk to its kernel path).
-    assert!(fixture.world.lock().expect("world").pvs.is_empty());
+    assert_eq!(
+        fixture.world.lock().expect("world").pvs,
+        Vec::<String>::new()
+    );
     // The undo ran as a real pvremove invocation.
     assert!(
         fixture
@@ -1100,7 +1103,10 @@ fn release_reconciles_forward_when_the_vg_is_verifiably_absent() {
     // The claim is gone and the leftover PV was cleaned up.
     let state = LvmState::load(&fixture.state_path).expect("state");
     assert!(state.device(&device).is_none());
-    assert!(fixture.world.lock().expect("world").pvs.is_empty());
+    assert_eq!(
+        fixture.world.lock().expect("world").pvs,
+        Vec::<String>::new()
+    );
 }
 
 #[test]
