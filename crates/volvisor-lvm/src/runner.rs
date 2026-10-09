@@ -562,4 +562,30 @@ mod tests {
         assert_eq!(out.stdout.len(), 262_144);
         assert!(out.stdout.bytes().all(|byte| byte == 0));
     }
+
+    #[test]
+    fn real_runner_drains_stderr_while_stdout_stays_open() {
+        let runner = RealRunner::with_timeout(Duration::from_secs(10));
+        // The deadlock the concurrent readers exist to prevent: a child
+        // that fills the STDERR pipe (> 64 KiB) while its stdout write end
+        // is still open. A sequential reader blocked on stdout-to-EOF
+        // would deadlock against the child blocked writing stderr. `dd`
+        // writing to /dev/stderr avoids any shell redirection.
+        let out = runner
+            .run(
+                "dd",
+                &["if=/dev/zero", "of=/dev/stderr", "bs=1024", "count=256"],
+            )
+            .expect("stderr-flooding command succeeds");
+        assert!(out.success);
+        // dd appends a short "N+0 records in/out" summary after the data,
+        // so the exact length is data + summary; what matters is that all
+        // 256 KiB of data arrived.
+        assert!(
+            out.stderr.len() >= 262_144,
+            "expected the full 256 KiB on stderr, got {}",
+            out.stderr.len()
+        );
+        assert!(out.stderr[..262_144].bytes().all(|byte| byte == 0));
+    }
 }

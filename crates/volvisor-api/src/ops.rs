@@ -279,7 +279,9 @@ fn operation_in_doubt(
         ApiErrorCode::OperationInDoubt,
         format!(
             "operation {operation_id} has a journaled intent without a recorded \
-             outcome; it may be in flight and is never re-executed"
+             outcome; it may be in flight and is never re-executed. To resolve it, \
+             inspect the current state of the target resource, and if you need to \
+             re-attempt the operation use a new operation_id"
         ),
     ))
 }

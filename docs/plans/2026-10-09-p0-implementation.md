@@ -253,3 +253,39 @@ fixed in the same PR:
   measured.
 - **Admin surface coverage in conformance kit**: claim/release semantics are
   tested per-provider, not yet by the shared kit.
+
+## 11. Review round 2 (2026-10-09) — findings disposition
+
+Round 2 verified the round-1 fixes and found seven new issues (2 medium, 5 low);
+all were fixed in commits ce576e8 and dc94c1e:
+
+- R2-1 (medium): a concurrent replay of a *failed* mutation was served as
+  HTTP 200 with the error body. `IntentAppend::Replayed` now carries the
+  success flag (the dead `Option` collapsed away), and both replay paths in
+  `ops::execute` share one status-reconstruction helper, so failure replays
+  return the recorded wire-code status with a byte-identical body. Verified by
+  an 8-caller concurrent regression test against a deterministically failing
+  create.
+- R2-2 (medium): device release was permanently stuck when the VG vanished
+  between `vgremove` and state persistence. Release now re-queries `vgs` on
+  `vgremove` failure and reconciles forward when the VG is verifiably absent;
+  startup reconcile drops claims whose VG is gone from a *successful* query
+  (claims are kept on query failure — honest unknown); remediation hints name
+  both manual steps in order.
+- R2-3: `RealRunner` redesigned — reader threads drain both pipes concurrently
+  (a stderr-flooding child cannot deadlock a sequential reader), the calling
+  thread is the watchdog (poll `try_wait`, kill at timeout, grace period,
+  detached reaper for D-state children), so no path blocks the caller
+  unbounded.
+- R2-4: the absent-LV delete skip applies only to `Failed` volumes; a `Ready`
+  volume with a transiently invisible LV fails loudly instead of silently
+  skipping erasure.
+- R2-5: capacity checks compare against the extent-rounded demand using the
+  VG's real `vg_extent_size`, so over-allocation surfaces as typed
+  `NO_SAFE_CAPACITY` rather than a raw `INTERNAL`.
+- R2-6: LV names capped at 113 characters (sanitized segment truncated to
+  100; injectivity rests on the full-id hash suffix).
+- Round-3 verification confirmed all of the above correct with no
+  critical/medium findings; the remaining low/nit items (concurrent-test
+  flakiness tolerance, stderr-drain coverage, fake free-space accounting,
+  this section, and the in-doubt recovery hint) were fixed immediately after.

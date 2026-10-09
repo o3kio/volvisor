@@ -1185,3 +1185,46 @@ fn startup_reconcile_keeps_claims_when_vgs_cannot_be_queried() {
         "claims are kept when the vgs query fails"
     );
 }
+
+#[tokio::test]
+async fn allocations_reduce_reported_free_and_delete_returns_it() {
+    let fixture = fixture();
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.vg_free.insert(common::CLAIMED_VG.to_owned(), 8 * MIB);
+    }
+
+    // The first create consumes its effective size from the VG's reported
+    // free space (the fake derives free space from the live LV map, like
+    // real LVM).
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("free-derive", 4 * MIB))
+        .await
+        .expect("first create");
+
+    // Baseline 8 MiB minus the allocated 4 MiB leaves 4 MiB: a second
+    // 4-MiB volume needs 4 MiB plus the headroom, so the typed
+    // NO_SAFE_CAPACITY must surface — proving the allocation was counted.
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("free-derive-2", 4 * MIB))
+        .await
+        .expect_err("free space must reflect the allocated LV");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity, "{err}");
+
+    // Deleting the first volume returns its space.
+    fixture
+        .provider
+        .delete_volume(
+            &created.volume_id,
+            &fixture_delete_request("free-derive", created.generation),
+        )
+        .await
+        .expect("delete returns the space");
+    fixture
+        .provider
+        .create_volume(&fixture_create_request("free-derive-2", 4 * MIB))
+        .await
+        .expect("create succeeds after the space was returned");
+}

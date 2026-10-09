@@ -617,14 +617,25 @@ async fn concurrent_failed_operation_replays_status_compatible() {
     }
 
     let mut bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_doubt = 0usize;
     for handle in handles {
         let (status, body) = handle.await.expect("task join");
-        assert_eq!(
-            status,
-            StatusCode::INSUFFICIENT_STORAGE,
-            "every concurrent caller of a failed operation must see the recorded \
-             failure status, got {status} with body: {body}"
+        // Legal outcomes mirror the success-flavored concurrent test: the
+        // recorded failure status (executor, race-replay or post-outcome
+        // replay) or an in-doubt 409 for callers that resolve the operation
+        // inside the executor's intent-to-outcome window.
+        assert!(
+            status == StatusCode::INSUFFICIENT_STORAGE || status == StatusCode::CONFLICT,
+            "illegal outcome for a concurrent failed operation: {status} with body: {body}"
         );
+        if status == StatusCode::CONFLICT {
+            assert!(
+                body.contains("OPERATION_IN_DOUBT"),
+                "409 must be OPERATION_IN_DOUBT, got: {body}"
+            );
+            in_doubt += 1;
+            continue;
+        }
         assert!(
             body.contains("NO_SAFE_CAPACITY"),
             "body must be the recorded error body: {body}"
@@ -634,20 +645,19 @@ async fn concurrent_failed_operation_replays_status_compatible() {
     assert_eq!(
         bodies.len(),
         1,
-        "all {CALLERS} responses must be byte-identical (executor, race-replay and \
+        "all non-in-doubt responses must be byte-identical (executor, race-replay and \
          post-outcome replay paths)"
     );
 
-    // Exactly one provider execution: one failure, {CALLERS-1} replays, and
-    // never a success or an in-doubt resolution.
+    // Exactly one provider execution: one failure, the rest replays or
+    // in-doubt resolutions, and never a success.
     let metrics = state.metrics.render();
     assert!(metrics.contains("operations_total{kind=\"create_volume\",outcome=\"failure\"} 1"));
+    let replays = CALLERS - 1 - in_doubt;
     assert!(metrics.contains(&format!(
-        "operations_total{{kind=\"create_volume\",outcome=\"replayed\"}} {}",
-        CALLERS - 1
+        "operations_total{{kind=\"create_volume\",outcome=\"replayed\"}} {replays}"
     )));
     assert!(!metrics.contains("operations_total{kind=\"create_volume\",outcome=\"success\"}"));
-    assert!(!metrics.contains("operations_total{kind=\"create_volume\",outcome=\"in_doubt\"}"));
 
     // One intent + one outcome, nothing else was journaled.
     assert_eq!(journal_record_count(&state), 2);

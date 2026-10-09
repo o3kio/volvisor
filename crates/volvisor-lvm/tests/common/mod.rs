@@ -50,7 +50,10 @@ pub struct FakeLvm {
     pub lvs: BTreeMap<String, u64>,
     /// PV device paths known to `pvs`.
     pub pvs: Vec<String>,
-    /// VG name to free bytes.
+    /// VG name to free bytes **before any LV allocations** (the baseline).
+    /// The reported `vgs` free space is this baseline minus the sizes of
+    /// all LVs currently present in the VG, mirroring real LVM where
+    /// `lvcreate`/`lvextend` consume and `lvremove` returns space.
     pub vg_free: BTreeMap<String, u64>,
     /// VG name to total size in bytes.
     pub vg_size: BTreeMap<String, u64>,
@@ -142,14 +145,34 @@ fn lvs_report(world: &FakeLvm) -> CommandOutput {
 }
 
 /// The `vgs` report rows for the simulated world.
+///
+/// Reported free space is derived: the VG's baseline free bytes minus the
+/// sizes of all LVs currently allocated in it (saturating at zero). This
+/// mirrors real LVM, where `lvcreate`/`lvextend` consume free space and
+/// `lvremove` returns it, and prevents the simulated world from claiming
+/// space that allocated LVs already occupy.
 fn vgs_report(world: &FakeLvm) -> CommandOutput {
     let rows: Vec<serde_json::Value> = world
         .vg_free
         .keys()
         .map(|vg| {
+            let allocated: u64 = world
+                .lvs
+                .iter()
+                .filter_map(|(path, size)| {
+                    path.split_once('/')
+                        .and_then(|(vg_name, _)| (vg_name == vg).then_some(*size))
+                })
+                .sum();
+            let free = world
+                .vg_free
+                .get(vg)
+                .copied()
+                .unwrap_or_default()
+                .saturating_sub(allocated);
             serde_json::json!({
                 "vg_name": vg,
-                "vg_free": world.vg_free.get(vg).copied().unwrap_or_default().to_string(),
+                "vg_free": free.to_string(),
                 "vg_size": world.vg_size.get(vg).copied().unwrap_or_default().to_string(),
                 "vg_extent_size": world.extent_size.to_string(),
             })
