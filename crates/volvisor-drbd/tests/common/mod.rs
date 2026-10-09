@@ -327,27 +327,36 @@ fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
 
 /// The `drbdsetup status` text for one running resource — the verified
 /// grammar of the claimed DRBDADM_VERSION=9.29.0: resource line
-/// (indent 0, `role:`), `disk:` line (indent 2), the UNCONDITIONAL
-/// `open:` line (indent 2, kernel >= 9.2.9) reflecting the world's
-/// open-devices state, a peer-node-named connection line (indent 2),
-/// `peer-disk:` line (indent 4, optionally with `replication:`/
-/// `done:`), trailing blank line.
+/// (indent 0, `role:`), ONE device line (indent 2) carrying `disk:`
+/// and the UNCONDITIONAL `open:` (kernel >= 9.2.9) — drbdsetup.c's
+/// device_status prints both through the column-oriented wrap_printf,
+/// so they share a line — a peer-node-named connection line
+/// (indent 2), and the peer-device line (indent 4; `replication:`
+/// FIRST with `done:` and no `%` suffix while resyncing, per
+/// drbdsetup.c peer_device_status), trailing blank line.
 fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String {
-    // drbdsetup.c:3350–3355: `open:` is printed unconditionally on
-    // kernel >= 9.2.9, naming whether the device is currently held
-    // open.
+    // drbdsetup.c: `open:` is printed unconditionally on kernel
+    // >= 9.2.9, naming whether the device is currently held open.
     let open = if world.open_devices.contains(&resource.minor) {
         "yes"
     } else {
         "no"
     };
     if world.peer_online {
-        let mut peer_disk_line = format!("    peer-disk:{}", disk_str(&resource.peer_disk));
-        if resource.resyncing {
-            peer_disk_line.push_str(" replication:SyncTarget done:37.50%");
-        }
+        // A seeding local (UpToDate) resyncs the fresh peer
+        // (Inconsistent) FROM here, so the local replication state is
+        // SyncSource — the direction as seen from this node. The
+        // resyncing state always pairs with an Inconsistent peer.
+        let peer_disk_line = if resource.resyncing {
+            format!(
+                "replication:SyncSource peer-disk:{} done:37.50",
+                disk_str(&resource.peer_disk)
+            )
+        } else {
+            format!("peer-disk:{}", disk_str(&resource.peer_disk))
+        };
         format!(
-            "{name} role:{role}\n  disk:{disk}\n  open:{open}\n  {peer} role:{peer_role}\n\
+            "{name} role:{role}\n  disk:{disk} open:{open}\n  {peer} role:{peer_role}\n    \
              {peer_disk_line}\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
@@ -356,7 +365,7 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         )
     } else {
         format!(
-            "{name} role:{role}\n  disk:{disk}\n  open:{open}\n  {peer} connection:WFConnection\n\n",
+            "{name} role:{role}\n  disk:{disk} open:{open}\n  {peer} connection:WFConnection\n\n",
             role = role_str(resource.role),
             disk = disk_str(&resource.local_disk),
             peer = resource.peer_node,

@@ -2739,7 +2739,13 @@ fn peer_freshness(status: &ResourceStatus) -> PeerFreshness {
 /// peer inconsistency or a lost connection is `Degraded`; an
 /// unrecognized local disk state is an honest `Unknown`, never a guess.
 fn observed_health(status: &ResourceStatus) -> Health {
-    match &status.local_disk {
+    // `force-io-failures:yes` is the disk-failure / fencing emulation
+    // path: local I/O is being failed on purpose, which is the
+    // unhealthiest observable state short of a parse failure.
+    if status.force_io_failures == Some(true) {
+        return Health::Unhealthy;
+    }
+    let base = match &status.local_disk {
         DiskState::Failed | DiskState::Diskless => Health::Unhealthy,
         DiskState::DUnknown | DiskState::Other(_) => Health::Unknown,
         DiskState::UpToDate => {
@@ -2753,7 +2759,16 @@ fn observed_health(status: &ResourceStatus) -> Health {
             }
         }
         DiskState::Inconsistent | DiskState::Outdated | DiskState::Consistent => Health::Degraded,
+    };
+    // A suspended resource (operator `drbdsetup suspend-io`, or the
+    // kernel's no-data-access suspension after local data-access
+    // loss) freezes I/O: no data is lost, but a Healthy verdict would
+    // claim serving capability the resource does not have. Degraded
+    // is the honest ceiling.
+    if status.suspended.is_some() && base == Health::Healthy {
+        return Health::Degraded;
     }
+    base
 }
 
 /// The observed backend (local disk) health from a resource status.
@@ -3132,7 +3147,52 @@ mod tests {
             resync_done: None,
             local_open: None,
             quorum: None,
+            suspended: None,
+            force_io_failures: None,
         }
+    }
+
+    #[test]
+    fn observed_health_surfaces_the_suspension_qualifiers() {
+        use Health::{Degraded, Healthy, Unhealthy};
+        // A fully-established, open, suspended resource (operator
+        // suspend-io): I/O is frozen — never Healthy.
+        let mut suspended = status(
+            DiskState::UpToDate,
+            true,
+            Some(DiskState::UpToDate),
+            None,
+            Some(Role::Secondary),
+        );
+        suspended.suspended = Some("user".to_owned());
+        assert_eq!(observed_health(&suspended), Degraded);
+        // The kernel's no-data-access suspension (local data path
+        // lost) degrades the same way — an honest "not serving", not
+        // an Unhealthy data-loss claim.
+        suspended.suspended = Some("no-data".to_owned());
+        assert_eq!(observed_health(&suspended), Degraded);
+        // force-io-failures:yes (disk-failure emulation) is Unhealthy.
+        let mut failing = status(
+            DiskState::UpToDate,
+            true,
+            Some(DiskState::UpToDate),
+            None,
+            Some(Role::Secondary),
+        );
+        failing.force_io_failures = Some(true);
+        assert_eq!(observed_health(&failing), Unhealthy);
+        // And the unsuspended baseline of the same facts is Healthy,
+        // so the qualifiers are what makes the difference.
+        assert_eq!(
+            observed_health(&status(
+                DiskState::UpToDate,
+                true,
+                Some(DiskState::UpToDate),
+                None,
+                Some(Role::Secondary)
+            )),
+            Healthy
+        );
     }
 
     #[test]

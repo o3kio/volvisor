@@ -8,31 +8,54 @@
 //!
 //! ```text
 //! <res> role:<Primary|Secondary>            # indent 0
-//!   disk:<DiskState>                        # indent 2
-//!   open:<yes|no>                           # indent 2, unconditional
-//!                                           # on kernel >= 9.2.9
-//!   [quorum:<yes|no>]                       # indent 2, only when
-//!                                           # quorum is enabled
+//!   [suspended:<reasons>]                   # same line, when any
+//!   [force-io-failures:<yes|no>]            #   suspension is active
+//!   disk:<DiskState>                        # indent 2 — ONE line:
+//!   [client:<...>]                          #   device_status prints
+//!   [quorum:<yes|no>]                       #   every token through
+//!   [open:<yes|no>]                         #   the column-oriented
+//!                                           #   wrap_printf
 //!   <peer-node> role:<Role>                 # indent 2, when Connected
-//!     peer-disk:<DiskState>                 # indent 4, when Connected
-//!       [replication:<SyncTarget|...> done:%.2f]
+//!     [replication:<X>] peer-disk:<DiskState>   # indent 4, when Connected
+//!     [peer-client:<...>] [done:%.2f] [resync-suspended:<...>]
 //!   <peer-node> connection:<CState>         # indent 2, when NOT Connected
 //! <blank line>
 //! ```
 //!
-//! The `open:` line is printed unconditionally by drbd-utils against
-//! kernel 9.2.9 and newer (drbdsetup.c:3350–3355), so every real
-//! non-verbose status of this generation carries it; the parser keeps
-//! it optional only for older kernels. `quorum:` appears only when
-//! quorum is enabled on the resource (drbdsetup.c:3345) — a volvisor
-//! resource cannot print it today (volvisor never enables quorum), but
-//! the parser must not explode the day that changes.
+//! Line structure is the detail most easily gotten wrong, so it is
+//! pinned here with its sources: `drbdsetup.c`'s `resource_status`,
+//! `device_status`, `peer_device_status` and `connection_status`
+//! print through `wrap_printf` (user/shared/wrap_printf.c), which is
+//! **column-oriented** — consecutive calls with the same indentation
+//! continue the SAME line until an explicit `\n`. A real non-verbose
+//! status therefore carries `disk:`, `quorum:` and `open:` on one
+//! indent-2 line (confirmed against real drbd-utils 9.30.0 /
+//! kmod 9.2.12 output: `  disk:UpToDate open:yes`), and
+//! `replication:` on the peer-device line BEFORE `peer-disk:` (only
+//! while resyncing/verifying — an established peer prints no
+//! `replication:` token at all), with `done:%.2f` carrying no `%`
+//! suffix. The token scans below are order-independent so a future
+//! re-ordering still parses, but unknown tokens fail loudly.
 //!
-//! The connection is named by the **peer node name**; when it is
-//! `Connected` the peer's role is printed on that line instead of a
-//! connection state. An unknown resource makes `drbdsetup` exit
-//! non-zero with `<res>: No such resource` on stderr (callers detect
-//! this by stderr content; the runner does not expose exit codes).
+//! The `open:` token is printed unconditionally by drbd-utils against
+//! kernel 9.2.9 and newer, so every real non-verbose status of this
+//! generation carries it; the parser keeps it optional only for older
+//! kernels. `quorum:` appears only when quorum is enabled on the
+//! resource — a volvisor resource cannot print it today (volvisor
+//! never enables quorum), but the parser must not explode the day
+//! that changes. `suspended:` appears on the resource line whenever
+//! any suspension reason is set (the operator `drbdsetup
+//! suspend-io`, fencing, quorum, or the kernel's no-data-access
+//! suspension after local data-access loss); `force-io-failures:` is
+//! printed when the resource is configured to fail local I/O.
+//!
+//! The connection is named by the **peer node name** (the mesh `on
+//! <host>` configuration names connections after the peer host);
+//! when it is `Connected` the peer's role is printed on that line
+//! instead of a connection state. An unknown resource makes
+//! `drbdsetup` exit non-zero with `<res>: No such resource` on
+//! stderr (callers detect this by stderr content; the runner does
+//! not expose exit codes).
 //!
 //! LVM parsing mirrors `volvisor-lvm`'s report module (the crates
 //! deliberately do not share it): permissive `Option` fields, sizes as
@@ -156,19 +179,37 @@ pub struct ResourceStatus {
     pub peer_role: Option<Role>,
     /// The peer's disk state, when connected.
     pub peer_disk: Option<DiskState>,
-    /// The replication direction during resync (`SyncTarget`, ...).
+    /// The replication direction while resyncing or verifying
+    /// (`SyncSource`, `SyncTarget`, ...) — printed only when the
+    /// replication state is beyond `Established`, BEFORE
+    /// `peer-disk:` on the peer-device line.
     pub replication: Option<String>,
-    /// Resync progress (`done:` percentage), when resyncing.
+    /// Resync progress (`done:` percentage), when resyncing. Real
+    /// drbdsetup prints the value with no `%` suffix; a trailing `%`
+    /// is tolerated.
     pub resync_done: Option<f64>,
     /// Whether the local device is currently held open (the indent-2
-    /// `open:` line, printed unconditionally by drbd-utils against
-    /// kernel 9.2.9 and newer). `None` when the line is absent (an
+    /// `open:` token, printed unconditionally by drbd-utils against
+    /// kernel 9.2.9 and newer). `None` when the token is absent (an
     /// older kernel); a `Some(false)` here is the detached-resource
     /// fact the demotion path can rely on.
     pub local_open: Option<bool>,
-    /// The quorum verdict (the indent-2 `quorum:` line), present only
+    /// The quorum verdict (the indent-2 `quorum:` token), present only
     /// when quorum is enabled on the resource.
     pub quorum: Option<bool>,
+    /// The resource-level suspension reason list (`suspended:` on the
+    /// resource line, verbatim), present only while any suspension is
+    /// active: the operator `drbdsetup suspend-io` (`user`), the
+    /// kernel's no-data-access suspension (`no-data`), fencing
+    /// (`fencing`) or quorum (`quorum`), comma-combined. `None` = not
+    /// suspended. I/O on a suspended resource is frozen, so this is a
+    /// first-class health fact, not decoration.
+    pub suspended: Option<String>,
+    /// Whether the resource is configured to fail local I/O
+    /// (`force-io-failures:yes` on the resource line — the
+    /// disk-failure / fencing emulation path). Printed only when set,
+    /// so `None` means the token was absent.
+    pub force_io_failures: Option<bool>,
 }
 
 /// An `INTERNAL` parse error for `drbdsetup status` output.
@@ -194,6 +235,131 @@ fn parse_yes_no(field: &str, value: &str) -> Result<bool, ApiError> {
     }
 }
 
+/// The mutable parse accumulator for one `drbdsetup status` output.
+#[derive(Default)]
+struct StatusFields {
+    name: Option<String>,
+    role: Option<Role>,
+    local_disk: Option<DiskState>,
+    connection: Option<ConnectionState>,
+    connected: bool,
+    peer_role: Option<Role>,
+    peer_disk: Option<DiskState>,
+    replication: Option<String>,
+    resync_done: Option<f64>,
+    local_open: Option<bool>,
+    quorum: Option<bool>,
+    suspended: Option<String>,
+    force_io_failures: Option<bool>,
+}
+
+impl StatusFields {
+    /// Resource line (indent 0): `<res> role:<Role>` optionally
+    /// followed by `suspended:<reasons>` and
+    /// `force-io-failures:<yes|no>` (all on the same line;
+    /// drbdsetup.c prints the qualifiers only when a suspension is
+    /// active / I/O failing is configured).
+    fn parse_resource_line(&mut self, tokens: &[&str], line: &str) -> Result<(), ApiError> {
+        self.name = Some(tokens[0].to_owned());
+        for token in &tokens[1..] {
+            if let Some(value) = token.strip_prefix("role:") {
+                self.role = Some(Role::parse(value)?);
+            } else if let Some(value) = token.strip_prefix("suspended:") {
+                if value.is_empty() {
+                    return Err(parse_error(format!(
+                        "malformed resource line (empty suspended:) {line:?}"
+                    )));
+                }
+                self.suspended = Some(value.to_owned());
+            } else if let Some(value) = token.strip_prefix("force-io-failures:") {
+                self.force_io_failures = Some(parse_yes_no("force-io-failures", value)?);
+            } else {
+                return Err(parse_error(format!("malformed resource line {line:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Indent-2 line: the device line (`disk:`, `client:`,
+    /// `quorum:`, `open:` — all on ONE line, see the module grammar)
+    /// or the peer line (`<peer-node> role:<Role>` when connected,
+    /// `<peer-node> connection:<State>` when not).
+    fn parse_device_or_peer_line(&mut self, tokens: &[&str], line: &str) -> Result<(), ApiError> {
+        let first = tokens[0];
+        if first.starts_with("volume:") {
+            return Err(parse_error(
+                "multi-volume status output is not supported by this parser",
+            ));
+        }
+        if first.starts_with("disk:")
+            || first.starts_with("client:")
+            || first.starts_with("quorum:")
+            || first.starts_with("open:")
+        {
+            for token in tokens {
+                if let Some(value) = token.strip_prefix("disk:") {
+                    self.local_disk = Some(DiskState::parse(value));
+                } else if token.starts_with("client:") {
+                    // Local diskless marker (`client:no|yes`); a known
+                    // spelling this parser does not model — tolerated,
+                    // never guessed from.
+                } else if let Some(value) = token.strip_prefix("quorum:") {
+                    self.quorum = Some(parse_yes_no("quorum", value)?);
+                } else if let Some(value) = token.strip_prefix("open:") {
+                    self.local_open = Some(parse_yes_no("open", value)?);
+                } else {
+                    return Err(parse_error(format!("malformed device line {line:?}")));
+                }
+            }
+        } else if tokens.len() == 2 && tokens[1].starts_with("role:") {
+            self.peer_role = Some(Role::parse(tokens[1].trim_start_matches("role:"))?);
+            self.connected = true;
+        } else if tokens.len() == 2 && tokens[1].starts_with("connection:") {
+            // Disconnected peer line:
+            // `  <peer-node> connection:<State>`.
+            let state = ConnectionState::parse(tokens[1].trim_start_matches("connection:"));
+            self.connected = self.connected || state.is_connected();
+            self.connection = Some(state);
+        } else {
+            return Err(parse_error(format!("malformed line {line:?}")));
+        }
+        Ok(())
+    }
+
+    /// Peer-device line (indent 4): `[replication:<X>]
+    /// peer-disk:<DiskState> [peer-client:<...>] [done:%.2f]
+    /// [resync-suspended:<...>]` — order-independent token scan (real
+    /// drbdsetup prints `replication:` BEFORE `peer-disk:`; see the
+    /// module grammar). `peer-disk:` must be present.
+    fn parse_peer_device_line(&mut self, tokens: &[&str], line: &str) -> Result<(), ApiError> {
+        let mut have_peer_disk = false;
+        for token in tokens {
+            if let Some(value) = token.strip_prefix("peer-disk:") {
+                self.peer_disk = Some(DiskState::parse(value));
+                have_peer_disk = true;
+            } else if let Some(value) = token.strip_prefix("replication:") {
+                self.replication = Some(value.to_owned());
+            } else if let Some(value) = token.strip_prefix("done:") {
+                self.resync_done = value.trim_end_matches('%').parse().ok();
+            } else if token.starts_with("peer-client:") || token.starts_with("resync-suspended:") {
+                // Known spellings this parser does not model.
+            } else if token.starts_with("volume:") {
+                return Err(parse_error(
+                    "multi-volume status output is not supported by this parser",
+                ));
+            } else {
+                return Err(parse_error(format!("malformed peer-device line {line:?}")));
+            }
+        }
+        if !have_peer_disk {
+            return Err(parse_error(format!(
+                "peer-device line without peer-disk: {line:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Parse the text output of `drbdsetup status <res>` (one resource).
 ///
 /// Strict where the grammar is known (a resource line with a role, a
@@ -205,17 +371,7 @@ fn parse_yes_no(field: &str, value: &str) -> Result<bool, ApiError> {
 /// # Errors
 /// `INTERNAL` when the output does not match the verified grammar.
 pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> {
-    let mut name: Option<String> = None;
-    let mut role: Option<Role> = None;
-    let mut local_disk: Option<DiskState> = None;
-    let mut connection: Option<ConnectionState> = None;
-    let mut connected = false;
-    let mut peer_role: Option<Role> = None;
-    let mut peer_disk: Option<DiskState> = None;
-    let mut replication: Option<String> = None;
-    let mut resync_done: Option<f64> = None;
-    let mut local_open: Option<bool> = None;
-    let mut quorum: Option<bool> = None;
+    let mut fields = StatusFields::default();
 
     for line in stdout.lines() {
         if line.trim().is_empty() {
@@ -227,55 +383,9 @@ pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> 
             continue;
         };
         match indent {
-            // Resource line: `<res> role:<Role>`.
-            0 => {
-                if tokens.len() != 2 || !tokens[1].starts_with("role:") {
-                    return Err(parse_error(format!("malformed resource line {line:?}")));
-                }
-                name = Some(first.to_owned());
-                role = Some(Role::parse(tokens[1].trim_start_matches("role:"))?);
-            }
-            // Device/connection line (`disk:`, `open:`, `quorum:`,
-            // `connection:`) or the connected peer line
-            // (`<peer-node> role:<Role>`).
-            2 => {
-                if let Some(value) = first.strip_prefix("disk:") {
-                    local_disk = Some(DiskState::parse(value));
-                } else if let Some(value) = first.strip_prefix("open:") {
-                    local_open = Some(parse_yes_no("open", value)?);
-                } else if let Some(value) = first.strip_prefix("quorum:") {
-                    quorum = Some(parse_yes_no("quorum", value)?);
-                } else if let Some(value) = first.strip_prefix("connection:") {
-                    let state = ConnectionState::parse(value);
-                    connected = connected || state.is_connected();
-                    connection = Some(state);
-                } else if tokens.len() == 2 && tokens[1].starts_with("role:") {
-                    peer_role = Some(Role::parse(tokens[1].trim_start_matches("role:"))?);
-                    connected = true;
-                } else if tokens.len() == 2 && tokens[1].starts_with("connection:") {
-                    // Disconnected peer line:
-                    // `  <peer-node> connection:<State>`.
-                    let state = ConnectionState::parse(tokens[1].trim_start_matches("connection:"));
-                    connected = connected || state.is_connected();
-                    connection = Some(state);
-                } else {
-                    return Err(parse_error(format!("malformed line {line:?}")));
-                }
-            }
-            // Peer-device line: `peer-disk:<DiskState>` optionally
-            // followed by `replication:<X>` and `done:<N>`.
-            4 => {
-                if let Some(value) = first.strip_prefix("peer-disk:") {
-                    peer_disk = Some(DiskState::parse(value));
-                }
-                for token in &tokens[1..] {
-                    if let Some(value) = token.strip_prefix("replication:") {
-                        replication = Some(value.to_owned());
-                    } else if let Some(value) = token.strip_prefix("done:") {
-                        resync_done = value.trim_end_matches('%').parse().ok();
-                    }
-                }
-            }
+            0 => fields.parse_resource_line(&tokens, line)?,
+            2 => fields.parse_device_or_peer_line(&tokens, line)?,
+            4 => fields.parse_peer_device_line(&tokens, line)?,
             // Deeper nesting or unexpected indentation: multi-volume
             // output (`volume:0`) and other unknown shapes fail loudly.
             _ => {
@@ -289,21 +399,27 @@ pub fn parse_drbdsetup_status(stdout: &str) -> Result<ResourceStatus, ApiError> 
         }
     }
 
-    let name = name.ok_or_else(|| parse_error("no resource line"))?;
-    let role = role.ok_or_else(|| parse_error("resource line carries no role"))?;
-    let local_disk = local_disk.ok_or_else(|| parse_error("no local disk: line"))?;
+    let name = fields.name.ok_or_else(|| parse_error("no resource line"))?;
+    let role = fields
+        .role
+        .ok_or_else(|| parse_error("resource line carries no role"))?;
+    let local_disk = fields
+        .local_disk
+        .ok_or_else(|| parse_error("no local disk: line"))?;
     Ok(ResourceStatus {
         name,
         role,
         local_disk,
-        connected,
-        connection,
-        peer_role,
-        peer_disk,
-        replication,
-        resync_done,
-        local_open,
-        quorum,
+        connected: fields.connected,
+        connection: fields.connection,
+        peer_role: fields.peer_role,
+        peer_disk: fields.peer_disk,
+        replication: fields.replication,
+        resync_done: fields.resync_done,
+        local_open: fields.local_open,
+        quorum: fields.quorum,
+        suspended: fields.suspended,
+        force_io_failures: fields.force_io_failures,
     })
 }
 
@@ -489,12 +605,11 @@ mod tests {
 
     #[test]
     fn parses_the_connected_single_volume_shape() {
-        // Verified grammar: resource line, disk line, open line, peer
-        // line (connection named by the PEER NODE NAME), peer-disk
-        // line, trailing blank line.
+        // Verified grammar: resource line, ONE device line carrying
+        // disk:/open: (wrap_printf columns), peer line named by the
+        // peer node name, peer-disk line, trailing blank line.
         let stdout = "vol-r0 role:Secondary\n  \
-                      disk:UpToDate\n  \
-                      open:no\n  \
+                      disk:UpToDate open:no\n  \
                       node-b role:Secondary\n    \
                       peer-disk:UpToDate\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
@@ -503,6 +618,8 @@ mod tests {
         assert_eq!(status.local_disk, DiskState::UpToDate);
         assert_eq!(status.local_open, Some(false));
         assert_eq!(status.quorum, None);
+        assert_eq!(status.suspended, None);
+        assert_eq!(status.force_io_failures, None);
         assert!(status.connected);
         assert_eq!(status.connection, None);
         assert_eq!(status.peer_role, Some(Role::Secondary));
@@ -514,8 +631,7 @@ mod tests {
     #[test]
     fn parses_the_disconnected_shape() {
         let stdout = "vol-r0 role:Primary\n  \
-                      disk:UpToDate\n  \
-                      open:yes\n  \
+                      disk:UpToDate open:yes\n  \
                       node-b connection:WFConnection\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.role, Role::Primary);
@@ -528,29 +644,33 @@ mod tests {
 
     #[test]
     fn parses_resync_progress_on_the_peer_disk_line() {
+        // Real print order: `replication:` BEFORE `peer-disk:`,
+        // `done:` with no `%` suffix (drbdsetup.c peer_device_status
+        // via the column-oriented wrap_printf).
         let stdout = "vol-r0 role:Primary\n  \
-                      disk:UpToDate\n  \
-                      open:no\n  \
+                      disk:UpToDate open:no\n  \
                       node-b role:Secondary\n    \
-                      peer-disk:Inconsistent replication:SyncTarget done:12.50%\n\n";
+                      replication:SyncSource peer-disk:Inconsistent done:12.50\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.peer_disk, Some(DiskState::Inconsistent));
-        assert_eq!(status.replication.as_deref(), Some("SyncTarget"));
+        assert_eq!(status.replication.as_deref(), Some("SyncSource"));
         assert_eq!(status.resync_done, Some(12.5));
     }
 
     /// A verbatim `drbdsetup status <res>` sample exactly as
-    /// drbd-utils 9.29.0 prints it against kernel >= 9.2.9, constructed
-    /// in drbdsetup.c's print order (role; disk; open — unconditional;
-    /// peer line with role when connected; peer-disk with
-    /// replication/done while resyncing).
+    /// drbd-utils 9.29.0 prints it against kernel >= 9.2.9,
+    /// constructed in drbdsetup.c's print order (role; ONE device
+    /// line with disk + open — unconditional; peer line with role
+    /// when connected; peer-disk with `replication:` FIRST and
+    /// `done:%.2f` without `%` while resyncing). Line structure
+    /// cross-confirmed against real drbd-utils 9.30.0 / kmod 9.2.12
+    /// output (`  disk:UpToDate open:yes`).
     #[test]
     fn parses_a_verbatim_drbd_utils_9_29_0_connected_status() {
         let stdout = "vol-r0 role:Secondary\n  \
-                      disk:UpToDate\n  \
-                      open:yes\n  \
+                      disk:UpToDate open:yes\n  \
                       node-b role:Secondary\n    \
-                      peer-disk:Inconsistent replication:SyncTarget done:37.50%\n\n";
+                      replication:SyncSource peer-disk:Inconsistent done:37.50\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.name, "vol-r0");
         assert_eq!(status.role, Role::Secondary);
@@ -559,7 +679,7 @@ mod tests {
         assert!(status.connected);
         assert_eq!(status.peer_role, Some(Role::Secondary));
         assert_eq!(status.peer_disk, Some(DiskState::Inconsistent));
-        assert_eq!(status.replication.as_deref(), Some("SyncTarget"));
+        assert_eq!(status.replication.as_deref(), Some("SyncSource"));
         assert_eq!(status.resync_done, Some(37.5));
     }
 
@@ -569,8 +689,7 @@ mod tests {
     #[test]
     fn parses_a_verbatim_drbd_utils_9_29_0_wfconnection_status() {
         let stdout = "vol-r0 role:Primary\n  \
-                      disk:UpToDate\n  \
-                      open:yes\n  \
+                      disk:UpToDate open:yes\n  \
                       node-b connection:WFConnection\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(status.role, Role::Primary);
@@ -584,14 +703,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_quorum_line_when_quorum_is_enabled() {
+    fn parses_the_quorum_token_when_quorum_is_enabled() {
         // A volvisor resource cannot print this today (quorum is never
         // enabled), but the spelling is a known grammar element: it
-        // must parse, not explode.
+        // must parse, not explode. On real output it shares the
+        // device line with disk: and open:.
         let stdout = "vol-r0 role:Secondary\n  \
-                      disk:UpToDate\n  \
-                      quorum:yes\n  \
-                      open:no\n  \
+                      disk:UpToDate quorum:yes open:no\n  \
                       node-b role:Secondary\n    \
                       peer-disk:UpToDate\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
@@ -599,28 +717,84 @@ mod tests {
         assert_eq!(status.local_open, Some(false));
     }
 
+    /// The resource-line suspension qualifiers (drbdsetup.c
+    /// resource_status): `suspended:` whenever any suspension reason
+    /// is set (operator suspend-io, fencing, quorum, or the kernel's
+    /// no-data-access suspension), `force-io-failures:` when I/O
+    /// failing is configured. Both share the resource line.
+    #[test]
+    fn parses_the_resource_line_suspension_qualifiers() {
+        let stdout = "vol-r0 role:Primary suspended:no-data\n  \
+                      disk:UpToDate open:yes\n  \
+                      node-b role:Secondary\n    \
+                      peer-disk:UpToDate\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.suspended.as_deref(), Some("no-data"));
+        assert_eq!(status.force_io_failures, None);
+
+        let stdout = "vol-r0 role:Primary suspended:user force-io-failures:yes\n  \
+                      disk:UpToDate open:yes\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.suspended.as_deref(), Some("user"));
+        assert_eq!(status.force_io_failures, Some(true));
+    }
+
+    /// A local diskless device prints `client:<...>` on the device
+    /// line and a diskless peer prints `peer-client:<...>` after
+    /// `peer-disk:` (non-tty output); both are known spellings this
+    /// parser tolerates without modeling.
+    #[test]
+    fn tolerates_the_diskless_client_markers() {
+        let stdout = "vol-r0 role:Secondary\n  \
+                      disk:Diskless client:no open:yes\n  \
+                      node-b role:Secondary\n    \
+                      peer-disk:Diskless peer-client:no\n\n";
+        let status = parse_drbdsetup_status(stdout).expect("parse");
+        assert_eq!(status.local_disk, DiskState::Diskless);
+        assert_eq!(status.peer_disk, Some(DiskState::Diskless));
+    }
+
     #[test]
     fn rejects_malformed_and_multi_volume_output() {
         assert!(parse_drbdsetup_status("garbage\n").is_err());
         assert!(parse_drbdsetup_status("vol-r0 role:SideWays\n  disk:UpToDate\n").is_err());
         assert!(parse_drbdsetup_status("vol-r0 role:Primary\n").is_err()); // no disk line
-        // Unknown yes/no spellings on the known indent-2 tokens stay
-        // malformed (fail-closed).
+        // Unknown yes/no spellings on the known device-line tokens
+        // stay malformed (fail-closed).
         assert!(
-            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate\n  open:maybe\n").is_err()
+            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate open:maybe\n").is_err()
+        );
+        assert!(parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate quorum:1\n").is_err());
+        // An unknown token on the device line or the peer-device
+        // line, and a peer-device line without `peer-disk:`, fail
+        // loudly rather than being silently dropped.
+        assert!(
+            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate frobnicated:yes\n")
+                .is_err()
         );
         assert!(
-            parse_drbdsetup_status("vol-r0 role:Primary\n  disk:UpToDate\n  quorum:1\n").is_err()
+            parse_drbdsetup_status(
+                "vol-r0 role:Primary\n  disk:UpToDate\n  node-b role:Secondary\n    done:12.50\n"
+            )
+            .is_err()
         );
         // Single-volume grammar has no `volume:0` prefix; a multi-volume
-        // shape must fail loudly instead of being mis-parsed.
+        // shape must fail loudly instead of being mis-parsed (on the
+        // device line and on the peer-device line alike).
         assert!(parse_drbdsetup_status("vol-r0 role:Primary\n  volume:0 disk:UpToDate\n").is_err());
+        assert!(
+            parse_drbdsetup_status(
+                "vol-r0 role:Primary\n  disk:UpToDate\n    volume:0 peer-disk:UpToDate\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn unknown_disk_states_are_kept_verbatim() {
-        // Legacy pre-9.2.9 shape: no `open:` line (the parser keeps it
-        // optional for older kernels) and an unrecognized disk spelling.
+        // Legacy pre-9.2.9 shape: no `open:` token (the parser keeps
+        // it optional for older kernels) and an unrecognized disk
+        // spelling.
         let stdout = "vol-r0 role:Secondary\n  disk:SomeFutureState\n\n";
         let status = parse_drbdsetup_status(stdout).expect("parse");
         assert_eq!(
