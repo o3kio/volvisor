@@ -1,0 +1,28 @@
+[package]
+name = "volvisor-lvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor native-local LVM provider (thick LV, P1 slice)"
+
+[lints]
+workspace = true
+
+[features]
+# Real-LVM integration tests on loop devices; additionally gated at runtime
+# by VOLVISOR_TEST_LVM=1 (requires root + losetup + lvm2).
+integration-lvm = []
+
+[dependencies]
+volvisor-types = { workspace = true }
+volvisor-provider = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

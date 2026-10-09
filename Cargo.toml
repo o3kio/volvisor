@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/volvisor-types",
+    "crates/volvisor-journal",
+    "crates/volvisor-provider",
+    "crates/volvisor-lvm",
+    "crates/volvisor-api",
+    "crates/volvisord",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/o3kio/volvisor"
+rust-version = "1.85"
+
+[workspace.dependencies]
+volvisor-types = { path = "crates/volvisor-types" }
+volvisor-journal = { path = "crates/volvisor-journal" }
+volvisor-provider = { path = "crates/volvisor-provider" }
+volvisor-lvm = { path = "crates/volvisor-lvm" }
+volvisor-api = { path = "crates/volvisor-api" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time", "io-util", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+proptest = "1"
+tempfile = "3"
+crc32fast = "1"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+# Doc-formatting lints produce churn disproportionate to value for a
+# contract-mirror crate; correctness lints stay at full strictness.
+missing_errors_doc = "allow"
+doc_markdown = "allow"

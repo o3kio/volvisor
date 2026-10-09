@@ -1,0 +1,27 @@
+[package]
+name = "volvisor-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor durable intent journal and idempotency registry"
+
+[features]
+# Test-only journal append fault injection. Never enable in production
+# builds; used by dependent crates' test suites to exercise the
+# outcome-could-not-be-journaled branches honestly.
+test-faults = []
+
+[lints]
+workspace = true
+
+[dependencies]
+volvisor-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crc32fast = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

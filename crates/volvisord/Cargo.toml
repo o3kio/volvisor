@@ -1,0 +1,37 @@
+[package]
+name = "volvisord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Volvisor volume virtualization daemon"
+
+[lints]
+workspace = true
+
+[lib]
+name = "volvisord"
+path = "src/lib.rs"
+
+[[bin]]
+name = "volvisord"
+path = "src/main.rs"
+
+[dependencies]
+volvisor-types = { workspace = true }
+volvisor-journal = { workspace = true }
+volvisor-provider = { workspace = true }
+volvisor-lvm = { workspace = true }
+volvisor-api = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = "0.9"
+clap = { version = "4", default-features = false, features = ["derive", "std", "help"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,191 @@
+//! Daemon configuration.
+//!
+//! Configuration is explicit and validated at startup; defaults are
+//! conservative. No secret material is ever logged (SPEC-0002 section 9).
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use crate::DaemonError;
+
+/// Provider backend selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// In-memory fake provider (testing only; never production).
+    Fake,
+    /// Native-local LVM provider (P1 prototype).
+    Lvm,
+}
+
+/// Daemon configuration (TOML file at `--config`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// HTTP bind address for the Volume API v2 surface.
+    pub listen: SocketAddr,
+    /// Directory holding the intent journal and lock file.
+    pub journal_dir: PathBuf,
+    /// Selected provider backend.
+    pub provider: ProviderKind,
+    /// LVM volume-group prefix used for claimed pools (LVM provider only).
+    pub lvm_vg_prefix: Option<String>,
+    /// Scoped destructive-authorization token for device claim/release
+    /// (LVM provider only; required for that provider, never logged).
+    pub device_claim_token: Option<String>,
+    /// Durable LVM provider state path (defaults to
+    /// `<journal_dir>/lvm-state.json`).
+    pub lvm_state_path: Option<std::path::PathBuf>,
+    /// Filesystem root for read-only device discovery (defaults to `/`;
+    /// test isolation only).
+    pub sysfs_root: Option<std::path::PathBuf>,
+    /// Static bearer token guarding the API's privileged surface (every
+    /// mutating endpoint and the whole `/v2/admin` route group, `GET`
+    /// included). When unset, those endpoints reject every request with
+    /// `401` (fail closed) and the daemon refuses to bind a non-loopback
+    /// address: the tokenless mode is loopback-only dev/test. Never logged.
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// Maximum request body size in bytes.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+fn default_max_body_bytes() -> usize {
+    1 << 20
+}
+
+impl Config {
+    /// Load and validate configuration from a TOML file.
+    ///
+    /// # Errors
+    /// Returns [`DaemonError::Config`] when the file is unreadable,
+    /// malformed or fails validation.
+    pub fn load(path: &std::path::Path) -> Result<Self, DaemonError> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| DaemonError::Config(format!("cannot read {}: {e}", path.display())))?;
+        let cfg: Self = toml::from_str(&raw)
+            .map_err(|e| DaemonError::Config(format!("cannot parse {}: {e}", path.display())))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validate cross-field constraints.
+    fn validate(&self) -> Result<(), DaemonError> {
+        if self.provider == ProviderKind::Lvm {
+            if self.lvm_vg_prefix.is_none() {
+                return Err(DaemonError::Config(
+                    "lvm_vg_prefix is required for the lvm provider".to_owned(),
+                ));
+            }
+            if self.device_claim_token.as_deref().unwrap_or("").is_empty() {
+                return Err(DaemonError::Config(
+                    "device_claim_token is required for the lvm provider (scoped destructive \
+                     authorization)"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(prefix) = &self.lvm_vg_prefix {
+            if prefix.is_empty() || prefix.len() > 64 {
+                return Err(DaemonError::Config(
+                    "lvm_vg_prefix must be 1..=64 characters".to_owned(),
+                ));
+            }
+            if !prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(DaemonError::Config(
+                    "lvm_vg_prefix may contain only alnum, '-' and '_'".to_owned(),
+                ));
+            }
+        }
+        // An explicitly empty token is a configuration mistake: unset means
+        // "fail closed, loopback only", while "" would authenticate an empty
+        // bearer. Reject it at startup instead.
+        if self.admin_token.as_deref().is_some_and(str::is_empty) {
+            return Err(DaemonError::Config(
+                "admin_token must not be empty when set (leave it unset for the loopback-only \
+                 fail-closed mode)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_toml() -> String {
+        "\
+listen = \"127.0.0.1:8787\"
+journal_dir = \"/var/lib/volvisor/journal\"
+provider = \"lvm\"
+lvm_vg_prefix = \"volvisor\"
+device_claim_token = \"scoped-destructive-auth\"
+"
+        .to_owned()
+    }
+
+    #[test]
+    fn parses_minimal_config() {
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.provider, ProviderKind::Lvm);
+        assert_eq!(cfg.max_body_bytes, 1 << 20);
+    }
+
+    #[test]
+    fn lvm_provider_requires_prefix_and_token() {
+        let raw = "\
+listen = \"127.0.0.1:8787\"
+journal_dir = \"/j\"
+provider = \"lvm\"
+";
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        assert!(cfg.validate().is_err());
+        let raw = raw.to_owned() + "device_claim_token = \"t\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err(), "still missing lvm_vg_prefix");
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let raw = minimal_toml() + "surprise = 1\n";
+        assert!(toml::from_str::<Config>(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_prefix() {
+        let raw = minimal_toml().replace("volvisor", "bad prefix!");
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_explicitly_empty_admin_token() {
+        let raw = minimal_toml() + "admin_token = \"\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "empty admin_token is a config mistake"
+        );
+    }
+
+    #[test]
+    fn accepts_unset_or_real_admin_token() {
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        assert!(
+            cfg.validate().is_ok(),
+            "unset admin_token is the loopback-only mode"
+        );
+        let raw = minimal_toml() + "admin_token = \"real-token\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+    }
+}
