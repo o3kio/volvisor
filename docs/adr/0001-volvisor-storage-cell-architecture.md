@@ -1,10 +1,12 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** Superseded for class taxonomy, volume semantics and storage-class names by [ADR-0003](0003-tiered-volume-virtualization.md); see also [ADR-0004](0004-nearline-replication-and-mobility.md) and [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md). Do not interpret v1 storage-class or provider contracts as compatible aliases for v2.
+
 # ADR-0001 — Volvisor Storage Cell architecture
 
 Status: Proposed  
 Date: 2026-10-05  
 Decision-accepted: pending  
 Supersedes: none  
-Superseded-by: none
+Superseded-by: ADR-0003 (class taxonomy, volume semantics and storage-class names)
 
 Related documents:
 

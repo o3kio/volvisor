@@ -1,3 +1,5 @@
+> **SUPERSEDED v1 draft — historical reference (2026-10-09).** The current proposed architecture is [ADR-0003](../adr/0003-tiered-volume-virtualization.md), [ADR-0004](../adr/0004-nearline-replication-and-mobility.md), and [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md). Historical research is retained; the v2 decision and contracts are authoritative.
+
 # Replicated-async R&D — local endpoint, NVMe replication and migration
 
 Status: Research / non-normative
