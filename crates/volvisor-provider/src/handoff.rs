@@ -38,13 +38,23 @@
 //!   longer owns (D6a): it requires the volume to be provably
 //!   not-writer first — Secondary role, or a fencing proof the
 //!   witness corroborates.
-//!
-//! `promote_target` (promote-under-granted-lease on the destination
-//! host) is a later slice of the plan and deliberately **not** part of
-//! this surface yet.
+//! - [`HandoffSurface::promote_target`] is the destination-side
+//!   half: **promote-under-granted-lease** (plan §6). It is a sibling
+//!   of the P4a adoption path, not a reuse — it shares the adoption
+//!   verification core (lineage, Secondary role, the definition
+//!   naming this host, ownership tag) and the entry-creation tail,
+//!   with three named deviations: the authority gate is *inverted*
+//!   (a live lease held by **this host at the epoch `GrantSet`
+//!   minted** is required, never refused), the classification admits
+//!   the protocol-independent migration-barrier evidence class
+//!   (§7), and the tracked entry is created with migration
+//!   provenance plus the attachment record the restore's disk-path
+//!   verification needs — not adoption's `"adopted"`-project/`Ready`
+//!   stamp.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use volvisor_types::request::{AttachVolumeRequest, AttachVolumeResponse};
 use volvisor_types::{ApiError, FencingProof, InspectVolumeResponse, MigrationId, VolumeId};
 
 /// One participant of a VM's handoff eligibility (plan §2, rule 6:
@@ -241,6 +251,46 @@ pub trait HandoffSurface: Send + Sync {
         volume_id: &VolumeId,
         proof: Option<&FencingProof>,
     ) -> Result<InspectVolumeResponse, ApiError>;
+
+    /// The destination-side half of the coordinated handoff (plan §6):
+    /// **promote-under-granted-lease**. The caller (the coordinator's
+    /// `DESTINATION_AUTHORIZED` step) has already run the W10
+    /// `GrantSet` at the witness — this method verifies the granted
+    /// lease is live and held by **this host** at the minted epoch,
+    /// that the migration's source epoch is durably retired, and the
+    /// adoption verification core (lineage, Secondary role, the
+    /// definition naming this host, ownership tag) — then classifies
+    /// (the migration-barrier evidence class of §7 applies,
+    /// protocol-independent) and promotes **only** on
+    /// `SAFE_CURRENT`: there is no `allow_loss` parameter on this
+    /// path, a coordinated cut that lost its evidence is a typed
+    /// refusal, never an authorized-loss promotion.
+    ///
+    /// The tracked entry is created with migration provenance
+    /// (migration id, granted epoch) and the attachment record
+    /// (vm id, host, device) the restore's disk-path verification
+    /// needs. Idempotent per migration: a re-drive of a tracked
+    /// entry whose creation payload names this migration re-verifies
+    /// everything and completes the tail (the crash window between
+    /// the durable record and the attachment save); a different
+    /// migration over a tracked volume is a typed refusal.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: unknown/unregistered volume,
+    /// verification failures (`INVALID_STATE`,
+    /// `FOREIGN_DEVICE_STATE`), a lease that is not live
+    /// (`INVALID_STATE`) or held by another host (`LEASE_HELD`), an
+    /// unretired source epoch (`UNSAFE_DATA_LOSS`), a classification
+    /// below `SAFE_CURRENT` (`UNSAFE_DATA_LOSS` with the
+    /// classification rendered in the detail — the coordinator
+    /// surfaces it, never authorizes loss from here), or an
+    /// unreachable witness (`UNKNOWN_FENCING_AUTHORITY`).
+    async fn promote_target(
+        &self,
+        volume_id: &VolumeId,
+        migration_id: &MigrationId,
+        attach: &AttachVolumeRequest,
+    ) -> Result<AttachVolumeResponse, ApiError>;
 }
 
 #[cfg(test)]
