@@ -43,6 +43,27 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 - [Volume API contract v2](contracts/volume-api-v2.md)
 - [Nearline replication contract v2](contracts/nearline-replication-v2.md)
 - [2026-10-09 adversarial design review](docs/reviews/2026-10-09-volume-architecture-review.md)
+- [P0 implementation plan](docs/plans/2026-10-09-p0-implementation.md)
+
+## Implementation (P0 bootstrap, in progress)
+
+A Rust workspace implements the P0 control plane (stable IDs, device claiming,
+single-volume API/attachments, provider conformance — SPEC-0002 section 12)
+plus the first native-local LVM slice:
+
+```text
+crates/volvisor-types      typed domain vocabulary (Volume API v2 mirror)
+crates/volvisor-journal    durable intent journal + idempotency registry
+crates/volvisor-provider   engine-neutral provider trait + conformance kit
+crates/volvisor-lvm        native-local LVM provider (thick LV, P1 slice)
+crates/volvisor-api        HTTP/JSON Volume API v2 server
+crates/volvisord           daemon binary
+```
+
+Build and test: `cargo build`, `cargo test --workspace`,
+`cargo clippy --all-targets` (CI denies warnings). Real-LVM integration tests
+run only when `VOLVISOR_TEST_LVM=1` and root are available. This is prototype
+software: no production-support claim is made or implied (AGENTS rule 12).
 
 ## Historical draft v1 (superseded proposals)
 
