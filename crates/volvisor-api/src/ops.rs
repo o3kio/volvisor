@@ -75,7 +75,12 @@ pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
 
 /// Object keys whose *string* values are credential references and are
 /// replaced with [`REDACTED`] before any payload is journaled.
-const REDACTED_KEYS: [&str; 3] = ["key_ref", "authorization_token", "witness_host_token"];
+const REDACTED_KEYS: [&str; 4] = [
+    "key_ref",
+    "authorization_token",
+    "witness_host_token",
+    "peer_api_token",
+];
 
 /// Replacement value written in place of credential material.
 const REDACTED: &str = "[redacted]";

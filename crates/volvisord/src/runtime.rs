@@ -399,6 +399,7 @@ fn journal_err(context: &'static str) -> impl Fn(ApiError) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MigrationConfig, VmmConfig};
 
     fn fake_config(listen: &str, admin_token: Option<&str>) -> Config {
         Config {
@@ -432,6 +433,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
         }
     }
@@ -471,6 +474,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
         }
     }
@@ -607,6 +612,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
             drbd_vg_name: None,
             drbd_config_dir: None,
@@ -705,6 +712,8 @@ mod tests {
             witness_url: Some("http://10.0.0.3:9101".to_owned()),
             witness_token: Some("witness-secret".to_owned()),
             witness_host_token: Some("host-a-secret".to_owned()),
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: Some(15),
             ..drbd_config(std::path::PathBuf::from("/j"))
         };
