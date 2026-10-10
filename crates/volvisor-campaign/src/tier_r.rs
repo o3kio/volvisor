@@ -261,9 +261,12 @@ pub fn drive(scenario: &Scenario) -> PathBuf {
 /// `out_dir` is the write target: [`drive`] passes the LIVE run
 /// directory (§6's shippable tree); the unit tests pass a STAGING
 /// directory — a constructed-host record must never reach the live
-/// tree (round-1 review, MAJOR-1; the live seam guards against it
-/// in [`Evidence::finish_tier_r`], and the staging seam
-/// [`Evidence::finish_tier_r_at`] skips the report refresh).
+/// tree (round-1 review, MAJOR-1; the guard lives at the write
+/// choke point, the private `Evidence::write_tier_r_record` —
+/// round-2 R2-MINOR-1 — so it holds for ANY seam that targets the
+/// live run directory, including this function called with
+/// `&run_dir()`; the staging seam [`Evidence::finish_tier_r_at`]
+/// skips the report refresh).
 ///
 /// # Panics
 ///
@@ -409,11 +412,12 @@ mod tests {
     }
 
     /// The live seam's defense-in-depth guard (round-1 review,
-    /// MAJOR-1): a Tier R record carrying a synthetic-host marker
-    /// must NEVER be writable into the live run directory — the
-    /// guard fires before any write.
+    /// MAJOR-1, hoisted to the write choke point in round 2): a
+    /// Tier R record carrying a synthetic-host marker must NEVER be
+    /// writable into the live run directory — the guard fires
+    /// before any write, whichever seam the caller took.
     #[test]
-    #[should_panic(expected = "must never reach the live evidence tree")]
+    #[should_panic(expected = "must never be written into the live evidence tree")]
     fn the_live_seam_refuses_synthetic_host_records() {
         Evidence::new_tier_r("tier-r/guard-probe").finish_tier_r(
             "blocked",
@@ -435,5 +439,26 @@ mod tests {
             "the documented body",
         );
         assert!(path.exists(), "the staged record landed");
+    }
+
+    /// The CHOKE-POINT guard (round-2 R2-MINOR-1): the natural
+    /// fabrication regression — `drive_with` aimed at the LIVE run
+    /// directory with a constructed host, bypassing `finish_tier_r`
+    /// entirely — must be refused before any byte is written. The
+    /// guard's placement is the fix: on the finisher it was
+    /// dead-code discipline; on the write path it holds for every
+    /// seam.
+    #[test]
+    #[should_panic(expected = "must never be written into the live evidence tree")]
+    fn the_choke_point_refuses_a_constructed_host_through_drive_with() {
+        drive_with(
+            &SCENARIOS[0],
+            Gate::Claimed,
+            Ok(RealHost {
+                drbd_version: "DRBDADM_BUILTIN".to_owned(),
+                ch_remote: "ch-remote".to_owned(),
+            }),
+            &crate::evidence::run_dir(),
+        );
     }
 }

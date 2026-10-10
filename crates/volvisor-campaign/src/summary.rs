@@ -973,7 +973,7 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
 fn render_coverage_matrix(report: &mut String, records: &[Value]) {
     report.push_str("\n## Coverage matrix (nearline §10 classes → §9 rows)\n\n");
     report.push_str(
-        "| Row | Tier | Family (§9) | Nearline §10 class | Records | Verdict | Duration |\n",
+        "| Row | Tier | Family (§9) | Nearline §10 class | Records | Verdict | Max record |\n",
     );
     report.push_str("|---|---|---|---|---|---|---|\n");
     for spec in ROWS {
