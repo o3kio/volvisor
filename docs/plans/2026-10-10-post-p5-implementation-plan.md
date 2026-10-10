@@ -58,10 +58,10 @@ silence.
 
 **Scope.** Every backlog item D1 triaged into P6's hardening slice, each
 either **fixed** or **explicitly declined with a recorded reason** — never
-silently dropped. (The two §1 backlog items *not* triaged here stay
+silently dropped (the two §1 backlog items *not* triaged here stay
 explicitly scheduled elsewhere: the local-mirror residue is the P8-C
 decision and the Tier R real-host drive is P8's faulting substrate — see
-the readiness plan §6.):
+the readiness plan §6):
 
 - the **`grant_set` wedge** — a witness kill inside the grant commit parks
   a migration safely at `destination_authorized` forever while the retry
