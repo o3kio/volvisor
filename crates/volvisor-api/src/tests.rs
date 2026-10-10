@@ -28,7 +28,7 @@ use volvisor_provider::conformance::{
     fixture_delete_request, fixture_detach_request, fixture_grow_request,
 };
 use volvisor_provider::fake::FakeProvider;
-use volvisor_types::{ApiError, ApiErrorCode};
+use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode};
 
 use crate::{ApiConfig, AppState, SharedState, ops, router};
 
@@ -2586,6 +2586,7 @@ struct FakePeerWitness {
         std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, volvisor_types::VolumeRegistration>>,
     grant_set_calls: std::sync::Mutex<Vec<GrantSetRequest>>,
     recorded_grants: std::sync::Mutex<BTreeMap<volvisor_types::OperationId, GrantSetResponse>>,
+    grant_set_refusals: std::sync::Mutex<std::collections::VecDeque<WitnessError>>,
 }
 
 /// A plausible registration for a scripted volume: one lineage UUID
@@ -2617,7 +2618,19 @@ impl FakePeerWitness {
             registrations: std::sync::Mutex::new(BTreeMap::new()),
             grant_set_calls: std::sync::Mutex::new(Vec::new()),
             recorded_grants: std::sync::Mutex::new(BTreeMap::new()),
+            grant_set_refusals: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Queue one refusal the next `grant_set` call serves and spends
+    /// (the wedge model: the transport death B's grant act sees when
+    /// the witness is killed inside the grant commit — the failure
+    /// B's route then journals).
+    fn refuse_next_grant_set(&self, error: WitnessError) {
+        self.grant_set_refusals
+            .lock()
+            .expect("grant-set refusals")
+            .push_back(error);
     }
 
     /// Script a registration without a lease (the pre-grant shape:
@@ -2732,6 +2745,22 @@ impl BlockingWitnessConnection for FakePeerWitness {
     fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError> {
         if request.host_id != self.host {
             return Err(WitnessError::IdentityRequired);
+        }
+        // The scripted-refusal knob (the wedge model): a queued
+        // WitnessError is served and spent before the recorded-grant
+        // path, modeling the transport death the destination's grant
+        // act sees when the witness is killed inside the grant commit.
+        if let Some(error) = self
+            .grant_set_refusals
+            .lock()
+            .expect("grant-set refusals")
+            .pop_front()
+        {
+            self.grant_set_calls
+                .lock()
+                .expect("grant-set calls")
+                .push(request);
+            return Err(error);
         }
         if let Some(recorded) = self
             .recorded_grants
@@ -3429,6 +3458,35 @@ fn inject_peer_intent(
         .expect("append injected intent");
 }
 
+/// Inject an intent-with-a-recorded-**failure** for a peer route's
+/// derived journal operation id — exactly like the recorded
+/// `grant_set` wedge (P6-A part 3): the act ran, its witness call
+/// died with the transport class, and the pipeline's failure tail
+/// journaled the error body under the derived id. The distinctive
+/// detail lets tests prove the stale failure is never re-served.
+fn inject_peer_failure(
+    kit: &PeerKit,
+    migration: &volvisor_types::MigrationId,
+    tag: &str,
+    op_kind: &'static str,
+    body: &Value,
+) {
+    inject_peer_intent(kit, migration, tag, op_kind, body);
+    let operation_id = ops::mobility_operation_id(migration, tag).expect("derived op id");
+    let error = ApiError::new(
+        ApiErrorCode::Internal,
+        "witness unreachable: the scripted transport death (the recorded wedge failure)",
+    );
+    let mut journal = kit.state.journal.lock().expect("journal lock in test");
+    journal
+        .append_outcome(
+            operation_id,
+            false,
+            serde_json::to_value(ApiErrorBody::from(error)).expect("serialize error body"),
+        )
+        .expect("append injected failure outcome");
+}
+
 #[tokio::test]
 async fn peer_grant_resolves_an_in_flight_intent_by_inspection() {
     let kit = setup_peer();
@@ -3561,6 +3619,235 @@ async fn peer_grant_re_drives_an_in_flight_intent_that_did_not_land() {
         "the re-drive re-executed the witness batch exactly once"
     );
     assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 1);
+}
+
+/// The `grant_set` wedge fix (P6-A part 3), re-execution flavor: a
+/// recorded failure of a re-issuable peer act is never a terminal
+/// replay. The first grant call dies at the witness batch (the
+/// transport class the real wedge journals under the derived id —
+/// the act died before any promote or device-path recording). The
+/// re-issue — the shape of every re-drive — re-evaluates through the
+/// inspection: nothing is provable (no lease, no promoted device
+/// paths), so the act re-executes under its idempotency discipline
+/// and succeeds; the success supersedes the recorded failure, and a
+/// later retry replays it byte-for-byte without executing.
+#[tokio::test]
+async fn peer_grant_reissues_a_recorded_failure_when_the_act_did_not_land() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-w1").await;
+
+    // The preparation must exist (the grant act loads it; the first
+    // call's failure is the scripted witness death, not a missing
+    // preparation).
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-wedge1", "vm-w", &[("vol-w1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The witness dies inside the grant commit: the first call fails
+    // at the witness batch (the transport class), and the pipeline
+    // journals the failure under the derived operation id.
+    kit.witness.refuse_next_grant_set(WitnessError::Unreachable(
+        "the witness was killed inside the grant commit (scripted)".to_owned(),
+    ));
+    let (status, first_body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{first_body}");
+    assert_eq!(first_body["code"], json!("INTERNAL"));
+    assert_eq!(
+        kit.handoff.promotes.lock().expect("promotes").len(),
+        0,
+        "the act died at the witness batch, before any promote"
+    );
+
+    // The re-issue: the inspection proves nothing landed, the act
+    // re-executes — the witness batch again, the promote, the device
+    // paths recorded — and its success supersedes the failure.
+    let (status, second_body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second_body}");
+    assert_eq!(
+        second_body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-w1")
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        2,
+        "the re-issue re-executed the witness batch — the recorded \
+         failure is not a terminal replay"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 1);
+
+    // The superseding success is the recorded outcome now: a later
+    // retry replays it byte-for-byte without executing.
+    let (status, third_body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(third_body, second_body);
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        2,
+        "the recorded success replays without re-executing"
+    );
+}
+
+/// The `grant_set` wedge fix, proven-landed flavor: when the world
+/// converged past the recorded failure (the witness's own replay
+/// landed the grant — a live lease held by this host — and the
+/// promoted device paths are on record), the re-issue serves the
+/// proven outcome and never re-calls the witness batch. The
+/// resolution supersedes the failure.
+#[tokio::test]
+async fn peer_grant_reissues_a_recorded_failure_when_the_act_provably_landed() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-w2").await;
+
+    // The proven-landed arrangement (the world the witness's own
+    // journal replay produces): the lease is live at this host and the
+    // promoted device path is durably recorded in the preparation.
+    let migration = migration_id("mig-wedge2");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-w2".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume_id("vol-w2"),
+                expected_generation: 1,
+                device_path: Some("/dev/drbd-by-res/vol-w2".to_owned()),
+            }],
+            created_at: 1,
+        })
+        .expect("install preparation");
+    kit.witness.set_live(&volume_id("vol-w2"), 2, 5);
+    inject_peer_failure(
+        &kit,
+        &migration,
+        "peer-grant",
+        ops::OP_PEER_GRANT,
+        &serde_json::to_value(PeerGrantRequest {
+            migration_id: migration.clone(),
+        })
+        .expect("serialize"),
+    );
+
+    // The re-issue resolves by inspection: the proven outcome is
+    // served (and journaled, superseding the failure) without the
+    // witness batch ever being re-called.
+    let (status, first_body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge2"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first_body}");
+    assert_eq!(
+        first_body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-w2")
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "the inspection proved the act landed; the witness batch was \
+         never re-called"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 0);
+
+    // The resolution is the recorded outcome now: a later retry
+    // replays it byte-for-byte.
+    let (status, second_body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge2"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second_body, first_body);
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "the resolution replays without re-executing"
+    );
+}
+
+/// The `grant_set` wedge fix, fail-closed flavor: when the inspection
+/// itself errors typed (the preparation is absent), the re-issue
+/// surfaces that typed error — the stale recorded failure is never
+/// re-served as a terminal answer.
+#[tokio::test]
+async fn peer_grant_surfaces_the_inspection_error_not_the_stale_recorded_failure() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-w3").await;
+
+    let migration = migration_id("mig-wedge3");
+    inject_peer_failure(
+        &kit,
+        &migration,
+        "peer-grant",
+        ops::OP_PEER_GRANT,
+        &serde_json::to_value(PeerGrantRequest {
+            migration_id: migration.clone(),
+        })
+        .expect("serialize"),
+    );
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-wedge3"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+    let message = body["message"].as_str().expect("message");
+    assert!(
+        message.contains("no target preparation"),
+        "the inspection's typed error is served: {message}"
+    );
+    assert!(
+        !message.contains("the recorded wedge failure"),
+        "the stale recorded failure is never re-served: {message}"
+    );
 }
 
 /// Write a minimal snapshot directory the fake VMM's restore can

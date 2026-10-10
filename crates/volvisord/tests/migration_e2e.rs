@@ -2020,10 +2020,16 @@ async fn row_17_dead_source_adopts_safe_current() {
 /// peer route journals the failure), the drive parks at
 /// `DESTINATION_AUTHORIZED` and the observation is the canonical
 /// state **plus the typed stall detail** — `IN_DOUBT`-observable,
-/// never a silent half-migration. The journaled failure replays
-/// verbatim under its derived operation id, so the stall persists
-/// even after the fault clears: the VM is never resumed
-/// half-migrated.
+/// never a silent half-migration. While the VMM stays dead the
+/// stall persists through honest re-execution: the re-issued act
+/// (the `grant_set` wedge fix's rule, P6-A part 3 — a recorded
+/// failure of a re-issuable peer act is re-evaluated against the
+/// world, never a terminal replay) re-runs and the failure
+/// reproduces — a bounded spin, never a silent resume. When the VMM
+/// is repaired the same re-issue HEALS the stall: the inspection
+/// cannot prove the restore landed, the act re-executes, succeeds,
+/// and the migration completes through the full restore → resume
+/// path — the VM is never resumed half-migrated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_18a_restore_fault_stalls_in_destination_authorized() {
     let rig = rig_with(&Seeds {
@@ -2081,10 +2087,17 @@ async fn row_18a_restore_fault_stalls_in_destination_authorized() {
             .filter(|(method, _)| *method == "restore")
             .count()
     };
+    // This rig spawns no retry task (only the production runtime and
+    // the campaign rig do), so the drive's first attempt is the only
+    // one until the explicit resolve below — the count is exact.
     assert_eq!(restore_calls(&rig), 1, "exactly one restore attempt");
 
-    // The fault clears — but the journaled failure replays verbatim
-    // (the peer route's derived operation id): the stall persists.
+    // The fault clears — and the re-issue HEALS the stall (the
+    // grant_set wedge fix's semantics on the restore act, P6-A part
+    // 3): the peer route's recorded failure is re-evaluated, the
+    // inspection cannot prove the restore landed (the VM is absent),
+    // so the act re-executes — against the repaired VMM it succeeds —
+    // and the drive completes through the full restore → resume path.
     rig.b
         .core
         .vmm
@@ -2096,17 +2109,31 @@ async fn row_18a_restore_fault_stalls_in_destination_authorized() {
         .coordinator()
         .resolve(&migration("mig-18a"))
         .await;
-    assert!(outcome.is_err(), "the journaled restore failure replays");
+    assert!(outcome.is_ok(), "the re-issued restore healed: {outcome:?}");
+    assert_eq!(
+        restore_calls(&rig),
+        2,
+        "the re-issue re-executed the restore exactly once — the recorded \\\n         failure was re-evaluated, not replayed"
+    );
+
+    // The healed shape: the VM is restored and resumed at the
+    // destination (never half-migrated — the completion went through
+    // the full path), the source stays destroyed, and the record is
+    // complete with no stall detail.
     assert_eq!(
         rig.b.core.vmm.vm_state("vm-18a").expect("vm state"),
+        VmState::Running
+    );
+    assert_eq!(
+        rig.a.core.vmm.vm_state("vm-18a").expect("vm state"),
         VmState::Absent
     );
-    assert_eq!(restore_calls(&rig), 1, "the replay re-executes nothing");
     let summary = parked_follow_up(&rig, "mig-18a").await;
-    assert_eq!(state_name(&summary), "destination_authorized");
-    assert_eq!(
-        summary["in_doubt_detail"].as_str().expect("stall detail"),
-        "stalled in DESTINATION_AUTHORIZED: migration not yet complete"
+    assert_eq!(state_name(&summary), "complete");
+    assert!(
+        summary["in_doubt_detail"].is_null(),
+        "the healed record carries no stall detail: {}",
+        summary["in_doubt_detail"]
     );
 }
 
@@ -2559,10 +2586,14 @@ async fn row_21_idempotency_and_canonical_observation() {
 /// (`IN_DOUBT`, "source revoked; destination grant not yet
 /// authorized") with a half-promoted destination — one participant
 /// Primary, one Secondary — and the VM restored nowhere. The
-/// reconcile re-drives the grant, which replays the journaled
-/// failure: with one participant holding no live lease the
-/// all-granted fold cannot fire, the stall persists, and the VM is
-/// never resumed half-migrated.
+/// reconcile re-drives the grant, which re-issues the journaled
+/// failure (the `grant_set` wedge fix's rule, P6-A part 3): the
+/// inspection cannot prove the grant landed (one participant holds
+/// no live lease), so the act re-executes idempotently and the
+/// stable typed refusal reproduces — a genuinely unresolvable
+/// failure, distinct from the (fixed) wedge. With one participant
+/// holding no live lease the all-granted fold cannot fire, the
+/// stall persists, and the VM is never resumed half-migrated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_22_partial_target_promotion_blocks_restore() {
     let rig = rig_with(&Seeds {
@@ -2642,10 +2673,13 @@ async fn row_22_partial_target_promotion_blocks_restore() {
         "the refused promote released its unusable lease"
     );
 
-    // The reconcile re-drives the authorize step and the journaled
-    // grant failure replays: `vol-22b` holds no live lease (its
-    // promote keeps refusing), so the all-granted fold cannot fire
-    // and the record stays parked at the source-revoked `IN_DOUBT`
+    // The reconcile re-drives the authorize step and the re-issued
+    // grant act reproduces the refusal (the grant_set wedge fix's
+    // rule: the recorded failure is re-evaluated — the inspection
+    // cannot prove the grant landed — and the act re-executes
+    // idempotently against the still-refusing promote): `vol-22b`
+    // holds no live lease, so the all-granted fold cannot fire and
+    // the record stays parked at the source-revoked `IN_DOUBT`
     // observation — nothing is ever resumed half-migrated.
     let outcome = rig
         .a
@@ -2653,7 +2687,10 @@ async fn row_22_partial_target_promotion_blocks_restore() {
         .coordinator()
         .resolve(&migration("mig-22"))
         .await;
-    assert!(outcome.is_err(), "the journaled grant failure replays");
+    assert!(
+        outcome.is_err(),
+        "the re-issued grant act reproduces the stable refusal"
+    );
     let summary = parked_follow_up(&rig, "mig-22").await;
     assert_eq!(state_name(&summary), "in_doubt", "summary: {summary}");
     assert_eq!(

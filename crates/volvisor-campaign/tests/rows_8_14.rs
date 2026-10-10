@@ -14,9 +14,13 @@
 //!
 //! The honesty rules that shape these rows (§0/§7, verbatim in
 //! spirit): a parked record is reported as parked, never as
-//! progress; the grant_set wedge that parks rows 8 and 12b is the
-//! RECORDED product defect from stage B — it is used as the
-//! deterministic injection window and never papered over; and the
+//! progress; the witness kill inside the grant commit (the recorded
+//! grant_set wedge from stage B, FIXED in P6-A part 3) is still the
+//! deterministic injection window of row 8 — with the fix it heals,
+//! and the row now proves the fence protection through the window
+//! AND the healed completion; row 12b's park is a different,
+//! genuinely unresolvable failure (a stable typed promote refusal)
+//! and still parks; and the
 //! out-of-band `write_raw` surface models an actor volvisor cannot
 //! see, so its divergence is invisible to the classification BY
 //! CONSTRUCTION — the fence (the live lease the witness holds) is
@@ -330,7 +334,17 @@ fn minor_of(index: usize) -> u32 {
 /// The W1-W5 check (the witness side) for one volume: the authority
 /// view's epoch, holder and lease state are exactly as the recovery
 /// implies — no authority without a live lease, no unexpected epoch
-/// (a double grant would show as epoch 3).
+/// (a double grant would show as epoch 3). The view is read with
+/// bounded polling to the FULL expected shape: the recovery's
+/// record-level waits do not cover an in-flight lease-state
+/// transition (a failed promote's fail-closed release, Live →
+/// Revoked, can land after the epochs are observed — the row-12b
+/// observation race, seen twice in isolated/parallel contexts), so a
+/// single-shot read could catch the pre-transition state. The poll
+/// predicate is the whole expected view — epoch and holder included
+/// — so the strength is the single-shot assert's: a wrong epoch or
+/// holder never satisfies it, and the bound expires into a failure
+/// carrying the last observed state.
 async fn assert_w1_w5_vol(
     rig: &Rig,
     vol: &VolumeId,
@@ -338,26 +352,31 @@ async fn assert_w1_w5_vol(
     holder: &str,
     live: bool,
 ) -> String {
-    let view = witness_view(&rig.witness, vol).await;
-    assert_eq!(
-        view.current_epoch.0, epoch,
-        "the witness epoch is exactly {epoch}: {:?}",
-        view.lease_state
-    );
-    assert_eq!(
-        view.holder.as_ref().map(HostId::as_str),
-        Some(holder),
-        "the epoch-{epoch} holder is {holder}"
-    );
     let expected = if live {
         LeaseState::Live
     } else {
         LeaseState::Revoked
     };
-    assert_eq!(
-        view.lease_state, expected,
-        "the epoch-{epoch} lease state is {expected:?}"
-    );
+    let deadline = Instant::now() + POLL_BOUND;
+    loop {
+        let view = witness_view(&rig.witness, vol).await;
+        if view.current_epoch.0 == epoch
+            && view.holder.as_ref().map(HostId::as_str) == Some(holder)
+            && view.lease_state == expected
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness view of {vol} never reached epoch {epoch} held by {holder} \
+             with a {expected:?} lease within {POLL_BOUND:?} (W1-W5); last observed: \
+             epoch {} held by {:?} with a {:?} lease",
+            view.current_epoch.0,
+            view.holder.as_ref().map(HostId::as_str),
+            view.lease_state,
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
     format!("pass: epoch {epoch} at {holder}, lease {expected:?} (W1-W5)")
 }
 
@@ -460,22 +479,32 @@ async fn assert_g5_aborted_n(rig: &Rig, mig: &str) -> String {
 
 /// Row 8 (§5.1, §9): the stale source write after the fence.
 ///
-/// The cut revokes the source's authority (epoch 2 granted to the
-/// destination) but parks mid-commit in the recorded grant_set wedge
-/// — the deterministic window where the source is FENCED yet its
-/// device is still writable by an actor below volvisor. A rogue
-/// writer then writes the source's map out-of-band (§2.4's
-/// `write_raw`): one block at a never-written index, one over an
-/// acknowledged index. The honest outcomes: the destination never
-/// receives either byte (out-of-band is below the replication path
-/// too — no queue entry, no resync from a fenced source, and the cut
-/// marker keeps the reconciler from resuming the source); the
-/// destination's acknowledged prefix stays byte-exact; the survivor
-/// daemon's adopt-and-promote refuses `unsafe` (the live epoch-2
-/// lease at the destination — the fence is the protection, the
-/// divergence is invisible to the classification BY CONSTRUCTION and
-/// recorded as such); and the abort refuses typed (cut-or-later,
-/// G1/D1a).
+/// The cut revokes the source's authority (the drive dies at the
+/// grant when the witness is killed inside the grant commit — the
+/// recorded `grant_set` wedge's injection window), and the
+/// witness-down interval is the deterministic fenced-but-writable
+/// window: the source is FENCED (the revoke is durable) yet its
+/// device is still writable by an actor below volvisor, and no
+/// recovery path can proceed (the fold and the re-issued act both
+/// need the witness). A rogue writer then writes the source's map
+/// out-of-band (§2.4's `write_raw`): one block at a never-written
+/// index, one over an acknowledged index. The honest outcomes: the
+/// destination never receives either byte (out-of-band is below the
+/// replication path too — no queue entry, no resync from a fenced
+/// source, and the cut marker keeps the reconciler from resuming the
+/// source); the destination's acknowledged prefix stays byte-exact;
+/// the abort refuses typed in the window (cut-or-later, G1/D1a); the
+/// survivor daemon's adopt-and-promote refuses `unsafe` (the live
+/// epoch-2 lease at the destination — the fence is the protection,
+/// the divergence is invisible to the classification BY CONSTRUCTION
+/// and recorded as such). Then the heal (the wedge fix, P6-A part
+/// 3): the witness returns and the source's retry task re-drives —
+/// the fold lands the grant, the promote re-issues B's recorded
+/// failure, re-executes it idempotently and the migration COMPLETES
+/// — and the completion path must still never cross the rogue
+/// writes: the source is destroyed/discarded fenced, and the
+/// destination's bytes stay prefix-exact through the healed
+/// completion (the rogue bytes never arrive, before or after).
 // One row is one coherent scenario (§9): the narrative reads top-to-bottom
 // through the fault, the recovery and the safety set — splitting it would
 // scatter the evidence.
@@ -487,24 +516,32 @@ async fn row_8_stale_source_write_after_fence() {
     let mut evidence = Evidence::new("row-8/stale-source-write-after-fence");
     evidence.fault(
         "stale_source_write_after_fence",
-        "the grant_set wedge (stage B's recorded park defect) + out-of-band write_raw on the \
-         fenced source's map, post-revoke",
+        "the witness kill inside the grant commit (the recorded grant_set wedge's injection \
+         window — self-healing since P6-A part 3) + out-of-band write_raw on the fenced \
+         source's map, post-revoke, inside the witness-down window",
     );
 
     prepare(&rig, "mig-r8").await;
-    // The wedge: the witness dies inside the destination's promote
-    // batch. B's peer-grant op journals its failure, the record parks
-    // at destination_authorized — the recorded product defect, used
-    // here as the deterministic fenced-but-writable window.
+    // The injection: the witness dies inside the destination's promote
+    // batch. B's peer-grant op journals its failure, and the drive
+    // parks at SOURCE_REVOKED (observed in_doubt: "source revoked;
+    // destination grant not yet authorized") — the source is fenced,
+    // the destination has not promoted, and with the witness down no
+    // recovery path can proceed: the window is deterministically open.
     rig.witness
         .crash
         .arm_witness("grant_set", StoreSavePoint::WitnessAfterApplyBeforeOutcome);
     let (status, body) = transfer(&rig, "mig-r8").await;
     assert_eq!(status, 202, "the transfer spawns the drive: {body}");
     await_kill(|| rig.witness.is_killed(), "witness grant_set commit").await;
-    rig.witness.restart().await;
-    rig.a.restart().await;
-    let summary = poll_migration(rig.a.addr, "mig-r8", "destination_authorized").await;
+    let parked = poll_migration(rig.a.addr, "mig-r8", "in_doubt").await;
+    assert!(
+        parked["in_doubt_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("source revoked")),
+        "the parked record's detail is the D3 window: {}",
+        parked["in_doubt_detail"]
+    );
 
     // The writer stopped at the cut (the VM is Absent); the
     // acknowledged prefix is fixed.
@@ -542,8 +579,8 @@ async fn row_8_stale_source_write_after_fence() {
 
     // The destination is untouched: the never-written index reads
     // zero fill, the acknowledged index still holds the writer's
-    // exact payload (the wedge's drain delivered it pre-rogue-write;
-    // nothing resyncs from a fenced source).
+    // exact payload (the drain delivered it pre-rogue-write; nothing
+    // resyncs from a fenced source).
     assert_eq!(
         read_raw(&rig.world_b, SEED_MINOR, never_written)
             .expect("read the destination")
@@ -560,12 +597,28 @@ async fn row_8_stale_source_write_after_fence() {
         "the destination's acknowledged byte is the writer's, not the rogue's"
     );
 
+    // The abort refuses typed inside the window (cut-or-later — the
+    // revoke is durable; G1/D1a): no route resumes the source.
+    let (status, body) = post_abort(rig.a.addr, "mig-r8").await.served("abort");
+    assert_refusal(status, &body, "INVALID_STATE", "the post-cut abort");
+
+    // THE HEAL (the grant_set wedge fix): the witness returns — its
+    // journal replay lands the grant (epoch 2 live at the
+    // destination) — and the source's retry task (the daemon never
+    // died; its 5 s tick is the production recovery path) re-drives:
+    // the fold lands destination_authorized, the promote re-issues
+    // B's recorded failure, re-executes it idempotently, and the
+    // migration completes.
+    rig.witness.restart().await;
+
     // The survivor daemon (P4a's unplanned-promotion route: a fresh
     // state file over the source's fixtures) asks to adopt. The
     // classification is UNSAFE: the witness holds a live epoch-2
     // lease for the destination — the fence, not the divergence, is
     // what refuses (the out-of-band write is invisible to it by
-    // construction, and this row records that honestly).
+    // construction, and this row records that honestly). The refusal
+    // is stable across the heal: the lease is live at the destination
+    // whether the convergence has finished or not.
     let survivor = rig.launch_source_survivor("row8").await;
     let (status, body) = admin(
         "POST",
@@ -603,31 +656,72 @@ async fn row_8_stale_source_write_after_fence() {
     );
     assert!(value["volume"].is_null(), "no volume was adopted: {body}");
 
-    // The abort refuses typed (cut-or-later — G1/D1a).
-    let (status, body) = post_abort(rig.a.addr, "mig-r8").await.served("abort");
-    assert_refusal(status, &body, "INVALID_STATE", "the post-cut abort");
+    let summary = poll_migration(rig.a.addr, "mig-r8", "complete").await;
 
-    // The safety set: the source is fenced, the destination never
-    // promoted, the epoch-2 lease is live at the witness.
+    // The healed path is visible in the record's history: the fold
+    // landed destination_authorized, then the re-issued promote drove
+    // vm_resumed and complete.
+    let history: Vec<&str> = summary["state_history"]
+        .as_array()
+        .expect("the summary carries the state history")
+        .iter()
+        .map(|entry| entry["state"].as_str().expect("a state name"))
+        .collect();
+    let authorized = history
+        .iter()
+        .position(|state| *state == "destination_authorized")
+        .expect("the fold landed destination_authorized");
+    let resumed = history
+        .iter()
+        .position(|state| *state == "vm_resumed")
+        .expect("the re-issued promote drove the restore and resume");
+    assert!(
+        authorized < resumed,
+        "the healed path is ordered: {history:?}"
+    );
+
+    // The safety set, through the healed completion: the source is
+    // fenced and never resumed, the destination promoted through the
+    // healed path, and the completion never crossed the rogue writes
+    // (the source is destroyed/discarded fenced — the destination's
+    // bytes stay prefix-exact).
     assert_eq!(
         rig.vmm_a.vm_state(&rig.vm).expect("source VM state"),
         VmState::Absent,
-        "the source VM is destroyed (the cut)"
+        "the source VM is destroyed (the cut; never resumed by the heal)"
     );
     assert_eq!(
         role_of(&rig.world_a, &rig.resource()),
         Role::Secondary,
-        "the source resource is demoted"
+        "the source resource is demoted (fenced, never resumed)"
     );
     assert_eq!(
         role_of(&rig.world_b, &rig.resource()),
-        Role::Secondary,
-        "the destination never promoted over the wedge"
+        Role::Primary,
+        "the destination promoted through the healed path"
+    );
+    assert_eq!(
+        read_raw(&rig.world_b, SEED_MINOR, never_written)
+            .expect("read the destination")
+            .payload,
+        [0_u8; BLOCK_SIZE],
+        "the rogue write never reached the destination — not through the \
+         window, not through the healed completion"
+    );
+    assert_eq!(
+        read_raw(&rig.world_b, SEED_MINOR, overwrite)
+            .expect("read the destination")
+            .payload,
+        tag_expected,
+        "the destination's acknowledged byte is still the writer's after the \
+         healed completion — the rogue overwrite never crossed"
     );
     evidence.invariant(
         "destination_untouched",
-        "pass: neither rogue byte reached the destination (no queue entry, no resync from a \
-         fenced source); the acknowledged prefix is byte-exact",
+        "pass: neither rogue byte reached the destination — not through the          witness-down window, not through the healed completion (no queue \
+         entry, no resync from a fenced source, and the completion path \
+         promotes the destination's own replica); the acknowledged prefix is \
+         byte-exact",
     );
     evidence.invariant(
         "unsafe_classification",
@@ -637,15 +731,26 @@ async fn row_8_stale_source_write_after_fence() {
     );
     evidence.invariant(
         "abort_refused",
-        "pass: the abort at destination_authorized refuses INVALID_STATE (cut-or-later, G1/D1a)",
+        "pass: the abort in the D3 window (source revoked, the cut durable) refuses \
+         INVALID_STATE (cut-or-later, G1/D1a)",
     );
     let w = assert_w1_w5_vol(&rig, &rig.volume_id(), 2, PEER_NODE, true).await;
     evidence.invariant("w1_w5", &w);
+    evidence.invariant(
+        "healed_completion",
+        "pass: the grant_set wedge healed — the retry re-issued B's recorded peer-grant \
+         failure, re-executed it idempotently and the migration completed; the epoch is \
+         exactly 2 (no dual writer — the re-executed witness batch replayed its recorded \
+         outcome), the source stayed fenced throughout, and no route resumed it without \
+         fenced reconciliation",
+    );
     evidence.outcome(
-        "pass: parked safe: the record is in doubt at destination_authorized (the recorded grant_set \
-         wedge defect), the destination holds the acknowledged prefix and never promoted, the \
-         rogue writes are confined to the fenced source's map, and no route resumes the source \
-         without fenced reconciliation",
+        "pass: the fenced-but-writable window held while the witness was down (the rogue \
+         writes confined to the fenced source's map, the destination holding the \
+         acknowledged prefix), and the healed completion — the grant_set wedge fix's \
+         convergence — never crossed them: the destination promoted with the acknowledged \
+         prefix byte-exact, the epoch exactly 2 (no dual writer), the source destroyed \
+         fenced; no route resumed the source without fenced reconciliation",
     );
     let record = emit_oracle(
         &rig,
@@ -1529,10 +1634,17 @@ async fn row_12a_multi_volume_cut_converges() {
 /// can write; it expires at the TTL). The drive parks IN_DOUBT (the
 /// detail: "source revoked; destination grant not yet authorized")
 /// — past the cut (the source's authority is revoked set-wide and
-/// the grant is minted) but the promote batch failed — in the
-/// recorded grant_set-wedge mechanism (B's peer-grant op journaled
-/// its failure; the ops pipeline replays recorded failures forever)
-/// — the recorded product defect, never weakened.
+/// the grant is minted) but the promote batch failed. This park is
+/// NOT the grant_set wedge (fixed in P6-A part 3): the wedge was a
+/// TRANSIENT failure replayed forever; this is a stable, world-derived
+/// typed refusal — the resource cannot go primary — and the wedge
+/// fix's re-issue makes the honesty visible: every retry tick
+/// re-issues the failed act, the inspection cannot prove it landed
+/// (the failed participant's lease was released), the act re-executes
+/// idempotently and the refusal reproduces identically (a bounded
+/// spin, never a silent resume). Recovery requires the operator to
+/// clear the promote blocker — the correct semantics for a genuinely
+/// unresolvable failure; never weakened to make this row pass.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn row_12b_multi_volume_one_fails_promote_parks_exactly() {
@@ -1702,10 +1814,11 @@ async fn row_12b_multi_volume_one_fails_promote_parks_exactly() {
     evidence.outcome(
         "parked safe (IN_DOUBT, detail \"source revoked; destination grant not yet authorized\" \
          — past the cut, the promote batch failed): one failed promote parks the whole set with \
-         no dual writer and no data loss. THE RECORDED DEFECT (stage B's grant_set wedge \
-         mechanism): B's peer-grant op journaled its failure and the ops pipeline replays \
-         recorded failures forever — recovery requires operator action (the retry task re-serves \
-         the failure at its 5s tick); never weakened to make this row pass",
+         no dual writer and no data loss. A genuinely unresolvable failure, distinct from the \
+         (fixed) grant_set wedge: the re-issue re-executes the failed act every retry tick and \
+         the stable typed refusal reproduces identically (a bounded spin, never a silent \
+         resume) — recovery requires the operator to clear the promote blocker; never weakened \
+         to make this row pass",
     );
     let boundary = joined[0].1.clone();
     let record = emit_oracle_n(

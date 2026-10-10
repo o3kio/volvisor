@@ -1099,27 +1099,48 @@ fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
 /// weakened scenario.
 const FINDINGS: &[(&str, &str)] = &[
     (
-        "The grant_set wedge (product defect, recorded never weakened)",
+        "The grant_set wedge (product defect, recorded never weakened; FIXED in P6-A part 3)",
         "A witness kill inside the grant commit (the grant_set mid-commit windows, \
-         §9 row 7) parks the migration PERMANENTLY: the destination's peer-grant op \
-         journaled its failure and the ops pipeline replays recorded failures forever — \
-         the retry task re-serves the failure at its 5 s tick (a bounded spin, never a \
-         silent resume). The park is safe (fail-closed: no dual writer, the source stays \
-         fenced) but recovery requires operator action. The campaign records the defect \
-         and reuses the park as a deterministic injection window (rows 8 and 12b).",
+         §9 row 7) parked the migration PERMANENTLY: the destination's peer-grant op \
+         journaled its failure and the ops pipeline replayed recorded failures forever — \
+         the retry task re-served the failure at its 5 s tick (a bounded spin, never a \
+         silent resume). The park was safe (fail-closed: no dual writer, the source stays \
+         fenced) but recovery required operator action. FIXED by re-resolvable peer acts \
+         (PR #23, P6-A part 3): a recorded failure of a re-issuable peer act is \
+         re-evaluated through the landed-ness inspection — proven landed → the proven \
+         outcome supersedes the failure; proven not landed → the act re-executes under \
+         its idempotency discipline (the witness batch replays its recorded outcome: \
+         never a second epoch); an inspection error surfaces typed (the stale failure is \
+         never re-served). The strict routes keep verbatim failure replay. With the fix, \
+         the row-7 wedge cells and row 8 now CONVERGE (the retry re-issues, reconciles, \
+         completes — epoch exactly 2, the prefix byte-exact); row 8 still injects the \
+         rogue writes in the witness-down window and proves the fence protection through \
+         it AND through the healed completion; row 12b's park is a different, genuinely \
+         unresolvable failure (a stable typed promote refusal) and still parks — the \
+         re-issue re-executes and the refusal reproduces identically each retry tick.",
     ),
     (
-        "The IN_DOUBT contract nuance (stage-B round-2 review)",
+        "The IN_DOUBT contract nuance (stage-B round-2 review; RESOLVED by the wedge fix)",
         "Nearline §6 reserves IN_DOUBT for unresolvable stalls (a failed barrier void, \
          a dead destination VMM) and directs that a resolvable post-authorization stall \
-         be reported as the canonical state plus a stall detail. The wedge above parks at \
-         destination_authorized with the stall detail — contract-shaped — but the stall \
-         never resolves without the operator, which strains the 'resolvable' reading: \
-         the record says 'stalled' forever while the migration is permanently parked. \
-         Whether a permanently stalled record should surface IN_DOUBT is a recorded \
-         contract question (its own plan/PR per §8), not silently decided. Row 12b's \
-         failed promote, by contrast, parks IN_DOUBT through the observe mapping of \
-         SOURCE_REVOKED ('source revoked; destination grant not yet authorized').",
+         be reported as the canonical state plus a stall detail. The wedge strained the \
+         'resolvable' reading: its park reported 'stalled' forever while the migration \
+         was permanently parked. The wedge fix RESOLVES the question in the contract's \
+         favor: a destination_authorized-shaped stall is now self-resolvable by \
+         construction while the witness-side grant remains live (the 60 s lease TTL — \
+         the retry re-issues the failed peer act and converges, proven by the healed \
+         row-7 cells and row 8); a park that outlives the minted leases (an unpromoted \
+         grant-hold lease is never renewed — the renewal pass iterates only the \
+         provider's own volumes) spins honestly with no re-mint path, the remedy \
+         directions (renewing unpromoted grant-hold leases during a park, or a \
+         fresh-grant epoch when the recorded grant's lease is provably dead) being a \
+         recorded follow-up, not shipped. Within that horizon the \
+         canonical-state-plus-stall-detail \
+         reading holds, and IN_DOUBT stays reserved for genuinely unresolvable \
+         stalls — row 12b's shape (a stable typed promote refusal the operator must \
+         clear), which parks IN_DOUBT through the observe mapping of SOURCE_REVOKED \
+         ('source revoked; destination grant not yet authorized'). No contract change \
+         was needed; the resolution is recorded here and in PR #23.",
     ),
     (
         "The row-9 lineage gap (found by this campaign, fixed)",
