@@ -101,6 +101,9 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod config;
+/// The journal-append crash hook (P5 plan §3.1) — test-gated,
+/// doc-gated trust class; see the module docs.
+pub mod crash;
 mod error;
 mod extract;
 mod handlers;
@@ -114,6 +117,19 @@ mod state;
 mod tests;
 
 pub use config::ApiConfig;
+pub use crash::{CRASH_PANIC_PREFIX, CrashHooks, CrashPoint, KillSwitch};
 pub use metrics::Metrics;
 pub use router::router;
 pub use state::{AppState, SharedState};
+
+/// The journal operation-kind constants — the crash hook's armed
+/// keys (P5 plan §3.1), exported so the campaign rig arms exact
+/// operation kinds instead of string literals.
+pub mod op_kinds {
+    pub use crate::ops::{
+        OP_ADOPT_VOLUME, OP_ATTACH_VOLUME, OP_CLAIM_DEVICE, OP_CLEAR_CUT_MARKER, OP_CREATE_VOLUME,
+        OP_DELETE_VOLUME, OP_DETACH_VOLUME, OP_GROW_VOLUME, OP_MIGRATION_ABORT,
+        OP_MIGRATION_PREPARE, OP_MIGRATION_TRANSFER, OP_PEER_DISCARD, OP_PEER_GRANT,
+        OP_PEER_PREPARE, OP_PEER_RESTORE_VM, OP_RELEASE_DEVICE,
+    };
+}
