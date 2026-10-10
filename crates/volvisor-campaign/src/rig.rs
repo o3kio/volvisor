@@ -34,9 +34,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use volvisor_api::{AppState, CrashHooks, router};
+use volvisor_api::{AppState, CrashHooks, KillSwitch, router};
 use volvisor_drbd::AuthorityContext;
-use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
+use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
 use volvisor_drbd::report::Role;
 use volvisor_drbd_testkit::{
     FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for, config_for_peer, fixture,
@@ -216,7 +216,13 @@ pub fn state_name(summary: &serde_json::Value) -> String {
 // ------------------------------------------------------------- witness
 
 /// The loopback witness: one durable directory, one frozen injected
-/// clock, per-host W8 credentials (the e2e composition).
+/// clock, per-host W8 credentials (the e2e composition) — plus the
+/// campaign's kill model (§3.3 applied to the witness itself): the
+/// serve task is abortable as one group, a restart re-opens the
+/// core from the journal (the W3 replay/roll-forward is the
+/// recovery), and the rig-owned store-save seam (§3.1's witness
+/// mid-save variant) survives every restart so an arm cannot leak
+/// or vanish across one.
 pub struct WitnessHandle {
     /// The witness's serving address.
     pub addr: SocketAddr,
@@ -225,7 +231,16 @@ pub struct WitnessHandle {
     /// The durable witness directory (journal survives; the evidence
     /// emitter snapshots it).
     pub dir: PathBuf,
-    serve: Option<JoinHandle<()>>,
+    /// The witness's mid-save crash seam (P5 plan §3.1): kills
+    /// inside the witness's own durable mutations. The rig arms
+    /// `(mutation kind, point)` pairs; the instance is shared by
+    /// every core this handle ever serves.
+    pub crash: Arc<volvisor_types::crash::StoreCrashHooks>,
+    /// The live serve task's slot (taken at kill or stop) — an
+    /// `Arc` so the kill switch's closure can hold a `Weak` to it.
+    serve: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Set by the witness kill switch; the scenarios poll it.
+    killed: Arc<AtomicBool>,
 }
 
 impl WitnessHandle {
@@ -240,23 +255,39 @@ impl WitnessHandle {
             addr,
             clock,
             dir,
-            serve: None,
+            crash: Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
+            serve: Arc::new(Mutex::new(None)),
+            killed: Arc::new(AtomicBool::new(false)),
         };
-        witness.launch(listener);
+        witness.install_kill_switch();
+        witness.launch(listener).await;
         witness
     }
 
+    /// Register the witness kill switch (once; the switch is
+    /// permanent): mark the kill and abort the serve task. The
+    /// firing handler task dies with its own panic (the seam's
+    /// consult), so the switch only needs to stop the listener. The
+    /// closure holds a `Weak` to the serve slot (a strong closure
+    /// would cycle and leak the handle; an upgrade failure means
+    /// the rig already dropped the witness).
+    fn install_kill_switch(&self) {
+        let killed = Arc::clone(&self.killed);
+        let weak_serve = Arc::downgrade(&self.serve);
+        self.crash.set_kill_switch(Arc::new(move || {
+            killed.store(true, Ordering::SeqCst);
+            if let Some(serve_slot) = weak_serve.upgrade() {
+                if let Some(serve) = take_slot(&serve_slot) {
+                    serve.abort();
+                }
+            }
+        }));
+    }
+
     /// Serve the (re-loaded) core on `listener`.
-    fn launch(&mut self, listener: TcpListener) {
-        let core = WitnessCore::open(
-            &self.dir,
-            WitnessCoreConfig {
-                lease_ttl_secs: TTL,
-                lease_grace_secs: 5,
-                suspend_budget_secs: 5,
-            },
-        )
-        .expect("witness core opens");
+    async fn launch(&mut self, listener: TcpListener) {
+        let mut core = open_witness_core(&self.dir).await;
+        core.attach_store_crash_hooks(Arc::clone(&self.crash));
         let mut host_tokens = BTreeMap::new();
         host_tokens.insert(NODE.to_owned(), NODE_TOKEN.to_owned());
         host_tokens.insert(PEER_NODE.to_owned(), PEER_NODE_TOKEN.to_owned());
@@ -271,7 +302,55 @@ impl WitnessHandle {
         let serve = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("witness serves");
         });
-        self.serve = Some(serve);
+        *lock_slot(&self.serve) = Some(serve);
+    }
+
+    /// Whether the witness kill switch has fired.
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+
+    /// Stop the witness (the outage window: kill-free from the
+    /// seam's point of view — the listener goes away, the durable
+    /// journal survives) and await the serve task's death so the
+    /// journal `flock` frees for the restart.
+    pub async fn stop(&mut self) {
+        if let Some(serve) = take_slot(&self.serve) {
+            serve.abort();
+            let _ = serve.await;
+        }
+        self.await_lingering_handlers().await;
+    }
+
+    /// Restart the witness on the same address from the durable
+    /// journal (the W3 replay/roll-forward is the recovery): rebind,
+    /// re-open the core, re-attach the shared crash seam, re-serve.
+    pub async fn restart(&mut self) {
+        self.stop().await;
+        let listener = TcpListener::bind(self.addr).await.expect("rebind witness");
+        self.launch(listener).await;
+    }
+
+    /// Bounded wait for the aborted serve future's detached
+    /// connection tasks to drop the state `Arc` (the journal
+    /// `flock` frees asynchronously from the restarter's view —
+    /// the same race [`open_journal`] absorbs for the daemons). The
+    /// probe opens the raw journal only: it must NOT run the
+    /// witness core's W3b roll-forward — that semantic act belongs
+    /// to the restart's own `WitnessCore::open`.
+    async fn await_lingering_handlers(&self) {
+        let deadline = tokio::time::Instant::now() + POLL_BOUND;
+        loop {
+            if Journal::open(&self.dir).is_ok() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "witness journal open (flock) did not free within {} s",
+                POLL_BOUND.as_secs()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The legacy admin (inspect-only) client.
@@ -295,6 +374,33 @@ impl WitnessHandle {
             Some(token.to_owned()),
             Duration::from_secs(5),
         )
+    }
+}
+
+/// Open a witness core with the bounded flock retry a restart needs
+/// (the killed witness's journal frees asynchronously — see
+/// [`open_journal`] for the daemon-side twin).
+async fn open_witness_core(dir: &Path) -> WitnessCore {
+    let deadline = tokio::time::Instant::now() + POLL_BOUND;
+    loop {
+        match WitnessCore::open(
+            dir,
+            WitnessCoreConfig {
+                lease_ttl_secs: TTL,
+                lease_grace_secs: 5,
+                suspend_budget_secs: 5,
+            },
+        ) {
+            Ok(core) => return core,
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "witness core open (flock) did not free within {} s: {error}",
+                    POLL_BOUND.as_secs()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
     }
 }
 
@@ -395,8 +501,11 @@ pub struct DaemonCore {
     /// The daemon's journal directory (flock-scoped; freed when the
     /// serve task drops).
     pub journal_dir: PathBuf,
-    /// The witness-managed provider.
-    pub provider: Arc<DrbdProvider>,
+    /// This host's verified provider configuration (the input each
+    /// provider-factory pass re-loads state under). The
+    /// provider itself is **per-launch** (see the `make_provider`
+    /// method).
+    pub provider_config: DrbdProviderConfig,
     /// This host's fake VMM.
     pub vmm: Arc<FakeVmm>,
     /// The OTHER daemon's address (the peer client's target).
@@ -422,28 +531,52 @@ pub struct DaemonCore {
 }
 
 impl DaemonCore {
+    /// Build a FRESH provider from the durable artifacts (the
+    /// honest restart shape): the closure-mode runner re-answers the
+    /// startup verification over the same world, the state file is
+    /// re-loaded from disk and reconciled. Stage B's store-save
+    /// kills (§3.1) fire *inside* the provider's state lock, so a
+    /// restart must not reuse the poisoned instance — and a real
+    /// process restart never does: the new process constructs a new
+    /// provider over the same media and the same state file, which
+    /// is exactly this method.
+    fn make_provider(&self) -> Arc<DrbdProvider> {
+        Arc::new(
+            DrbdProvider::with_authority(
+                FakeDrbd::runner(&self.world),
+                self.provider_config.clone(),
+                self.state_path.clone(),
+                authority_for(
+                    self.witness_addr,
+                    &self.name,
+                    &self.witness_token,
+                    &self.clock,
+                ),
+            )
+            .expect("provider construction over the durable artifacts"),
+        )
+    }
+
     /// Take whichever group slot holds the daemon's tasks.
     fn take_any_group(self: &Arc<Self>) -> Option<TaskGroup> {
         take_slot(&self.dead_group).or_else(|| take_slot(&self.group))
     }
 
-    /// Register the kill switch (§3.3) this core's crash hook fires
-    /// into: mark the kill, abort the whole group, park it for the
-    /// supervisor to await. Firing order inside the crash hook
-    /// guarantees the tasks stop before the rig can drive the daemon
-    /// again. Called once at construction (the switch is permanent;
-    /// each launch refreshes the group slot it aborts). The closure
-    /// holds `Weak` handles, not `Arc`s: a strong closure would cycle
-    /// (`DaemonCore` → its crash state → the closure → `DaemonCore`)
-    /// and leak the pair together when the rig drops the daemon; the
-    /// `killed` flag is a plain `Arc<AtomicBool>` (it must survive to
-    /// the supervisor's post-mortem reads even if the core went
-    /// away). An upgrade failure means the rig already dropped the
-    /// daemon — there is nothing left to kill and nothing driving it.
-    fn install_kill_switch(self: &Arc<Self>) {
+    /// The kill switch (§3.3): mark the kill, abort the whole group,
+    /// park it for the supervisor to await. Firing order inside a
+    /// crash hook guarantees the tasks stop before the rig can drive
+    /// the daemon again. The closure holds `Weak` handles, not
+    /// `Arc`s: a strong closure would cycle (`DaemonCore` → its
+    /// crash state → the closure → `DaemonCore`) and leak the pair
+    /// together when the rig drops the daemon; the `killed` flag is
+    /// a plain `Arc<AtomicBool>` (it must survive to the
+    /// supervisor's post-mortem reads even if the core went away).
+    /// An upgrade failure means the rig already dropped the daemon —
+    /// there is nothing left to kill and nothing driving it.
+    fn kill_switch(self: &Arc<Self>) -> KillSwitch {
         let weak = Arc::downgrade(self);
         let killed = Arc::clone(&self.killed);
-        self.crash.set_kill_switch(Arc::new(move || {
+        Arc::new(move || {
             killed.store(true, Ordering::SeqCst);
             let Some(core) = weak.upgrade() else {
                 return;
@@ -453,7 +586,16 @@ impl DaemonCore {
             };
             abort_group(&group);
             *lock_slot(&core.dead_group) = Some(group);
-        }));
+        })
+    }
+
+    /// Register the kill switch this core's journal-append crash
+    /// hook fires into (called once at construction; the switch is
+    /// permanent). Each launch separately registers the SAME switch
+    /// on the per-launch store-save seams (the provider's and the
+    /// migration store's — both fresh instances a restart rebuilds).
+    fn install_kill_switch(self: &Arc<Self>) {
+        self.crash.set_kill_switch(self.kill_switch());
     }
 }
 
@@ -483,11 +625,11 @@ fn daemon_core(core: DaemonCore) -> Arc<DaemonCore> {
     core
 }
 
-/// One launched daemon: its address and its migration handle. The
-/// serve, renewal and retry tasks live in the core's group slot —
-/// the rig deliberately holds NO `AppState` clone, so a kill's
-/// unwinding releases the journal `flock` (the restart's
-/// `Journal::open` is the proof).
+/// One launched daemon: its address, its migration handle and its
+/// per-launch provider. The serve, renewal and retry tasks live in
+/// the core's group slot — the rig deliberately holds NO `AppState`
+/// clone, so a kill's unwinding releases the journal `flock` (the
+/// restart's `Journal::open` is the proof).
 pub struct Daemon {
     /// The daemon's immutable core (shared across restarts).
     pub core: Arc<DaemonCore>,
@@ -496,6 +638,10 @@ pub struct Daemon {
     /// The daemon's migration handle (the retry task's and the
     /// drive registry's owner).
     pub handle: Arc<MigrationHandle>,
+    /// This launch's provider (fresh from the durable artifacts at
+    /// every launch — see the core's `make_provider` method; the
+    /// store-save seams a scenario arms hang off it).
+    pub provider: Arc<DrbdProvider>,
 }
 
 impl Daemon {
@@ -504,6 +650,14 @@ impl Daemon {
     /// loop and the crash-hook wiring the campaign needs).
     pub async fn launch(core: Arc<DaemonCore>, listener: TcpListener) -> Daemon {
         let addr = listener.local_addr().expect("daemon local addr");
+        // The per-launch provider (§3.3's restart shape): state
+        // re-loaded from disk, reconciled against the world, with
+        // the daemon's kill switch registered on its store-save
+        // seam — a store kill fires into exactly this group.
+        let provider = core.make_provider();
+        provider
+            .store_crash_hooks()
+            .set_kill_switch(core.kill_switch());
         let witness = Arc::new(HttpWitnessConnection::new(
             format!("http://{}", core.witness_addr),
             Some(core.witness_token.clone()),
@@ -514,10 +668,10 @@ impl Daemon {
             PEER_TOKEN,
             Duration::from_secs(30),
         );
-        let provider = Arc::clone(&core.provider);
+        let facts_provider = Arc::clone(&provider);
         let facts: ParticipantFacts = Arc::new(
             move |volume_id: &VolumeId, vm_id: &str, expected_generation: u64| {
-                provider.migration_participant_facts(volume_id, vm_id, expected_generation)
+                facts_provider.migration_participant_facts(volume_id, vm_id, expected_generation)
             },
         );
         let (handle, peer_ctx) = wire_migration(
@@ -525,8 +679,8 @@ impl Daemon {
             witness,
             core.witness_addr,
             Arc::clone(&core.vmm) as Arc<dyn VmmController>,
-            Arc::clone(&core.provider) as Arc<dyn HandoffSurface>,
-            Arc::clone(&core.provider) as Arc<dyn VolumeProvider>,
+            Arc::clone(&provider) as Arc<dyn HandoffSurface>,
+            Arc::clone(&provider) as Arc<dyn VolumeProvider>,
             Arc::new(peer) as Arc<dyn PeerClient>,
             facts,
             core.snapshot_root.clone(),
@@ -535,6 +689,12 @@ impl Daemon {
             Arc::clone(&core.clock),
         )
         .expect("wire migration");
+        // The migration store's store-save seam is fresh per
+        // `wire_migration` call: register the same kill switch so a
+        // record-save kill fires into the same group.
+        handle
+            .store_crash_hooks()
+            .set_kill_switch(core.kill_switch());
 
         // The recovery engine (§3.3's group member): the production
         // retry task, spawned abortable and part of the kill group.
@@ -548,41 +708,16 @@ impl Daemon {
         // re-implemented over the public `renew_leases` surface —
         // the same tick shape, every outcome a structured event,
         // never a crash).
-        let renewal = {
-            let provider = Arc::clone(&core.provider);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(RENEWAL_TICK).await;
-                    match provider.renew_leases() {
-                        Ok(report) => {
-                            for renewed in &report.renewed {
-                                tracing::info!(
-                                    kind = "renew_lease",
-                                    volume_id = %renewed,
-                                    "campaign renewal pass"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                kind = "renew_leases",
-                                error = %error,
-                                "campaign renewal pass failed"
-                            );
-                        }
-                    }
-                }
-            })
-        };
+        let renewal = spawn_renewal_loop(Arc::clone(&provider));
 
         let state = AppState::new(
-            Arc::clone(&core.provider) as Arc<dyn VolumeProvider>,
+            Arc::clone(&provider) as Arc<dyn VolumeProvider>,
             None,
             open_journal(&core.journal_dir).await,
             Some(ADMIN_TOKEN.to_owned()),
         )
-        .with_adoption(Arc::clone(&core.provider) as Arc<dyn AdoptionSurface>)
-        .with_handoff(Arc::clone(&core.provider) as Arc<dyn HandoffSurface>)
+        .with_adoption(Arc::clone(&provider) as Arc<dyn AdoptionSurface>)
+        .with_handoff(Arc::clone(&provider) as Arc<dyn HandoffSurface>)
         .with_migration(Arc::clone(&handle) as Arc<dyn volvisor_handoff::MigrationSurface>)
         .with_peer_routes(Some(PEER_TOKEN.to_owned()), peer_ctx)
         .with_crash_hooks(Arc::clone(&core.crash));
@@ -606,7 +741,12 @@ impl Daemon {
                 handle: Arc::clone(&handle),
             });
         }
-        Daemon { core, addr, handle }
+        Daemon {
+            core,
+            addr,
+            handle,
+            provider,
+        }
     }
 
     /// Whether this daemon's kill switch has fired (set before the
@@ -651,6 +791,38 @@ impl Daemon {
         let core = Arc::clone(&self.core);
         *self = Daemon::launch(core, listener).await;
     }
+}
+
+/// The rig-side renewal loop (§3.3: production's
+/// `spawn_renewal_task` is private, so the loop is re-implemented
+/// over the public [`DrbdProvider::renew_leases`] surface — the
+/// same tick shape, every outcome a structured event, never a
+/// crash; a dead witness or a killed daemon surfaces as an error
+/// event the loop outlives).
+fn spawn_renewal_loop(provider: Arc<DrbdProvider>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RENEWAL_TICK).await;
+            match provider.renew_leases() {
+                Ok(report) => {
+                    for renewed in &report.renewed {
+                        tracing::info!(
+                            kind = "renew_lease",
+                            volume_id = %renewed,
+                            "campaign renewal pass"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        kind = "renew_leases",
+                        error = %error,
+                        "campaign renewal pass failed"
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// Open a daemon's journal with a bounded retry: a killed daemon's
@@ -723,13 +895,15 @@ fn attach_req(volume_id: &str, vm: &str, host: &str) -> AttachVolumeRequest {
     }
 }
 
-/// A witness-managed authority for `host` over the shared clock
-/// (the e2e composition).
+/// A witness-managed authority for `host` over a coordinator clock
+/// (the e2e composition; the clock is the rig's shared frozen
+/// closure, so the per-launch provider factory can rebuild the
+/// authority without holding the `Arc<AtomicU64>` itself).
 fn authority_for(
     witness_addr: SocketAddr,
     host: &str,
     token: &str,
-    clock: &Arc<AtomicU64>,
+    clock: &Clock,
 ) -> AuthorityContext {
     let connection: Arc<dyn volvisor_witness::BlockingWitnessConnection> =
         Arc::new(volvisor_witness::BlockingWitness::new(
@@ -741,12 +915,11 @@ fn authority_for(
             tokio::runtime::Handle::current(),
             Duration::from_secs(5),
         ));
-    let clock = Arc::clone(clock);
     AuthorityContext::new(
         connection,
         HostId::new(host).expect("valid host id"),
         INTERVAL,
-        Arc::new(move || clock.load(Ordering::SeqCst)),
+        Arc::clone(clock),
     )
     .expect("authority context")
 }
@@ -839,33 +1012,9 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
     let target_state = target.base.join("state-peer.json");
     seed_linked_pair(&source, &target, volume_id);
 
-    let provider_a = Arc::new(
-        DrbdProvider::with_authority(
-            FakeDrbd::runner(&source.world),
-            config_for(&source.base),
-            source.state_path.clone(),
-            authority_for(witness.addr, NODE, NODE_TOKEN, &clock),
-        )
-        .expect("source provider construction"),
-    );
-    let provider_b = Arc::new(
-        DrbdProvider::with_authority(
-            FakeDrbd::runner(&target.world),
-            config_for_peer(&target.base),
-            target_state,
-            authority_for(witness.addr, PEER_NODE, PEER_NODE_TOKEN, &clock),
-        )
-        .expect("destination provider construction"),
-    );
-
     let snapshot_root = leak_tempdir();
     let (vmm_a, _devices_a) = wired_vmm(&snapshot_root, &source.world);
     let (vmm_b, _devices_b) = wired_vmm(&snapshot_root, &target.world);
-
-    // The source's writer shape (setup, not scenario driving — the
-    // e2e composition boundary): register, attach (generation 1; the
-    // witness grants epoch 1 to node-a on the promote), then the VM.
-    seed_source_workload(&provider_a, &vmm_a, volume_id, vm).await;
 
     // Both listeners bind first so the peer URLs are known, then the
     // daemons compose over them.
@@ -881,7 +1030,7 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
         state_path: source.state_path.clone(),
         world: Arc::clone(&source.world),
         journal_dir: leak_tempdir(),
-        provider: Arc::clone(&provider_a),
+        provider_config: config_for(&source.base),
         vmm: Arc::clone(&vmm_a),
         peer_addr: addr_b,
         witness_addr: witness.addr,
@@ -895,10 +1044,10 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
     let core_b = daemon_core(DaemonCore {
         name: PEER_NODE.to_owned(),
         witness_token: PEER_NODE_TOKEN.to_owned(),
-        state_path: target.base.join("state-peer.json"),
+        state_path: target_state,
         world: Arc::clone(&target.world),
         journal_dir: leak_tempdir(),
-        provider: Arc::clone(&provider_b),
+        provider_config: config_for_peer(&target.base),
         vmm: Arc::clone(&vmm_b),
         peer_addr: addr_a,
         witness_addr: witness.addr,
@@ -909,6 +1058,16 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
         dead_group: Mutex::new(None),
         killed: Arc::new(AtomicBool::new(false)),
     });
+
+    // The source's writer shape (setup, not scenario driving — the
+    // e2e composition boundary): register, attach (generation 1; the
+    // witness grants epoch 1 to node-a on the promote), then the VM.
+    // The setup runs on the core's FIRST provider product; each
+    // daemon launch then constructs its own fresh provider over the
+    // same durable state file (the honest restart shape — the
+    // setup's saves are what the launch re-loads).
+    seed_source_workload(&core_a.make_provider(), &vmm_a, volume_id, vm).await;
+
     let b = Daemon::launch(core_b, listener_b).await;
     let a = Daemon::launch(core_a, listener_a).await;
     Rig {
