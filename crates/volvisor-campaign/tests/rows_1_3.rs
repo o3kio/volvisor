@@ -77,7 +77,13 @@ const WRITER_WARMUP: Duration = Duration::from_millis(80);
 /// before any act is driven.
 async fn scenario(prefix: &str) -> (Rig, WriterHandle, PeerTransport) {
     let rig = campaign_rig(&format!("vm-{prefix}"), &format!("vol-{prefix}")).await;
-    let writer = WriterHandle::start(&rig.world_a, &rig.vmm_a, &rig.vm, SEED_MINOR, &rig.clock);
+    let writer = WriterHandle::start(
+        &rig.world_a,
+        &rig.vmm_a,
+        &rig.vm,
+        SEED_MINOR,
+        &rig.stamp_clock,
+    );
     let transport = spawn_peer_transport(&rig.world_a, SEED_MINOR, TRANSPORT_LAG);
     tokio::time::sleep(WRITER_WARMUP).await;
     (rig, writer, transport)
@@ -209,15 +215,21 @@ async fn assert_d6a(rig: &Rig, addr: std::net::SocketAddr, epoch: u64, holder: &
 
 /// Emit the scenario's §6 evidence record: the oracle section from
 /// the byte-level verdict and boundary, the log capture, and the
-/// report refresh. Returns the record path.
+/// report refresh. Returns the record path. The boundary
+/// cross-check (§2.3 rule 1) is computed HERE from the migration
+/// summary whenever the coordinator recorded a barrier (the
+/// comprehensive review's S6: every barrier-bearing row's oracle
+/// section carries the cross-check, never only row 1's) — a
+/// summary without a `BARRIER_DURABLE` entry (or `None`, for
+/// scenarios that drove no migration) records no barrier and no
+/// skew, honestly.
 fn emit(
     rig: &Rig,
     mut evidence: Evidence,
     acked: &[volvisor_campaign::oracle::AckedWrite],
     boundary: Option<(u64, StopReason)>,
     verified_side: &str,
-    barrier_at: Option<u64>,
-    skew: Option<i64>,
+    summary: Option<&serde_json::Value>,
 ) -> PathBuf {
     let verdict_source = verify_against(&rig.world_a, SEED_MINOR, acked, WRITER_ID);
     let verdict_peer = verify_against(&rig.world_b, SEED_MINOR, acked, WRITER_ID);
@@ -237,6 +249,8 @@ fn emit(
                 },
             )
         });
+    let barrier_at = summary.and_then(barrier_timestamp);
+    let skew = barrier_at.and_then(|at| boundary_skew(acked, at));
     evidence.oracle(oracle_value(
         acked.len() as u64,
         verified,
@@ -334,8 +348,7 @@ async fn row_1_happy_path_oracle_boundary_and_evidence() {
         &acked,
         boundary,
         "destination",
-        Some(barrier_at),
-        Some(skew),
+        Some(&summary),
     );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
@@ -379,7 +392,7 @@ async fn row_2_abort_with_shaped_pre_quiesce_lag() {
 
     let (status, body) = post_abort(rig.a.addr, "mig-r2").await.served("abort");
     assert_eq!(status, 200, "abort: {body}");
-    poll_migration(rig.a.addr, "mig-r2", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-r2", "aborted").await;
     let (acked, boundary) = writer.join().await;
     assert!(!acked.is_empty(), "the writer acknowledged writes");
     let source = verify_against(&rig.world_a, SEED_MINOR, &acked, WRITER_ID);
@@ -411,7 +424,7 @@ async fn row_2_abort_with_shaped_pre_quiesce_lag() {
         "pass: every acknowledged write intact at the source (in bytes)",
     );
     evidence.outcome("aborted: source intact, tail honestly nonzero");
-    emit(&rig, evidence, &acked, boundary, "source", None, None);
+    emit(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 // -------------------------------------------------------------- row 3
@@ -447,7 +460,7 @@ async fn row_3_k1_transfer_after_intent() {
 
     // The recovery: the startup retry pass resolves the intent-only
     // record — no cut exists, so it rolls back to ABORTED.
-    poll_migration(rig.a.addr, "mig-k1", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-k1", "aborted").await;
 
     // Rule 8: the re-POST of the same operation is refused typed —
     // the journal holds the intent without an outcome and refuses
@@ -477,7 +490,7 @@ async fn row_3_k1_transfer_after_intent() {
         "pass: the re-POST is refused typed OPERATION_IN_DOUBT (never re-executed)",
     );
     evidence.outcome("recovered: ABORTED (rollback of an intent-only record)");
-    emit(&rig, evidence, &acked, boundary, "source", None, None);
+    emit(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 /// K2 (§9 row 3): kill the source at the transfer's before-outcome
@@ -515,7 +528,7 @@ async fn row_3_k2_transfer_before_outcome() {
 
     // The recovery: the drive was aborted mid-convergence (no cut),
     // so the retry pass rolls the record back.
-    poll_migration(rig.a.addr, "mig-k2", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-k2", "aborted").await;
 
     // Rule 8: the intent exists without an outcome — the re-POST
     // refuses typed, though the mutation did run (the journal cannot
@@ -563,7 +576,7 @@ async fn row_3_k2_transfer_before_outcome() {
         "pass: the re-POST is refused typed OPERATION_IN_DOUBT (never re-executed)",
     );
     evidence.outcome("recovered: ABORTED (the killed drive never durably cut)");
-    emit(&rig, evidence, &acked, boundary, "source", None, None);
+    emit(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 /// K3 (§9 row 3): kill the source at the transfer's after-outcome
@@ -629,7 +642,7 @@ async fn row_3_k3_transfer_after_outcome() {
         "pass: the re-POST replays the recorded 202 without re-execution",
     );
     evidence.outcome("recovered: ABORTED; the journaled outcome replays");
-    emit(&rig, evidence, &acked, boundary, "source", None, None);
+    emit(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 /// K4 (§9 row 3): kill the destination at the peer grant's
@@ -714,8 +727,7 @@ async fn row_3_k4_peer_grant_after_intent() {
         &acked,
         boundary,
         "destination",
-        Some(barrier_at),
-        Some(skew),
+        Some(&summary),
     );
 }
 
@@ -794,7 +806,6 @@ async fn row_3_k5_peer_grant_before_outcome() {
         &acked,
         boundary,
         "destination",
-        Some(barrier_at),
-        Some(skew),
+        Some(&summary),
     );
 }

@@ -42,7 +42,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 #![allow(clippy::panic)] // cell-dispatch assertions (see above)
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -52,16 +52,17 @@ use volvisor_api::crash::CrashPoint;
 use volvisor_api::op_kinds;
 use volvisor_campaign::evidence::{Evidence, LogSources, oracle_value};
 use volvisor_campaign::matrix::{self, Cell, Family, Hook};
-use volvisor_campaign::oracle::{AckedWrite, StopReason, WRITER_ID, WriterHandle, verify_against};
+use volvisor_campaign::oracle::{
+    AckedWrite, StopReason, WRITER_ID, WriterHandle, barrier_timestamp, boundary_skew,
+    verify_against,
+};
 use volvisor_campaign::rig::{
     POLL_BOUND, POLL_STEP, Reply, Rig, START, admin, body_json, campaign_rig, get_migration,
     get_volume, poll_migration, post_abort, post_prepare, post_transfer, role_of, state_name,
     witness_view,
 };
 use volvisor_drbd::report::Role;
-use volvisor_drbd_testkit::{
-    NODE, PEER_NODE, PeerTransport, SEED_MINOR, leak_tempdir, spawn_peer_transport,
-};
+use volvisor_drbd_testkit::{NODE, PEER_NODE, PeerTransport, SEED_MINOR, spawn_peer_transport};
 use volvisor_provider::VmState;
 use volvisor_provider::VmmController;
 use volvisor_types::{LeaseState, MigrationId};
@@ -151,15 +152,12 @@ where
         family.name(),
         FAMILY_BOUND.as_secs()
     );
-    // The family record aggregates; its log capture is an empty
-    // placeholder (the per-cell records carry the real sources —
-    // `finish` copies trees, so it needs existing paths).
-    let placeholder = leak_tempdir();
-    evidence.finish(&LogSources {
-        a_journal: Path::new(&placeholder),
-        b_journal: Path::new(&placeholder),
-        witness: Path::new(&placeholder),
-    });
+    // The family record aggregates: no log capture of its own (the
+    // comprehensive review's U4 — the aggregate is computed, not
+    // observed; the per-cell records carry the real sources, and
+    // `finish_rollup` writes `logs: null` instead of five paths
+    // that resolve to nothing).
+    evidence.finish_rollup();
 }
 
 /// Emit a cell's evidence record with the rig's log sources.
@@ -181,6 +179,7 @@ fn emit_oracle(
     acked: &[AckedWrite],
     boundary: Option<(u64, StopReason)>,
     verified_side: &str,
+    summary: Option<&serde_json::Value>,
 ) -> PathBuf {
     let verdict_source = verify_against(&rig.world_a, SEED_MINOR, acked, WRITER_ID);
     let verdict_peer = verify_against(&rig.world_b, SEED_MINOR, acked, WRITER_ID);
@@ -200,6 +199,8 @@ fn emit_oracle(
                 },
             )
         });
+    let barrier_at = summary.and_then(barrier_timestamp);
+    let skew = barrier_at.and_then(|at| boundary_skew(acked, at));
     evidence.oracle(oracle_value(
         acked.len() as u64,
         verified,
@@ -209,8 +210,8 @@ fn emit_oracle(
         boundary_seq,
         "data-path",
         &stop_reason,
-        None,
-        None,
+        barrier_at,
+        skew,
     ));
     emit_rig(rig, evidence)
 }
@@ -238,7 +239,13 @@ fn assert_refusal(status: u16, body: &str, code: &str, context: &str) {
 /// transport — the cut-crossing cells' shape).
 async fn live_scenario(prefix: &str) -> (Rig, WriterHandle, PeerTransport) {
     let rig = campaign_rig(&format!("vm-{prefix}"), &format!("vol-{prefix}")).await;
-    let writer = WriterHandle::start(&rig.world_a, &rig.vmm_a, &rig.vm, SEED_MINOR, &rig.clock);
+    let writer = WriterHandle::start(
+        &rig.world_a,
+        &rig.vmm_a,
+        &rig.vm,
+        SEED_MINOR,
+        &rig.stamp_clock,
+    );
     let transport = spawn_peer_transport(&rig.world_a, SEED_MINOR, TRANSPORT_LAG);
     tokio::time::sleep(WRITER_WARMUP).await;
     (rig, writer, transport)
@@ -1151,7 +1158,7 @@ async fn mobility_transfer_cell(cell: Cell) {
         "pass: the re-POST refuses typed or replays the recorded 202, never re-executes",
     );
     evidence.outcome("recovered: ABORTED (rollback of a pre-cut record)");
-    emit_oracle(&rig, evidence, &acked, boundary, "source");
+    emit_oracle(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 /// One abort cell: the abort of a prepared (un-transferred) migration
@@ -1334,7 +1341,7 @@ async fn peer_cut_cell(cell: Cell) {
     // source — the startup pass re-drives the durable cut forward.
     rig.b.restart().await;
     rig.a.restart().await;
-    poll_migration(rig.a.addr, "mig-x", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-x", "complete").await;
 
     // The oracle and the no-double-grant proof (the epoch is exactly
     // 2: a re-driven grant that re-executed would mint 3).
@@ -1362,7 +1369,14 @@ async fn peer_cut_cell(cell: Cell) {
         "pass: the peer op resolves by inspection (or replays its outcome) — never re-executes",
     );
     evidence.outcome("recovered: COMPLETE (the startup pass drove the cut forward)");
-    emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
 }
 
 /// One peer-discard cell: B dies inside the rollback's destination
@@ -1476,7 +1490,7 @@ async fn witness_barrier_cell(cell: Cell, point: volvisor_types::crash::StoreSav
     // up first: a rollback over a dead witness self-fences).
     rig.witness.restart().await;
     rig.a.restart().await;
-    poll_migration(rig.a.addr, "mig-x", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-x", "aborted").await;
 
     let (acked, boundary) = writer.join().await;
     assert!(!acked.is_empty(), "the writer acknowledged writes");
@@ -1499,7 +1513,7 @@ async fn witness_barrier_cell(cell: Cell, point: volvisor_types::crash::StoreSav
         "pass: the witness's restart replay re-derived the barrier and the void confirmed it",
     );
     evidence.outcome("recovered: ABORTED over the replayed-and-voided barrier");
-    emit_oracle(&rig, evidence, &acked, boundary, "source");
+    emit_oracle(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 /// One grant_set mid-commit cell: the witness dies inside the
@@ -1607,7 +1621,14 @@ async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSaveP
          failure replays on every re-drive; the source stays fenced, the destination never \
          promotes, no dual writer, no data loss; recovery needs operator action",
     );
-    emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
 }
 
 /// One outage cell: the witness is STOPPED (no armed seam — the
@@ -1644,7 +1665,7 @@ async fn witness_outage_cell(cell: Cell) {
     // — the startup pass rolls the pre-cut record back.
     rig.witness.restart().await;
     rig.a.restart().await;
-    poll_migration(rig.a.addr, "mig-x", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-x", "aborted").await;
 
     let (acked, boundary) = writer.join().await;
     assert!(!acked.is_empty(), "the writer acknowledged writes");
@@ -1667,7 +1688,7 @@ async fn witness_outage_cell(cell: Cell) {
         &assert_d6a(&rig, rig.a.addr, 1, NODE).await,
     );
     evidence.outcome("recovered: ABORTED (the witness returned, the rollback ran)");
-    emit_oracle(&rig, evidence, &acked, boundary, "source");
+    emit_oracle(&rig, evidence, &acked, boundary, "source", Some(&summary));
 }
 
 // ------------------------------------------------------------ the rows

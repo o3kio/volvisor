@@ -502,6 +502,15 @@ pub struct FakeDrbd {
     /// (taking the linked world's lock while holding this one could
     /// deadlock the pair). See [`DeferredResync`].
     deferred_resyncs: Vec<DeferredResync>,
+    /// The peer-apply drain mutex ([`apply_peer_writes`]'s structural
+    /// single-drainer — the comprehensive review's S5): cloned out
+    /// under a brief world lock and then held across one drain's
+    /// whole pop-and-apply-and-requeue critical section, so the
+    /// queue's ordering guarantees hold under any number of
+    /// concurrent drainers. Leaf-ordered by construction: the drain
+    /// lock is always taken BEFORE the world lock and released after
+    /// it, never the reverse (no deadlock is possible).
+    pub drain_lock: Arc<Mutex<()>>,
     // -- Fault-injection matrix (one bool per scripted failure) --
     /// `lvcreate` fails.
     pub fail_lvcreate: bool,
@@ -570,6 +579,7 @@ impl Default for FakeDrbd {
             lineage_salt: 0,
             peer_world: None,
             deferred_resyncs: Vec::new(),
+            drain_lock: Arc::new(Mutex::new(())),
             fail_lvcreate: false,
             fail_lvextend: false,
             fail_primary: false,
@@ -1865,21 +1875,55 @@ pub fn open_device(world: &Arc<Mutex<FakeDrbd>>, minor: u32) -> Result<DeviceHan
 /// rules and the single-world shapes are documented on the private
 /// `apply_at_peer` helper.
 ///
-/// # Concurrency shape (round-2 N1, the single-drainer invariant)
+/// # Concurrency shape (the single-drainer invariant, STRUCTURAL —
+/// the comprehensive review's S5)
 ///
-/// The ordering guarantees — front-first requeue, same-block entries
-/// applied oldest-first — hold under **one drainer per world at a
-/// time** (the spawned transport thread, or a single-threaded test
-/// body). Two concurrent drainers could interleave a failed drain's
-/// requeue with a successful drain of a newer same-block entry. That
-/// is the invariant's limit, stated here deliberately: stage C adds
-/// a second drainer only together with a serialized drain (one world
-/// lock critical section around pop-and-apply, or a drain mutex).
+/// The drain is serialized by a dedicated mutex stored on the world
+/// ([`FakeDrbd::drain_lock`]): it is held across the WHOLE
+/// pop-and-apply-and-requeue critical section, so the ordering
+/// guarantees — front-first requeue, same-block entries applied
+/// oldest-first — hold under any number of concurrent drainers (the
+/// spawned transport thread together with a test body, or two
+/// transports on linked worlds), where the old documented
+/// one-drainer-at-a-time invariant could interleave a failed drain's
+/// requeue with a newer same-block apply. The lock is leaf-ordered
+/// by construction: the drain lock is cloned out under a brief world
+/// lock (which is then released), taken BEFORE the world lock and
+/// held past its release — the only nesting is drain -> world, never
+/// world -> drain, so no deadlock is possible. The scripted
+/// `resync_to_peer` path needs no drain lock: it runs under the
+/// world lock inside a scripted command, and its clear-then-resync
+/// is idempotent against a drain's in-flight window (the same
+/// payload lands either way).
+///
+/// # Poison behavior (the comprehensive review's S4)
+///
+/// A poisoned world lock at ENTRY fails closed with the typed
+/// `Internal` error — nothing has been popped yet, so nothing is
+/// lost. A poison that lands in the window between the pop and the
+/// requeue is RECOVERED: the popped entries are still in hand and
+/// the queue's content is consistent (the poison came from another
+/// actor's panic, not from a half-written queue), so the requeue
+/// proceeds through the recovered guard instead of returning early —
+/// the old `?` on that path dropped the entries from the queue AND
+/// never delivered them, while the convergence gate kept reading
+/// `UpToDate` over un-applied blocks: exactly the lie the fail-closed
+/// corner exists to prevent.
 pub fn apply_peer_writes(
     world: &Arc<Mutex<FakeDrbd>>,
     minor: u32,
     up_to: u64,
 ) -> Result<(), ApiError> {
+    // The structural single-drainer (S5): clone the drain mutex out
+    // under a brief world lock, release the world, THEN take the
+    // drain lock — the only lock ordering is drain -> world.
+    let drain = {
+        let guard = world_lock(world)?;
+        Arc::clone(&guard.drain_lock)
+    };
+    let _drain_guard = drain
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (resource, entries) = {
         let mut guard = world_lock(world)?;
         let name = guard
@@ -1909,14 +1953,21 @@ pub fn apply_peer_writes(
         // §2.3's hinge): put the entries back, front-first in the
         // original order, so the queue stays open and the gate stays
         // closed. The drain is retried when the peer can receive.
-        let mut guard = world_lock(world)?;
-        let state = guard
-            .resources
-            .get_mut(&resource)
-            .expect("the resource was found above");
-        for entry in entries.into_iter().rev() {
-            state.apply_queue.push_front(entry);
+        // The lock is recovered from poison (S4): the entries are in
+        // hand and the queue is consistent — dropping them here would
+        // silently un-deliver acknowledged writes.
+        let mut guard = world
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = guard.resources.get_mut(&resource) {
+            for entry in entries.into_iter().rev() {
+                state.apply_queue.push_front(entry);
+            }
         }
+        // A resource that vanished between the pop and the requeue
+        // (a concurrent `lvremove`) takes its queue with it: there is
+        // nothing to requeue into, and the entries are moot with the
+        // resource's blocks gone.
     }
     Ok(())
 }

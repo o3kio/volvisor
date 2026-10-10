@@ -73,8 +73,19 @@ fn tier_s(scenario: &str, outcome: &str, duration_ms: u64) -> Value {
 }
 
 /// One oracle section (the [`volvisor_campaign::evidence`]
-/// canonical shape — the honest byte-level verdict).
-fn oracle(acknowledged: u64, verified: u64, corrupted: u64, tail: u64, skew: Option<i64>) -> Value {
+/// canonical shape — the honest byte-level verdict). `barrier_at`
+/// and `skew` travel together: a section that recorded a barrier
+/// carries its cross-check, one that recorded none (an
+/// abort-before-cut) carries neither (the comprehensive review's
+/// S6 — a barrier without a skew is a gap).
+fn oracle(
+    acknowledged: u64,
+    verified: u64,
+    corrupted: u64,
+    tail: u64,
+    barrier_at: Option<u64>,
+    skew: Option<i64>,
+) -> Value {
     json!({
         "acknowledged": acknowledged,
         "verified": verified,
@@ -84,7 +95,7 @@ fn oracle(acknowledged: u64, verified: u64, corrupted: u64, tail: u64, skew: Opt
         "boundary_seq": acknowledged,
         "boundary_source": "data-path",
         "stop_reason": "paused",
-        "barrier_durable_at": 1010,
+        "barrier_durable_at": barrier_at,
         "boundary_skew_ticks": skew,
     })
 }
@@ -104,7 +115,7 @@ fn complete_fixture() -> PathBuf {
         &dir,
         &tier_s(
             "row-15/summary-and-completion-gates",
-            "pass: the coverage matrix exists, budget-adherent and truthful",
+            "pass: the coverage matrix exists, is budget-adherent, and the completion gates pass over it",
             5,
         ),
     );
@@ -146,14 +157,14 @@ fn fixture_oracle_rows(dir: &Path) {
         "complete: acknowledged prefix intact",
         78,
     );
-    row_1["oracle"] = oracle(10, 10, 0, 0, Some(0));
+    row_1["oracle"] = oracle(10, 10, 0, 0, Some(1010), Some(0));
     write_record(dir, &row_1);
     let mut row_2 = tier_s(
         "row-2/abort-shaped-lag",
         "aborted: source intact, tail honestly nonzero",
         41,
     );
-    row_2["oracle"] = oracle(27, 27, 0, 15, None);
+    row_2["oracle"] = oracle(27, 27, 0, 15, None, None);
     write_record(dir, &row_2);
     for scenario in [
         "kill-matrix/transfer/after-intent",
@@ -163,7 +174,7 @@ fn fixture_oracle_rows(dir: &Path) {
         "kill-matrix/peer-grant/before-outcome",
     ] {
         let mut record = tier_s(scenario, "recovered: ABORTED", 60);
-        record["oracle"] = oracle(8, 8, 0, 3, Some(1));
+        record["oracle"] = oracle(8, 8, 0, 3, Some(1010), Some(1));
         write_record(dir, &record);
     }
 }
@@ -231,9 +242,9 @@ fn fixture_injections(dir: &Path) {
         260,
     );
     converge["oracle"] = json!([
-        oracle(10, 10, 0, 0, Some(0)),
-        oracle(10, 10, 0, 0, Some(0)),
-        oracle(10, 10, 0, 0, Some(0)),
+        oracle(10, 10, 0, 0, Some(1010), Some(0)),
+        oracle(10, 10, 0, 0, Some(1010), Some(0)),
+        oracle(10, 10, 0, 0, Some(1010), Some(0)),
     ]);
     write_record(dir, &converge);
     let mut storm = tier_s(
@@ -241,7 +252,7 @@ fn fixture_injections(dir: &Path) {
         "pass: 25 cycles, no residue, no lease leak, terminal records immutable",
         2534,
     );
-    storm["oracle"] = oracle(400, 400, 0, 0, Some(0));
+    storm["oracle"] = oracle(400, 400, 0, 0, Some(1010), Some(0));
     write_record(dir, &storm);
 }
 
@@ -372,7 +383,7 @@ fn row_15_coverage_matrix_budgets_and_gates() {
         "pass: two renders of the same run directories are byte-identical, and the \
          standalone campaign-summary binary renders the same text",
     );
-    evidence.outcome("pass: the coverage matrix exists, budget-adherent and truthful");
+    evidence.outcome("pass: the coverage matrix exists, is budget-adherent, and the completion gates pass over it");
     let base = row_15_log_sources();
     evidence.finish(&LogSources {
         a_journal: &base.join("a"),

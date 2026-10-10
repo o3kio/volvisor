@@ -343,8 +343,16 @@ impl WitnessHandle {
     /// Restart the witness on the same address from the durable
     /// journal (the W3 replay/roll-forward is the recovery): rebind,
     /// re-open the core, re-attach the shared crash seam, re-serve.
+    /// The kill flag resets with the relaunch (the comprehensive
+    /// review's S3, same rationale as [`Daemon::restart`]): the old
+    /// serve task is awaited dead first, so no late kill can land,
+    /// and a scenario polling [`WitnessHandle::is_killed`] after a
+    /// restart waits for the NEW kill, never reads the old one's
+    /// sticky residue (row 14 kills the witness in every F3/F4
+    /// cycle).
     pub async fn restart(&mut self) {
         self.stop().await;
+        self.killed.store(false, Ordering::SeqCst);
         let listener = TcpListener::bind(self.addr).await.expect("rebind witness");
         self.launch(listener).await;
     }
@@ -530,8 +538,23 @@ pub struct DaemonCore {
     pub peer_addr: SocketAddr,
     /// The witness's address (the connection and probe target).
     pub witness_addr: SocketAddr,
-    /// The frozen coordinator/authority clock.
+    /// The coordinator's STAMP clock ([`Rig::stamp_clock`]'s view):
+    /// pure timestamps — the migration record's history entries,
+    /// `updated_at`, the measured cut duration — sharing the
+    /// writer's per-ack tick domain so the §2.3 rule-1 boundary
+    /// cross-check is comparable (and live: the clock advances once
+    /// per acknowledged write, with no freeze). Never read for
+    /// lease arithmetic.
     pub clock: Clock,
+    /// The AUTHORITY clock ([`Rig::clock`]'s view — the lease
+    /// domain): the witness grant/renewal deadlines, the W5
+    /// response-anchored local deadlines and the provider's
+    /// W5/W7 enforcement all read THIS clock, so the writer's
+    /// stamp ticks can never expire a lease as a rig artifact
+    /// (the stage-C lesson the old `CLOCK_ADVANCE_CAP` encoded;
+    /// the comprehensive review's S1 keeps the property
+    /// structurally — the split — instead of by a cap).
+    pub authority_clock: Clock,
     /// The shared snapshot root (one directory per VM).
     pub snapshot_root: PathBuf,
     /// This daemon's journal-append crash hook (§3.1) — the armed
@@ -568,7 +591,7 @@ impl DaemonCore {
                     self.witness_addr,
                     &self.name,
                     &self.witness_token,
-                    &self.clock,
+                    &self.authority_clock,
                 ),
             )
             .expect("provider construction over the durable artifacts"),
@@ -808,6 +831,16 @@ impl Daemon {
     /// `Arc` unwound.
     pub async fn restart(&mut self) {
         self.stop().await;
+        // The kill flag is per-LAUNCH state, not per-daemon state
+        // (the comprehensive review's S3): the old launch's group is
+        // fully dead — awaited above, so no late abort can land —
+        // and the flag resets before the new launch serves. A
+        // sticky flag made `is_killed()` vacuously true from the
+        // second kill onward (row 14 kills the same daemon every
+        // 5th cycle), which could mask a second kill that never
+        // armed or fired. `Reply::Died` remains the primary kill
+        // evidence; the flag is the polling convenience.
+        self.core.killed.store(false, Ordering::SeqCst);
         let listener = TcpListener::bind(self.addr).await.expect("rebind daemon");
         let core = Arc::clone(&self.core);
         *self = Daemon::launch(core, listener).await;
@@ -883,8 +916,25 @@ pub struct Rig {
     pub b: Daemon,
     /// The loopback witness.
     pub witness: WitnessHandle,
-    /// The frozen clock (witness, authorities, coordinators).
+    /// The frozen LEASE clock (witness, authorities, the provider's
+    /// W5/W7 enforcement — the lease domain): the writer NEVER
+    /// advances it (a guest I/O tick is not a second of lease
+    /// time); the scenarios advance it deliberately (lease lapses,
+    /// fence windows), and nothing else moves it.
     pub clock: Arc<AtomicU64>,
+    /// The monotonic STAMP clock (the comprehensive review's S1):
+    /// the writer advances it ONE tick per acknowledged write,
+    /// unbounded, and the coordinator's history stamps read it —
+    /// the two sides of the §2.3 rule-1 boundary cross-check share
+    /// it, so the check stays live for the whole scenario. The OLD
+    /// design let the writer advance the lease clock under a
+    /// `CLOCK_ADVANCE_CAP`, which froze both sides at the same
+    /// value past the cap and made `boundary_skew_ticks: 0` a
+    /// tautology (an early barrier past the freeze was invisible).
+    /// Nothing lease-relevant reads this clock: a stamp tick only
+    /// ORDERS events, it never expires a lease (the stage-C lesson
+    /// the old cap encoded, preserved structurally by the split).
+    pub stamp_clock: Arc<AtomicU64>,
     /// The shared snapshot root.
     pub snapshot_root: PathBuf,
     /// The scenario's VM id (created and started on the source).
@@ -954,7 +1004,10 @@ fn authority_for(
     .expect("authority context")
 }
 
-/// The coordinator clock over the shared frozen clock.
+/// A clock closure over one of the rig's shared counters (the
+/// coordinator's stamp view or the authority's lease view — see
+/// [`Rig::stamp_clock`] / [`Rig::clock`] for which is which and
+/// why they are different counters).
 fn clock_of(shared: &Arc<AtomicU64>) -> Clock {
     let clock = Arc::clone(shared);
     Arc::new(move || clock.load(Ordering::SeqCst))
@@ -1008,6 +1061,46 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
     campaign_rig_volumes(vm, &[volume_id]).await
 }
 
+/// One daemon's immutable core over the rig's shared clocks (the
+/// e2e `DaemonCore` composition; see [`DaemonCore::clock`] and
+/// [`DaemonCore::authority_clock`] for the two-clock split — the
+/// comprehensive review's S1). The two daemons differ only in name,
+/// token, state, world, VMM, peer direction and provider config.
+#[allow(clippy::too_many_arguments)]
+fn rig_daemon_core(
+    name: &str,
+    token: &str,
+    state_path: PathBuf,
+    world: &Arc<Mutex<FakeDrbd>>,
+    journal_dir: PathBuf,
+    provider_config: DrbdProviderConfig,
+    vmm: &Arc<FakeVmm>,
+    peer_addr: SocketAddr,
+    witness_addr: SocketAddr,
+    stamp_clock: &Arc<AtomicU64>,
+    lease_clock: &Arc<AtomicU64>,
+    snapshot_root: &Path,
+) -> Arc<DaemonCore> {
+    daemon_core(DaemonCore {
+        name: name.to_owned(),
+        witness_token: token.to_owned(),
+        state_path,
+        world: Arc::clone(world),
+        journal_dir,
+        provider_config,
+        vmm: Arc::clone(vmm),
+        peer_addr,
+        witness_addr,
+        clock: clock_of(stamp_clock),
+        authority_clock: clock_of(lease_clock),
+        snapshot_root: snapshot_root.to_path_buf(),
+        crash: Arc::new(CrashHooks::new()),
+        group: Mutex::new(None),
+        dead_group: Mutex::new(None),
+        killed: Arc::new(AtomicBool::new(false)),
+    })
+}
+
 /// Build the full campaign fixture for one VM and N volumes (§9
 /// row 12's multi-volume cut): witness, both worlds (every volume
 /// identity-seeded on the source and peer-seeded on the destination
@@ -1027,6 +1120,10 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
     );
     let volume_ids: Vec<String> = volume_ids.iter().map(ToString::to_string).collect();
     let clock = Arc::new(AtomicU64::new(START));
+    // The stamp clock (S1): the writer's per-ack ticks and the
+    // coordinator's stamps share it; the lease clock above stays
+    // untouched by guest I/O.
+    let stamp_clock = Arc::new(AtomicU64::new(START));
     let witness = WitnessHandle::spawn(Arc::clone(&clock)).await;
 
     let source = fixture();
@@ -1070,40 +1167,34 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
         .expect("bind destination");
     let addr_b = listener_b.local_addr().expect("destination local addr");
     let addr_a = listener_a.local_addr().expect("source local addr");
-    let core_a = daemon_core(DaemonCore {
-        name: NODE.to_owned(),
-        witness_token: NODE_TOKEN.to_owned(),
-        state_path: source.state_path.clone(),
-        world: Arc::clone(&source.world),
-        journal_dir: leak_tempdir(),
-        provider_config: config_for(&source.base),
-        vmm: Arc::clone(&vmm_a),
-        peer_addr: addr_b,
-        witness_addr: witness.addr,
-        clock: clock_of(&clock),
-        snapshot_root: snapshot_root.clone(),
-        crash: Arc::new(CrashHooks::new()),
-        group: Mutex::new(None),
-        dead_group: Mutex::new(None),
-        killed: Arc::new(AtomicBool::new(false)),
-    });
-    let core_b = daemon_core(DaemonCore {
-        name: PEER_NODE.to_owned(),
-        witness_token: PEER_NODE_TOKEN.to_owned(),
-        state_path: target_state,
-        world: Arc::clone(&target.world),
-        journal_dir: leak_tempdir(),
-        provider_config: config_for_peer(&target.base),
-        vmm: Arc::clone(&vmm_b),
-        peer_addr: addr_a,
-        witness_addr: witness.addr,
-        clock: clock_of(&clock),
-        snapshot_root: snapshot_root.clone(),
-        crash: Arc::new(CrashHooks::new()),
-        group: Mutex::new(None),
-        dead_group: Mutex::new(None),
-        killed: Arc::new(AtomicBool::new(false)),
-    });
+    let core_a = rig_daemon_core(
+        NODE,
+        NODE_TOKEN,
+        source.state_path.clone(),
+        &source.world,
+        leak_tempdir(),
+        config_for(&source.base),
+        &vmm_a,
+        addr_b,
+        witness.addr,
+        &stamp_clock,
+        &clock,
+        &snapshot_root,
+    );
+    let core_b = rig_daemon_core(
+        PEER_NODE,
+        PEER_NODE_TOKEN,
+        target_state,
+        &target.world,
+        leak_tempdir(),
+        config_for_peer(&target.base),
+        &vmm_b,
+        addr_a,
+        witness.addr,
+        &stamp_clock,
+        &clock,
+        &snapshot_root,
+    );
 
     // The source's writer shape (setup, not scenario driving — the
     // e2e composition boundary): register, attach (generation 1; the
@@ -1121,6 +1212,7 @@ pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
         b,
         witness,
         clock,
+        stamp_clock,
         snapshot_root,
         vm: vm.to_owned(),
         volume: volume_ids[0].clone(),
@@ -1181,7 +1273,8 @@ impl Rig {
             vmm: Arc::clone(&self.vmm_a),
             peer_addr: self.b.addr,
             witness_addr: self.witness.addr,
-            clock: clock_of(&self.clock),
+            clock: clock_of(&self.stamp_clock),
+            authority_clock: clock_of(&self.clock),
             snapshot_root: self.snapshot_root.clone(),
             crash: Arc::new(CrashHooks::new()),
             group: Mutex::new(None),

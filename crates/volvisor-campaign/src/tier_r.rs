@@ -441,6 +441,23 @@ mod tests {
         assert!(path.exists(), "the staged record landed");
     }
 
+    /// The OUTCOME VOCABULARY (the comprehensive review's U2): a
+    /// Tier R record IS a gate statement — skipped or blocked,
+    /// never a pass. A "pass" outcome is refused at the write for
+    /// BOTH seams (it would render as a matrix pass in the summary;
+    /// the gate layer rejects it again on read — defense in depth).
+    #[test]
+    #[should_panic(expected = "a gate statement (skipped/blocked)")]
+    fn a_tier_r_record_cannot_claim_a_pass() {
+        let staging = staging_dir();
+        Evidence::new_tier_r("tier-r/pass-probe").finish_tier_r_at(
+            &staging,
+            "pass",
+            "a fabricated claim",
+            "the documented body",
+        );
+    }
+
     /// The CHOKE-POINT guard (round-2 R2-MINOR-1): the natural
     /// fabrication regression — `drive_with` aimed at the LIVE run
     /// directory with a constructed host, bypassing `finish_tier_r`

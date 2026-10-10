@@ -384,6 +384,192 @@ fn drained_writes_reach_the_linked_peer_worlds_map() {
     assert_eq!(resource_of(&world_b, &resource).blocks.len(), 2);
 }
 
+/// S5 (the comprehensive review): the single-drainer invariant is
+/// STRUCTURAL — a drain mutex stored on the world
+/// ([`FakeDrbd::drain_lock`]) is held across the whole
+/// pop-and-apply-and-requeue critical section, so a second drainer
+/// can never interleave a failed drain's requeue with a newer
+/// same-block delivery. The choreography pins the structure
+/// deterministically: while drainer A is blocked mid-critical-section
+/// (at the linked peer's lock, after its pop), the drain mutex must
+/// be HELD (a `try_lock` refuses), a newer same-block write waits in
+/// the queue, and drainer B makes no progress until A completes —
+/// after which B delivers the newer write and the peer ends on the
+/// LAST payload, never a stale overwrite. Under the old
+/// one-drainer-at-a-time-by-convention shape, B would pop and
+/// deliver concurrently and the peer's final content depended on the
+/// threads' wakeup order.
+#[test]
+fn the_drain_mutex_spans_the_whole_critical_section() {
+    let (base_a, world_a, runner_a, resource) = seeded_world("vol-drain-lock");
+    let base_b = host_dir();
+    let world_b = Arc::new(Mutex::new(FakeDrbd::default()));
+    seed_peer_volume(
+        &base_b,
+        &world_b,
+        "vol-drain-lock",
+        MIB,
+        ReplicationMode::A,
+        SEED_MINOR,
+        volvisor_drbd_testkit::SEED_PORT,
+    );
+    link_replication_peers(&world_a, &world_b);
+
+    promote(&runner_a, &base_a, &resource);
+    let device = open_device(&world_a, SEED_MINOR).expect("open the source device");
+    device.write(0, &payload(0x11)).expect("write 1");
+
+    // Hold the PEER world's lock: drainer A pops the entry and then
+    // blocks inside its critical section (the delivery cannot
+    // proceed past the peer's lock).
+    let peer_guard = world_b.lock().expect("peer world");
+    let drainer_a = {
+        let world = Arc::clone(&world_a);
+        std::thread::spawn(move || apply_peer_writes(&world, SEED_MINOR, u64::MAX))
+    };
+
+    // The deterministic signal that A popped: the queue empties
+    // while A is inside its critical section.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resource_of(&world_a, &resource).apply_queue.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drainer A never reached its pop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // A newer same-block write lands BEHIND A's in-flight entry.
+    device.write(0, &payload(0x22)).expect("write 2");
+    assert_eq!(
+        resource_of(&world_a, &resource).apply_queue.len(),
+        1,
+        "the newer write waits in the queue"
+    );
+
+    // THE structural pin: A holds the drain mutex while blocked
+    // mid-critical-section — the mutex spans pop through delivery,
+    // so no second drainer can interleave.
+    let drain = Arc::clone(&world_a.lock().expect("world").drain_lock);
+    assert!(
+        drain.try_lock().is_err(),
+        "the drain mutex is held across the in-flight critical section"
+    );
+
+    // Drainer B contends: it must make NO progress while A is
+    // in flight (it blocks on the drain mutex, before its pop).
+    let drainer_b = {
+        let world = Arc::clone(&world_a);
+        std::thread::spawn(move || apply_peer_writes(&world, SEED_MINOR, u64::MAX))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    assert_eq!(
+        resource_of(&world_a, &resource).apply_queue.len(),
+        1,
+        "drainer B cannot pop while A holds the drain mutex"
+    );
+
+    // Release the peer: A delivers its entry and completes; only
+    // then does B pop and deliver the NEWER write. The peer ends on
+    // the last payload — the stale-overwrite interleave is
+    // structurally impossible.
+    drop(peer_guard);
+    drainer_a
+        .join()
+        .expect("drainer A thread")
+        .expect("drainer A delivers cleanly");
+    drainer_b
+        .join()
+        .expect("drainer B thread")
+        .expect("drainer B delivers cleanly");
+    let peer = resource_of(&world_b, &resource);
+    assert_eq!(
+        peer.blocks[&0].payload,
+        payload(0x22),
+        "the peer ends on the LAST write, never a stale overwrite"
+    );
+    assert!(
+        resource_of(&world_a, &resource).apply_queue.is_empty(),
+        "both drains completed"
+    );
+}
+
+/// S4 (the comprehensive review): a poison that lands in the window
+/// between the pop and the requeue must not drop the popped entries
+/// — the old `?` on the requeue's lock returned early and silently
+/// dropped them from the queue AND never delivered them, while the
+/// convergence gate kept reading `UpToDate` over un-applied blocks.
+/// The choreography is deterministic: the drainer blocks at the
+/// linked peer's lock (held by the test) after its pop; the test
+/// then poisons the SOURCE world's lock and releases the peer; the
+/// delivery fails (the peer carries no same-named resource) and the
+/// requeue runs through the RECOVERED guard — the function returns
+/// `Ok` and the queue keeps its entries, in order.
+// The deliberate panic below IS the mechanism (poisoning the lock);
+// clippy's panic lint is allowed for exactly this test.
+#[test]
+#[allow(clippy::panic)]
+fn a_poisoned_window_never_drops_popped_entries() {
+    let (base_a, world_a, runner_a, resource) = seeded_world("vol-poison-window");
+    // The linked peer carries NO same-named resource: every
+    // delivery fails, so the requeue path is the one under test.
+    let world_b = Arc::new(Mutex::new(FakeDrbd::default()));
+    link_replication_peers(&world_a, &world_b);
+
+    promote(&runner_a, &base_a, &resource);
+    let device = open_device(&world_a, SEED_MINOR).expect("open the source device");
+    let first = device.write(0, &payload(0x0e)).expect("write 1");
+    let second = device.write(1, &payload(0xe0)).expect("write 2");
+    assert_eq!(resource_of(&world_a, &resource).apply_queue.len(), 2);
+
+    // Hold the peer's lock: the drainer pops both entries and blocks
+    // inside its critical section.
+    let peer_guard = world_b.lock().expect("peer world");
+    let drainer = {
+        let world = Arc::clone(&world_a);
+        std::thread::spawn(move || apply_peer_writes(&world, SEED_MINOR, u64::MAX))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !resource_of(&world_a, &resource).apply_queue.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drainer never reached its pop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Poison the SOURCE world's lock. The drainer holds no source
+    // lock while blocked at the peer, so the poisoning thread
+    // acquires it and panics — the lock lands poisoned exactly in
+    // the pop-to-requeue window.
+    let poison = Arc::clone(&world_a);
+    let _ = std::thread::spawn(move || {
+        let _guard = poison.lock().expect("acquire to poison");
+        panic!("poison the source world lock");
+    })
+    .join();
+
+    // Release the peer: the delivery fails (no resource at the
+    // peer), and the requeue must RECOVER from the poison instead of
+    // dropping the entries.
+    drop(peer_guard);
+    let outcome = drainer.join().expect("the drainer thread");
+    outcome.expect("the requeue recovered from the poison and completed");
+
+    // The queue keeps its entries, in the original order — read
+    // through the same poison-recovering idiom the requeue uses.
+    let guard = world_a
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = guard.resources.get(&resource).expect("resource");
+    let seqs: Vec<u64> = state.apply_queue.iter().map(|entry| entry.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![first, second],
+        "the popped entries were requeued, not dropped: {seqs:?}"
+    );
+}
+
 // ------------------------------------------------------------- §2.4
 
 /// A completing resync copies CONTENT, not just state: payload and

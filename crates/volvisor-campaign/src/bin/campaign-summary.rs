@@ -21,6 +21,18 @@
 //!                     process exit code
 //! ```
 //!
+//! WHAT A FULL CERTIFICATION IS (the comprehensive review's NOTE-4,
+//! on the same root as the mixed-commit gate): each `cargo test`
+//! binary process writes its OWN run directory, so the DEFAULT
+//! (newest-run) mode renders ONE test-binary's partial run — useful
+//! while iterating, never a certification. A full-suite
+//! certification is `--all --check` over the whole evidence tree
+//! after a FRESH full-suite run at ONE commit (a clean tree, or one
+//! whose older runs the newest sweep fully re-emits): the gates
+//! require every winning record to carry the same commit, and a
+//! tree that mixes revisions reads INCOMPLETE with the commits
+//! named — re-run the suite and certify again.
+//!
 //! The claim discipline (§0/§6) is the report's header, verbatim:
 //! Tier S proves the implemented logic's behavior under the bounded
 //! injected fault space; it proves nothing about real media, real

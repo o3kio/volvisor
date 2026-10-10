@@ -198,8 +198,13 @@ real; both are deliverables of stage A:
    role flip the migration actually caused at the device. The
    coordinator's own `BARRIER_DURABLE` history timestamp is then
    **cross-checked against it** (a coordinator that records the
-   barrier late — after writes it should have covered — is a finding,
-   reported as a boundary-skew violation). The oracle never takes the
+   barrier *early* — before the last write it must cover was
+   acknowledged — is the violation this check exists for: writes slip
+   past the barrier's protection, and the skew reads negative. The
+   opposite failure, a barrier recorded *late* — after a tail it
+   should have covered — is invisible to the skew by construction and
+   surfaces instead as missing blocks in the byte verdict; the two
+   checks together cover both directions). The oracle never takes the
    coordinator's word for what should exist.
 - **The peer-apply window is real, and the gate cannot lie while it is
   open.** The fake gains an async replication queue: a source-side

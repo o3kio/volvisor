@@ -30,7 +30,7 @@
 //! or tested for asynchronous acknowledgement — the peer-apply
 //! window makes the tail explicit.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,32 +51,13 @@ const NOTICE_STEP: Duration = Duration::from_millis(1);
 /// block index is unique.
 const WRITE_EVERY_TICKS: u64 = 4;
 
-/// How far ONE SCENARIO's writers may advance the shared frozen
-/// clock (one tick per ack): the boundary cross-check needs the
-/// coordinator's `BARRIER_DURABLE` timestamp to be comparable to ack
-/// times, and the total advance stays far under the 100 s lease TTL
-/// so no lease window is disturbed. The budget is shared by every
-/// writer the scenario runs ([`ClockBudget`]): the multi-volume rows
-/// (one writer per participant) must not multiply it — N writers
-/// each burning the cap would advance the synthetic clock past the
-/// earliest lease deadline and expire the lease as a RIG ARTIFACT,
-/// not as the fault under test.
-const CLOCK_ADVANCE_CAP: u64 = 40;
-
-/// The per-scenario clock-advance budget (see
-/// `CLOCK_ADVANCE_CAP`): one per scenario, shared by all its
-/// writers. [`WriterHandle::start`] mints a fresh one (the
-/// single-writer default); [`WriterHandle::start_shared`] joins an
-/// existing budget (the multi-writer rows).
-pub type ClockBudget = Arc<AtomicU64>;
-
 /// The block tag's magic (`VCW1` — volvisor campaign writer v1).
 const MAGIC: [u8; 4] = *b"VCW1";
 
 /// One acknowledged write: the writer's tag sequence, the device's
 /// ack sequence (the drain identity `apply_peer_writes` models at
-/// the peer), the block index and the shared frozen clock at ack
-/// time.
+/// the peer), the block index and the shared stamp clock's tick at
+/// ack time.
 #[derive(Clone, Debug)]
 pub struct AckedWrite {
     /// The writer's monotonic tag sequence (in the payload).
@@ -85,7 +66,11 @@ pub struct AckedWrite {
     pub ack: u64,
     /// The block index the write landed at (unique per scenario).
     pub index: u64,
-    /// The shared frozen clock at ack time.
+    /// The shared STAMP clock's tick at ack time — exactly the tick
+    /// THIS ack advanced the clock to, so the journal is strictly
+    /// monotonic per ack for the whole scenario (no freeze; the
+    /// comprehensive review's S1) and comparable with the
+    /// coordinator's history stamps, which read the same clock.
     pub clock: u64,
 }
 
@@ -235,6 +220,13 @@ pub fn barrier_timestamp(summary: &serde_json::Value) -> Option<u64> {
 /// destination, which [`verify_against`] reports. The two checks
 /// together cover both failure directions; neither is sufficient
 /// alone (the negative tests in `tests/oracle_negative.rs` pin both).
+///
+/// The check is LIVE for the whole scenario (the comprehensive
+/// review's S1): both sides read the shared stamp clock, which the
+/// writer advances once per ack with NO cap — the old design froze
+/// the shared clock after 40 acks, past which any barrier and any
+/// ack read the same value and a zero skew was a tautology rather
+/// than a check.
 #[must_use]
 pub fn boundary_skew(acked: &[AckedWrite], barrier_at: u64) -> Option<i64> {
     let last = acked.last().map(|write| write.clock)?;
@@ -253,10 +245,9 @@ struct GuestWriter {
     vmm: Arc<FakeVmm>,
     vm_id: String,
     minor: u32,
+    /// The shared STAMP clock (`Rig::stamp_clock` — never the lease
+    /// clock): advanced one tick per ack, unbounded.
     clock: Arc<std::sync::atomic::AtomicU64>,
-    /// The scenario's shared clock-advance budget (see
-    /// `CLOCK_ADVANCE_CAP`).
-    budget: ClockBudget,
     /// The acknowledged journal.
     acked: Vec<AckedWrite>,
     /// The notice-tick counter (the write cadence's divisor).
@@ -313,18 +304,22 @@ impl GuestWriter {
         match handle.write(seq, &payload) {
             Ok(ack) => {
                 self.next_seq += 1;
-                // `fetch_add` first: every writer's claim on the
-                // shared budget is unique, so exactly the first
-                // CLOCK_ADVANCE_CAP claims advance the clock — the
-                // budget is per scenario, never per writer.
-                if self.budget.fetch_add(1, Ordering::SeqCst) < CLOCK_ADVANCE_CAP {
-                    self.clock.fetch_add(1, Ordering::SeqCst);
-                }
+                // One tick per ack, unbounded (S1): `fetch_add` hands
+                // every concurrent writer a unique tick, and the
+                // recorded value is exactly the tick THIS ack advanced
+                // the stamp clock to — the journal is strictly
+                // monotonic per ack for the whole scenario (no
+                // freeze), and the coordinator's stamps (the same
+                // clock) stay comparable. The lease clock is never
+                // touched: a guest I/O tick is not a second of lease
+                // time (the stage-C rig-artifact lesson, now
+                // structural instead of a cap).
+                let tick = self.clock.fetch_add(1, Ordering::SeqCst) + 1;
                 self.acked.push(AckedWrite {
                     seq,
                     ack,
                     index: seq,
-                    clock: self.clock.load(Ordering::SeqCst),
+                    clock: tick,
                 });
             }
             Err(error) => {
@@ -350,12 +345,13 @@ pub struct WriterHandle {
 
 impl WriterHandle {
     /// Start the continuous writer for `vm` on `minor` (the source
-    /// world's device), advancing the shared frozen clock by one
-    /// tick per ack (capped — see the `CLOCK_ADVANCE_CAP`
-    /// constant). Mints a FRESH scenario budget: the single-writer
-    /// default. Scenarios running more than one writer share one
-    /// budget via [`WriterHandle::start_shared`] — the cap is per
-    /// scenario, never per writer.
+    /// world's device), advancing the shared STAMP clock by one tick
+    /// per ack — unbounded and strictly monotonic (the comprehensive
+    /// review's S1; see [`AckedWrite::clock`]). `clock` must be the
+    /// rig's stamp clock, NEVER the lease clock: nothing
+    /// lease-relevant may read the writer's ticks. Scenarios running
+    /// more than one writer pass the SAME stamp clock (every writer
+    /// shares it; `fetch_add` hands each ack a unique tick).
     pub fn start(
         world: &Arc<Mutex<FakeDrbd>>,
         vmm: &Arc<FakeVmm>,
@@ -363,31 +359,12 @@ impl WriterHandle {
         minor: u32,
         clock: &Arc<std::sync::atomic::AtomicU64>,
     ) -> WriterHandle {
-        let budget: ClockBudget = Arc::new(AtomicU64::new(0));
-        Self::start_shared(world, vmm, vm, minor, clock, &budget)
-    }
-
-    /// Start the continuous writer JOINING an existing scenario
-    /// budget ([`ClockBudget`]): every writer of one scenario shares
-    /// the `CLOCK_ADVANCE_CAP` total, so N writers advance the
-    /// clock at most CAP ticks between them (the multi-volume rows'
-    /// shape — see the constant's doc for why a per-writer cap would
-    /// expire the lease as a rig artifact).
-    pub fn start_shared(
-        world: &Arc<Mutex<FakeDrbd>>,
-        vmm: &Arc<FakeVmm>,
-        vm: &str,
-        minor: u32,
-        clock: &Arc<std::sync::atomic::AtomicU64>,
-        budget: &ClockBudget,
-    ) -> WriterHandle {
         let inner = Arc::new(Mutex::new(GuestWriter {
             world: Arc::clone(world),
             vmm: Arc::clone(vmm),
             vm_id: vm.to_owned(),
             minor,
             clock: Arc::clone(clock),
-            budget: Arc::clone(budget),
             acked: Vec::new(),
             ticks: 0,
             next_seq: 1,

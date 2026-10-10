@@ -191,7 +191,37 @@ impl Evidence {
         copy_tree(sources.a_journal, &scenario_logs.join("a"));
         copy_tree(sources.b_journal, &scenario_logs.join("b"));
         copy_tree(sources.witness, &scenario_logs.join("witness"));
+        let logs = json!({
+            "journal": scenario_logs.join("a").join("journal.log"),
+            "migration_records": scenario_logs.join("a").join("migrations"),
+            "peer_preparations": scenario_logs.join("b").join("peer-preparations"),
+            "destination_journal": scenario_logs.join("b").join("journal.log"),
+            "witness": scenario_logs.join("witness"),
+        });
+        let path = self.write_record(&dir, Some(&logs));
+        render_report(&dir);
+        path
+    }
 
+    /// Finish a ROLLUP record — a family aggregate (§3.2), the
+    /// comprehensive review's U4: the aggregate is COMPUTED, not
+    /// observed, so there is no log capture — the per-cell records
+    /// carry the real sources, and this record's `logs` field is
+    /// null (the truthful-logs standard: a path in the record must
+    /// resolve to real captured bytes, never to an empty
+    /// placeholder implying a capture that did not happen — the
+    /// old finish-with-placeholder shape wrote five paths that
+    /// resolved to nothing).
+    pub fn finish_rollup(self) -> PathBuf {
+        let dir = run_dir();
+        let path = self.write_record(&dir, None);
+        render_report(&dir);
+        path
+    }
+
+    /// The §6 record writer shared by the observed and rollup
+    /// finishes: `logs` is `Some` exactly when a capture happened.
+    fn write_record(self, dir: &Path, logs: Option<&Value>) -> PathBuf {
         let record = json!({
             "scenario": self.scenario,
             "tier": self.tier,
@@ -211,13 +241,7 @@ impl Evidence {
             "invariants": self.invariants.iter()
                 .map(|(name, verdict)| json!({name: verdict}))
                 .collect::<Vec<_>>(),
-            "logs": {
-                "journal": scenario_logs.join("a").join("journal.log"),
-                "migration_records": scenario_logs.join("a").join("migrations"),
-                "peer_preparations": scenario_logs.join("b").join("peer-preparations"),
-                "destination_journal": scenario_logs.join("b").join("journal.log"),
-                "witness": scenario_logs.join("witness"),
-            },
+            "logs": logs,
             "outcome": self.outcome,
             "duration_ms": u64::try_from(self.started.elapsed().as_millis())
                 .expect("scenario duration fits a u64"),
@@ -231,7 +255,6 @@ impl Evidence {
             serde_json::to_string_pretty(&record).expect("record JSON"),
         )
         .expect("write record");
-        render_report(&dir);
         path
     }
 
@@ -307,6 +330,19 @@ impl Evidence {
         reason: &str,
         would_run: &str,
     ) -> PathBuf {
+        // The outcome vocabulary (the comprehensive review's U2): a
+        // Tier R record IS a gate statement — skipped or blocked,
+        // never a pass. A record claiming any other outcome would
+        // render as a matrix pass in the summary, so it is refused
+        // here at the write, for BOTH seams (the fabrication shape
+        // is wrong in staging exactly as in the live tree; the
+        // summary's gate layer rejects it again on read —
+        // defense in depth).
+        assert!(
+            matches!(outcome, "skipped" | "blocked"),
+            "a Tier R record's outcome must be a gate statement (skipped/blocked), \
+             never {outcome:?} — a Tier R record cannot claim a pass"
+        );
         // The choke-point guard (see the method docs): only the
         // LIVE run directory is protected — staging directories are
         // where the constructed hosts live by design.
