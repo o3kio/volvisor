@@ -63,6 +63,15 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             "/v2/admin/nearline/{volume_id}/adopt",
             post(handlers::adopt_volume),
         )
+        // Nearline residue cleanup (P4b plan §6): clear the cut marker
+        // of an interrupted handoff — the operator's typed, journaled
+        // escape hatch for the Secondary-with-marker residue. Admin
+        // token required; providers without a handoff surface serve
+        // the typed 404.
+        .route(
+            "/v2/admin/nearline/{volume_id}/clear-cut-marker",
+            post(handlers::clear_cut_marker),
+        )
         // Consumer-facing mobility (P4b plan §6, stage B2): the four
         // journaled migration routes plus the read-only eligibility
         // check. Admin token required like every mutation; a daemon

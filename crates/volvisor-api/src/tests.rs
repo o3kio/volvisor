@@ -2055,6 +2055,7 @@ struct FakeHandoffSurface {
         )>,
     >,
     eligibility: std::sync::Mutex<Vec<String>>,
+    cleared: std::sync::Mutex<Vec<(volvisor_types::VolumeId, bool)>>,
 }
 
 impl FakeHandoffSurface {
@@ -2062,7 +2063,33 @@ impl FakeHandoffSurface {
         Self {
             promotes: std::sync::Mutex::new(Vec::new()),
             eligibility: std::sync::Mutex::new(Vec::new()),
+            cleared: std::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// A minimal honest inspect answer for the scripted clear-cut-marker
+/// (the full field truth is the provider tests' business; the route
+/// tests pin the journal behavior and the replay).
+fn cleared_marker_inspect(
+    volume_id: &volvisor_types::VolumeId,
+) -> volvisor_types::InspectVolumeResponse {
+    volvisor_types::InspectVolumeResponse {
+        volume_id: volume_id.clone(),
+        backend_class: volvisor_types::domain::VolumeClass::NativeLocal,
+        project_id: volvisor_types::ProjectId::new("seed-project").expect("valid project id"),
+        generation: 1,
+        state: volvisor_types::VolumeLifecycle::Ready,
+        provisioned_bytes: 1024,
+        allocated_bytes: 1024,
+        effective_protection: volvisor_types::EffectiveProtection::default(),
+        failure_domain: volvisor_types::FailureDomain::Host,
+        health: volvisor_types::Health::Unknown,
+        attachment_ids: Vec::new(),
+        current_writer: None,
+        backend_health: volvisor_types::Health::Unknown,
+        evidence_status: volvisor_types::domain::EvidenceStatus::default(),
+        authority: None,
     }
 }
 
@@ -2120,10 +2147,14 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
 
     async fn clear_cut_marker(
         &self,
-        _volume_id: &volvisor_types::VolumeId,
-        _proof: Option<&volvisor_types::FencingProof>,
+        volume_id: &volvisor_types::VolumeId,
+        proof: Option<&volvisor_types::FencingProof>,
     ) -> Result<volvisor_types::InspectVolumeResponse, ApiError> {
-        Err(ApiError::not_found("not scripted"))
+        self.cleared
+            .lock()
+            .expect("cleared")
+            .push((volume_id.clone(), proof.is_some()));
+        Ok(cleared_marker_inspect(volume_id))
     }
 
     async fn promote_target(
@@ -2194,6 +2225,162 @@ async fn check_mobility_reads_the_handoff_surface() {
     );
     // Read-only: no journal record for an eligibility answer.
     assert_eq!(journal_record_count(&state), 0);
+}
+
+/// The clear-cut-marker request body (no fencing proof — sufficient
+/// only for a volume that is Secondary on this host).
+fn clear_cut_body(operation_id: &str) -> Value {
+    serde_json::json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": operation_id,
+        "fencing_proof": null,
+    })
+}
+
+/// The clear-cut-marker request body carrying a fencing proof.
+fn clear_cut_body_with_proof(operation_id: &str) -> Value {
+    serde_json::json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": operation_id,
+        "fencing_proof": {
+            "volume_id": "vol-clear-1",
+            "retired_epoch": 1,
+            "commit_index": 7,
+        },
+    })
+}
+
+/// Setup with the handoff surface wired (the drbd daemon wiring, in
+/// miniature): the state's provider is still the `FakeProvider`.
+fn setup_with_handoff() -> (SharedState, Arc<FakeHandoffSurface>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_handoff(handoff.clone()),
+    );
+    (state, handoff, dir)
+}
+
+#[tokio::test]
+async fn clear_cut_marker_runs_through_the_journal_and_replays() {
+    let (state, handoff, _dir) = setup_with_handoff();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-clear-1/clear-cut-marker";
+
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &clear_cut_body("op-clear-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["volume_id"], json!("vol-clear-1"));
+    // The surface saw exactly one execution, with no proof.
+    assert_eq!(
+        *handoff.cleared.lock().expect("cleared"),
+        vec![(volume_id("vol-clear-1"), false)]
+    );
+
+    // The SAME operation id replays the recorded outcome byte-for-byte
+    // without a second execution.
+    let (status, replayed) = send_json(
+        &app,
+        json_request(Method::POST, uri, &clear_cut_body("op-clear-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(body, replayed);
+    assert_eq!(
+        handoff.cleared.lock().expect("cleared").len(),
+        1,
+        "replays never re-execute"
+    );
+}
+
+#[tokio::test]
+async fn clear_cut_marker_conflicts_when_the_same_operation_changes_the_proof() {
+    let (state, _handoff, _dir) = setup_with_handoff();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-clear-2/clear-cut-marker";
+
+    let (status, _body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &clear_cut_body("op-clear-2")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The proof is part of the request hash: a different authorization
+    // under the same operation id is an idempotency conflict, never a
+    // silent second clearing.
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::POST, uri, &clear_cut_body_with_proof("op-clear-2")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("IDEMPOTENCY_CONFLICT"));
+}
+
+#[tokio::test]
+async fn clear_cut_marker_requires_the_admin_token() {
+    let (state, _handoff, _dir) = setup_with_handoff();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request_without_auth(
+            Method::POST,
+            "/v2/admin/nearline/vol-clear-3/clear-cut-marker",
+            &clear_cut_body("op-clear-3"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], json!("UNAUTHORIZED"));
+}
+
+#[tokio::test]
+async fn clear_cut_marker_validates_the_envelope() {
+    let (state, _handoff, _dir) = setup_with_handoff();
+    let app = app(&state);
+    let uri = "/v2/admin/nearline/vol-clear-4/clear-cut-marker";
+
+    // A wrong api_version is a typed invalid request (nothing journaled).
+    let mut wrong_version = clear_cut_body("op-clear-4");
+    wrong_version["api_version"] = json!("volvisor.volume.v1");
+    let (status, body) = send_json(&app, json_request(Method::POST, uri, &wrong_version)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["code"],
+        json!("UNSUPPORTED_CLASS_OR_POLICY"),
+        "a foreign api_version is the unsupported-policy refusal, before anything is journaled"
+    );
+    assert_eq!(journal_record_count(&state), 0, "nothing is journaled");
+}
+
+#[tokio::test]
+async fn clear_cut_marker_serves_the_typed_404_without_a_handoff_surface() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/admin/nearline/vol-clear-5/clear-cut-marker",
+            &clear_cut_body("op-clear-5"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+    assert_eq!(
+        body["message"],
+        json!("handoff surface not available for this provider")
+    );
 }
 
 // ---------------------------------------------------------------------------

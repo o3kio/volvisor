@@ -70,6 +70,8 @@ pub(crate) const OP_CLAIM_DEVICE: &str = "claim_device";
 pub(crate) const OP_RELEASE_DEVICE: &str = "release_device";
 /// Operation kind: adopt-and-promote a nearline volume (admin surface).
 pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
+/// Operation kind: clear a stale migration-cut marker (admin surface).
+pub(crate) const OP_CLEAR_CUT_MARKER: &str = "clear_cut_marker";
 /// Operation kind: `PrepareNearlineHandoff` (mobility surface).
 pub(crate) const OP_MIGRATION_PREPARE: &str = "migration_prepare";
 /// Operation kind: `BarrierAndTransfer` (mobility surface).

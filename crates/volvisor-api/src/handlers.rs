@@ -25,7 +25,7 @@ use volvisor_types::request::{
     DetachVolumeRequest, DrainProof, GrowVolumeRequest, ListVolumesResponse,
 };
 use volvisor_types::{
-    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, MigrationId, ProjectId,
+    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, MigrationId, ProjectId,
     ReleaseDeviceRequest, VolumeId,
 };
 
@@ -408,6 +408,54 @@ pub(crate) async fn adopt_volume(
     .map_err(ApiErrorReply::from)
 }
 
+/// `POST /v2/admin/nearline/{volume_id}/clear-cut-marker` — the
+/// operator-driven residue cleanup of an interrupted handoff (P4b plan
+/// §6): clear a stale migration-cut marker once this host provably no
+/// longer writes the volume (it is Secondary here, or the caller
+/// supplies a fencing proof the witness corroborates).
+///
+/// Routed through the journal pipeline like every privileged mutation
+/// (rule 8): the volume id and the (optional) fencing proof are folded
+/// into the request hash, so a replay with a different proof under the
+/// same operation id is an `IDEMPOTENCY_CONFLICT`, never a silent
+/// second clearing. The surface's refusals (a Primary/writer without a
+/// corroborated proof, no marker present) are typed errors and journal
+/// as failures, replaying verbatim — fail-closed, exactly like the
+/// adopt refusals.
+pub(crate) async fn clear_cut_marker(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(volume_id): Path<String>,
+    ValidJson(req): ValidJson<ClearCutMarkerRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first (see `claim_device`).
+    let handoff = state
+        .handoff
+        .clone()
+        .ok_or_else(|| ApiErrorReply(handoff_surface_unavailable()))?;
+    volvisor_types::validate_api_version(&req.api_version)?;
+    let volume_id = parse_volume_id(&volume_id)?;
+    tracing::info!(
+        kind = ops::OP_CLEAR_CUT_MARKER,
+        operation_id = %req.operation_id,
+        volume_id = %volume_id,
+        "accepting clear_cut_marker"
+    );
+    let payload = ops::volume_payload(&volume_id, &req)?;
+    let hash = ops::mobility_request_hash("clear-cut-marker", &payload);
+    let proof = req.fencing_proof;
+    ops::execute(
+        &state,
+        ops::OP_CLEAR_CUT_MARKER,
+        req.operation_id.clone(),
+        hash,
+        payload,
+        move || async move { handoff.clear_cut_marker(&volume_id, proof.as_ref()).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
 // ---------------------------------------------------------------------------
 // Mobility surface (P4b plan §6, stage B2) — consumer routes
 // ---------------------------------------------------------------------------
@@ -692,6 +740,23 @@ struct CapabilitiesResponse {
     capabilities: CapabilitySet,
     /// Volume classes served by this provider instance.
     supported_classes: Vec<VolumeClass>,
+}
+
+/// `POST /v2/admin/nearline/{volume_id}/clear-cut-marker` request body.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClearCutMarkerRequest {
+    /// Must equal `volvisor.volume.v2`.
+    api_version: String,
+    /// Idempotency key.
+    operation_id: volvisor_types::OperationId,
+    /// The witness's durable retirement statement that authorizes
+    /// clearing the marker while this host still holds the volume
+    /// Primary (the surface corroborates it against the witness);
+    /// `None` is sufficient only when the volume is Secondary here —
+    /// the surface refuses a live writer typed, never on the
+    /// caller's say-so.
+    fencing_proof: Option<FencingProof>,
 }
 
 /// `POST /v2/vms/{vm_id}/check-mobility` request body.
