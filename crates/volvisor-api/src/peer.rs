@@ -791,8 +791,11 @@ pub struct PeerPreparedVolume {
 /// fresh by the source at call time, never cached in a record. The
 /// route re-runs exactly the replica-level gate prepare ran
 /// ([`HandoffSurface::verify_target_replica`]) and mutates nothing.
+///
+/// No `deny_unknown_fields` (the additive discipline this PR's new
+/// types follow): an unknown field from a newer peer is skipped, not
+/// a decode failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PeerVerifyLineageRequest {
     /// The migration identity.
     pub migration_id: MigrationId,
@@ -847,8 +850,10 @@ impl PeerVerifyLineageRequest {
 /// participant set, echoed in preparation order so the source driver
 /// can assert the destination re-verified exactly the volumes the
 /// record carries (same order, never a subset).
+///
+/// No `deny_unknown_fields` (the additive discipline this PR's new
+/// types follow).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PeerVerifyLineageResponse {
     /// The migration identity.
     pub migration_id: MigrationId,

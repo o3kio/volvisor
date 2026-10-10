@@ -2275,10 +2275,14 @@ async fn row_18c_coordinator_re_drives_a_half_restored_destination() {
     // at the barrier must not abort the migration) with the record
     // parked pre-cut at `QUIESCED`, observable while the drive is
     // still riding. (Before the re-check, this outage surfaced one
-    // step later, at the grant: a transport failure parking the
-    // record at the source-revoked `IN_DOUBT`. That post-cut parking
-    // shape stays covered by the kill matrix's peer-grant cells,
-    // which kill the destination after the barrier.)
+    // step later, at the grant: a pure transport failure parking the
+    // record at the source-revoked `IN_DOUBT`, nothing journaled by
+    // the peer, so the re-drive completed clean once it returned.
+    // That transport-class parking shape is pinned at the driver
+    // level, in `a_transport_outage_at_the_grant_parks_in_doubt_and_the_re_drive_is_clean`
+    // (`crates/volvisord/src/handoff.rs`) — and the kill matrix's
+    // peer-grant cells cover a different class: journal-kills, a
+    // destination dead mid-journal-op.)
     rig.b.stop().await;
     let (status, body) = post_transfer(rig.a.addr, "mig-18c").await;
     assert_eq!(status, 202, "transfer: {body}");

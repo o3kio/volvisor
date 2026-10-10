@@ -224,8 +224,13 @@ pub struct StateHistoryEntry {
 /// durable state, not a log line — the drive that refused may be
 /// gone (a crash, a restart), and the marker is what makes the
 /// refusal re-observable without re-executing the gate first.
+///
+/// No `deny_unknown_fields`, by the additive-record discipline: the
+/// marker is embedded in the durable [`MigrationRecord`], and a
+/// future additive field must decode on readers of this version —
+/// unknown fields are skipped, never a decode failure of the
+/// migration's own history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TypedRefusal {
     /// The contract-spelled error code (e.g. `FOREIGN_DEVICE_STATE`)
     /// — the same wire vocabulary [`volvisor_types::ApiErrorCode`]
@@ -235,6 +240,30 @@ pub struct TypedRefusal {
     pub detail: String,
     /// Unix epoch seconds at which the refusal was journaled.
     pub at: u64,
+}
+
+/// The observation layer's projection of a journaled
+/// [`TypedRefusal`]: the refusal verbatim (evidence — the journal is
+/// never rewritten) plus the one fact only the observation can add —
+/// whether it is an **active condition** (the record is parked on
+/// the refusal; the operator must re-seed the target or abort) or
+/// **historical** (the operator aborted; the refusal is the typed
+/// reason of record on a terminal record, not a live park).
+///
+/// The distinction lives here, never in the record: the stored
+/// marker is byte-identical either way, because it is evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedRefusal {
+    /// The journaled refusal, verbatim.
+    #[serde(flatten)]
+    pub refusal: TypedRefusal,
+    /// `false` while the record is parked on the refusal (the active
+    /// condition); `true` once the record is terminal (`Aborted` —
+    /// and `Complete`, which is structurally unreachable with a
+    /// standing marker: the re-check discharges it before the drive
+    /// converges) — the refusal is then history, honestly rendered
+    /// as such.
+    pub historical: bool,
 }
 
 /// The v1 abort policy: a pre-cut migration is automatically rolled
@@ -428,6 +457,15 @@ impl MigrationRecord {
             }
             self.state.clone()
         };
+        // The observation layer's one addition to the marker (F4): a
+        // terminal record renders a standing refusal as history — the
+        // operator aborted, so the refusal is the typed reason of
+        // record, not a live park. Every other shape (a stalled
+        // `IN_DOUBT` above all) renders it active: the abort never
+        // landed, the record is not terminal, and the marker still
+        // names the condition an operator must resolve.
+        let refusal_historical =
+            matches!(state, HandoffState::Aborted { .. } | HandoffState::Complete);
         MigrationSummary {
             state,
             state_history: self.state_history.clone(),
@@ -437,7 +475,12 @@ impl MigrationRecord {
                 (Some(started), Some(completed)) => Some(completed.saturating_sub(started)),
                 _ => None,
             },
-            barrier_lineage_refusal: self.barrier_lineage_refusal.clone(),
+            barrier_lineage_refusal: self.barrier_lineage_refusal.as_ref().map(|refusal| {
+                ObservedRefusal {
+                    refusal: refusal.clone(),
+                    historical: refusal_historical,
+                }
+            }),
         }
     }
 }
@@ -469,8 +512,10 @@ pub struct MigrationSummary {
     /// (P6-A F1), when one stands: the record parks for the operator
     /// — the canonical state stays `QUIESCED` (pre-cut, no barrier
     /// recorded) and this marker is the typed reason. Carried through
-    /// `Aborted` (the operator's abort is the marker's other exit).
-    pub barrier_lineage_refusal: Option<TypedRefusal>,
+    /// `Aborted` (the operator's abort is the marker's other exit),
+    /// projected as [`ObservedRefusal`] so a terminal record reads
+    /// the refusal as history rather than as a live park.
+    pub barrier_lineage_refusal: Option<ObservedRefusal>,
 }
 
 #[cfg(test)]
@@ -541,19 +586,37 @@ mod tests {
         );
         assert_eq!(
             summary.barrier_lineage_refusal,
-            parked.barrier_lineage_refusal.clone(),
-            "the observation carries the journaled typed refusal verbatim"
+            Some(ObservedRefusal {
+                refusal: parked
+                    .barrier_lineage_refusal
+                    .clone()
+                    .expect("scripted marker"),
+                historical: false,
+            }),
+            "the parked (active) observation carries the journaled typed \
+             refusal verbatim, rendered as a live condition"
         );
 
-        // The marker survives the operator's abort (the other exit).
+        // The marker survives the operator's abort (the other exit) —
+        // and the observation says what that now is: history, the
+        // typed reason of record on a terminal record (F4). The
+        // journal byte is unchanged; only the rendering moved.
         let mut aborted = parked;
         aborted.state = HandoffState::Aborted {
             reason: "operator abort".to_owned(),
             at: 9,
         };
-        assert!(
-            aborted.observe().barrier_lineage_refusal.is_some(),
-            "the aborted record keeps the typed refusal of record"
+        assert_eq!(
+            aborted.observe().barrier_lineage_refusal,
+            Some(ObservedRefusal {
+                refusal: aborted
+                    .barrier_lineage_refusal
+                    .clone()
+                    .expect("scripted marker"),
+                historical: true,
+            }),
+            "the aborted record keeps the typed refusal of record, rendered \
+             historical — refused at the barrier before the operator abort"
         );
     }
 

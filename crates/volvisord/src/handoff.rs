@@ -315,12 +315,7 @@ impl HttpPeerClient {
         path: &str,
         body: &(impl Serialize + Sync),
     ) -> Result<T, ApiError> {
-        let unreachable = |detail: String| {
-            ApiError::new(
-                ApiErrorCode::Internal,
-                format!("peer daemon unreachable: {detail}"),
-            )
-        };
+        let unreachable = |detail: String| ApiError::peer_unreachable(detail);
         let uri = format!("{}{path}", self.base_url)
             .parse::<Uri>()
             .map_err(|err| unreachable(format!("invalid peer base URL: {err}")))?;
@@ -768,10 +763,11 @@ impl HandoffDriver for DaemonHandoffDriver {
         // driver-owned bound (the `track_sync` discipline): the
         // re-check must not abort a migration whose destination is
         // bouncing — the cut proceeds once the peer answers. Only
-        // the transport class ("peer daemon unreachable", the
-        // [`HttpPeerClient`] stamp) is retryable: a typed peer
-        // refusal — the FOREIGN_DEVICE_STATE gate above all —
-        // surfaces immediately, never retried into a pass.
+        // the transport class ([`ApiError::is_peer_unreachable`],
+        // the same centralized source that builds the error) is
+        // retryable: a typed peer refusal — the
+        // FOREIGN_DEVICE_STATE gate above all — surfaces
+        // immediately, never retried into a pass.
         let deadline = std::time::Instant::now() + self.peer_recheck_bound;
         loop {
             match self
@@ -804,10 +800,7 @@ impl HandoffDriver for DaemonHandoffDriver {
                     }
                     return Ok(());
                 }
-                Err(error)
-                    if error.code == ApiErrorCode::Internal
-                        && error.detail.contains("peer daemon unreachable") =>
-                {
+                Err(error) if error.is_peer_unreachable() => {
                     if std::time::Instant::now() >= deadline {
                         return Err(ApiError::new(
                             ApiErrorCode::Internal,
@@ -2075,7 +2068,16 @@ mod tests {
         }
 
         async fn track_sync(&self, volume_id: &VolumeId) -> Result<SyncProof, ApiError> {
-            let lag = self.track_sync_lag.fetch_sub(1, Ordering::SeqCst);
+            // The lag knob counts down to convergence and then stays
+            // there: a wrapping `fetch_sub` used to turn the first
+            // converged call into a `u64::MAX` lag for the next one
+            // (surfaced by the first full-drive wiring test over
+            // this fake — `replica_caught_up` consumes the zero, the
+            // barrier's D2 proof then always refused).
+            let lag = self.track_sync_lag.load(Ordering::SeqCst);
+            if lag > 0 {
+                self.track_sync_lag.store(lag - 1, Ordering::SeqCst);
+            }
             if self.track_sync_stuck.load(Ordering::SeqCst) || lag > 0 {
                 return Err(ApiError::new(
                     ApiErrorCode::ReplicaNotDurable,
@@ -2179,6 +2181,9 @@ mod tests {
         /// Queued `verify-lineage` refusals, served first-failure
         /// first (the transport-retry tests' outage script).
         verify_refusals: Mutex<Vec<ApiError>>,
+        /// Queued grant refusals, served first-failure first (the
+        /// transport-outage-at-the-grant test's script).
+        grant_refusals: Mutex<Vec<ApiError>>,
     }
 
     impl StubPeer {
@@ -2190,6 +2195,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 restores: Mutex::new(Vec::new()),
                 verify_refusals: Mutex::new(Vec::new()),
+                grant_refusals: Mutex::new(Vec::new()),
             }
         }
 
@@ -2259,6 +2265,9 @@ mod tests {
             request: volvisor_api::peer::PeerGrantRequest,
         ) -> Result<volvisor_api::peer::PeerGrantResponse, ApiError> {
             self.record("grant");
+            if let Some(error) = self.grant_refusals.lock().expect("grant refusals").pop() {
+                return Err(error);
+            }
             Ok(volvisor_api::peer::PeerGrantResponse {
                 migration_id: request.migration_id,
                 grants: self.grants.clone(),
@@ -2461,10 +2470,7 @@ mod tests {
                 .verify_refusals
                 .lock()
                 .expect("verify refusals")
-                .push(ApiError::new(
-                    ApiErrorCode::Internal,
-                    "peer daemon unreachable: transport failure (scripted)",
-                ));
+                .push(ApiError::peer_unreachable("transport failure (scripted)"));
         }
         kit.driver
             .verify_target_lineage(&record)
@@ -2507,10 +2513,7 @@ mod tests {
                 .verify_refusals
                 .lock()
                 .expect("verify refusals")
-                .push(ApiError::new(
-                    ApiErrorCode::Internal,
-                    "peer daemon unreachable: transport failure (scripted)",
-                ));
+                .push(ApiError::peer_unreachable("transport failure (scripted)"));
         }
         let error = tight
             .verify_target_lineage(&record)
@@ -2558,6 +2561,186 @@ mod tests {
                 .count(),
             1,
             "a typed refusal is asked exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lineage_recheck_does_not_ride_out_a_non_transport_internal_error() {
+        // The ride-out's discriminator is the typed transport class
+        // alone (`ApiError::is_peer_unreachable`): every other
+        // INTERNAL failure — here an unrelated scripted one — is
+        // asked exactly once and surfaces immediately. This is the
+        // fail-safe direction of the discriminator: a class that
+        // drifted narrow (or a failure misfiled into it) stops
+        // riding and errors the drive pre-cut, where the established
+        // rollback semantics own the record — never a false pass,
+        // never an unbounded spin over a bug.
+        let kit = driver_kit().await;
+        let record = record_for("mig-recheck4", vec![participant("vol-recheck4", 1, 100)]);
+        kit.peer
+            .verify_refusals
+            .lock()
+            .expect("verify refusals")
+            .push(ApiError::new(
+                ApiErrorCode::Internal,
+                "an unrelated internal failure (scripted)",
+            ));
+        let error = kit
+            .driver
+            .verify_target_lineage(&record)
+            .await
+            .expect_err("the non-transport internal surfaces");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            !error.is_peer_unreachable(),
+            "the surfaced error is not the transport class: {error}"
+        );
+        assert_eq!(
+            kit.peer
+                .calls()
+                .iter()
+                .filter(|call| **call == "verify_lineage")
+                .count(),
+            1,
+            "a non-transport internal is asked exactly once — no ride-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_outage_at_the_grant_parks_in_doubt_and_the_re_drive_is_clean() {
+        // PR #22 review F1 — the property row 18c's relocation lost,
+        // pinned at the coordinator/driver seam: the destination is
+        // FULLY DEAD when the cut reaches the grant. A pure transport
+        // failure — the request never lands, so nothing is journaled
+        // by the peer — parks the record at SOURCE_REVOKED, observed
+        // IN_DOUBT ("source revoked; destination grant not yet
+        // authorized"), and the re-drive, once the peer answers,
+        // completes: the destination journaled no failure outcome, so
+        // nothing is replayed at the re-drive — its grant is a fresh
+        // ask. (The `grant_set` wedge — a peer dead mid-journal-op —
+        // is the other class, the kill matrix's peer-grant cells.)
+        //
+        // The real `DaemonHandoffDriver` over the loopback witness,
+        // the fake VMM and surface, and a scripted peer: the full
+        // production drive path, not a full e2e.
+        let witness = witness_kit().await;
+        let snapshot_dir = tempfile::tempdir().expect("snapshot dir");
+        let dirs = tempfile::tempdir().expect("store dir");
+        let vol = volume("vol-tg");
+        let vmm = Arc::new(FakeVmm::new(snapshot_dir.path()));
+        vmm.create("vm-tg", &["/dev/drbd100"])
+            .expect("the source VM exists");
+        // The consumer's act (volvisor never launches VMMs, plan §1):
+        // a running source, as the cut's pause expects to find.
+        vmm.start("vm-tg").expect("the source VM runs");
+        let surface: Arc<dyn HandoffSurface> = Arc::new(FakeSurface::new());
+        let stub = Arc::new(StubPeer::new(vec![grant_outcome(
+            "vol-tg",
+            "/dev/drbd-by-target",
+        )]));
+        *stub.prepare_participants.lock().expect("participants") =
+            vec![participant("vol-tg", 1, 100)];
+        // The destination dies for exactly the grant: one
+        // transport-class failure, served once. The stub owns no
+        // journal — a pure transport outage never reaches one, which
+        // is precisely the property under test.
+        stub.grant_refusals
+            .lock()
+            .expect("grant refusals")
+            .push(ApiError::peer_unreachable("transport failure (scripted)"));
+        let peer: Arc<dyn PeerClient> = stub.clone();
+        let facts: ParticipantFacts =
+            Arc::new(|_volume, _vm, _generation| Ok(("drbd-res".to_owned(), 100_u32)));
+        // The volume is registered and the source holds the epoch-1
+        // lease: the cut's barrier and revoke are real witness acts.
+        register_volume(&witness, &vol).await;
+        grant_to_node(&witness, &vol).await;
+        let (handle, _peer_ctx) = wire_migration(
+            host(NODE),
+            Arc::new(client_for(&witness.server, Some(NODE_TOKEN))),
+            witness.server.addr,
+            vmm.clone(),
+            surface,
+            Arc::new(FakeProvider::new()),
+            peer,
+            facts,
+            snapshot_dir.path().to_owned(),
+            dirs.path().join("migrations"),
+            dirs.path().join("peer-preparations"),
+            Arc::new(|| 0_u64),
+        )
+        .expect("wiring");
+
+        let mig = migration("mig-tg");
+        handle
+            .coordinator()
+            .prepare(PrepareHandoffRequest {
+                migration_id: mig.clone(),
+                vm_id: "vm-tg".to_owned(),
+                source_host: host(NODE),
+                target_host: host(PEER),
+                participants: vec![participant("vol-tg", 1, 100)],
+            })
+            .await
+            .expect("prepare");
+
+        // The cut runs through the barrier, the snapshot, the destroy
+        // and the revoke — then the dead destination surfaces the
+        // transport class and the drive parks.
+        let error = handle
+            .coordinator()
+            .transfer(&mig)
+            .await
+            .expect_err("the grant outage parks the drive");
+        assert!(
+            error.is_peer_unreachable(),
+            "the surfaced error is the transport class: {error}"
+        );
+
+        // The D3 window, observed: the revoke landed, the grant has
+        // not — IN_DOUBT, never a progress-like clean state (G1).
+        let parked = handle
+            .coordinator()
+            .observe(&mig)
+            .expect("observe")
+            .expect("the parked record exists");
+        assert!(matches!(parked.state, HandoffState::InDoubt { .. }));
+        assert_eq!(
+            parked.in_doubt_detail.as_deref(),
+            Some("source revoked; destination grant not yet authorized"),
+            "the park is the source-revoked window: {parked:?}"
+        );
+        assert_eq!(
+            stub.calls().iter().filter(|call| **call == "grant").count(),
+            1,
+            "the dead destination was asked exactly once"
+        );
+
+        // The destination returns (the scripted outage is spent) and
+        // the re-drive completes through the production drive path:
+        // the grant is re-asked fresh — no journaled failure outcome
+        // is replayed at it, because none was ever journaled — the
+        // VM is restored at the destination, and the source's copy is
+        // gone (the destroy held).
+        let resolved = handle
+            .coordinator()
+            .resolve(&mig)
+            .await
+            .expect("the re-drive completes");
+        assert_eq!(resolved.state, HandoffState::Complete);
+        assert!(
+            stub.calls().iter().filter(|call| **call == "grant").count() >= 2,
+            "the re-drive re-asked the grant — a fresh ask, nothing replayed"
+        );
+        assert_eq!(
+            stub.restores.lock().expect("restores").len(),
+            1,
+            "the destination restored the VM"
+        );
+        assert_eq!(
+            vmm.vm_state("vm-tg").expect("the source VMM answers"),
+            VmState::Absent,
+            "the source's VM copy was destroyed by the cut"
         );
     }
 

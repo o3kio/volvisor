@@ -892,6 +892,11 @@ async fn row_9b_post_prepare_injection_refused_at_the_barrier() {
         json!("FOREIGN_DEVICE_STATE"),
         "the observation carries the typed-refusal marker: {summary}"
     );
+    assert_eq!(
+        summary["barrier_lineage_refusal"]["historical"],
+        json!(false),
+        "the park renders the refusal as the active condition: {summary}"
+    );
 
     // The cut never crossed foreign data: no barrier exists at the
     // witness, the source resource was never demoted, the epoch-1
@@ -989,7 +994,8 @@ async fn await_lineage_park(addr: std::net::SocketAddr, mig: &str) -> serde_json
         assert_eq!(status, 200, "the observation answers: {body}");
         let summary = body_json(&body);
         let parked = state_name(&summary) == "quiesced"
-            && summary["barrier_lineage_refusal"]["code"] == json!("FOREIGN_DEVICE_STATE");
+            && summary["barrier_lineage_refusal"]["code"] == json!("FOREIGN_DEVICE_STATE")
+            && summary["barrier_lineage_refusal"]["historical"] == json!(false);
         if parked {
             return summary;
         }

@@ -54,5 +54,5 @@ pub use store::MigrationStore;
 pub use surface::{MigrationSurface, MobilityRequest, migration_not_enabled};
 pub use types::{
     AbortPolicy, BarrierProof, CutProgress, HandoffState, MigrationRecord, MigrationSummary,
-    Participant, PrepareHandoffRequest, StateHistoryEntry, TypedRefusal,
+    ObservedRefusal, Participant, PrepareHandoffRequest, StateHistoryEntry, TypedRefusal,
 };

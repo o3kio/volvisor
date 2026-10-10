@@ -1218,11 +1218,15 @@ async fn barrier_lineage_recheck_refuses_typed_and_parks_for_the_operator() {
         Some(None),
         "no cut write-ahead exists (the barrier never executed)"
     );
-    let refusal = parked
+    let observed = parked
         .barrier_lineage_refusal
         .as_ref()
         .expect("the typed refusal is journaled on the observation");
-    assert_eq!(refusal.code, "FOREIGN_DEVICE_STATE");
+    assert_eq!(observed.refusal.code, "FOREIGN_DEVICE_STATE");
+    assert!(
+        !observed.historical,
+        "the parked record renders the refusal as the active condition"
+    );
     assert_eq!(stored_refusal(&fixture).code, "FOREIGN_DEVICE_STATE");
 
     // The gate refused before any barrier act: no D2 proof, no
@@ -1362,6 +1366,22 @@ async fn abort_from_the_lineage_park_retains_the_refusal() {
             .as_ref()
             .map(|r| r.code.as_str()),
         Some("FOREIGN_DEVICE_STATE")
+    );
+    // F4: the observation layer says what the retained marker now is
+    // — history. The journal byte is unchanged (the record's marker
+    // above is verbatim); only the rendering moved, so the terminal
+    // record never reads as if it were still parked on the refusal.
+    assert_eq!(
+        coordinator
+            .observe(&migration_id())
+            .expect("observe")
+            .expect("the aborted record exists")
+            .barrier_lineage_refusal
+            .as_ref()
+            .map(|r| (r.refusal.code.as_str(), r.historical)),
+        Some(("FOREIGN_DEVICE_STATE", true)),
+        "the aborted observation renders the refusal historical — refused \
+         at the barrier before the operator abort"
     );
     {
         let world = fixture.world.lock().unwrap();
