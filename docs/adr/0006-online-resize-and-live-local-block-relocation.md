@@ -52,7 +52,7 @@ QSD brings extra process, packaging, failure domain and potential latency/CPU co
 1. Consumer requests `GrowVolume` with `expected_generation` and new size. Grow-only in v0, and ensure quota, reserve, layout and thin metadata headroom.
 2. Volvisor journal intent and grows backing LV using LVM/dm (e.g. `lvextend -L +50G vg/vol` for a qualified thick LV; thin virtual-size changes use their specific LVM operations).
 3. Verify actual mapped block size with `blockdev --getsize64`. Do not infer from command exit code alone.
-4. Call Cloud Hypervisor `PUT /api/v1/vm.resize-disk` using its configured disk ID and actual desired bytes, *on a pinned version proven to support host block devices*.
+4. Call Cloud Hypervisor `PUT /api/v1/vm.resize-disk` using its configured disk ID (the consumer-declared `vmm_disk_id` recorded at attach; an attachment without one cannot be addressed — see the contract's section 3) and actual desired bytes, *on a pinned version proven to support host block devices*.
 5. Verify guest capacity change; guest partition and filesystem growth are independent and may need guest action.
 6. Persist effective size and outcome, including partial case: backend grew but guest notification failed. Retry **notification**, never shrink the LV to 'undo' a successful expansion.
 
@@ -109,11 +109,15 @@ what remains closed):
 
 1. **Grow-notification (Option "online grow", step 4 above).**
    `GrowVolume` on an attached `native-local` volume completes the VMM
-   capacity-notification step through the existing
-   `ChRemoteVmm` adapter (`PUT /api/v1/vm.resize-disk`) on a **pinned,
-   startup-verified Cloud Hypervisor version** — upstream PR #7948 is
+   capacity-notification step through the existing `ChRemoteVmm`
+   controller's REST call over the per-VM API socket
+   (`PUT /api/v1/vm.resize-disk`; Cloud Hypervisor's `ch-remote` CLI has
+   no resize-disk subcommand — the resize-disk API is REST-only), on a
+   **pinned, startup-verified Cloud Hypervisor version** — upstream PR #7948 is
    required for externally grown host block devices, so a version that
-   is not proven at startup refuses the grow typed instead of growing
+   is not proven at startup refuses the **notification** typed with the
+   recorded reason: the grow itself succeeds, and the response reports
+   `guest_notification_status: retry_required` instead of growing
    without notification. Resize of **vhost-user-blk** frontends remains
    unproven and out of scope. Partial-failure semantics are the ADR's
    existing rule: the backend may grow before the VMM/guest is

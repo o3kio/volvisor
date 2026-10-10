@@ -84,6 +84,9 @@ pub const STORE_MIGRATION_RECORDS: &str = "migration_records";
 pub const STORE_DRBD_STATE: &str = "drbd_state";
 /// See [`STORE_MIGRATION_RECORDS`].
 pub const STORE_WITNESS_COMMIT: &str = "witness_commit";
+/// See [`STORE_MIGRATION_RECORDS`]: the one grow-notification
+/// state file a daemon's engine owns (P6-B).
+pub const STORE_GROW_NOTIFICATIONS: &str = "grow_notifications";
 
 /// One deterministic kill point inside a durable save (P5 plan
 /// §3.1).

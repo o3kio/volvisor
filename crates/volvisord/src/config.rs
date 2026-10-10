@@ -214,7 +214,8 @@ pub struct MigrationConfig {
     pub peer_api_token: Option<String>,
 }
 
-/// The `[vmm]` table: the ch-remote adapter's knobs (P4b plan §5/§6).
+/// The `[vmm]` table: the ch-remote adapter's knobs (P4b plan
+/// §5/§6) and the grow-notification gate's knobs (P6-B).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmmConfig {
@@ -225,6 +226,20 @@ pub struct VmmConfig {
     /// (`{api_socket_dir}/{vm_id}.sock`); required when migration is
     /// enabled.
     pub api_socket_dir: Option<std::path::PathBuf>,
+    /// Path of the `cloud-hypervisor` binary (P6-B): probed once at
+    /// startup (`<binary> --version`, shell-free, through the real
+    /// runner) for the grow-notification version gate. Not probed
+    /// by `--check-config` (hermeticity: the check must not depend
+    /// on the host carrying a VMM).
+    pub cloud_hypervisor_bin: Option<std::path::PathBuf>,
+    /// The minimum cloud-hypervisor version the grow notification
+    /// accepts (P6-B): semver (`37.0`, `37.0.1`, `v37.0.0` — the
+    /// tolerant parse; see the provider's `vmm_version`). The
+    /// repository pins no default — the operator configures the
+    /// release they have actually qualified. Absent fields leave
+    /// the gate refused (fail-closed): attached grows report
+    /// `retry_required` with the recorded reason.
+    pub minimum_version: Option<String>,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -698,6 +713,29 @@ impl Config {
                  fail-closed mode)"
                     .to_owned(),
             ));
+        }
+        // The grow-notification gate's fields (P6-B): shape only —
+        // the version probe itself is deliberately NOT run here
+        // (`--check-config` stays hermetic: it must not depend on
+        // the host carrying a VMM binary).
+        if self
+            .vmm
+            .cloud_hypervisor_bin
+            .as_ref()
+            .is_some_and(|bin| bin.as_os_str().is_empty())
+        {
+            return Err(DaemonError::Config(
+                "vmm.cloud_hypervisor_bin must not be empty when set".to_owned(),
+            ));
+        }
+        if let Some(minimum) = self.vmm.minimum_version.as_deref() {
+            if volvisor_provider::Semver::parse(minimum).is_err() {
+                return Err(DaemonError::Config(format!(
+                    "vmm.minimum_version {minimum:?} is not a semantic version (expected \
+                     MAJOR[.MINOR[.PATCH]] with an optional leading v, pre-release and build \
+                     metadata)"
+                )));
+            }
         }
         Ok(())
     }
@@ -1384,6 +1422,48 @@ provider = \"drbd\"
         assert_eq!(
             cfg.vmm.ch_remote_bin.as_deref(),
             Some(std::path::Path::new("/usr/bin/ch-remote"))
+        );
+    }
+
+    // --------------------------------------------------- grow gate
+
+    #[test]
+    fn validates_the_grow_gate_fields_without_probing_the_host() {
+        // The path deliberately does not exist on the test host:
+        // validation is shape-only (hermeticity — the probe runs at
+        // daemon startup, never in --check-config).
+        let raw = minimal_toml()
+            + "[vmm]\n\
+               cloud_hypervisor_bin = \"/nonexistent/cloud-hypervisor\"\n\
+               minimum_version = \"37.0\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate().expect("the gate fields are valid shapes");
+        assert_eq!(
+            cfg.vmm.minimum_version.as_deref(),
+            Some("37.0"),
+            "the minimum parses verbatim; the semver interpretation is the gate's"
+        );
+    }
+
+    #[test]
+    fn a_malformed_minimum_version_is_refused() {
+        let raw = minimal_toml() + "[vmm]\nminimum_version = \"37.x\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("not a semantic version");
+        assert!(
+            error.to_string().contains("semantic version"),
+            "error names the rule: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_cloud_hypervisor_bin_is_refused() {
+        let raw = minimal_toml() + "[vmm]\ncloud_hypervisor_bin = \"\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("an empty binary path");
+        assert!(
+            error.to_string().contains("cloud_hypervisor_bin"),
+            "error names the rule: {error}"
         );
     }
 

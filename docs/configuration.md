@@ -136,6 +136,32 @@ the peer daemon's URL and credential, and a configured `[vmm]` table.
 | `migration.peer_api_token` | string | required when enabled | The daemon-to-daemon credential (distinct from the witness and consumer tokens). Never logged. |
 | `vmm.ch_remote_bin` | path | required when migration is enabled | Path of the `ch-remote` binary. |
 | `vmm.api_socket_dir` | path | required when migration is enabled | Directory holding the per-VM API sockets (`{api_socket_dir}/{vm_id}.sock`). |
+| `vmm.cloud_hypervisor_bin` | path | unset | Path of the `cloud-hypervisor` binary, probed once at daemon startup for the grow-notification version gate (P6-B; lvm provider). Never probed by `--check-config`. |
+| `vmm.minimum_version` | semver string | unset | The minimum cloud-hypervisor version the grow notification accepts (`37.0`, `37.0.1`, `v37.0.0`; a leading `v` is tolerated). |
+
+### The grow-notification version gate (P6-B)
+
+Online grow (Volume API v2 §4A) is a two-step act: the backing
+grows, then the VMM is told (`PUT /api/v1/vm.resize-disk` over the
+per-VM API socket) so the guest can see the new capacity. The
+notification needs a VMM that handles host block devices grown
+outside the VMM — support added upstream in
+[cloud-hypervisor PR #7948](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/7948).
+The `vmm.minimum_version` gate exists for that reason: the operator
+pins the release they have actually qualified, the daemon probes
+`<cloud_hypervisor_bin> --version` exactly once at startup, and
+below the minimum (or with either field unset, or with an
+unrunnable/unparseable binary) the gate refuses — fail-closed. A
+refusal never fails the grow: the volume's backing is already
+resized, and the response honestly says `retry_required` with the
+recorded reason until the configuration is fixed. The repository
+pins no default release. Consumer attachments carry the VMM-side
+disk id (`vmm_disk_id` on the attach request) the notification
+addresses; an attached volume without one cannot be notified and
+reports the same recorded refusal. Outstanding notifications are
+retried by a background pass every 5 seconds and reconciled at
+startup; a detached volume's pending notification resolves
+`not_applicable`.
 
 ## `volvisor-witnessd` configuration
 

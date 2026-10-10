@@ -493,3 +493,152 @@ fn restore_refuses_a_mapping_without_a_config_disk_typed() {
         r#"{"disks": [{"path": "/dev/drbd1"}]}"#
     );
 }
+
+// ---------------------------------------------------------------------
+// resize_disk (P6-B): byte-exact HTTP over a real unix domain socket
+// ---------------------------------------------------------------------
+
+/// Build the adapter over `socket_dir` with an inert scripted runner
+/// (resize_disk must not touch the runner — it is REST-only).
+fn resize_adapter(socket_dir: &std::path::Path) -> ChRemoteVmm {
+    ChRemoteVmm::new(
+        ChRemoteConfig {
+            ch_remote_bin: PathBuf::from("ch-remote"),
+            api_socket_dir: socket_dir.to_path_buf(),
+        },
+        Arc::new(FakeRunner::with_closure(|_program, _args| None)) as Arc<dyn CommandRunner>,
+    )
+}
+
+/// Run a one-shot fake UDS HTTP server for `vm_id` (the adapter's
+/// socket convention), scripting `response`: accept one connection,
+/// capture the exact request bytes, answer and close. The P6-B
+/// discipline: the argv-exact contract of the `ch-remote` commands
+/// translates to byte-exact HTTP assertions for the REST-only
+/// resize-disk call (no `ch-remote` subcommand exists — verified
+/// against cloud-hypervisor v37.0's published command list).
+fn serve_resize_once(
+    socket_dir: &std::path::Path,
+    vm_id: &str,
+    response: &str,
+) -> std::thread::JoinHandle<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let socket = socket_dir.join(format!("{vm_id}.sock"));
+    let listener = UnixListener::bind(&socket).expect("bind the fake api socket");
+    let response = response.to_owned();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept one connection");
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).expect("read the request");
+            raw.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let headers = &text[..header_end];
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        (name.eq_ignore_ascii_case("content-length"))
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or_default();
+                if raw.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+            if read == 0 {
+                break;
+            }
+        }
+        stream
+            .write_all(response.as_bytes())
+            .expect("write the scripted response");
+        drop(stream);
+        String::from_utf8_lossy(&raw).into_owned()
+    })
+}
+
+#[test]
+fn resize_disk_writes_the_exact_http_bytes_and_accepts_204() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = serve_resize_once(dir.path(), "vm-1", "HTTP/1.1 204 No Content\r\n\r\n");
+    let vmm = resize_adapter(dir.path());
+    vmm.resize_disk("vm-1", "vol-1", 2_147_483_648)
+        .expect("204 is the verified success shape");
+    let request = server.join().expect("the server thread");
+    assert_eq!(
+        request,
+        "PUT /api/v1/vm.resize-disk HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 36\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {\"id\":\"vol-1\",\"new_size\":2147483648}",
+        "the request bytes are pinned: method, path, headers and the \
+         VmResizeDisk body (id + new_size, slot omitted)"
+    );
+}
+
+#[test]
+fn resize_disk_is_rest_only_and_never_touches_the_runner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = serve_resize_once(dir.path(), "vm-1", "HTTP/1.1 204 No Content\r\n\r\n");
+    let runner = Arc::new(FakeRunner::with_closure(|_program, _args| None));
+    let vmm = ChRemoteVmm::new(
+        ChRemoteConfig {
+            ch_remote_bin: PathBuf::from("ch-remote"),
+            api_socket_dir: dir.path().to_path_buf(),
+        },
+        Arc::clone(&runner) as Arc<dyn CommandRunner>,
+    );
+    vmm.resize_disk("vm-1", "vol-1", 2048).expect("resize");
+    assert_eq!(
+        runner.invocations(),
+        Vec::<Invocation>::new(),
+        "resize_disk is REST-only: no ch-remote command runs"
+    );
+    server.join().expect("the server thread");
+}
+
+#[test]
+fn resize_disk_maps_a_non_2xx_answer_to_a_typed_refusal_carrying_the_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = serve_resize_once(
+        dir.path(),
+        "vm-1",
+        "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"error\":\"Failed to resize disk\"}",
+    );
+    let vmm = resize_adapter(dir.path());
+    let err = vmm
+        .resize_disk("vm-1", "vol-1", 2048)
+        .expect_err("a VMM refusal is a typed error");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(err.detail.contains("500"), "the status is carried: {err}");
+    assert!(
+        err.detail.contains("vol-1"),
+        "the disk id is carried: {err}"
+    );
+    assert!(err.detail.contains("Failed to resize disk"), "{err}");
+    server.join().expect("the server thread");
+}
+
+#[test]
+fn resize_disk_fails_typed_when_nothing_listens_on_the_socket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vmm = resize_adapter(dir.path());
+    let err = vmm
+        .resize_disk("vm-1", "vol-1", 2048)
+        .expect_err("a dead socket is a typed transport failure");
+    assert_eq!(err.code, ApiErrorCode::Internal);
+    assert!(err.detail.contains("failed to connect"), "{err}");
+    let socket = dir.path().join("vm-1.sock").display().to_string();
+    assert!(
+        err.detail.contains(&socket),
+        "the error names the socket it targeted: {err}"
+    );
+}

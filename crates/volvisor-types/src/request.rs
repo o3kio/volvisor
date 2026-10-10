@@ -220,6 +220,17 @@ pub struct AttachVolumeRequest {
     /// Requested frontend (e.g. `virtio-blk`).
     #[serde(default)]
     pub requested_frontend: Option<String>,
+    /// The VMM-side disk id the consumer configured for this
+    /// attachment's frontend (e.g. Cloud Hypervisor's
+    /// `--disk path=...,id=...`), when it configured one. Recorded
+    /// with the attachment so a later grow of an **attached** volume
+    /// can address the VMM's resize-disk API (P6-B, ADR-0006 first
+    /// slice part 1). The id is the consumer's own VMM device
+    /// identity — volvisor never invents one. Absent on an attached
+    /// volume: the grow's notification is refused with a recorded
+    /// reason (fail-closed), never a silent un-notified success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
 }
 
 /// Access-mode request values.
@@ -239,6 +250,11 @@ impl AttachVolumeRequest {
         crate::validate_api_version(&self.api_version)?;
         if self.vm_id.is_empty() {
             return Err(ApiError::invalid_request("vm_id must not be empty"));
+        }
+        if self.vmm_disk_id.as_deref() == Some("") {
+            return Err(ApiError::invalid_request(
+                "vmm_disk_id must not be empty when present",
+            ));
         }
         Ok(())
     }

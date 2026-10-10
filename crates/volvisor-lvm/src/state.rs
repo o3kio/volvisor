@@ -87,6 +87,15 @@ pub struct AttachmentRecord {
     pub generation: u64,
     /// Granted access mode.
     pub access_mode: AccessMode,
+    /// The VMM-side disk id the consumer configured for this
+    /// frontend, when it configured one (P6-B): the durable mapping
+    /// a grow's capacity notification addresses the VMM's
+    /// resize-disk call with. Absent on an attached volume is a
+    /// recorded, fail-closed refusal reason at notification time —
+    /// never a guess. Optional and defaulted so state files written
+    /// before P6-B load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
 }
 
 /// A claimed physical device.
@@ -295,6 +304,7 @@ mod tests {
                         host_id: HostId::new("host-1").expect("valid id"),
                         generation: 1,
                         access_mode: AccessMode::SingleWriter,
+                        vmm_disk_id: None,
                     }),
                 },
             },

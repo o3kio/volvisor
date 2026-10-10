@@ -79,7 +79,7 @@ authority: { epoch, lease_state, holder, lease_remaining_secs }
 
 ```text
 Attach(volume_id, vm_id, host_id, attachment_id, expected_volume_generation,
-       access_mode=single_writer, requested_frontend, idempotency_key)
+       access_mode=single_writer, requested_frontend, vmm_disk_id, idempotency_key)
 Detach(attachment_id, expected_attachment_generation, vm_stopped_or_io_drained_proof)
 ```
 
@@ -88,6 +88,12 @@ Conditions:
 - other readers only if backend and consumer have an explicit safe multi-reader contract;
 - no guessed path or tenant-accessible backend credential;
 - attach returns a **host-scoped, ephemeral backend handle**, not raw secrets;
+- `vmm_disk_id`, when the consumer sets it, is the consumer's own VMM device
+  identity for the frontend (e.g. Cloud Hypervisor's `--disk path=...,id=...`),
+  recorded with the attachment as the durable mapping a grow's capacity
+  notification addresses (section 4A); the provider never invents one — an
+  attached volume without a recorded id cannot be notified, and the grow
+  reports the recorded refusal, never a silent un-notified success;
 - VMM attach evidence must distinguish `prepared`, `advertised` and `active`;
 - detach cannot release authority until in-flight writes are drained and stale device handles rejected;
 - stale generations return a typed conflict, not success;
@@ -115,7 +121,7 @@ MoveVolumeBackingOnline(volume_id, target_pool_id, expected_generation,
      FAILED | IN_DOUBT
 ```
 
-- Grow-only by default; backend may grow before the VMM/guest is notified. The provider must retry notification, not automatically shrink. Guest filesystem expansion is not implied. For an **attached** volume the notification is version-gated per [ADR-0006](../docs/adr/0006-online-resize-and-live-local-block-relocation.md): it is issued through the VMM's resize-disk API only on a pinned, startup-verified version (upstream PR #7948 for externally grown host block devices); when the version is not proven, the grow of an attached volume refuses typed rather than growing silently un-notified. The `guest_notification_status` field records the outcome — `notified`, `retry_required` (pending or failed notification; the retry rule above) or `not_applicable` (no frontend).
+- Grow-only by default; backend may grow before the VMM/guest is notified. The provider must retry notification, not automatically shrink. Guest filesystem expansion is not implied. For an **attached** volume the notification is version-gated per [ADR-0006](../docs/adr/0006-online-resize-and-live-local-block-relocation.md): it is issued through the VMM's resize-disk API (REST over the per-VM API socket; the disk identity is the consumer-declared `vmm_disk_id` recorded at attach, section 3) only on a pinned, startup-verified version (upstream PR #7948 for externally grown host block devices); when the version is not proven, the **notification** is refused typed with the recorded reason — the grow itself succeeds and the response honestly reports `retry_required` — rather than growing silently un-notified. The `guest_notification_status` field records the outcome — `notified`, `retry_required` (pending or failed notification; the retry rule above) or `not_applicable` (no frontend).
 - `MoveVolumeBackingOnline` does not change compute host or guest disk identity. Backends advertise `same_vg_extent_move` and `same_host_live_backing_move` separately, bound to actual LV layout/VMM/frontend/QSD qualification.
 - **P6 implementation scope (ADR-0006 first slice):** only `same_vg_extent_move` is implemented and advertised; `same_host_live_backing_move` is advertised nowhere until the QSD mirror/pivot acceptance suite passes. Any move outside the advertised, qualified capability scope — cross-VG, cross-pool, cross-class, or a capability the backend does not qualify — is refused typed with `MOVE_UNSUPPORTED_SCOPE` (fail-closed, never silent, never a generic `FAILED`).
 - Native LVM `pvmove` is restricted to supported physical extent migrations within the same VG, and should not be presented as arbitrary per-thin-LV cross-pool movement.

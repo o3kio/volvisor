@@ -25,7 +25,20 @@
 //!   the Cloud Hypervisor `ch-remote` adapter
 //!   ([`vmm::ChRemoteVmm`]) over [`CommandRunner`], and the TEST-ONLY
 //!   [`vmm::FakeVmm`] harness that makes the device-open discipline
-//!   provable in tests.
+//!   provable in tests;
+//! - [`vmm_http`]: the hand-rolled HTTP/1.1 `PUT` over a unix domain
+//!   socket behind [`vmm::VmmController::resize_disk`] (P6-B — the
+//!   REST-only resize-disk call; `ch-remote` has no such
+//!   subcommand);
+//! - [`vmm_version`]: the Cloud Hypervisor version gate (P6-B) — the
+//!   semver type, the tolerant `--version` output scan and the
+//!   startup probe caching the fail-closed verdict the
+//!   grow-notification consults;
+//! - [`grow`]: the grow-notification engine (P6-B, ADR-0006 first
+//!   slice part 1) — the real `guest_notification_status` machine:
+//!   the [`grow::GrowNotifier`] seam the API layer composes inside
+//!   the grow operation, the durable notification store and the
+//!   retry pass that restores the notification invariant.
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -38,19 +51,28 @@
 pub mod admin;
 pub mod conformance;
 pub mod fake;
+pub mod grow;
 pub mod handoff;
 pub mod provider;
 pub mod runner;
 pub mod vmm;
+pub mod vmm_http;
+pub mod vmm_version;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
+pub use grow::{
+    AttachmentForGrow, GrowAttachmentFacts, GrowNotificationEngine, GrowNotificationRecord,
+    GrowNotificationStatus, GrowNotificationStore, GrowNotifier, GrowRetryReport,
+};
 pub use handoff::{
     EligibilityParticipant, EligibilityReport, HandoffSurface, QuiesceProof, SyncProof,
 };
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
 pub use vmm::{
-    ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeVmm, PauseProof,
-    VmState, VmmController,
+    ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeResizeCall, FakeVmm,
+    PauseProof, VmState, VmmController,
 };
+pub use vmm_http::{MAX_RESPONSE_BYTES, VmmHttpResponse};
+pub use vmm_version::{GateVerdict, Semver, VmmVersionGate, parse_version_output};
