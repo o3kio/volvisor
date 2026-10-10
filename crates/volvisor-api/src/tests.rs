@@ -2139,6 +2139,13 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         Err(ApiError::not_found("not scripted"))
     }
 
+    async fn replica_caught_up(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
     async fn track_sync(
         &self,
         _volume_id: &volvisor_types::VolumeId,

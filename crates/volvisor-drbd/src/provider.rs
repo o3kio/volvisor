@@ -367,6 +367,10 @@ impl HandoffSurface for DrbdProvider {
         DrbdProvider::handoff_eligibility(self, vm_id)
     }
 
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        DrbdProvider::replica_caught_up(self, volume_id)
+    }
+
     async fn quiesce_for_barrier(
         &self,
         volume_id: &VolumeId,
@@ -5337,6 +5341,61 @@ impl DrbdProvider {
             format!(
                 "the peer of {} has not converged through the barrier yet (peer-disk {:?}, \
                  resync {}, connection {}): retry the observation",
+                entry.resource_name,
+                status.peer_disk,
+                if resync_active { "active" } else { "idle" },
+                if connection_established {
+                    "established"
+                } else {
+                    "not established"
+                },
+            ),
+        ))
+    }
+
+    /// Observe whether the replication has caught up **while the
+    /// source is still the writer** — the contract's `PRECOPY` step
+    /// ("source writer; replica catch-up"): peer disk `UpToDate`, no
+    /// resync in progress, connection established. Unlike
+    /// [`Self::track_sync`] this mints no proof: no boundary exists
+    /// yet, so the observation claims nothing about one; it exists so
+    /// the caller can wait for convergence *before* pausing the VM
+    /// and bound the pause window. A single observation — the caller
+    /// owns the bounded wait and retries the typed
+    /// `REPLICA_NOT_DURABLE` refusal while the peer lags.
+    ///
+    /// # Errors
+    /// [`ApiErrorCode::ReplicaNotDurable`] while the peer has not
+    /// caught up (retryable); `NOT_FOUND` for an unknown volume;
+    /// `INVALID_STATE` when the resource is verifiably down;
+    /// `INTERNAL` when the status query fails.
+    pub fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        let entry = stored.entry.clone();
+        let status = self.resource_status(&entry.resource_name)?;
+        let Some(status) = status else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {} is down; volume {volume_id} requires reconciliation",
+                    entry.resource_name
+                ),
+            ));
+        };
+        let peer_up_to_date = status.peer_disk == Some(DiskState::UpToDate);
+        let resync_active = status.replication.is_some();
+        let connection_established = status.connected;
+        if peer_up_to_date && !resync_active && connection_established {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ApiErrorCode::ReplicaNotDurable,
+            format!(
+                "the peer of {} has not caught up yet (peer-disk {:?}, resync {}, \
+                 connection {}): retry the observation",
                 entry.resource_name,
                 status.peer_disk,
                 if resync_active { "active" } else { "idle" },

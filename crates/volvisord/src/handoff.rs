@@ -30,6 +30,7 @@
 //! | `target_granted` | witness `inspect`: lease live **and** held by the target host |
 //! | `witness_reachable` | a bounded TCP connect to the witness endpoint (below) |
 //! | `prepare_target` / `discard_target` | peer `prepare` / `discard` |
+//! | `replica_caught_up` | `HandoffSurface::replica_caught_up`, the same bounded retry — the pre-quiesce `PRECOPY` convergence observation (no proof minted; the D2 proof stays `track_sync`'s) |
 //! | `pause_vm` / `snapshot_vm` / `destroy_vm` | local `VmmController` (verified adapter) |
 //! | `quiesce_source` | `HandoffSurface::quiesce_for_barrier` |
 //! | `track_sync` | `HandoffSurface::track_sync`, bounded retry over the retryable `REPLICA_NOT_DURABLE` refusal |
@@ -659,6 +660,36 @@ impl HandoffDriver for DaemonHandoffDriver {
             })
             .await?;
         Ok(())
+    }
+
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        // The pre-quiesce convergence observation (the contract's
+        // `PRECOPY` step: the source is still the writer, no boundary
+        // exists yet) shares the driver-owned bounded wait: the
+        // retryable REPLICA_NOT_DURABLE refusal is retried inside the
+        // bound and only the bound's expiry surfaces as the drive's
+        // typed error — surfaced at `PREPARED`, before any suspension
+        // or barrier, so the abort path is fully intact.
+        let deadline = std::time::Instant::now() + self.track_sync_bound;
+        loop {
+            match self.handoff.replica_caught_up(volume_id).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code == ApiErrorCode::ReplicaNotDurable => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ApiError::new(
+                            ApiErrorCode::ReplicaNotDurable,
+                            format!(
+                                "the peer of {volume_id} did not converge before the quiesce \
+                                 within {} s (last refusal: {error})",
+                                self.track_sync_bound.as_secs()
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(self.track_sync_retry_delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn pause_vm(&self, vm_id: &str) -> Result<(), ApiError> {
@@ -1645,6 +1676,13 @@ mod tests {
                 cut_marker_durable: true,
                 suspended_at: 0,
             })
+        }
+
+        async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+            // The pre-quiesce observation shares the fake's
+            // convergence model (the lag knobs) but mints no proof —
+            // mirroring the real split from `track_sync`.
+            self.track_sync(volume_id).await.map(|_| ())
         }
 
         async fn track_sync(&self, volume_id: &VolumeId) -> Result<SyncProof, ApiError> {

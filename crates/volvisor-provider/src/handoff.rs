@@ -19,6 +19,11 @@
 //!   migration-cut marker** first (write-ahead: the marker is
 //!   persisted before the suspension command, so a crash in between
 //!   leaves a volume the provider's own reconcile refuses to resume);
+//! - [`HandoffSurface::replica_caught_up`] observes pre-quiesce
+//!   replication convergence while the source is still the writer
+//!   (the contract's `PRECOPY` step) — no proof is minted, because
+//!   no boundary exists yet; it bounds the pause window by waiting
+//!   before the quiesce;
 //! - [`HandoffSurface::track_sync`] proves replication catch-up by
 //!   observation, **only after** the suspension fixed the boundary (a
 //!   catch-up observation taken before the freeze proves nothing about
@@ -160,6 +165,32 @@ pub trait HandoffSurface: Send + Sync {
     /// unreadable state); an ineligible participant is a **result**
     /// carried in the report with typed reasons, never an error.
     async fn handoff_eligibility(&self, vm_id: &str) -> Result<EligibilityReport, ApiError>;
+
+    /// Observe whether the replication has caught up **while the
+    /// source is still the writer** — the contract's `PRECOPY` step
+    /// ("source writer; replica catch-up"): peer disk `UpToDate`, no
+    /// resync in progress, connection established.
+    ///
+    /// This is **not** the D2 barrier proof and mints no proof
+    /// object: no boundary exists yet, so the observation claims
+    /// nothing about one. It exists so the coordinator can wait for
+    /// convergence *before* pausing the VM, bounding the pause
+    /// window (the contract's rate-control duty: "prioritize
+    /// convergence and abort before destructive cutover"). The D2
+    /// proof is [`Self::track_sync`], taken strictly after the
+    /// suspension fixed the boundary.
+    ///
+    /// Like `track_sync` this is a single observation: the caller
+    /// owns the bounded wait and retries the typed, retryable
+    /// refusal while the peer lags.
+    ///
+    /// # Errors
+    /// [`ApiError`] with code
+    /// `volvisor_types::ApiErrorCode::ReplicaNotDurable` while the
+    /// peer has not caught up (retryable); typed refusals for an
+    /// unknown volume or a resource that is verifiably down;
+    /// `INTERNAL` when the status query fails.
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
 
     /// Suspend one participant's source I/O at the kernel enforcement
     /// point and stamp the durable migration-cut marker (D6a),

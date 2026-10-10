@@ -297,6 +297,10 @@ impl HandoffDriver for FakeDriver {
         self.vcall("track_sync", volume_id)
     }
 
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        self.vcall("replica_caught_up", volume_id)
+    }
+
     async fn record_barrier(
         &self,
         volume_id: &VolumeId,
@@ -1125,6 +1129,7 @@ async fn resolve_rolls_back_pre_cut_states() {
     // The AutoBeforeCut reconcile: every pre-cut state without a cut
     // is rolled back at startup (the consumer re-issues).
     for act in [
+        "replica_caught_up:vol-a",
         "track_sync:vol-a",
         "quiesce_source:vol-a",
         "record_barrier:vol-b",

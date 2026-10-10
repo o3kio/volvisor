@@ -82,6 +82,17 @@ pub trait HandoffDriver: Send + Sync {
     /// Discard the target-side preparation (the pre-cut abort tail).
     async fn discard_target(&self, record: &MigrationRecord) -> Result<(), ApiError>;
 
+    /// Observe pre-quiesce replica catch-up per participant (the
+    /// contract's `PRECOPY` step: "source writer; replica catch-up").
+    /// **Not** the D2 proof and mints none — no boundary exists yet;
+    /// this step exists so the drive waits for convergence *before*
+    /// pausing the VM, bounding the pause window. The D2 boundary
+    /// proof is [`Self::track_sync`], taken strictly after the
+    /// suspension. The driver owns the bounded wait; a timeout is
+    /// its typed error (surfaced at `PREPARED`, before any
+    /// suspension or barrier — the abort path is intact).
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+
     /// Pause the source VM (verified: the adapter requires the
     /// observed `Paused` state, not the command's exit status).
     async fn pause_vm(&self, vm_id: &str) -> Result<(), ApiError>;
@@ -654,16 +665,22 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         Ok(())
     }
 
-    /// `Prepared → Precopy`: observe replication catch-up per
-    /// participant. The driver owns the bounded wait; a timeout is its
-    /// typed error (surfaced here — no state corruption, plan §9 row
-    /// 9).
+    /// `Prepared → Precopy`: observe pre-quiesce replica catch-up per
+    /// participant (the contract's `PRECOPY` step: the source is
+    /// still the writer). This is **not** the D2 boundary proof —
+    /// that is `drive_barriers`'s post-suspension `track_sync`; this
+    /// step waits for convergence *before* the pause to bound the
+    /// pause window. The driver owns the bounded wait; a timeout is
+    /// its typed error (surfaced here — no state corruption, plan §9
+    /// row 9).
     async fn drive_precopy(&self, record: &mut MigrationRecord) -> Result<(), ApiError> {
         if record.state != HandoffState::Prepared {
             return Ok(());
         }
         for participant in &record.participants {
-            self.driver.track_sync(&participant.volume_id).await?;
+            self.driver
+                .replica_caught_up(&participant.volume_id)
+                .await?;
         }
         self.transition(record, HandoffState::Precopy, None, None)
     }

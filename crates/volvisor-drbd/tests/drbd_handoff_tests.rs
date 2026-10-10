@@ -820,6 +820,51 @@ async fn a_cut_that_outlives_its_lease_fences_but_keeps_the_marker() {
     assert!(cut_marker_of(&state.state_path, &state.volume).is_none());
 }
 
+// ------------------------------------------ replica_caught_up (PRECOPY)
+
+/// The pre-quiesce convergence observation (the contract's `PRECOPY`
+/// step — the source is still the writer): it answers convergence
+/// through the REAL status tokens while nothing is suspended and no
+/// marker exists — minting no proof, claiming nothing about a
+/// boundary — and shares the retryable refusal shape so the driver's
+/// bounded wait treats it exactly like the barrier wait. The D2 proof
+/// stays `track_sync`'s alone (the row-9 test below proves that
+/// split: the pre-freeze `track_sync` is refused outright).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replica_caught_up_observes_convergence_before_the_quiesce() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-precopy").await;
+    // The source is still the writer: no marker, no suspension — and
+    // the observation is served, because it claims nothing about a
+    // boundary (there is none yet).
+    state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect("converged while the source writes");
+    // Peer lag (fake asynchronous apply) is the same typed,
+    // retryable refusal the bounded wait retries.
+    set_peer_lag(&state.world, SEED_MINOR, true);
+    let lagging = state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect_err("the peer has not caught up");
+    assert_eq!(lagging.code, ApiErrorCode::ReplicaNotDurable);
+    assert!(lagging.detail.contains("retry"));
+    // Convergence flips back on.
+    set_peer_lag(&state.world, SEED_MINOR, false);
+    state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect("converged again");
+    // A lost connection is a refusal too, never a silent Ok.
+    state.world.lock().expect("world").peer_online = false;
+    let disconnected = state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect_err("no connection, no convergence claim");
+    assert_eq!(disconnected.code, ApiErrorCode::ReplicaNotDurable);
+}
+
 // -------------------------------------------------- track_sync (row 9)
 
 /// Peer lag (fake asynchronous apply) makes the barrier wait: the
