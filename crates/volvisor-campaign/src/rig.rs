@@ -890,8 +890,17 @@ pub struct Rig {
     /// The scenario's VM id (created and started on the source).
     pub vm: String,
     /// The scenario's volume id (identity-seeded on the source,
-    /// peer-seeded on the destination, attached to the VM).
+    /// peer-seeded on the destination, attached to the VM) — the
+    /// FIRST of [`Rig::volumes`] (the single-volume scenarios' name).
     pub volume: String,
+    /// Every participating volume id, in attach order (the
+    /// multi-volume cut's participant set, §9 row 12).
+    pub volumes: Vec<String>,
+    /// The source host's fixture directory (the survivor daemon of
+    /// [`Rig::launch_source_survivor`] boots over it).
+    pub source_base: PathBuf,
+    /// The destination host's fixture directory.
+    pub target_base: PathBuf,
     /// The source's fake VMM (the writer's guest-I/O model reads
     /// its VM state).
     pub vmm_a: Arc<FakeVmm>,
@@ -964,74 +973,90 @@ pub fn role_of(world: &Arc<Mutex<FakeDrbd>>, resource: &str) -> Role {
 }
 
 /// The source's writer shape (setup, not scenario driving — the e2e
-/// composition boundary): register the volume, attach it single-
-/// writer (generation 1; the witness grants epoch 1 to node-a on
-/// the promote), then create and start the VM holding its device.
+/// composition boundary): register every volume, attach each
+/// single-writer (generation 1; the witness grants epoch 1 to node-a
+/// on the promote), then create and start the VM holding every
+/// volume's device.
 async fn seed_source_workload(
     provider: &Arc<DrbdProvider>,
     vmm: &Arc<FakeVmm>,
-    volume_id: &str,
+    volume_ids: &[String],
     vm: &str,
 ) {
-    let volume = VolumeId::new(volume_id).expect("valid volume id");
-    provider.register_volume(&volume, None).expect("register");
-    provider
-        .attach_volume(&volume, &attach_req(volume_id, vm, NODE))
-        .await
-        .expect("attach");
-    vmm.create(vm, &[&format!("/dev/drbd{SEED_MINOR}")])
-        .expect("create VM");
+    for volume_id in volume_ids {
+        let volume = VolumeId::new(volume_id).expect("valid volume id");
+        provider.register_volume(&volume, None).expect("register");
+        provider
+            .attach_volume(&volume, &attach_req(volume_id, vm, NODE))
+            .await
+            .expect("attach");
+    }
+    // The `i`-th volume's device identity (the constructor's
+    // documented allocation).
+    let volume_count: u32 = volume_ids.len().try_into().expect("volume count fits u32");
+    let owned: Vec<String> = (0..volume_count)
+        .map(|index| format!("/dev/drbd{}", SEED_MINOR + index))
+        .collect();
+    let devices: Vec<&str> = owned.iter().map(String::as_str).collect();
+    vmm.create(vm, &devices).expect("create VM");
     vmm.start(vm).expect("start VM");
 }
 
-/// Seed the linked replication pair for one volume (§2.1): the
-/// volume identity-seeded on the source, peer-seeded on the
-/// destination (both BEFORE the providers construct — providers
-/// load state at construction), and the two worlds linked so queue
-/// drains and content-copying resyncs on either side hand blocks to
-/// the other's same-named resource — the oracle's destination reads
-/// observe real delivered content.
-fn seed_linked_pair(
-    source: &volvisor_drbd_testkit::Fixture,
-    target: &volvisor_drbd_testkit::Fixture,
-    volume_id: &str,
-) {
-    seed_volume_with_identity(
-        &source.base,
-        &source.world,
-        volume_id,
-        GIB,
-        volvisor_drbd::state::ReplicationMode::A,
-        SEED_MINOR,
-        SEED_PORT,
-    );
-    seed_peer_volume(
-        &target.base,
-        &target.world,
-        volume_id,
-        GIB,
-        volvisor_drbd::state::ReplicationMode::A,
-        SEED_MINOR,
-        SEED_PORT,
-    );
-    link_replication_peers(&source.world, &target.world);
+/// Build the full campaign fixture for one VM and one volume (the
+/// single-volume shape — see [`campaign_rig_volumes`]).
+pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
+    campaign_rig_volumes(vm, &[volume_id]).await
 }
 
-/// Build the full campaign fixture for one VM and one volume:
-/// witness, both worlds (the volume seeded BEFORE the providers
-/// construct — providers load state at construction — and the
+/// Build the full campaign fixture for one VM and N volumes (§9
+/// row 12's multi-volume cut): witness, both worlds (every volume
+/// identity-seeded on the source and peer-seeded on the destination
+/// BEFORE the providers construct — providers load state at
+/// construction — with one device identity per volume, and the two
 /// worlds LINKED so queue drains and resyncs really move content,
 /// §2.1), both providers, both wired VMMs, the source's
-/// register/attach/VM, then both daemons under the supervisor.
-pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
+/// register/attach/VM over every volume, then both daemons under
+/// the supervisor. The `i`-th volume's device identity is
+/// `SEED_MINOR + i` / `SEED_PORT + i` (the fixture's allocation
+/// ranges hold ten volumes; more than that is a rig bug).
+pub async fn campaign_rig_volumes(vm: &str, volume_ids: &[&str]) -> Rig {
     install_panic_filter();
+    assert!(
+        !volume_ids.is_empty(),
+        "a campaign rig needs at least one volume"
+    );
+    let volume_ids: Vec<String> = volume_ids.iter().map(ToString::to_string).collect();
     let clock = Arc::new(AtomicU64::new(START));
     let witness = WitnessHandle::spawn(Arc::clone(&clock)).await;
 
     let source = fixture();
     let target = fixture();
     let target_state = target.base.join("state-peer.json");
-    seed_linked_pair(&source, &target, volume_id);
+    for (index, volume_id) in volume_ids.iter().enumerate() {
+        let index: u32 = index.try_into().expect("volume index fits u32");
+        let port_delta: u16 = index.try_into().expect("volume index fits u16");
+        let minor = SEED_MINOR + index;
+        let port = SEED_PORT + port_delta;
+        seed_volume_with_identity(
+            &source.base,
+            &source.world,
+            volume_id,
+            GIB,
+            volvisor_drbd::state::ReplicationMode::A,
+            minor,
+            port,
+        );
+        seed_peer_volume(
+            &target.base,
+            &target.world,
+            volume_id,
+            GIB,
+            volvisor_drbd::state::ReplicationMode::A,
+            minor,
+            port,
+        );
+    }
+    link_replication_peers(&source.world, &target.world);
 
     let snapshot_root = leak_tempdir();
     let (vmm_a, _devices_a) = wired_vmm(&snapshot_root, &source.world);
@@ -1087,7 +1112,7 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
     // daemon launch then constructs its own fresh provider over the
     // same durable state file (the honest restart shape — the
     // setup's saves are what the launch re-loads).
-    seed_source_workload(&core_a.make_provider(), &vmm_a, volume_id, vm).await;
+    seed_source_workload(&core_a.make_provider(), &vmm_a, &volume_ids, vm).await;
 
     let b = Daemon::launch(core_b, listener_b).await;
     let a = Daemon::launch(core_a, listener_a).await;
@@ -1098,7 +1123,10 @@ pub async fn campaign_rig(vm: &str, volume_id: &str) -> Rig {
         clock,
         snapshot_root,
         vm: vm.to_owned(),
-        volume: volume_id.to_owned(),
+        volume: volume_ids[0].clone(),
+        volumes: volume_ids,
+        source_base: source.base.clone(),
+        target_base: target.base.clone(),
         vmm_a,
         world_a: Arc::clone(&source.world),
         world_b: Arc::clone(&target.world),
@@ -1115,6 +1143,52 @@ impl Rig {
     /// The rig's volume id, typed.
     pub fn volume_id(&self) -> VolumeId {
         VolumeId::new(self.volume.as_str()).expect("valid volume id")
+    }
+
+    /// The DRBD resource names of every participating volume, in
+    /// [`Rig::volumes`] order (deterministic; the same names in
+    /// both worlds).
+    pub fn resources(&self) -> Vec<String> {
+        self.volumes
+            .iter()
+            .map(|volume| resource_name_for(&VolumeId::new(volume.as_str()).expect("valid id")))
+            .collect()
+    }
+
+    /// Launch the P4a "surviving host" daemon over the SOURCE's host
+    /// directory (§5.1's promotion attempt of the source): a fresh
+    /// control state (a state file of its own — no tracked volumes)
+    /// over the source's world, config and identity, sharing the
+    /// witness and the peer link. This is the unplanned-failover
+    /// composition the adopt flow exists for (`drbd_authority_tests`
+    /// boots the same shape in-process): the operator tries to bring
+    /// the volume back on a host whose control state was lost, and
+    /// the adopt route's classification answers from observed facts
+    /// only. The survivor holds its OWN journal (fresh) and never
+    /// touches the source daemon's — the two daemons coexist, the
+    /// parked source keeps its retry task.
+    pub async fn launch_source_survivor(&self, tag: &str) -> Daemon {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind survivor");
+        let core = daemon_core(DaemonCore {
+            name: NODE.to_owned(),
+            witness_token: NODE_TOKEN.to_owned(),
+            state_path: self.source_base.join(format!("state-survivor-{tag}.json")),
+            world: Arc::clone(&self.world_a),
+            journal_dir: leak_tempdir(),
+            provider_config: config_for(&self.source_base),
+            vmm: Arc::clone(&self.vmm_a),
+            peer_addr: self.b.addr,
+            witness_addr: self.witness.addr,
+            clock: clock_of(&self.clock),
+            snapshot_root: self.snapshot_root.clone(),
+            crash: Arc::new(CrashHooks::new()),
+            group: Mutex::new(None),
+            dead_group: Mutex::new(None),
+            killed: Arc::new(AtomicBool::new(false)),
+        });
+        Daemon::launch(core, listener).await
     }
 }
 
