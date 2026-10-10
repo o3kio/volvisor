@@ -90,7 +90,12 @@ evidence status stated honestly:
   root cause (the kit's `server.handle.abort()` aborts the axum serve
   without draining in-flight renewals) is unproven, so the fix must start
   from either a reproduction or a drain fix that is provably correct
-  regardless;
+  regardless — **resolved in PR #21 (P6-A part 1): the suspicion was
+  right in class, refined in mechanism (the abort's close of the
+  lingering keep-alive connections is asynchronous, so a renewal
+  dispatched over the client's pooled connection could complete inside
+  that window); the kit's abort is replaced by a graceful-shutdown drain
+  whose completion proves no connection remains serviceable**;
 - the **kill-matrix startup race** in the campaign suite
   (`row_5_consumer_mobility_kill_matrix`, the post-restart "rolled back to
   aborted" assertion in `rows_4_7.rs`): reproduced roughly 2–3 of 6

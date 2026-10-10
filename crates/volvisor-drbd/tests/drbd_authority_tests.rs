@@ -79,9 +79,53 @@ const INTERVAL: u64 = 20;
 
 // ---------------------------------------------------------------- kit
 
+/// The loopback witness server: the serve task plus the
+/// graceful-shutdown trigger that makes [`Server::stop`] a
+/// deterministic unreachability gate (see its docs).
 struct Server {
     addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
+    /// The shutdown trigger: dropped by [`Server::stop`] to start
+    /// the drain. `None` once stopped.
+    shutdown: Option<tokio::sync::watch::Sender<()>>,
+    /// The serve task: taken and awaited by [`Server::stop`] (the
+    /// drain barrier). `None` once stopped.
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Server {
+    /// Make the witness deterministically unreachable, and PROVE it:
+    /// drop the shutdown trigger, then await the serve future to
+    /// completion. Axum's graceful shutdown gives that completion an
+    /// exact meaning — the serve future returns only after the
+    /// listener is dropped (new connections are refused) AND every
+    /// already-accepted connection's task has exited (in-flight
+    /// requests drained; no idle keep-alive connection is left
+    /// serviceable). After this returns, no request can complete
+    /// against the server, whatever the client does with its pooled
+    /// connections.
+    ///
+    /// The old shape — `handle.abort()` — raced exactly that: the
+    /// abort closes the lingering connections asynchronously (the
+    /// serve future's drop closes the signal channel; each
+    /// connection task then gracefully shuts down whenever it is
+    /// next polled), so a request dispatched right after the abort
+    /// over the client's pooled keep-alive connection could still be
+    /// read and processed before the close landed — a renewal
+    /// completing against the "unreachable" witness (the recorded
+    /// ~1-in-20 full-suite flake in
+    /// `an_unreachable_witness_defers_renewal_until_the_deadline`;
+    /// the probe evidence: the renewal is dispatched over the
+    /// lingering connection in most runs — a `SendRequest` transport
+    /// error, not `Connect` — and whether the close or the request
+    /// wins is a scheduling race load can flip).
+    ///
+    /// Idempotent: a second call is a no-op.
+    async fn stop(&mut self) {
+        drop(self.shutdown.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
 }
 
 async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
@@ -108,10 +152,24 @@ async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
+    // Graceful shutdown over a watch trigger: dropping the sender
+    // (Server::stop) completes the signal future, the serve loop
+    // stops accepting, tells every connection task to drain, and
+    // waits for all of them — the drain barrier stop() awaits.
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server serves");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await
+            .expect("server serves");
     });
-    Server { addr, handle }
+    Server {
+        addr,
+        shutdown: Some(shutdown),
+        handle: Some(handle),
+    }
 }
 
 /// The legacy shared-token client (read-only on a v2 witness: used for
@@ -431,13 +489,13 @@ async fn attach_without_registration_is_refused_typed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_witness_refuses_attach_typed() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let f = fixture();
     seed_volume(&f.base, &f.world, "vol-down", GIB);
     let provider = authority_provider(&kit, &f.state_path, &f.world);
     let vol = volume("vol-down");
     provider.register_volume(&vol, None).expect("register");
-    kit.server.handle.abort();
+    kit.server.stop().await;
     let error = provider
         .attach_volume(&vol, &attach_req("vol-down", 1))
         .await
@@ -517,9 +575,9 @@ async fn a_superseded_epoch_self_fences() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_passed_deadline_self_fences_even_with_the_witness_down() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-deadline").await;
-    kit.server.handle.abort();
+    kit.server.stop().await;
     // Past the W5 deadline: the writer fences itself without asking.
     kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
     let report = state.provider.renew_leases().expect("renewal pass");
@@ -537,9 +595,9 @@ async fn a_passed_deadline_self_fences_even_with_the_witness_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_witness_defers_renewal_until_the_deadline() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-defer").await;
-    kit.server.handle.abort();
+    kit.server.stop().await;
     // Renewal is due, the witness is down, but the W5 deadline has not
     // passed: keep serving (the deferred entry carries the bound).
     kit.writer_clock
@@ -560,6 +618,47 @@ async fn an_unreachable_witness_defers_renewal_until_the_deadline() {
         .await
         .expect("inspect");
     assert!(inspect.authority.is_some(), "the block survives a deferral");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_witness_is_deterministically_unreachable() {
+    // The unreachability gate's own contract (the fix for the
+    // recorded renewal-deadline flake): after `Server::stop` returns,
+    // NO request can complete against the witness — the drain is
+    // proven, not assumed. The abort shape this replaces could still
+    // answer on the client's pooled keep-alive connection inside the
+    // asynchronous close window; under load that race completed
+    // renewals against the "dead" witness (~1-in-20 full suites).
+    // This test fails on that old behavior in exactly the same
+    // stochastic way — and is deterministic under the drain.
+    let mut kit = witness_kit().await;
+    let state = attached(&kit, "vol-gate").await;
+    kit.server.stop().await;
+
+    // The provider path: a due renewal defers (the local W5 deadline
+    // is the bound), never renews, never fences.
+    kit.writer_clock
+        .store(START + INTERVAL + 1, Ordering::SeqCst);
+    let report = state.provider.renew_leases().expect("renewal pass");
+    assert_eq!(report.renewed, Vec::<volvisor_types::VolumeId>::new());
+    assert_eq!(
+        report.fenced,
+        Vec::<volvisor_drbd::state::FencedVolume>::new()
+    );
+    assert_eq!(report.deferred.len(), 1);
+
+    // The client path: a direct request over the very connection the
+    // attach pooled cannot complete either — the gate holds at the
+    // transport level, not just through the provider's error mapping.
+    let error = kit
+        .client
+        .inspect(&state.volume)
+        .await
+        .expect_err("a stopped witness answers nothing");
+    assert!(
+        matches!(error, volvisor_witness::proto::WitnessError::Unreachable(_)),
+        "the direct request is a transport unreachability: {error:?}"
+    );
 }
 
 // ----------------------------------------------------------- detach
@@ -629,9 +728,9 @@ async fn startup_validation_resumes_a_proven_primary() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_with_the_witness_down_stays_suspended_and_failed() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-stalled").await;
-    kit.server.handle.abort();
+    kit.server.stop().await;
     let provider = authority_provider(&kit, &state.state_path, &state.world);
     // Fail-closed: the unproven writer stays frozen, never resumed.
     assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
