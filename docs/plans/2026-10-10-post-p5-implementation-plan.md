@@ -104,21 +104,28 @@ witness fault still injected.
 ### P6-B: grow-notification (ADR-0006 first slice, part 1)
 
 **Scope.** `GrowVolume` on an attached `native-local` volume completes the
-VMM capacity-notification step through the existing `ChRemoteVmm` adapter
-(`PUT /api/v1/vm.resize-disk`): the Cloud Hypervisor version is **pinned
+VMM capacity-notification step through the existing `ChRemoteVmm`
+controller's REST call over the per-VM API socket
+(`PUT /api/v1/vm.resize-disk`; Cloud Hypervisor's `ch-remote` CLI has no
+resize-disk subcommand — the resize-disk API is REST-only): the Cloud
+Hypervisor version is **pinned
 and verified at startup** (upstream PR #7948 required for externally grown
 host block devices; vhost-user-blk resize remains out of scope); an
-unproven version refuses the attached grow **typed** instead of growing
-silently un-notified. Partial-failure semantics per the contract: the
+unproven version refuses the **notification** typed with the recorded
+reason — the grow itself succeeds and the response reports
+`retry_required` — instead of growing silently un-notified. Partial-failure semantics per the contract: the
 backend may grow before the VMM/guest is notified; the provider **retries
 the notification, never shrinks to undo** — `guest_notification_status`
 becomes a real state machine (`notified` / `retry_required` /
 `not_applicable`) instead of today's placeholder (no notification path
 exists; an attached volume always reports `retry_required`).
 
-**Test/evidence shape.** argv-exact tests against the scripted runner (the
-`vmm_tests.rs` pattern): the resize-disk call's exact argv including the
-`--api-socket` convention; the version-gate refusal; the retry path.
+**Test/evidence shape.** Byte-exact tests against the UDS transport (the
+`vmm_tests.rs` pattern): the resize-disk request's exact bytes — request
+line, headers and JSON body over the per-VM API socket (the API is
+REST-only; `ch-remote` has no resize-disk subcommand); the version-gate
+probe stays argv-exact (`<binary> --version` through the runner); the
+version-gate refusal; the retry path.
 Integration through `FakeVmm` (the campaign rig's writer/poll shapes): a
 grow during attachment flips `retry_required` → `notified` on the retry
 tick; a detached grow stays `not_applicable`; the never-shrink rule is
