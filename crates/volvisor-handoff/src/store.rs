@@ -37,6 +37,10 @@ pub struct MigrationStore {
     dir: PathBuf,
     /// The loaded index, keyed by migration identity.
     records: BTreeMap<MigrationId, MigrationRecord>,
+    /// The store-save crash seam (P5 plan §3.1): inert by default,
+    /// armed only by the constructing test rig through
+    /// [`Self::store_crash_hooks`].
+    crash: std::sync::Arc<volvisor_types::crash::StoreCrashHooks>,
 }
 
 impl MigrationStore {
@@ -98,7 +102,11 @@ impl MigrationStore {
             }
             records.insert(file_id, record);
         }
-        Ok(Self { dir, records })
+        Ok(Self {
+            dir,
+            records,
+            crash: std::sync::Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
+        })
     }
 
     /// Load one record file, failing typed on any parse or validation
@@ -144,7 +152,7 @@ impl MigrationStore {
     /// remains intact.
     pub fn upsert(&mut self, record: &MigrationRecord) -> Result<(), ApiError> {
         let path = self.record_path(&record.migration_id);
-        save_record_atomic(&path, record)?;
+        save_record_atomic(&path, record, &self.crash)?;
         self.records
             .insert(record.migration_id.clone(), record.clone());
         Ok(())
@@ -180,6 +188,14 @@ impl MigrationStore {
         &self.dir
     }
 
+    /// The store-save crash seam (P5 plan §3.1): the armed table a
+    /// test rig aims and the kill switch fires into. Inert unless a
+    /// rig arms it; no route or input reaches it.
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> &std::sync::Arc<volvisor_types::crash::StoreCrashHooks> {
+        &self.crash
+    }
+
     fn record_path(&self, migration_id: &MigrationId) -> PathBuf {
         self.dir.join(format!("{migration_id}.json"))
     }
@@ -188,10 +204,17 @@ impl MigrationStore {
 /// Persist `record` at `path` atomically: serialize → write
 /// `<path>.tmp` (owner-only `0600` on unix) → fsync → rename over
 /// `path` → fsync the parent directory. If any step fails, the temp
-/// file is removed (best effort) and the previous file remains intact.
-fn save_record_atomic(path: &Path, record: &MigrationRecord) -> Result<(), ApiError> {
+/// file is removed (best effort) and the previous file remains
+/// intact. The `crash` seam (P5 plan §3.1) can terminate the saving
+/// task at either side of the fsync/rename commit boundaries — the
+/// store-save windows a real process death lands in.
+fn save_record_atomic(
+    path: &Path,
+    record: &MigrationRecord,
+    crash: &volvisor_types::crash::StoreCrashHooks,
+) -> Result<(), ApiError> {
     let tmp_path = sibling_tmp_path(path);
-    let result = save_record_to(&tmp_path, path, record);
+    let result = save_record_to(&tmp_path, path, record, crash);
     if result.is_err() {
         // Best-effort cleanup: never leave a stale .tmp behind.
         drop(fs::remove_file(&tmp_path));
@@ -199,7 +222,12 @@ fn save_record_atomic(path: &Path, record: &MigrationRecord) -> Result<(), ApiEr
     result
 }
 
-fn save_record_to(tmp_path: &Path, path: &Path, record: &MigrationRecord) -> Result<(), ApiError> {
+fn save_record_to(
+    tmp_path: &Path,
+    path: &Path,
+    record: &MigrationRecord,
+    crash: &volvisor_types::crash::StoreCrashHooks,
+) -> Result<(), ApiError> {
     let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
     let tmp_display = tmp_path.display();
     let path_display = path.display();
@@ -209,14 +237,29 @@ fn save_record_to(tmp_path: &Path, path: &Path, record: &MigrationRecord) -> Res
         .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
     file.write_all(&data)
         .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
+    // The store-save crash points (P5 plan §3.1): after the tmp
+    // content write, after its fsync, after the rename. Inert unless
+    // the rig armed this store's seam.
+    crash.consult(
+        volvisor_types::crash::STORE_MIGRATION_RECORDS,
+        volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+    );
     file.sync_all()
         .map_err(|e| internal(format!("failed to fsync {tmp_display}: {e}")))?;
     drop(file);
+    crash.consult(
+        volvisor_types::crash::STORE_MIGRATION_RECORDS,
+        volvisor_types::crash::StoreSavePoint::AfterFsyncBeforeRename,
+    );
     fs::rename(tmp_path, path).map_err(|e| {
         internal(format!(
             "failed to rename {tmp_display} to {path_display}: {e}"
         ))
     })?;
+    crash.consult(
+        volvisor_types::crash::STORE_MIGRATION_RECORDS,
+        volvisor_types::crash::StoreSavePoint::AfterRename,
+    );
     // fsync the directory so the rename itself is durable.
     let dir = fs::File::open(
         path.parent()

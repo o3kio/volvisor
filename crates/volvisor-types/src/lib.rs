@@ -27,6 +27,7 @@
 pub mod admin;
 pub mod authority;
 pub mod capability;
+pub mod crash;
 pub mod domain;
 pub mod error;
 pub mod id;

@@ -88,6 +88,32 @@ pub const OP_PEER_RESTORE_VM: &str = "peer_restore_vm";
 /// Operation kind: destination-side peer discard.
 pub const OP_PEER_DISCARD: &str = "peer_discard";
 
+/// Every journaled operation kind the router table exposes (P5 plan
+/// §3.1's armable surface — the journal-append hook keys its armed
+/// entries on exactly these). The campaign's generated kill matrix
+/// (§3.2) consumes this list and must account for every entry:
+/// either a matrix cell drives the kind, or the kind appears in the
+/// campaign's recorded-gaps table with its reason (never a silent
+/// cut).
+pub const ALL_OP_KINDS: [&str; 16] = [
+    OP_CREATE_VOLUME,
+    OP_ATTACH_VOLUME,
+    OP_DETACH_VOLUME,
+    OP_GROW_VOLUME,
+    OP_DELETE_VOLUME,
+    OP_CLAIM_DEVICE,
+    OP_RELEASE_DEVICE,
+    OP_ADOPT_VOLUME,
+    OP_CLEAR_CUT_MARKER,
+    OP_MIGRATION_PREPARE,
+    OP_MIGRATION_TRANSFER,
+    OP_MIGRATION_ABORT,
+    OP_PEER_PREPARE,
+    OP_PEER_GRANT,
+    OP_PEER_RESTORE_VM,
+    OP_PEER_DISCARD,
+];
+
 // ---------------------------------------------------------------------------
 // Payload redaction (SPEC-0002 section 9: no secret material at rest in the
 // journal beyond what the operator already owns)

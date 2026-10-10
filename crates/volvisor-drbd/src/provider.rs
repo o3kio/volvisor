@@ -337,6 +337,10 @@ pub struct DrbdProvider {
     /// witness-managed. `None` keeps exactly the P3 behavior
     /// (pre-authority, epoch 0) for every code path below.
     authority: Option<AuthorityContext>,
+    /// The store-save crash seam (P5 plan §3.1) this provider's
+    /// state saves consult — inert unless the constructing test rig
+    /// arms it (see [`Self::store_crash_hooks`]).
+    store_crash: Arc<volvisor_types::crash::StoreCrashHooks>,
 }
 
 /// Verified adoption facts (P4a plan §5 step 1): everything the
@@ -564,6 +568,11 @@ impl DrbdProvider {
         authority: Option<AuthorityContext>,
     ) -> Result<Self, ApiError> {
         config.validate()?;
+        // The store-save crash seam (P5 plan §3.1): created inert
+        // here, attached into the loaded state so every save
+        // consults it, and exposed read-only to the constructing rig
+        // (the doc-gated trust class — no route or input reaches it).
+        let store_crash = Arc::new(volvisor_types::crash::StoreCrashHooks::new());
         let provider = Self {
             runner,
             config,
@@ -571,12 +580,26 @@ impl DrbdProvider {
             state: Mutex::new(DrbdState::default()),
             last_reconcile: Mutex::new(None),
             authority,
+            store_crash,
         };
         provider.verify_startup()?;
-        let state = DrbdState::load(&provider.state_path)?;
+        let mut state = DrbdState::load(&provider.state_path)?;
+        // The seam must survive the load: attach it into the state
+        // the provider will save from now on (the loaded state's
+        // field is `None` — it is never serialized).
+        state.attach_store_crash_hooks(Arc::clone(&provider.store_crash));
         *provider.lock_state()? = state;
         provider.reconcile()?;
         Ok(provider)
+    }
+
+    /// The provider's store-save crash seam (P5 plan §3.1): the
+    /// armed table a campaign rig aims and the kill switch fires
+    /// into. Inert unless a rig arms it; shared with the state's
+    /// saves for this provider's whole lifetime.
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> &Arc<volvisor_types::crash::StoreCrashHooks> {
+        &self.store_crash
     }
 
     /// Lock the in-memory state, mapping poisoning to `INTERNAL`.
@@ -6525,6 +6548,7 @@ mod tests {
             state: Mutex::new(DrbdState::default()),
             last_reconcile: Mutex::new(None),
             authority: None,
+            store_crash: Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
         };
         let capabilities = provider.capabilities();
         assert!(capabilities.contains(Capability::Create));

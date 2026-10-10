@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -206,6 +207,26 @@ enum Mutation {
     },
 }
 
+impl Mutation {
+    /// The mutation's serde tag (the `mutation` field's snake_case
+    /// value) — the identity the store-save crash seam (P5 plan
+    /// §3.1) keys a witness-commit arm on: the witness journals
+    /// timer-driven renewals too, so an arm must name the mutation
+    /// kind it targets to stay deterministic.
+    fn kind(&self) -> &'static str {
+        match self {
+            Mutation::Register { .. } => "register",
+            Mutation::Grant { .. } => "grant",
+            Mutation::Renew { .. } => "renew",
+            Mutation::Revoke { .. } => "revoke",
+            Mutation::RecordBarrier { .. } => "record_barrier",
+            Mutation::VoidBarrier { .. } => "void_barrier",
+            Mutation::RevokeSet { .. } => "revoke_set",
+            Mutation::GrantSet { .. } => "grant_set",
+        }
+    }
+}
+
 /// One member of a journaled [`Mutation::RevokeSet`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,9 +329,25 @@ pub struct WitnessCore {
     /// Empty after a successful operation; rebuilt never — startup
     /// roll-forward reads the intents from the journal directly.
     in_flight: HashMap<OperationId, serde_json::Value>,
+    /// The store-save crash seam (P5 plan §3.1): kills inside this
+    /// core's own durable mutations — after the intent append, or
+    /// between the in-memory apply and the outcome append (the W3b
+    /// in-flight window). `None` in every production construction;
+    /// the constructing rig attaches its instance.
+    crash: Option<Arc<volvisor_types::crash::StoreCrashHooks>>,
 }
 
 impl WitnessCore {
+    /// Attach the store-save crash seam (P5 plan §3.1) this core's
+    /// commits consult — the witness's mid-save kill points, inside
+    /// its own durable mutations. Test-rig plumbing only (the
+    /// doc-gated trust class in `volvisor-types::crash`); must be
+    /// called before the core serves (the rig constructs the core,
+    /// attaches, then wraps it in the server state).
+    pub fn attach_store_crash_hooks(&mut self, hooks: Arc<volvisor_types::crash::StoreCrashHooks>) {
+        self.crash = Some(hooks);
+    }
+
     /// Open (or create) the registry in `dir`, replaying the journal into
     /// state and rolling forward any intent whose outcome is missing
     /// (W3b).
@@ -329,6 +366,7 @@ impl WitnessCore {
             commit_index: 0,
             next_lease_id: 1,
             in_flight: HashMap::new(),
+            crash: None,
         };
         for record in records {
             let JournalRecord::Intent(intent) = record else {
@@ -1225,6 +1263,16 @@ impl WitnessCore {
             .append_intent(operation_id.clone(), request_hash, op_kind, payload)?
         {
             IntentAppend::New => {
+                // The store-save crash point (P5 plan §3.1, the
+                // witness variant): the intent is durable, neither
+                // the in-memory apply nor the outcome has happened —
+                // a restart's replay re-derives the whole mutation.
+                if let Some(crash) = &self.crash {
+                    crash.consult_witness(
+                        mutation.kind(),
+                        volvisor_types::crash::StoreSavePoint::WitnessAfterIntentAppend,
+                    );
+                }
                 // The intent is durable: the mutation has happened.
                 self.apply(mutation);
             }
@@ -1238,6 +1286,16 @@ impl WitnessCore {
             }
         }
         self.in_flight.insert(operation_id.clone(), response_value);
+        // The store-save crash point (P5 plan §3.1, the witness
+        // variant): the mutation is applied in memory, the outcome
+        // is not yet durable — the W3b in-flight window a restart's
+        // roll-forward completes from the recorded envelope.
+        if let Some(crash) = &self.crash {
+            crash.consult_witness(
+                mutation.kind(),
+                volvisor_types::crash::StoreSavePoint::WitnessAfterApplyBeforeOutcome,
+            );
+        }
         match self
             .journal
             .append_outcome(operation_id.clone(), true, envelope.response)
