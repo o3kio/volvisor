@@ -1118,9 +1118,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "volvisor-drbd-testkit",
  "volvisor-provider",
  "volvisor-types",
  "volvisor-witness",
+]
+
+[[package]]
+name = "volvisor-drbd-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "volvisor-drbd",
+ "volvisor-provider",
+ "volvisor-types",
 ]
 
 [[package]]
