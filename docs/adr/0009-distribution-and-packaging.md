@@ -93,6 +93,10 @@ the installed binary runs and parses its config without needing devices.
 ### Provenance
 
 - Signed git tags; `SHA256SUMS` for every released artifact.
+- The exact build toolchain (compiler version, target triples, build
+  environment) is recorded with each release — reproducible-build best
+  effort: the record exists even where bit-reproducibility is not
+  achievable.
 - Distro repository hosting and package signing infrastructure are out of
   P7 scope (best-effort later; the artifacts themselves are complete
   without them).
