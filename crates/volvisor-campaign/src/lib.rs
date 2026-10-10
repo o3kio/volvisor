@@ -3,10 +3,11 @@
 //! The P5 plan of record's independent harness
 //! (`docs/plans/2026-10-10-p5-aggressive-failure-campaign.md` §4):
 //! the two-daemon rig, the write-trace oracle (§2.2), the
-//! evidence emitter (§6) and — in `tests/` — the stage-A scenario
-//! rows (§9 rows 1–3). This crate is **test-support, never
-//! production**: no other crate depends on it, and it must never
-//! become one (AGENTS rule 12's evidence discipline starts here).
+//! evidence emitter (§6), the Tier R scaffolding (§0/§6) and the
+//! summary renderer (§6) — with the stage scenario rows (§9) in
+//! `tests/`. This crate is **test-support, never production**: no
+//! other crate depends on it, and it must never become one
+//! (AGENTS rule 12's evidence discipline starts here).
 //!
 //! ## The claim discipline (§0/§6, verbatim)
 //!
@@ -72,7 +73,10 @@ pub mod evidence;
 pub mod matrix;
 pub mod oracle;
 pub mod rig;
+pub mod summary;
+pub mod tier_r;
 
 pub use evidence::{Evidence, LogSources, render_report, run_dir};
 pub use oracle::{AckedWrite, Verdict, WriterHandle, verify_against};
 pub use rig::{Daemon, Reply, Rig, campaign_rig};
+pub use summary::{GateStatus, build_campaign_report, completion_gates, completion_gates_over};

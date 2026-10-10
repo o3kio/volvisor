@@ -1,0 +1,1152 @@
+//! The campaign summary renderer (P5 plan §6, stage D): the final
+//! `REPORT.md` — the §10 coverage matrix (fault class × scenario ×
+//! verdict, with per-family durations and budget adherence), the
+//! recorded findings and the §11 completion-gate checklist — built
+//! from the run directories' records ALONE (§6: the report must be
+//! reproducible from the records; the renderer reads nothing but the
+//! record files — no live rig, no test state, no clock).
+//!
+//! Three entry points share one builder:
+//!
+//! - [`render_report`]: one run directory — the per-finish refresh
+//!   every scenario's `Evidence::finish` triggers. A single run
+//!   directory holds only its own test binary's records (each
+//!   campaign test binary is its own process, hence its own run
+//!   directory), so a partial view reads `MISSING` for absent rows,
+//!   never a silent omission — the file describes the run as far as
+//!   it has progressed.
+//! - [`build_campaign_report`]: many run directories merged — the
+//!   shippable artifact. Records dedupe by scenario (the latest run
+//!   wins; directories are processed in ascending modified-time
+//!   order), and mixed commits across the constituent runs are
+//!   flagged in the provenance, never averaged away.
+//! - the `campaign-summary` binary: the standalone path over the
+//!   same builder (`--check` makes the §11 gates a process exit
+//!   code).
+//!
+//! ## The claim discipline (§0/§6, verbatim)
+//!
+//! Tier S proves the implemented logic's behavior under the bounded
+//! injected fault space (§0/§3.2); it proves nothing about real
+//! media, real DRBD, or a real VMM; production support is not
+//! claimed. The report carries it as its header, and the Tier R
+//! rows carry the open hardware gate.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+/// One formatted report line (`writeln!` over the report string —
+/// its `fmt::Write` impl is infallible; the Result discard keeps
+/// that explicit).
+macro_rules! line {
+    ($report:expr, $($argument:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($report, $($argument)*);
+    }};
+}
+
+use crate::matrix::{self, Family};
+use crate::tier_r;
+
+/// The suite's whole-campaign bound (§3.2: "the whole campaign
+/// inside the existing suite budget ~60s"), in milliseconds. The
+/// renderer checks the SERIALIZED sum of the top-level scenario
+/// durations against it — an upper bound on the suite's wall time
+/// (the binaries and the cells run with bounded parallelism, so
+/// wall time is at most the sum), which keeps the check honest
+/// without a wall-clock harness.
+pub const SUITE_BOUND_MS: u64 = 60_000;
+
+// ---------------------------------------------------------------------------
+// The §9 mapping (static, reviewable — CG1's executable form)
+// ---------------------------------------------------------------------------
+
+/// How one §9 row's records are selected from the run directories.
+enum Coverage {
+    /// The exact scenario record names (rows with fixed scenarios).
+    Names(&'static [&'static str]),
+    /// Every generated cell of one kill-matrix family (rows 4-7:
+    /// the expected set is [`matrix::cells`] — the matrix is the
+    /// campaign's single enumeration, §3.2).
+    MatrixFamily(Family),
+}
+
+/// One §9 Tier S row's mapping into the coverage matrix. §9 states
+/// the table "so CG1 is reviewable now, not only in the report" —
+/// this is its executable form: the renderer realizes exactly this
+/// mapping, and the §9 table in the plan remains the review
+/// surface.
+struct RowSpec {
+    /// §9's row number.
+    row: u8,
+    /// §9's family label (short form).
+    family: &'static str,
+    /// The nearline §10 / SPEC-0002 fault class the row covers.
+    class: &'static str,
+    /// The row's scenario records.
+    coverage: Coverage,
+    /// The §3.2 per-family budget in milliseconds, when the plan
+    /// states one for this row's family (the kill families and the
+    /// oracle families are ≤ 5s; the storm ≤ 10s; the injection
+    /// rows carry no stated bound and show durations only).
+    budget_ms: Option<u64>,
+}
+
+/// The §9 Tier S rows (1-15), in row order.
+const ROWS: &[RowSpec] = &[
+    RowSpec {
+        row: 1,
+        family: "oracle across a happy-path migration",
+        class: "write-trace oracle, planned migration",
+        coverage: Coverage::Names(&["row-1/happy-path"]),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 2,
+        family: "oracle across an aborted migration",
+        class: "write-trace oracle, tail under abort",
+        coverage: Coverage::Names(&["row-2/abort-shaped-lag"]),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 3,
+        family: "oracle across kill-and-recover migrations",
+        class: "SIGKILL during WAL/meta commit",
+        coverage: Coverage::Names(&[
+            "kill-matrix/transfer/after-intent",
+            "kill-matrix/transfer/before-outcome",
+            "kill-matrix/transfer/after-outcome",
+            "kill-matrix/peer-grant/after-intent",
+            "kill-matrix/peer-grant/before-outcome",
+        ]),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 4,
+        family: "kill matrix: volume mutations",
+        class: "SIGKILL during ACK/WAL commit",
+        coverage: Coverage::MatrixFamily(Family::VolumeMutations),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 5,
+        family: "kill matrix: consumer mobility routes",
+        class: "SIGKILL during WAL commit",
+        coverage: Coverage::MatrixFamily(Family::ConsumerMobility),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 6,
+        family: "kill matrix: peer routes",
+        class: "SIGKILL during peer stream/replay",
+        coverage: Coverage::MatrixFamily(Family::PeerRoutes),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 7,
+        family: "kill matrix: witness journal",
+        class: "SIGKILL during meta commit, quorum loss window",
+        coverage: Coverage::MatrixFamily(Family::WitnessJournal),
+        budget_ms: Some(5_000),
+    },
+    RowSpec {
+        row: 8,
+        family: "stale source write after fence",
+        class: "source-after-fence stale writes",
+        coverage: Coverage::Names(&["row-8/stale-source-write-after-fence"]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 9,
+        family: "wrong-lineage injection at the target",
+        class: "wrong-epoch data injection (lineage-shaped)",
+        coverage: Coverage::Names(&["row-9/wrong-lineage-data-at-target"]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 10,
+        family: "forged barrier proofs",
+        class: "wrong-epoch barrier injection",
+        coverage: Coverage::Names(&["row-10/forged-barrier-proofs"]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 11,
+        family: "witness divergence",
+        class: "control-plane disconnect / stale authority",
+        coverage: Coverage::Names(&["row-11/witness-divergence-journal-rollback"]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 12,
+        family: "concurrent multi-volume cut, resync under foreground, \
+                 source-VMM death mid-cut, kills during an in-flight resync",
+        class: "multi-disk final cut; resync while foreground continues; \
+                VMM crash; SIGKILL during the dirty-bitmap window (logical)",
+        coverage: Coverage::Names(&[
+            "row-12/multi-volume-cut/converges",
+            "row-12/multi-volume-cut/one-fails-promote",
+            "row-12/multi-volume-cut/source-killed-mid-drive",
+            "row-12/multi-volume-cut/witness-restart-mid-drive",
+            "row-12/resync-under-foreground",
+            "row-12/source-vmm-death-mid-cut",
+            "row-12/kill-during-divergence-window",
+        ]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 13,
+        family: "replication partition mid-migration",
+        class: "storage network disconnect",
+        coverage: Coverage::Names(&["row-13/replication-partition-mid-migration"]),
+        budget_ms: None,
+    },
+    RowSpec {
+        row: 14,
+        family: "abort storm (25 cycles, rotating pre-cut faults)",
+        class: "repeated migration aborts",
+        coverage: Coverage::Names(&["row-14/abort-storm"]),
+        budget_ms: Some(10_000),
+    },
+    RowSpec {
+        row: 15,
+        family: "evidence bundle + summary render",
+        class: "exact versions, independent harness, full logs",
+        coverage: Coverage::Names(&["row-15/summary-and-completion-gates"]),
+        budget_ms: None,
+    },
+];
+
+/// One §9 row's expected scenario names, in matrix order.
+fn expected_names(spec: &RowSpec) -> Vec<String> {
+    match &spec.coverage {
+        Coverage::Names(names) => names.iter().map(ToString::to_string).collect(),
+        Coverage::MatrixFamily(family) => matrix::family_cells(*family)
+            .iter()
+            .map(matrix::Cell::scenario)
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The merged campaign view
+// ---------------------------------------------------------------------------
+
+/// One constituent run directory's provenance.
+struct RunInfo {
+    /// The directory's name (the run id).
+    name: String,
+    /// The commit the run's records carry (the first record's;
+    /// `unknown` for an empty run).
+    commit: String,
+}
+
+/// The merged campaign: every record from every run directory,
+/// deduped by scenario (the latest run wins), with per-run
+/// provenance.
+struct Campaign {
+    records: Vec<Value>,
+    runs: Vec<RunInfo>,
+}
+
+/// Collect one directory's records (the §6 layout: scenario-nested
+/// JSON files; the `logs/` capture is skipped — logs are referenced
+/// by path, never inlined).
+fn collect_dir(dir: &Path, records: &mut Vec<Value>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() != "logs" {
+                collect_dir(&path, records);
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                if let Ok(record) = serde_json::from_str::<Value>(&body) {
+                    records.push(record);
+                }
+            }
+        }
+    }
+}
+
+/// The merged view over the given run directories: records collected
+/// per directory (in ascending modified-time order, so a scenario
+/// finished again in a later run supersedes the earlier record),
+/// deduped by scenario name with the latest occurrence kept.
+fn merge(dirs: &[PathBuf]) -> Campaign {
+    let mut ordered: Vec<&PathBuf> = dirs.iter().collect();
+    ordered.sort_by_key(|dir| {
+        std::fs::metadata(dir)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis())
+    });
+    let mut runs = Vec::new();
+    let mut records: Vec<Value> = Vec::new();
+    for dir in ordered {
+        let mut run_records = Vec::new();
+        collect_dir(dir, &mut run_records);
+        let commit = run_records
+            .first()
+            .and_then(|record| record["commit"].as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        runs.push(RunInfo {
+            name: dir.file_name().map_or_else(
+                || "?".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            commit,
+        });
+        // The latest run wins per scenario: drop any earlier record
+        // of a scenario this run re-emitted.
+        records.retain(|record| {
+            let scenario = record["scenario"].as_str().unwrap_or_default();
+            !run_records
+                .iter()
+                .any(|fresh| fresh["scenario"].as_str() == Some(scenario))
+        });
+        records.extend(run_records);
+    }
+    records.sort_by(|left, right| {
+        left["scenario"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["scenario"].as_str().unwrap_or_default())
+    });
+    Campaign { records, runs }
+}
+
+/// The record for exactly `scenario`, when present.
+fn record_for<'a>(records: &'a [Value], scenario: &str) -> Option<&'a Value> {
+    records
+        .iter()
+        .find(|record| record["scenario"].as_str() == Some(scenario))
+}
+
+// ---------------------------------------------------------------------------
+// The coverage matrix
+// ---------------------------------------------------------------------------
+
+/// One coverage-matrix row's computed verdict.
+enum RowVerdict {
+    /// Every expected record is present with an outcome.
+    Covered {
+        /// The record count (expected == present).
+        count: usize,
+        /// The primary record's outcome text.
+        outcome: String,
+        /// The row's maximum record duration, in milliseconds.
+        duration_ms: u64,
+    },
+    /// Some expected records are absent — named, never silent.
+    Missing(Vec<String>),
+    /// Present but without an outcome (an unfinished record is an
+    /// honest gap, not a pass).
+    Unfinished(Vec<String>),
+}
+
+/// The row verdict over `records`.
+fn row_verdict(spec: &RowSpec, records: &[Value]) -> RowVerdict {
+    let expected = expected_names(spec);
+    let missing: Vec<String> = expected
+        .iter()
+        .filter(|scenario| record_for(records, scenario).is_none())
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return RowVerdict::Missing(missing);
+    }
+    let unfinished: Vec<String> = expected
+        .iter()
+        .filter(|scenario| {
+            record_for(records, scenario).is_some_and(|record| record["outcome"].is_null())
+        })
+        .cloned()
+        .collect();
+    if !unfinished.is_empty() {
+        return RowVerdict::Unfinished(unfinished);
+    }
+    let duration_ms = expected
+        .iter()
+        .filter_map(|scenario| record_for(records, scenario))
+        .filter_map(|record| record["duration_ms"].as_u64())
+        .max()
+        .unwrap_or(0);
+    let outcome = expected
+        .iter()
+        .find_map(|scenario| record_for(records, scenario))
+        .and_then(|record| record["outcome"].as_str())
+        .unwrap_or("?")
+        .to_owned();
+    RowVerdict::Covered {
+        count: expected.len(),
+        outcome,
+        duration_ms,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budgets (§3.2)
+// ---------------------------------------------------------------------------
+
+/// One budget line: a family or row's measured wall time against
+/// its §3.2 bound.
+struct BudgetLine {
+    /// The line's label.
+    label: String,
+    /// The §3.2 bound, in milliseconds.
+    bound_ms: u64,
+    /// The measured duration, in milliseconds.
+    measured_ms: u64,
+}
+
+impl BudgetLine {
+    /// Whether the measurement is inside the bound.
+    fn adheres(&self) -> bool {
+        self.measured_ms <= self.bound_ms
+    }
+}
+
+/// The budget lines computable from `records` (§3.2's stated bounds
+/// only — the plan bounds the kill families, the oracle families,
+/// the storm and the suite; the injection rows carry no stated
+/// bound and show durations in the matrix alone).
+fn budget_lines(records: &[Value]) -> Vec<BudgetLine> {
+    let mut lines = Vec::new();
+    for spec in ROWS {
+        let Some(bound_ms) = spec.budget_ms else {
+            continue;
+        };
+        let expected = expected_names(spec);
+        let measured_ms = expected
+            .iter()
+            .filter_map(|scenario| record_for(records, scenario))
+            .filter_map(|record| record["duration_ms"].as_u64())
+            .max()
+            .unwrap_or(0);
+        let cells = match spec.coverage {
+            Coverage::MatrixFamily(family) => {
+                format!(" ({} cells)", matrix::family_cells(family).len())
+            }
+            Coverage::Names(_) => String::new(),
+        };
+        lines.push(BudgetLine {
+            label: format!("row {} {}{}", spec.row, spec.family, cells),
+            bound_ms,
+            measured_ms,
+        });
+    }
+    lines
+}
+
+/// The serialized sum of the campaign's top-level scenario
+/// durations (families, rows and Tier R scaffolds) — an upper bound
+/// on the suite's wall time (bounded parallelism), checked against
+/// [`SUITE_BOUND_MS`]. Top-level only: the matrix families
+/// aggregate through their `_family` record (the cells run inside
+/// it), so the cells' own durations are not summed.
+fn suite_serialized_ms(records: &[Value]) -> u64 {
+    records
+        .iter()
+        .filter(|record| {
+            let scenario = record["scenario"].as_str().unwrap_or_default();
+            !scenario.starts_with("matrix/") || scenario.ends_with("/_family")
+        })
+        .filter_map(|record| record["duration_ms"].as_u64())
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// The completion gates (§11, CG1-CG5)
+// ---------------------------------------------------------------------------
+
+/// One completion gate's computed status.
+pub struct GateStatus {
+    /// The gate's id (CG1-CG5).
+    pub gate: &'static str,
+    /// Whether the gate holds over the records it was computed
+    /// from.
+    pub complete: bool,
+    /// The checkable detail: what was verified, or exactly what is
+    /// missing (scenario names, budgets, violations).
+    pub detail: String,
+}
+
+/// The typed-marker vocabulary CG4 accepts (§11: "a typed refusal,
+/// an honest UNSAFE/IN_DOUBT classification, or a pass — never a
+/// silent corruption or a generic success").
+const TYPED_MARKERS: [&str; 4] = ["refus", "UNSAFE", "IN_DOUBT", "pass"];
+
+/// Compute the §11 completion gates over `records` — the report's
+/// CG1-CG5 checklist and the `--check` exit path. Every gate is
+/// computed from the records alone (§6's reproducibility); a gate
+/// that cannot be verified from what is present reads `incomplete`
+/// with the exact gap named, never a pass by absence.
+#[must_use]
+pub fn completion_gates(records: &[Value]) -> Vec<GateStatus> {
+    vec![
+        cg1_class_coverage(records),
+        cg2_oracle_verdicts(records),
+        cg3_kill_matrix_and_budgets(records),
+        cg4_injection_outcomes(records),
+        cg5_claim_discipline(records),
+    ]
+}
+
+/// The §11 completion gates over the given run directories — over
+/// exactly what [`build_campaign_report`] renders (collect, merge,
+/// compute): the `campaign-summary --check` exit path.
+#[must_use]
+pub fn completion_gates_over(dirs: &[PathBuf]) -> Vec<GateStatus> {
+    completion_gates(&merge(dirs).records)
+}
+
+/// CG1: every nearline §10 / SPEC-0002 fault class is covered by a
+/// Tier S scenario family (the §9 mapping) or recorded as Tier
+/// R-gated / out-of-scope with its reason.
+fn cg1_class_coverage(records: &[Value]) -> GateStatus {
+    let mut missing: Vec<String> = Vec::new();
+    for spec in ROWS {
+        if let RowVerdict::Missing(absent) = row_verdict(spec, records) {
+            missing.push(format!("row {} ({})", spec.row, absent.join(", ")));
+        }
+    }
+    for scenario in tier_r::SCENARIOS {
+        if record_for(records, &format!("tier-r/{}", scenario.name)).is_none() {
+            missing.push(format!("tier-r/{} (no gate record)", scenario.name));
+        }
+    }
+    GateStatus {
+        gate: "CG1",
+        complete: missing.is_empty(),
+        detail: if missing.is_empty() {
+            format!(
+                "every §9 Tier S row (1-15) has its records and every Tier R-only class \
+                 carries its gate record ({} skipped records); the §9 mapping is realized \
+                 in the coverage matrix",
+                tier_r::SCENARIOS.len()
+            )
+        } else {
+            format!(
+                "not every class is covered or gated: {}",
+                missing.join("; ")
+            )
+        },
+    }
+}
+
+/// One oracle-bearing record's oracle sections: a single object for
+/// the single-volume rows, an array for the multi-volume rows
+/// (§9 row 12 — one section per volume, each the same canonical
+/// shape).
+fn oracle_sections(record: &Value) -> Vec<&Value> {
+    match &record["oracle"] {
+        Value::Array(sections) => sections.iter().collect(),
+        Value::Object(_) => vec![&record["oracle"]],
+        _ => Vec::new(),
+    }
+}
+
+/// CG2: the oracle's verdicts appear in the records —
+/// acknowledged-prefix preservation across a complete migration,
+/// honest (nonzero) tail quantification on an abort, and the
+/// boundary derived from the data path with the coordinator
+/// cross-check present. The multi-volume rows carry one oracle
+/// section per volume; every section is checked.
+fn cg2_oracle_verdicts(records: &[Value]) -> GateStatus {
+    let mut problems: Vec<String> = Vec::new();
+    // The oracle sections, flattened with their record's scenario.
+    let oracle_records: Vec<&Value> = records
+        .iter()
+        .filter(|record| !record["oracle"].is_null())
+        .collect();
+    let sections: Vec<(String, &Value)> = oracle_records
+        .iter()
+        .flat_map(|record| {
+            let scenario = record["scenario"].as_str().unwrap_or("?").to_owned();
+            oracle_sections(record)
+                .into_iter()
+                .map(move |section| (scenario.clone(), section))
+        })
+        .collect();
+    let complete_prefix = sections.iter().any(|(_, oracle)| {
+        oracle["acknowledged"].as_u64().unwrap_or(0) > 0
+            && oracle["verified"] == oracle["acknowledged"]
+            && oracle["corrupted"].as_u64() == Some(0)
+    });
+    if !complete_prefix {
+        problems.push("no complete-migration record proves the acknowledged prefix".to_owned());
+    }
+    let honest_tail = sections
+        .iter()
+        .any(|(_, oracle)| oracle["tail"].as_u64().unwrap_or(0) > 0);
+    if !honest_tail {
+        problems.push("no abort record quantifies a nonzero tail".to_owned());
+    }
+    let bad_boundary: Vec<String> = sections
+        .iter()
+        .filter(|(_, oracle)| oracle["boundary_source"].as_str() != Some("data-path"))
+        .map(|(scenario, _)| scenario.clone())
+        .collect();
+    if !bad_boundary.is_empty() {
+        problems.push(format!(
+            "records derive the boundary from something other than the data path: {}",
+            bad_boundary.join(", ")
+        ));
+    }
+    let cross_checked = sections
+        .iter()
+        .any(|(_, oracle)| !oracle["boundary_skew_ticks"].is_null());
+    if !cross_checked {
+        problems.push("no record carries the barrier/boundary cross-check".to_owned());
+    }
+    GateStatus {
+        gate: "CG2",
+        complete: problems.is_empty(),
+        detail: if problems.is_empty() {
+            format!(
+                "{} oracle sections across {} records: the complete-migration prefix is \
+                 byte-verified, aborts quantify their tails, every boundary is data-path \
+                 derived and the barrier cross-check is present",
+                sections.len(),
+                oracle_records.len()
+            )
+        } else {
+            problems.join("; ")
+        },
+    }
+}
+
+/// CG3: the kill matrix covers every journaled mutation stage at
+/// the §3.2 bounds — every generated cell has its record (with its
+/// invariant set), and every stated budget adheres.
+fn cg3_kill_matrix_and_budgets(records: &[Value]) -> GateStatus {
+    let mut problems: Vec<String> = Vec::new();
+    for cell in matrix::cells() {
+        let scenario = cell.scenario();
+        match record_for(records, &scenario) {
+            None => problems.push(format!("cell {scenario} has no record")),
+            Some(record) => {
+                if record["invariants"].as_array().is_none_or(Vec::is_empty) {
+                    problems.push(format!("cell {scenario} records no invariants"));
+                }
+            }
+        }
+    }
+    for family in [
+        Family::VolumeMutations,
+        Family::ConsumerMobility,
+        Family::PeerRoutes,
+        Family::WitnessJournal,
+    ] {
+        let scenario = format!("matrix/{}/_family", family.name());
+        if record_for(records, &scenario).is_none() {
+            problems.push(format!("family {scenario} has no aggregate record"));
+        }
+    }
+    let over: Vec<String> = budget_lines(records)
+        .into_iter()
+        .filter(|line| !line.adheres())
+        .map(|line| {
+            format!(
+                "{}: {} ms over its {} ms bound",
+                line.label, line.measured_ms, line.bound_ms
+            )
+        })
+        .collect();
+    problems.extend(over);
+    if suite_serialized_ms(records) > SUITE_BOUND_MS {
+        problems.push(format!(
+            "the serialized campaign sum is {} ms over the {} ms suite bound",
+            suite_serialized_ms(records),
+            SUITE_BOUND_MS
+        ));
+    }
+    GateStatus {
+        gate: "CG3",
+        complete: problems.is_empty(),
+        detail: if problems.is_empty() {
+            format!(
+                "all {} generated cells across the four families have records with their \
+                 invariant sets, every stated §3.2 budget adheres and the serialized sum \
+                 ({} ms) is inside the {} ms suite bound",
+                matrix::cells().len(),
+                suite_serialized_ms(records),
+                SUITE_BOUND_MS
+            )
+        } else {
+            problems.join("; ")
+        },
+    }
+}
+
+/// The §9 rows whose scenarios are the §5 adversarial injections
+/// (CG4's scope).
+const INJECTION_ROWS: [u8; 6] = [8, 9, 10, 11, 12, 13];
+
+/// CG4: every adversarial injection ends in a typed refusal, an
+/// honest UNSAFE/IN_DOUBT classification, or a pass — checked at
+/// the report level by the outcome's presence and the typed-marker
+/// vocabulary in the record (the scenarios themselves assert the
+/// exact wire-level refusals; the gate makes the vocabulary
+/// checkable from the artifacts).
+fn cg4_injection_outcomes(records: &[Value]) -> GateStatus {
+    let mut problems: Vec<String> = Vec::new();
+    for row in INJECTION_ROWS {
+        let Some(spec) = ROWS.iter().find(|spec| spec.row == row) else {
+            continue;
+        };
+        for scenario in expected_names(spec) {
+            match record_for(records, &scenario) {
+                None => problems.push(format!("{scenario} has no record")),
+                Some(record) => {
+                    if record["outcome"].is_null() {
+                        problems.push(format!("{scenario} records no outcome"));
+                    } else {
+                        let text = serde_json::to_string(record).unwrap_or_default();
+                        let lowercase = text.to_lowercase();
+                        if !TYPED_MARKERS
+                            .iter()
+                            .any(|marker| lowercase.contains(&marker.to_lowercase()))
+                        {
+                            problems.push(format!(
+                                "{scenario} carries none of the typed markers \
+                                 (refusal/UNSAFE/IN_DOUBT/pass)"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    GateStatus {
+        gate: "CG4",
+        complete: problems.is_empty(),
+        detail: if problems.is_empty() {
+            "every §5 injection record (§9 rows 8-13) ends in a typed refusal, an \
+             UNSAFE/IN_DOUBT classification or a pass"
+                .to_owned()
+        } else {
+            problems.join("; ")
+        },
+    }
+}
+
+/// CG5: the claim discipline holds everywhere — no record claims
+/// production support (the discipline sentence lives in the report
+/// header, never in a record), and the open hardware gate is
+/// stated, not silent (every Tier R scenario carries its record).
+fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
+    let mut problems: Vec<String> = Vec::new();
+    for record in records {
+        let text = serde_json::to_string(record).unwrap_or_default();
+        if text.to_lowercase().contains("production support") {
+            let scenario = record["scenario"].as_str().unwrap_or("?");
+            problems.push(format!(
+                "record {scenario} mentions production support (the claim discipline \
+                 lives in the report header, never in a record)"
+            ));
+        }
+    }
+    let ungated: Vec<String> = tier_r::SCENARIOS
+        .iter()
+        .map(|scenario| format!("tier-r/{}", scenario.name))
+        .filter(|scenario| record_for(records, scenario).is_none())
+        .collect();
+    if !ungated.is_empty() {
+        problems.push(format!(
+            "the hardware gate is silent for: {} (§0: not run must be recorded, not absent)",
+            ungated.join(", ")
+        ));
+    }
+    GateStatus {
+        gate: "CG5",
+        complete: problems.is_empty(),
+        detail: if problems.is_empty() {
+            format!(
+                "no record claims production support and every Tier R scenario states its \
+                 gate ({} records); the report header carries the discipline verbatim and \
+                 the not-delivered §10 rows are enumerated in the nearline §10 note",
+                tier_r::SCENARIOS.len()
+            )
+        } else {
+            problems.join("; ")
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The report
+// ---------------------------------------------------------------------------
+
+/// The recorded-findings blocks (§6: the report is the only place
+/// campaign results are summarized; §7: PR descriptions cite it).
+/// Each is a finding the campaign recorded along the way — never a
+/// weakened scenario.
+const FINDINGS: &[(&str, &str)] = &[
+    (
+        "The grant_set wedge (product defect, recorded never weakened)",
+        "A witness kill inside the grant commit (the grant_set mid-commit windows, \
+         §9 row 7) parks the migration PERMANENTLY: the destination's peer-grant op \
+         journaled its failure and the ops pipeline replays recorded failures forever — \
+         the retry task re-serves the failure at its 5 s tick (a bounded spin, never a \
+         silent resume). The park is safe (fail-closed: no dual writer, the source stays \
+         fenced) but recovery requires operator action. The campaign records the defect \
+         and reuses the park as a deterministic injection window (rows 8 and 12b).",
+    ),
+    (
+        "The IN_DOUBT contract nuance (stage-B round-2 review)",
+        "Nearline §6 reserves IN_DOUBT for unresolvable stalls (a failed barrier void, \
+         a dead destination VMM) and directs that a resolvable post-authorization stall \
+         be reported as the canonical state plus a stall detail. The wedge above parks at \
+         destination_authorized with the stall detail — contract-shaped — but the stall \
+         never resolves without the operator, which strains the 'resolvable' reading: \
+         the record says 'stalled' forever while the migration is permanently parked. \
+         Whether a permanently stalled record should surface IN_DOUBT is a recorded \
+         contract question (its own plan/PR per §8), not silently decided. Row 12b's \
+         failed promote, by contrast, parks IN_DOUBT through the observe mapping of \
+         SOURCE_REVOKED ('source revoked; destination grant not yet authorized').",
+    ),
+    (
+        "The row-9 lineage gap (found by this campaign, fixed)",
+        "The replica-level lineage gate did not exist before stage C: a target holding \
+         foreign data under the right epoch passed prepare and the cut would have \
+         delivered it. The row-9 injection found the gap; the fix (in the stage-C base \
+         commit) refuses FOREIGN_DEVICE_STATE — the same-id re-drive and the fresh-id \
+         re-issue both refuse typed, and the record never reads COMPLETE over foreign \
+         data.",
+    ),
+    (
+        "The F1 defense-in-depth note",
+        "The lineage gate is one-shot at prepare: the target's replica lineage is \
+         verified before the cut and is not re-checked at the barrier. A foreign \
+         injection landing after prepare (mid-drive) is caught only by the \
+         epoch/fencing disciplines, not by lineage re-verification. A barrier-time \
+         re-check is a recorded follow-up (defense in depth), not a shipped guarantee.",
+    ),
+    (
+        "Design property: the live-lease fence is the protection (row 8)",
+        "The out-of-band writer's divergence is invisible to the adopt classification \
+         BY CONSTRUCTION — volvisor cannot see an actor below its enforcement. The \
+         protection is the fence: the live lease the witness holds, which the survivor's \
+         adopt refuses UNSAFE over and which keeps the stale source from ever re-entering \
+         the data path. The row proves the fence holds; it does not, and cannot, prove \
+         the classification sees the divergence.",
+    ),
+    (
+        "Design property: the resume gate is epoch-wide (row 10)",
+        "The witness's void enumeration is migration-keyed (an abort voids only its own \
+         barrier), but the resume gate is EPOCH-wide: any unvoided barrier of the writer \
+         epoch parks another migration's abort with OPERATION_IN_DOUBT ('never a silent \
+         resume'). Recovery is the recording holder's void — the one legitimate cleanup \
+         path — plus the retry pass. Both levels are pinned by row 10, never weakened.",
+    ),
+];
+
+/// Build the final report text for the given run directories (§6):
+/// the claim-discipline header, the provenance, the §10 coverage
+/// matrix (the §9 mapping — Tier S rows with their verdicts, Tier
+/// R-only classes with their recorded gates), the §3.2 budget
+/// adherence, the recorded findings and the §11 completion-gate
+/// checklist. Deterministic: the same directories' records render
+/// the same text (no clock, no counters).
+#[must_use]
+pub fn build_campaign_report(dirs: &[PathBuf]) -> String {
+    let campaign = merge(dirs);
+    let records = &campaign.records;
+
+    let mut report = String::new();
+    report.push_str("# Volvisor aggressive failure campaign — evidence report\n\n");
+    // The claim discipline, verbatim (§6) — the report's header.
+    report.push_str(
+        "> Tier S proves the implemented logic's behavior under the bounded\n\
+         > injected fault space (§0/§3.2); it proves nothing about real media,\n\
+         > real DRBD, or a real VMM; production support is not claimed.\n\n",
+    );
+    render_provenance(&mut report, &campaign);
+    render_coverage_matrix(&mut report, records);
+    render_budgets(&mut report, records);
+    render_findings(&mut report);
+    render_gates(&mut report, records);
+    report.push('\n');
+    report
+}
+
+/// The provenance: the constituent runs and their commits — flagged
+/// when mixed, never averaged away.
+fn render_provenance(report: &mut String, campaign: &Campaign) {
+    let records = &campaign.records;
+    let mut commits: Vec<&str> = campaign
+        .runs
+        .iter()
+        .map(|run| run.commit.as_str())
+        .collect();
+    commits.sort_unstable();
+    commits.dedup();
+    let tier_r_count = records
+        .iter()
+        .filter(|record| record["tier"].as_str() == Some("R"))
+        .count();
+    let commit_cell = if commits.len() == 1 {
+        format!("`{}`", commits[0])
+    } else {
+        format!(
+            "MIXED ({})",
+            commits
+                .iter()
+                .map(|commit| format!("`{commit}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    line!(
+        report,
+        "- Runs: {}\n- Commit: {}\n- Kernel: {}\n- Records: {} (Tier S: {}, Tier R: {})",
+        campaign
+            .runs
+            .iter()
+            .map(|run| format!("`{}`", run.name))
+            .collect::<Vec<_>>()
+            .join(", "),
+        commit_cell,
+        records
+            .first()
+            .and_then(|record| record["kernel"].as_str())
+            .unwrap_or("unknown"),
+        records.len(),
+        records.len() - tier_r_count,
+        tier_r_count,
+    );
+}
+
+/// The coverage matrix (§6: fault class × scenario × verdict): the
+/// §9 Tier S rows with their verdicts, then every Tier R-only class
+/// with its recorded gate (never a hole).
+fn render_coverage_matrix(report: &mut String, records: &[Value]) {
+    report.push_str("\n## Coverage matrix (nearline §10 classes → §9 rows)\n\n");
+    report.push_str(
+        "| Row | Tier | Family (§9) | Nearline §10 class | Records | Verdict | Duration |\n",
+    );
+    report.push_str("|---|---|---|---|---|---|---|\n");
+    for spec in ROWS {
+        let expected = expected_names(spec);
+        let verdict = row_verdict(spec, records);
+        let (records_cell, verdict_cell, duration_cell) = match verdict {
+            RowVerdict::Covered {
+                count,
+                outcome,
+                duration_ms,
+            } => (count.to_string(), outcome, format!("{duration_ms} ms")),
+            RowVerdict::Missing(absent) => (
+                format!("{}/{}", expected.len() - absent.len(), expected.len()),
+                format!("**MISSING**: {}", absent.join(", ")),
+                "—".to_owned(),
+            ),
+            RowVerdict::Unfinished(names) => (
+                format!("{}/{}", expected.len(), expected.len()),
+                format!("**UNFINISHED** (no outcome): {}", names.join(", ")),
+                "—".to_owned(),
+            ),
+        };
+        line!(
+            report,
+            "| {} | S | {} | {} | {} | {} | {} |",
+            spec.row,
+            spec.family,
+            spec.class,
+            records_cell,
+            verdict_cell,
+            duration_cell,
+        );
+    }
+    for scenario in tier_r::SCENARIOS {
+        let name = format!("tier-r/{}", scenario.name);
+        let (verdict_cell, duration_cell) = match record_for(records, &name) {
+            Some(record) => (
+                format!(
+                    "{}: {}",
+                    record["outcome"].as_str().unwrap_or("?"),
+                    record["reason"].as_str().unwrap_or("?")
+                ),
+                record["duration_ms"]
+                    .as_u64()
+                    .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms")),
+            ),
+            None => (
+                "**MISSING** (no gate record — a hole, not a gate)".to_owned(),
+                "—".to_owned(),
+            ),
+        };
+        line!(
+            report,
+            "| — | R | {} | {} | `{}` | {} | {} |",
+            scenario.family,
+            scenario.class,
+            name,
+            verdict_cell,
+            duration_cell,
+        );
+    }
+}
+
+/// Budget adherence (§3.2's stated bounds only — the plan bounds the
+/// kill families, the oracle families, the storm and the suite; the
+/// injection rows carry no stated bound).
+fn render_budgets(report: &mut String, records: &[Value]) {
+    report.push_str("\n## Budget adherence (§3.2)\n\n");
+    report.push_str("| Family / row | Bound | Measured | Verdict |\n|---|---|---|---|\n");
+    for line in budget_lines(records) {
+        line!(
+            report,
+            "| {} | {} ms | {} ms | {} |",
+            line.label,
+            line.bound_ms,
+            line.measured_ms,
+            if line.adheres() { "adhere" } else { "**OVER**" },
+        );
+    }
+    let suite_ms = suite_serialized_ms(records);
+    line!(
+        report,
+        "| suite (serialized sum; wall ≤ sum under bounded parallelism) | {} ms | {} ms | {} |",
+        SUITE_BOUND_MS,
+        suite_ms,
+        if suite_ms <= SUITE_BOUND_MS {
+            "adhere"
+        } else {
+            "**OVER**"
+        },
+    );
+}
+
+/// The recorded findings (§6): what the campaign found along the
+/// way — recorded, never weakened.
+fn render_findings(report: &mut String) {
+    report.push_str("\n## Recorded findings\n\n");
+    for (title, body) in FINDINGS {
+        line!(report, "- **{title}**: {body}");
+    }
+}
+
+/// The completion gates (§11), computed from the records alone.
+fn render_gates(report: &mut String, records: &[Value]) {
+    report.push_str("\n## Completion gates (§11)\n\n");
+    for gate in completion_gates(records) {
+        line!(
+            report,
+            "- **{}**: {} — {}",
+            gate.gate,
+            if gate.complete {
+                "pass"
+            } else {
+                "**incomplete**"
+            },
+            gate.detail,
+        );
+    }
+}
+
+/// Render one run directory's final-form report and write it to
+/// `<dir>/REPORT.md` (the per-finish refresh, §6). Idempotent and
+/// deterministic; parallel finishes race benignly (the last write
+/// wins and includes every record on disk).
+pub fn render_report(dir: &Path) {
+    let report = build_campaign_report(&[dir.to_path_buf()]);
+    let path = dir.join("REPORT.md");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("evidence dir");
+    }
+    std::fs::write(&path, report).expect("write report");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every §9 row 1-15 appears exactly once in the mapping (the
+    /// executable §9 table is complete — CG1's static half).
+    #[test]
+    fn the_row_mapping_is_complete_and_unique() {
+        let mut rows: Vec<u8> = ROWS.iter().map(|spec| spec.row).collect();
+        rows.sort_unstable();
+        let expected: Vec<u8> = (1..=15).collect();
+        assert_eq!(rows, expected, "the §9 rows 1-15 map exactly once each");
+    }
+
+    /// No scenario name is claimed by two rows (a record
+    /// double-counted would inflate coverage).
+    #[test]
+    fn no_scenario_is_claimed_twice() {
+        let mut names: Vec<String> = ROWS.iter().flat_map(expected_names).collect();
+        names.sort();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "a scenario name appears in two §9 rows"
+        );
+    }
+
+    /// The Tier R table's scenario names are unique and never
+    /// collide with a Tier S row's records.
+    #[test]
+    fn the_tier_r_table_is_disjoint() {
+        let mut tier_names: Vec<&str> = tier_r::SCENARIOS
+            .iter()
+            .map(|scenario| scenario.name)
+            .collect();
+        tier_names.sort_unstable();
+        let before = tier_names.len();
+        tier_names.dedup();
+        assert_eq!(before, tier_names.len(), "a Tier R scenario name repeats");
+        for scenario in tier_r::SCENARIOS {
+            let name = format!("tier-r/{}", scenario.name);
+            assert!(
+                ROWS.iter().flat_map(expected_names).all(|row| row != name),
+                "the Tier R scenario {name} collides with a Tier S row"
+            );
+        }
+    }
+
+    /// CG5's scan flags a planted production-support mention (the
+    /// gate is checkable, not decorative).
+    #[test]
+    fn cg5_flags_a_planted_claim() {
+        let planted = json!({
+            "scenario": "planted/claim",
+            "tier": "S",
+            "outcome": "pass: production support is proven",
+        });
+        let gates = completion_gates(&[planted]);
+        let cg5 = &gates[4];
+        assert!(!cg5.complete, "the planted claim must fail CG5");
+        assert!(cg5.detail.contains("planted/claim"));
+    }
+
+    /// A record-free view is honestly incomplete, never a pass by
+    /// absence: CG1 names the gap, CG3 names the cells.
+    #[test]
+    fn an_empty_campaign_fails_every_relevant_gate() {
+        let gates = completion_gates(&[]);
+        assert!(!gates[0].complete, "CG1 fails on no records");
+        assert!(gates[0].detail.contains("row 1"));
+        assert!(!gates[1].complete, "CG2 fails on no records");
+        assert!(!gates[2].complete, "CG3 fails on no records");
+        assert!(!gates[3].complete, "CG4 fails on no records");
+        assert!(
+            !gates[4].complete,
+            "CG5 fails on no records (the gate is silent)"
+        );
+    }
+}
