@@ -172,3 +172,23 @@ For DRBD single-primary migration, source block device closure before `drbdadm s
 - Saturated disk/network, multi-TB seed, growing dirty rate, repeated migration aborts, resync while foreground continues and mirror rebuild.
 - Benchmark DRBD Protocol A (where its actual ACK/cache semantics match), qualified Mayastor and Ceph reference with comparable VMM/frontend topology; record semantic mismatches.
 - Exact source commit/version, independent fault harness and full logs. No claim of production support based on simulation or successful happy path alone.
+
+### Implementation status (2026-10, P5 failure campaign)
+
+The aggressive failure campaign (`crates/volvisor-campaign`, plan of record `docs/plans/2026-10-10-p5-aggressive-failure-campaign.md`) implements this section as two explicitly separated tiers:
+
+- **Tier S (simulation) is implemented**: the write-trace oracle, the generated kill matrix over every journaled mutation stage (volume mutations, consumer mobility, peer routes, the witness journal), the adversarial injections (stale source writes after fence, wrong-lineage and wrong-epoch data, control-plane divergence, multi-volume cuts, partitions, abort storms) and the evidence records with per-scenario log capture. The coverage matrix — fault class × scenario × verdict, per-family durations and budget adherence — is rendered into `REPORT.md` under `target/campaign-evidence/<run-id>/` by the `campaign-summary` renderer (also a standalone binary over any run directory, with `--check` exposing the plan's completion gates as an exit code). Tier S proves the implemented logic's behavior under the bounded injected fault space; it proves nothing about real media, real DRBD, or a real VMM.
+- **Tier R (real-host) is scaffolded and hardware-gated**: the scenario families are enumerated with detection and portability scaffolds, and emit explicit `skipped` evidence records (`tier-r/...`) in every run — skipped, not silent. Setting `VOLVISOR_CAMPAIGN_TIER=R` claims real-host execution and fails loudly unless the environment (and the real-host drive) can back the claim.
+- **Production support is not claimed** for any class in this section.
+
+The §10 rows this campaign does **not** deliver, each recorded as a gate in the Tier R section of the report rather than a hole:
+
+- Benchmarks (DRBD Protocol A comparison, Mayastor/Ceph qualification) — no benchmark row exists in either tier; a benchmark is not a durability proof and none is claimed.
+- Local mirror leg loss/repair/rebuild — no mirror implementation exists to fault; the gate is double-recorded (hardware **and** implementation) as `tier-r/mirror-leg-loss`.
+- Saturated disk/network, multi-TB seed, growing dirty rate — Tier S covers the convergence-gating *logic* (row 12's resync-under-foreground); the real scale and wall-clock behavior is the `tier-r/saturation-multitb` gate.
+- Media-level flush/FUA and host power loss — Tier S covers the flush *protocol* (barrier and suspension proofs); the media level is the `tier-r/media-flush-fua` and `tier-r/power-cut` gates.
+- The durable dirty-bitmap/meta boundary — no persisted bitmap exists; Tier S covers kills during an *in-flight* resync only (row 12). The durable boundary is the `tier-r/durable-dirty-bitmap-meta` gate.
+- Storage Cell crash — no cell class exists in the campaign (see `rook-cell-experimental-v0`); no gate is claimed for it.
+- O3K control-plane disconnect — covered in Tier S only through the witness-divergence proxy (row 11), which models the journal rollback of a control-plane authority; the real control-plane disconnect is part of the `tier-r/same-families-on-real-hosts` gate.
+
+Any violation the campaign finds that requires a contract amendment goes through its own plan/PR, never silently; the recorded findings (including the `grant_set` permanent park and the `IN_DOUBT` stall-nuance question) are enumerated in the report's findings section.
