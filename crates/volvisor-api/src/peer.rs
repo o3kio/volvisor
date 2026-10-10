@@ -65,7 +65,7 @@
 //! lineage set and this route re-runs exactly the replica-level gate
 //! prepare ran, so a wrong-lineage injection landing on the target
 //! after the prepare is refused at the barrier, before the cut
-//! crosses foreign data (see [`verify_lineage`]).
+//! crosses foreign data (see the `verify_lineage` handler below).
 
 // axum handlers consume their extractors by value; clippy's
 // pass-by-value heuristics do not apply to the handler boundary.
