@@ -6,9 +6,14 @@
 //!
 //! 1. *(in the handler)* typed request validation — rejections happen before
 //!    anything is journaled, so they leave no journal record;
-//! 2. **journal lookup** — a recorded outcome for the same `operation_id` and
-//!    immutable request hash is replayed byte-for-byte *without executing*;
-//!    a same-hash intent without an outcome fails closed with
+//! 2. **journal lookup** — a recorded **success** outcome for the same
+//!    `operation_id` and immutable request hash is replayed byte-for-byte
+//!    *without executing*; a recorded **failure** outcome is answered by
+//!    the route's [`FailureReplay`] class (verbatim on the strict routes,
+//!    re-evaluated through the caller's inspection on the re-issuable
+//!    peer routes — the `grant_set` wedge fix: a failure is a fact about
+//!    the attempt, not about the world, and the world may have converged
+//!    past it); a same-hash intent without an outcome fails closed with
 //!    `OPERATION_IN_DOUBT` (the operation may be in flight; it is never
 //!    re-executed); a different hash for the same `operation_id` is an
 //!    `IDEMPOTENCY_CONFLICT`;
@@ -17,8 +22,9 @@
 //!    then journal the outcome — the serialized response on success, the
 //!    `{"code","message"}` error body on failure — and return it. The stored
 //!    success body is the exact body served to the first caller, so replays
-//!    are byte-compatible. A recorded *failure* outcome is also replayed
-//!    verbatim, with the status reconstructed from its recorded code.
+//!    are byte-compatible. A recorded *failure* outcome of a strict route
+//!    is also replayed verbatim, with the status reconstructed from its
+//!    recorded code.
 //!
 //! If the outcome record of a *successful* mutation cannot be journaled
 //! (journal I/O error), the failure is logged loudly: the caller still
@@ -162,6 +168,36 @@ pub(crate) fn redact(payload: &mut Value) {
     }
 }
 
+/// How a recorded **failure** outcome is answered on a retry (the
+/// `grant_set` wedge fix, P6-A part 3; the diagnosis is
+/// `docs/plans/2026-10-10-grant-set-wedge-diagnosis.md`).
+///
+/// Every recorded **success** replays byte-for-byte on every route — the
+/// classes differ on the failure tail only.
+pub(crate) enum FailureReplay {
+    /// Serve the recorded failure verbatim, never re-executing — the
+    /// strict routes (the volume operations and the mobility routes).
+    /// Their operation ids are consumer-supplied and their refusals can
+    /// carry operator judgment (a validation or policy verdict), so the
+    /// recorded failure is the honest terminal answer.
+    Terminal,
+    /// Re-evaluate the act against the world through the caller's
+    /// inspection — the re-issuable routes (the four peer acts). Their
+    /// safety shape: a deterministic migration-derived operation id, a
+    /// total landed-ness inspection, and an idempotent re-execution at
+    /// every layer (the witness batch under its own operation id, the
+    /// promote per migration, the attachment identity deterministic).
+    /// Proven landed → the proven outcome is journaled (superseding the
+    /// recorded failure — the registry's most-recent-outcome rule) and
+    /// served; proven not landed → the act re-executes under its
+    /// idempotency discipline, its new outcome superseding the failure;
+    /// an inspection error surfaces typed. The recorded failure is never
+    /// re-served as a terminal answer: a failure is a fact about the
+    /// attempt, not about the world, and the world may have converged
+    /// past it (the witness-replayed grant of the recorded wedge).
+    Reissue,
+}
+
 /// Execute one mutating operation through the journal pipeline.
 ///
 /// `run` performs the provider mutation; it is invoked only after the intent
@@ -188,9 +224,11 @@ where
 {
     // The volume operations keep the strict fail-closed in-doubt rule: an
     // intent without an outcome may be in flight right now, so it is never
-    // re-executed (and never "resolved" by guessing). Successes replay as
-    // plain `200` with no recorded status — byte-identical to the
-    // pre-stage-B2 behavior.
+    // re-executed (and never "resolved" by guessing). Their recorded
+    // failures are terminal replays too (see [`FailureReplay::Terminal`]):
+    // consumer-supplied operation ids, refusals that can carry operator
+    // judgment. Successes replay as plain `200` with no recorded status —
+    // byte-identical to the pre-stage-B2 behavior.
     let in_doubt_id = operation_id.clone();
     let in_doubt_state = Arc::clone(state);
     execute_resolvable(
@@ -200,6 +238,7 @@ where
         request_hash,
         payload,
         None,
+        FailureReplay::Terminal,
         move || async move { Err(in_doubt_error(&in_doubt_state, op_kind, &in_doubt_id)) },
         run,
     )
@@ -211,7 +250,8 @@ where
 /// `201`, `BarrierAndTransfer` answers `202`. The status is journaled
 /// with the outcome so an idempotent replay is status-compatible with
 /// the first caller's response, not just body-compatible. The in-doubt
-/// rule is the strict one (see [`execute`]).
+/// rule is the strict one, and so is the failure rule
+/// ([`FailureReplay::Terminal`]; see [`execute`]).
 pub(crate) async fn execute_with_status<R, F, Fut>(
     state: &SharedState,
     op_kind: &'static str,
@@ -235,6 +275,7 @@ where
         request_hash,
         payload,
         Some(success_status),
+        FailureReplay::Terminal,
         move || async move { Err(in_doubt_error(&in_doubt_state, op_kind, &in_doubt_id)) },
         run,
     )
@@ -242,8 +283,9 @@ where
 }
 
 /// The general journal pipeline: [`execute`] and [`execute_with_status`]
-/// (strict in-doubt) and the mobility/peer routes (inspection-resolved
-/// in-doubt) are all this one ordering.
+/// (strict in-doubt, terminal failure replay) and the peer routes
+/// (inspection-resolved in-doubt, re-issued failures) are all this one
+/// ordering.
 ///
 /// On an intent-without-outcome retry, the `inspect` closure decides:
 /// `Ok(Some(value))` **proves** the act already landed — its result is
@@ -257,6 +299,21 @@ where
 /// (the volume operations: a concurrent caller may be executing
 /// right now, and the mobility transfer whose drive task may be
 /// mid-flight).
+///
+/// On a recorded-**failure** retry, `failures` decides (the `grant_set`
+/// wedge fix): [`FailureReplay::Terminal`] serves the recorded failure
+/// verbatim; [`FailureReplay::Reissue`] runs the *same* inspection as
+/// the in-flight case — proven landed → the proven outcome supersedes
+/// the recorded failure (the journal's most-recent-outcome rule) and
+/// is served; proven not landed → the act re-executes under its
+/// idempotency discipline and its outcome supersedes the failure; an
+/// `Err` surfaces typed. The recorded failure itself is never re-served
+/// as a terminal answer on a re-issuable route.
+// The pipeline is one ordered narrative (lookup → intent → execute)
+// whose fall-through control flow does not factor further without
+// scattering the ordering the module docs promise; the length is the
+// honesty, not complexity.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn execute_resolvable<R, F, Fut, I, IFut>(
     state: &SharedState,
     op_kind: &'static str,
@@ -264,6 +321,7 @@ pub(crate) async fn execute_resolvable<R, F, Fut, I, IFut>(
     request_hash: [u8; 32],
     mut payload: Value,
     success_status: Option<StatusCode>,
+    failures: FailureReplay,
     inspect: I,
     run: F,
 ) -> Result<Response, ApiError>
@@ -290,25 +348,51 @@ where
         }
         match entry.outcome {
             Some(outcome) => {
-                state.metrics.record_operation(op_kind, "replayed");
-                tracing::info!(
-                    kind = op_kind,
-                    operation_id = %operation_id,
-                    "replaying recorded outcome without executing"
-                );
-                return replay_response(outcome.success, outcome.http_status, &outcome.response);
+                if !outcome.success && matches!(failures, FailureReplay::Reissue) {
+                    // The `grant_set` wedge fix: a recorded failure of a
+                    // re-issuable act is re-issued, never re-served.
+                    if let Some(reissued) = resolve_retry_by_inspection(
+                        state,
+                        op_kind,
+                        &operation_id,
+                        success_status,
+                        Arrival::RecordedFailure,
+                        inspect,
+                    )
+                    .await?
+                    {
+                        return Ok(reissued);
+                    }
+                    // Proven not landed: fall through to (4), the act
+                    // re-executing under its idempotency discipline.
+                } else {
+                    state.metrics.record_operation(op_kind, "replayed");
+                    tracing::info!(
+                        kind = op_kind,
+                        operation_id = %operation_id,
+                        "replaying recorded outcome without executing"
+                    );
+                    return replay_response(
+                        outcome.success,
+                        outcome.http_status,
+                        &outcome.response,
+                    );
+                }
             }
             None => {
                 // In flight (or interrupted before its outcome was
                 // journaled): the inspect closure resolves it.
-                if let Some(body) =
-                    resolve_in_flight(state, op_kind, &operation_id, success_status, inspect)
-                        .await?
+                if let Some(response) = resolve_retry_by_inspection(
+                    state,
+                    op_kind,
+                    &operation_id,
+                    success_status,
+                    Arrival::InFlight,
+                    inspect,
+                )
+                .await?
                 {
-                    return Ok(json_response(
-                        success_status.unwrap_or(StatusCode::OK),
-                        &body,
-                    ));
+                    return Ok(response);
                 }
             }
         }
@@ -332,26 +416,49 @@ where
                 response,
                 http_status,
             } => {
-                state.metrics.record_operation(op_kind, "replayed");
-                tracing::info!(
-                    kind = op_kind,
-                    operation_id = %operation_id,
-                    "replaying concurrently recorded outcome without executing"
-                );
-                // Same reconstruction as the first-lookup replay above: a
-                // concurrently recorded failure must serve the recorded error
-                // status, never a 200 wrapping the error body.
-                return replay_response(success, http_status, &response);
+                if !success && matches!(failures, FailureReplay::Reissue) {
+                    // The `grant_set` wedge fix, race flavor: the rule
+                    // must not depend on winning a race — a concurrently
+                    // recorded failure of a re-issuable act is re-issued
+                    // exactly like the first-lookup path above.
+                    if let Some(reissued) = resolve_retry_by_inspection(
+                        state,
+                        op_kind,
+                        &operation_id,
+                        success_status,
+                        Arrival::RecordedFailure,
+                        inspect,
+                    )
+                    .await?
+                    {
+                        return Ok(reissued);
+                    }
+                    // Proven not landed: fall through to (4).
+                } else {
+                    state.metrics.record_operation(op_kind, "replayed");
+                    tracing::info!(
+                        kind = op_kind,
+                        operation_id = %operation_id,
+                        "replaying concurrently recorded outcome without executing"
+                    );
+                    // Same reconstruction as the first-lookup replay above: a
+                    // concurrently recorded failure must serve the recorded error
+                    // status, never a 200 wrapping the error body.
+                    return replay_response(success, http_status, &response);
+                }
             }
             IntentAppend::AlreadyInFlight => {
-                if let Some(body) =
-                    resolve_in_flight(state, op_kind, &operation_id, success_status, inspect)
-                        .await?
+                if let Some(response) = resolve_retry_by_inspection(
+                    state,
+                    op_kind,
+                    &operation_id,
+                    success_status,
+                    Arrival::InFlight,
+                    inspect,
+                )
+                .await?
                 {
-                    return Ok(json_response(
-                        success_status.unwrap_or(StatusCode::OK),
-                        &body,
-                    ));
+                    return Ok(response);
                 }
             }
         }
@@ -437,19 +544,57 @@ where
     }
 }
 
-/// Resolve one in-flight (intent-without-outcome) retry through the
-/// caller's inspection: `Ok(Some(body))` journals the proven result as
-/// the outcome (with the caller's success status, so a later replay
-/// through the recorded outcome is status-compatible) and returns it
-/// for serving; `Ok(None)` reports "not landed — re-execute" (the
-/// caller proceeds to `run`); an `Err` propagates typed.
-async fn resolve_in_flight<R, I, IFut>(
+/// How the inspection resolver was reached: an intent without an
+/// outcome, or a recorded failure being re-issued. The transition
+/// semantics are identical — only the tracing wording differs.
+#[derive(Clone, Copy)]
+enum Arrival {
+    /// The journal holds the intent without an outcome: the act may be
+    /// in flight or may have died before journaling its outcome.
+    InFlight,
+    /// The journal holds a recorded *failure* outcome and the route
+    /// re-issues the act ([`FailureReplay::Reissue`]): the recorded
+    /// answer described a past attempt, not the world.
+    RecordedFailure,
+}
+
+impl Arrival {
+    /// The tracing label for this arrival.
+    fn label(self) -> &'static str {
+        match self {
+            Arrival::InFlight => "in-flight operation",
+            Arrival::RecordedFailure => "recorded failure",
+        }
+    }
+}
+
+/// Resolve one inspection-gated retry through the caller's inspection
+/// and serve the proven outcome. Reached two ways (see [`Arrival`]):
+/// an intent-without-outcome retry (the in-flight crash window), or a
+/// recorded-failure retry of a re-issuable act (the `grant_set` wedge
+/// fix — the callers gate on [`FailureReplay::Reissue`], so a strict
+/// route's recorded failure is a terminal replay and never reaches
+/// this).
+///
+/// `Ok(Some(response))` — the act is provably landed: the proven
+/// outcome is journaled (with the caller's success status, so a later
+/// replay through the recorded outcome is status-compatible) and the
+/// response returned for serving, closing the in-flight crash window
+/// or superseding the recorded failure (the registry's
+/// most-recent-outcome rule). `Ok(None)` — the act is provably not
+/// landed: the caller falls through to the execution, the act
+/// re-running under its idempotency discipline with its own first
+/// step re-verifying. An `Err` propagates typed (nothing is guessed);
+/// in the recorded-failure arrival this is the rule that the stale
+/// failure is never re-served as a terminal answer.
+async fn resolve_retry_by_inspection<R, I, IFut>(
     state: &SharedState,
     op_kind: &'static str,
     operation_id: &OperationId,
     success_status: Option<StatusCode>,
+    arrival: Arrival,
     inspect: I,
-) -> Result<Option<Value>, ApiError>
+) -> Result<Option<Response>, ApiError>
 where
     R: Serialize,
     I: FnOnce() -> IFut,
@@ -472,8 +617,8 @@ where
                     kind = op_kind,
                     operation_id = %operation_id,
                     error = %journal_error,
-                    "in-flight resolution proved the act landed but its outcome \
-                     could not be journaled; replays will re-resolve by inspection"
+                    "the inspection proved the act landed but its outcome \
+                     could not be journaled; retries will re-resolve by inspection"
                 );
             }
             // The resolved outcome is durable (the campaign's
@@ -484,17 +629,23 @@ where
             tracing::info!(
                 kind = op_kind,
                 operation_id = %operation_id,
-                "in-flight operation resolved by inspection: the act is proven done"
+                arrival = arrival.label(),
+                "resolved by inspection: the act is proven done (a recorded \
+                 failure is superseded, never served past this point)"
             );
-            Ok(Some(body))
+            Ok(Some(json_response(
+                success_status.unwrap_or(StatusCode::OK),
+                &body,
+            )))
         }
         Ok(None) => {
             state.metrics.record_operation(op_kind, "re_drive");
             tracing::info!(
                 kind = op_kind,
                 operation_id = %operation_id,
-                "in-flight operation proven not landed; re-executing (the act \
-                 re-verifies its own preconditions)"
+                arrival = arrival.label(),
+                "proven not landed; re-executing (the act re-verifies its \
+                 own preconditions)"
             );
             Ok(None)
         }

@@ -19,6 +19,31 @@
 //! own first step re-verifying its preconditions; an `Err` surfaces
 //! typed and nothing is guessed.
 //!
+//! ## The failure re-issue rule (the `grant_set` wedge fix)
+//!
+//! A recorded **failure** outcome of a peer mutation is re-issued, not
+//! re-served ([`crate::ops::FailureReplay::Reissue`]): the failure is a
+//! fact about a past attempt, and the world may have converged past it
+//! — the recorded wedge (P6-A part 3) was exactly that shape, a
+//! witness kill inside the grant commit whose witness-side replay
+//! landed the grant while B's journaled failure replayed forever. The
+//! re-issue runs the *same* inspection as the in-flight rule: proven
+//! landed → the proven outcome supersedes the recorded failure and is
+//! served; proven not landed → the act re-executes under its
+//! idempotency discipline (below); the inspection's own error surfaces
+//! typed — the stale failure is never re-served as a terminal answer.
+//! The rule is safe for exactly these four acts and no others: their
+//! operation ids are migration-derived (deterministic per migration —
+//! no consumer recourse exists after the cut, which is why a permanent
+//! park was a defect), their landed-ness is totally inspectable, their
+//! re-execution is idempotent at every layer, and their refusals are
+//! world-derived and reproduce identically on re-execution (an
+//! operator-judgment refusal never rides this path — the strict routes
+//! keep verbatim failure replay). A genuinely unresolvable failure
+//! (a stable typed refusal, e.g. a promote the resource cannot
+//! serve) still parks: the re-issue re-executes and the refusal
+//! reproduces — a bounded, honest spin.
+//!
 //! Each act is built to make that resolution honest:
 //!
 //! - **prepare** is content-idempotent through the durable
@@ -1146,6 +1171,7 @@ pub(crate) async fn prepare(
         hash,
         body,
         None,
+        ops::FailureReplay::Reissue,
         move || {
             let ctx = Arc::clone(&inspect_ctx);
             let req = inspect_req.clone();
@@ -1358,6 +1384,7 @@ pub(crate) async fn grant(
         hash,
         body,
         None,
+        ops::FailureReplay::Reissue,
         move || {
             let ctx = Arc::clone(&inspect_ctx);
             let req = inspect_req.clone();
@@ -1561,6 +1588,7 @@ pub(crate) async fn restore_vm(
         hash,
         body,
         None,
+        ops::FailureReplay::Reissue,
         move || {
             let ctx = Arc::clone(&inspect_ctx);
             let req = inspect_req.clone();
@@ -1735,6 +1763,7 @@ pub(crate) async fn discard(
         hash,
         body,
         None,
+        ops::FailureReplay::Reissue,
         move || {
             let ctx = Arc::clone(&inspect_ctx);
             let req = inspect_req.clone();
