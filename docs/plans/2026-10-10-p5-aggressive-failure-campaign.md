@@ -107,6 +107,16 @@ Out of scope (recorded, each with its reason):
   by **lineage** (data-generation UUID); there is no per-block writer-
   epoch tag to corrupt in Tier S (§5.2 records the boundary). Epoch
   *authority* is already adversarially tested at the witness (P4a W1–W7).
+- **The durable dirty-bitmap/meta boundary** (§10's "SIGKILL … during
+  dirty bitmap") — the implemented prototype persists **no dirty
+  bitmap or resync progress**: `DrbdState` carries roles, generations
+  and markers only, and the fake's resync state is in-memory. There is
+  no durable bitmap-write boundary to kill against in Tier S. The
+  class maps to (i) Tier S row 12: kills **during an in-flight
+  resync** (the logical window — the daemon dies while content-copy
+  runs; restart reconciles and re-drives it), and (ii) Tier R: real
+  DRBD's bitmap persistence in kernel/meta state. Recorded here and
+  in the §8 note.
 - **Wire-codec fuzzing** — serde `deny_unknown_fields` is already
   exercised by route tests; a dedicated fuzzer is recorded follow-up.
 
@@ -146,6 +156,12 @@ inside, but *driving* never does):
 - **Suspension gates the write path** — a resource in the suspended
   set (the existing `suspend-io` state) refuses writes on its handle;
   the quiesce is real at the data path, not just a flag.
+- **Openers and the busy model (rule-17 fidelity)** — the oracle's
+  handle models the guest's I/O: it participates in the openers set
+  exactly as the FakeVmm's device hooks do while the VM is Running
+  (a held device blocks the demote), and the oracle stops writing
+  when the VM pauses. A post-mortem or rogue read/write uses
+  `read_raw`/`write_raw`, which never touch the openers set.
 - **Acknowledgment model** — a write's return is the source-side ack
   (the fake transport is synchronous up to the source's own block
   map). This is deliberately the *Protocol C-shaped* ack; §2.3 adds
@@ -185,19 +201,30 @@ real; both are deliverables of stage A:
    barrier late — after writes it should have covered — is a finding,
    reported as a boundary-skew violation). The oracle never takes the
    coordinator's word for what should exist.
-2. **The peer-apply window is real.** The fake gains an async
-   replication queue: a source-side write is acked when it lands in
-   the source's block map, and is applied to the peer's map only when
-   the kit's `apply_peer_writes(minor, up_to)` is driven — by the
-   campaign at a controlled lag (a bounded number of writes behind, or
-   held entirely until a resync). The contract consequence is modeled
-   exactly per AGENTS rule 16: the *acknowledged* set may exceed the
-   *peer-applied* set during steady state; the barrier path (the
-   existing suspension + `track_sync` convergence + resync) is what
-   closes the gap before the cut, and the oracle asserts it did —
-   `COMPLETE` with target blocks missing behind the data-path
-   boundary is a **caught violation**, and an abort's honestly
-   reported tail may be genuinely nonzero.
+- **The peer-apply window is real, and the gate cannot lie while it is
+  open.** The fake gains an async replication queue: a source-side
+  write is acked when it lands in the source's block map, and is
+  applied to the peer's map only when the queue drains. **The coupling
+  rule (stage A's deliverable, the anti-circularity hinge):** the
+  status tokens the convergence gate reads (`connected`,
+  `peer_disk == UpToDate`, "no active resync" — what
+  `track_sync`/`replica_caught_up` observe) are **derived from the
+  queue's block-apply state**, not set independently — a resource
+  reads `UpToDate` only when the queue is fully drained, and
+  "resyncing" is true while content-copying is in flight. Post-barrier
+  drain is performed by the fake's content-copying resync (the system
+  path, §2.4), never by the campaign; the campaign's queue control
+  (`apply_peer_writes(minor, up_to)`) exists only to shape the
+  **pre-quiesce lag**. The contract consequence is modeled exactly
+  per AGENTS rule 16: the *acknowledged* set may exceed the
+  *peer-applied* set during steady state; the barrier path (the
+  existing suspension + `track_sync` convergence + resync) is what
+  closes the gap before the cut, and the oracle asserts it did —
+  `COMPLETE` with target blocks missing behind the data-path boundary
+  is a **caught violation** (and because the gate reads the queue, it
+  is a violation in volvisor's convergence logic, not a harness
+  artifact), and an abort's honestly reported tail may be genuinely
+  nonzero.
 
 ### 2.4 Resync and out-of-band writes
 
@@ -278,16 +305,44 @@ uncovered points enumerated in the report, never a silent cut.
 
 A real `kill -9` removes the process: server, background tasks, locks,
 in-memory state — all at once. The campaign's kill must model that, so
-the rig's daemon is a **task group**: the serve task, the lease
-renewal task and the migration retry task are scoped together (spawned
-under one supervisor; the kill aborts all three). This also releases
-the journal's flock (no lingering `Arc` into the shared state holds
-it), so the restart's re-open succeeds exactly as a real process
-restart's would. The kill fires from inside the armed hook mid-
-operation — no shutdown handlers, no graceful drain. What survives is
-exactly what a process kill leaves: the journal files, the DRBD state
-file, the witness journal, the migration records, the fake worlds'
-block maps. Recovery is asserted from those artifacts only.
+the rig's daemon is a **task group** and the group is enumerated
+completely (a supervisor that misses the mutation engine is not a kill
+model):
+
+- the **serve task** (the axum listener),
+- the **lease renewal task** — production's `spawn_renewal_task` is
+  private and detached, so the rig re-implements the renewal loop over
+  the public provider `renew_leases` surface under its own supervisor
+  (consistent with §4's import discipline: the campaign crate uses no
+  `volvisord` internals beyond the exported constructors),
+- the **migration retry task** (`spawn_migration_retry_task`, already
+  `pub`, returns an abortable `JoinHandle`),
+- the **transfer drive task** — the detached task `transfer` spawns to
+  perform the actual cut. Stage A includes one small, behavior-neutral
+  runtime change for this: the drive task is spawned into a **tracked
+  registry** on the migration handle (the `JoinHandle` is recorded;
+  nothing else changes — graceful paths behave identically), so the
+  supervisor can abort it with the group. Without this, a mid-cut kill
+  would leave a live drive task mutating witness and migration state
+  after the "kill" — an interleaving a real `kill -9` cannot produce.
+- **in-flight request tasks**: axum handler tasks are not children of
+  the serve future. The rig's driving discipline makes this
+  deterministic: scenarios drive **one request at a time**, so the
+  only in-flight request at kill time is the one whose journal hook
+  fired the kill — aborting the group from inside that request is
+  exactly a process dying mid-handler. Concurrent-request interleaving
+  at kill time is out of the deterministic matrix's scope (recorded;
+  it is a scheduling race, Tier R's territory).
+
+The kill fires from inside the armed hook mid-operation — no shutdown
+handlers, no graceful drain. Aborting the group releases the
+journal's flock (no lingering `Arc` into the shared state holds it —
+verified: the `Journal` drops its exclusive lock with the value), so
+the restart's re-open succeeds exactly as a real process restart's
+would. What survives is exactly what a process kill leaves: the
+journal files, the DRBD state file, the witness journal, the migration
+records, the fake worlds' block maps. Recovery is asserted from those
+artifacts only.
 
 The in-process residue that a task abort *would* leave but a process
 kill would not (e.g. the fake worlds living in the same process) is
@@ -458,10 +513,15 @@ Every scenario emits a JSON record:
   (with the coverage-matrix reference); Tier R is scaffolded and
   hardware-gated (skipped records emitted, not silence); production
   support is not claimed; and the §10 rows this campaign does **not**
-  deliver are enumerated in the note (benchmarks, local mirror
-  leg loss/repair/rebuild — no mirror implementation exists to
-  fault, saturation/multi-TB scale, media-level flush/FUA and power
-  loss), each pointing at the report's recorded gate.
+  deliver are enumerated in the note and point at the report's
+  recorded gates: benchmarks, local mirror leg loss/repair/rebuild
+  (no mirror implementation exists to fault), saturation/multi-TB
+  scale, media-level flush/FUA and power loss, the durable
+  dirty-bitmap/meta boundary (no persisted bitmap exists; Tier S
+  covers kills during in-flight resync only), Storage Cell crash
+  (no cell class in the campaign), and O3K control-plane disconnect
+  (covered in Tier S only through the witness-divergence proxy,
+  row 11).
 - This document is the plan of record; the campaign `REPORT.md`
   template lands with stage A.
 - No behavior contract changes are planned — the campaign tests the
@@ -487,7 +547,7 @@ the report):
 | 9 | wrong-lineage injection at the target | wrong-epoch data injection (lineage-shaped, §1) | typed refusal; never `COMPLETE` over foreign data |
 | 10 | forged barrier proofs | wrong-epoch barrier injection | void keys by migration; mismatch refuses typed |
 | 11 | witness divergence | control-plane disconnect / stale authority | next mutation fails closed |
-| 12 | concurrent multi-volume cut + resync-under-foreground + source-VMM death mid-cut | multi-disk final cut; resync while foreground continues; VMM crash | convergence or exact `IN_DOUBT` participant report; the convergence gate never lies over a partition or an in-flight resync |
+| 12 | concurrent multi-volume cut + resync-under-foreground + source-VMM death mid-cut + kills during an in-flight resync (the dirty-bitmap window) | multi-disk final cut; resync while foreground continues; VMM crash; SIGKILL during dirty bitmap (logical window — §1 records the durable boundary as Tier R) | convergence or exact `IN_DOUBT` participant report; the convergence gate never lies over a partition, an in-flight resync, or an un-drained apply queue |
 | 13 | replication partition mid-migration | storage network disconnect | no caught-up claim over a partition; cut refuses/parks; async tail covered |
 | 14 | abort storm (25 cycles, rotating pre-cut faults) | repeated migration aborts | no state residue, no lease leak, terminal records immutable, fresh-id recovery idempotent |
 | 15 | evidence bundle + summary render | exact versions, independent harness, full logs | the coverage matrix exists, budget-adherent, and is truthful |
@@ -496,7 +556,9 @@ Tier R rows (env-gated, `skipped` records until hardware): the same
 families against real DRBD/CH, plus the rows with no Tier S
 equivalent — power cut, real SSD loss, media-level flush/FUA,
 saturation and multi-TB scale, local mirror leg loss (once a mirror
-implementation exists), real dirty-bitmap/peer-stream kill timing.
+implementation exists), the durable dirty-bitmap/peer-stream meta
+boundaries, and real kill-timing races (concurrent requests at kill
+time, scheduling interleavings).
 
 ## 10. Staging (PR map)
 
@@ -504,9 +566,11 @@ The house per-stage adversarial review process applies:
 
 - **Stage A (PR: oracle substrate + harness)**: §2 in full — the
   fake data path (blocks, lineage, handles, suspension gating, the
-  peer-apply queue), the boundary rules, the oracle library, the
-  campaign rig (task-group kill model, HTTP-only driving), rows 1–3,
-  the evidence emitter + `REPORT.md` template.
+  peer-apply queue with the gate-coupling rule), the boundary rules,
+  the oracle library, the campaign rig (the complete task-group kill
+  model of §3.3, including the behavior-neutral drive-task registry
+  change and the rig-side renewal loop), rows 1–3, the evidence
+  emitter + `REPORT.md` template.
 - **Stage B (PR: the kill matrix)**: §3 — the armed hooks (journal
   append, store-save, witness), the generated matrix, rows 4–7.
 - **Stage C (PR: the adversarial injections)**: §5 — rows 8–14
