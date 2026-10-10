@@ -95,7 +95,11 @@ evidence status stated honestly:
   (`row_5_consumer_mobility_kill_matrix`, the post-restart "rolled back to
   aborted" assertion in `rows_4_7.rs`): reproduced roughly 2–3 of 6
   full-suite runs during this plan's review round — the assertion races
-  the daemon's async startup reconciliation;
+  the daemon's async startup reconciliation — **resolved in PR #21
+  (P6-A part 1): the retry task's startup pass runs concurrently with
+  the serve and its `try_lock` defers behind the test's own fresh-prepare
+  drive, so the single-shot observation became the same bounded poll the
+  transfer and abort cells already use**;
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 
