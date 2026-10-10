@@ -2267,8 +2267,10 @@ async fn row_14_abort_storm() {
     );
     evidence.invariant(
         "no_marker_residue",
-        "pass: every cycle's prepare succeeded over the previous cycle's rollback — a lingering \
-         cut marker would refuse",
+        "pass: the per-cycle W1-W5/role/VM checks plus the journal-growth accounting hold — \
+         the cut marker is voided with each rollback (the abort's participant voids) and \
+         nothing accumulates. (Note: prepare itself does not consult the cut marker — the \
+         residue evidence is the per-cycle state checks, not a prepare refusal.)",
     );
     evidence.invariant(
         "no_lease_leak",

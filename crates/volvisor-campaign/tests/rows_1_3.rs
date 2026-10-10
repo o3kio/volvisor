@@ -536,7 +536,19 @@ async fn row_3_k2_transfer_before_outcome() {
     );
     let peer = verify_against(&rig.world_b, SEED_MINOR, &acked, WRITER_ID);
     assert_eq!(peer.corrupted, 0, "no corruption: {peer:?}");
-    assert!(peer.tail() > 0, "the frozen tail is nonzero: {peer:?}");
+    // The stable invariant, not the frozen window's size: every
+    // acknowledged write is present or tail at the peer, and none is
+    // corrupted. The tail's SIZE here is honestly timing-dependent —
+    // the rollback's own resync (the system path) may legitimately
+    // sync the peer before the observation, and the window the
+    // transport froze can be drained by it; the nonzero-tail shape
+    // is row 2's business, where the lag is shaped deterministically
+    // (the round-1 review's F4: this assert was an unbounded race).
+    assert_eq!(
+        peer.present + peer.tail(),
+        peer.acknowledged,
+        "every acknowledged write is present or tail at the peer: {peer:?}"
+    );
 
     evidence.invariant(
         "g5_no_resume_over_barrier",
