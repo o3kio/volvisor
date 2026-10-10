@@ -97,13 +97,13 @@ impl FromRequestParts<SharedState> for RequireAdmin {
 
 /// Extract the bearer token from an `Authorization` header, if present and
 /// well-formed.
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     value.strip_prefix("Bearer ")
 }
 
 /// Length-checked, no-early-exit byte comparison.
-fn fixed_time_eq(presented: &str, expected: &str) -> bool {
+pub(crate) fn fixed_time_eq(presented: &str, expected: &str) -> bool {
     if presented.len() != expected.len() {
         return false;
     }

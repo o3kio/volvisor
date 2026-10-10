@@ -46,6 +46,20 @@ pub struct Outcome {
     /// Response body (or error detail) returned to the caller; replayed
     /// verbatim on idempotent retries.
     pub response: serde_json::Value,
+    /// The HTTP status the original response was served with, when the
+    /// operation recorded one (stage B2: the mobility routes answer
+    /// `201` and `202`, and an idempotent replay must be
+    /// status-compatible with the first caller's response — a replayed
+    /// `PrepareNearlineHandoff` serves `201`, not `200`).
+    ///
+    /// `None` on outcomes recorded without a status (the pre-stage-B2
+    /// shape and internal outcomes): those replay through the default
+    /// mapping (`200` on success, the wire-code status on failure).
+    ///
+    /// Additive stage-B2 field: journals written before stage B2 decode
+    /// with `None` (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 /// Operator/administrative marker record; carries no idempotency state.
@@ -102,11 +116,39 @@ mod tests {
             operation_id: OperationId::new("op-2").expect("valid id"),
             success: false,
             response: serde_json::json!({"error": "boom"}),
+            http_status: None,
         });
         let back: JournalRecord =
             serde_json::from_str(&serde_json::to_string(&record).expect("serialize"))
                 .expect("deserialize");
         assert_eq!(back, record);
+
+        // A stage-B2 outcome carries its HTTP status; an older journal
+        // (no `http_status` key) decodes with `None` (serde default),
+        // and the field is not serialized when absent.
+        let with_status = JournalRecord::Outcome(Outcome {
+            operation_id: OperationId::new("op-2b").expect("valid id"),
+            success: true,
+            response: serde_json::json!({"state": "PREPARED"}),
+            http_status: Some(201),
+        });
+        let json = serde_json::to_string(&with_status).expect("serialize");
+        assert!(json.contains("\"http_status\":201"));
+        assert_eq!(
+            serde_json::from_str::<JournalRecord>(&json).expect("deserialize"),
+            with_status
+        );
+        let legacy = json.replace(",\"http_status\":201", "");
+        let back: JournalRecord = serde_json::from_str(&legacy).expect("legacy decode");
+        assert_eq!(
+            back,
+            JournalRecord::Outcome(Outcome {
+                operation_id: OperationId::new("op-2b").expect("valid id"),
+                success: true,
+                response: serde_json::json!({"state": "PREPARED"}),
+                http_status: None,
+            })
+        );
     }
 
     #[test]

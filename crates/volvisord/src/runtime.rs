@@ -9,11 +9,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use volvisor_api::peer::PeerRouteContext;
 use volvisor_api::{AppState, SharedState, router};
 use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
 use volvisor_drbd::{AuthorityContext, DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
 use volvisor_lvm::{LvmProvider, RealRunner};
+use volvisor_provider::vmm::{ChRemoteConfig, ChRemoteVmm};
 use volvisor_provider::{AdminSurface, AdoptionSurface};
 use volvisor_types::{ApiError, HostId};
 use volvisor_witness::client::HttpWitnessConnection;
@@ -21,6 +23,11 @@ use volvisor_witness::{BlockingWitness, BlockingWitnessConnection};
 
 use crate::DaemonError;
 use crate::config::{Config, ProviderKind};
+use crate::handoff::{
+    HttpPeerClient, MigrationHandle, PEER_REQUEST_TIMEOUT, ParticipantFacts, PeerClient,
+    migration_records_dir, migration_witness_probe, peer_preparations_dir,
+    spawn_migration_retry_task, wire_migration,
+};
 
 /// The witness request timeout for the blocking adapter: bounds every
 /// control-path witness wait (the engine holds its state lock across
@@ -81,8 +88,33 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
                 spawn_renewal_task(&provider);
             }
             let adoption: Arc<dyn AdoptionSurface> = provider.clone();
-            AppState::new(provider, None, journal, config.admin_token.clone())
-                .with_adoption(adoption)
+            // The provider's handoff surface is attached whenever the
+            // provider is the DRBD engine (check-mobility is a
+            // read-only eligibility observation — its typed 404 is
+            // about the provider class, not the migration opt-in).
+            let mut state =
+                AppState::new(provider.clone(), None, journal, config.admin_token.clone())
+                    .with_adoption(adoption)
+                    .with_handoff(provider.clone());
+            // The coordinated handoff itself (P4b plan §6, stage B2):
+            // opt-in behind `[migration] enabled`. Both roles are
+            // wired at once — one daemon serves whichever role the
+            // migration assigns it (the consumer mobility routes and
+            // the source-side drive, plus the internal peer routes
+            // for the destination side) — and the retry task owns the
+            // periodic reconcile.
+            if config.migration.enabled {
+                let (handle, peer_ctx) = wire_daemon_migration(config, &provider)?;
+                state = state
+                    .with_migration(handle.clone())
+                    .with_peer_routes(config.migration.peer_api_token.clone(), peer_ctx);
+                // Detached by design (the renewal-task pattern): the
+                // task owns the periodic reconcile for the daemon's
+                // lifetime and never fails the startup that spawned
+                // it — every outcome is a structured event.
+                let _detached = spawn_migration_retry_task(handle);
+            }
+            state
         }
     };
     Ok(Arc::new(state))
@@ -257,6 +289,114 @@ fn drbd_authority(config: &Config) -> Result<Option<AuthorityContext>, DaemonErr
         .map_err(|e| DaemonError::Config(format!("witness authority construction failed: {e}")))
 }
 
+/// Wire the daemon's migration roles (P4b plan §6, stage B2) over the
+/// real surfaces: the source-role driver (witness over this host's W8
+/// credential, the `ch-remote` VMM adapter, the provider's handoff
+/// surface, the peer daemon's internal API), the consumer handle with
+/// the provider-local participant-facts enrichment, and the
+/// destination-side peer-route context. Both durable stores live under
+/// the journal directory (`migrations/`, `peer-preparations/` — the
+/// `drbd-state.json` precedent: beside the journal, never inside its
+/// lock).
+///
+/// The configuration is already validated (enabling requires the drbd
+/// provider, a witness, a snapshot dir, a peer URL and token, and both
+/// VMM fields); the `ok_or_else` guards here are defense in depth for
+/// a programmatic `Config` that skipped validation — never a panic.
+///
+/// Must be called from an async context (the blocking witness adapter
+/// captures the runtime handle).
+///
+/// # Errors
+/// [`DaemonError::Config`] when a validated-mandatory field is absent
+/// (defense in depth), the witness probe target cannot be resolved, or
+/// either durable store cannot be opened.
+fn wire_daemon_migration(
+    config: &Config,
+    provider: &Arc<DrbdProvider>,
+) -> Result<(Arc<MigrationHandle>, Arc<PeerRouteContext>), DaemonError> {
+    let witness_url = config.witness_url.clone().ok_or_else(|| {
+        DaemonError::Config(
+            "migration.enabled requires a witness_url (config validation should have refused \
+             this earlier)"
+                .to_owned(),
+        )
+    })?;
+    let node_name = config.drbd_node_name.clone().ok_or_else(|| {
+        DaemonError::Config("drbd_node_name is required for the drbd provider".to_owned())
+    })?;
+    let host_id = HostId::new(node_name.as_str())
+        .map_err(|e| DaemonError::Config(format!("drbd_node_name: {e}")))?;
+    // W8: this connection authenticates as THIS host — the same
+    // credential and timeout the authority context uses; the driver's
+    // witness mutations (RecordBarrier, VoidBarrier, RevokeSet) and the
+    // destination-side peer routes share it.
+    let witness = Arc::new(HttpWitnessConnection::new(
+        witness_url.clone(),
+        config.witness_host_token.clone(),
+        WITNESS_REQUEST_TIMEOUT,
+    ));
+    let witness_probe = migration_witness_probe(&witness_url)?;
+    let vmm = Arc::new(ChRemoteVmm::new(
+        ChRemoteConfig {
+            ch_remote_bin: config.vmm.ch_remote_bin.clone().ok_or_else(|| {
+                DaemonError::Config(
+                    "vmm.ch_remote_bin is required when migration is enabled".to_owned(),
+                )
+            })?,
+            api_socket_dir: config.vmm.api_socket_dir.clone().ok_or_else(|| {
+                DaemonError::Config(
+                    "vmm.api_socket_dir is required when migration is enabled".to_owned(),
+                )
+            })?,
+        },
+        Arc::new(RealRunner::default()),
+    ));
+    let peer: Arc<dyn PeerClient> = Arc::new(HttpPeerClient::new(
+        config.migration.peer_api_url.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "migration.peer_api_url is required when migration is enabled".to_owned(),
+            )
+        })?,
+        config.migration.peer_api_token.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "migration.peer_api_token is required when migration is enabled".to_owned(),
+            )
+        })?,
+        PEER_REQUEST_TIMEOUT,
+    ));
+    let snapshot_root = config.migration.snapshot_dir.clone().ok_or_else(|| {
+        DaemonError::Config(
+            "migration.snapshot_dir is required when migration is enabled".to_owned(),
+        )
+    })?;
+    // The prepare enrichment: the provider-local facts (resource,
+    // minor) derived from provider state, never asserted by the
+    // consumer (the `MigrationSurface` module docs' documented
+    // deviation).
+    let facts_provider = Arc::clone(provider);
+    let facts: ParticipantFacts = Arc::new(
+        move |volume_id: &volvisor_types::VolumeId, vm_id: &str, expected_generation: u64| {
+            facts_provider.migration_participant_facts(volume_id, vm_id, expected_generation)
+        },
+    );
+    let clock: volvisor_handoff::Clock = Arc::new(crate::unix_now_secs);
+    wire_migration(
+        host_id,
+        witness,
+        witness_probe,
+        vmm,
+        provider.clone(),
+        provider.clone(),
+        peer,
+        facts,
+        snapshot_root,
+        migration_records_dir(&config.journal_dir),
+        peer_preparations_dir(&config.journal_dir),
+        clock,
+    )
+}
+
 /// Spawn the background lease-renewal task (P4a plan §6): ticks every
 /// [`RENEWAL_TICK`] — `renew_leases` itself throttles actual renewals
 /// to the configured interval and checks the W5 deadline on every
@@ -399,6 +539,7 @@ fn journal_err(context: &'static str) -> impl Fn(ApiError) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MigrationConfig, VmmConfig};
 
     fn fake_config(listen: &str, admin_token: Option<&str>) -> Config {
         Config {
@@ -432,6 +573,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
         }
     }
@@ -471,6 +614,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
         }
     }
@@ -607,6 +752,8 @@ mod tests {
             witness_url: None,
             witness_token: None,
             witness_host_token: None,
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
             drbd_vg_name: None,
             drbd_config_dir: None,
@@ -705,6 +852,8 @@ mod tests {
             witness_url: Some("http://10.0.0.3:9101".to_owned()),
             witness_token: Some("witness-secret".to_owned()),
             witness_host_token: Some("host-a-secret".to_owned()),
+            migration: MigrationConfig::default(),
+            vmm: VmmConfig::default(),
             witness_renewal_interval_secs: Some(15),
             ..drbd_config(std::path::PathBuf::from("/j"))
         };

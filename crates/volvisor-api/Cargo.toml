@@ -14,11 +14,14 @@ workspace = true
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 tracing = { workspace = true }
+volvisor-handoff = { workspace = true }
 volvisor-journal = { workspace = true }
 volvisor-provider = { workspace = true }
 volvisor-types = { workspace = true }
+volvisor-witness = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

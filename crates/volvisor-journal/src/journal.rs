@@ -31,6 +31,10 @@ pub struct RecordedOutcome {
     pub success: bool,
     /// Response body (or error detail) recorded when the operation finished.
     pub response: serde_json::Value,
+    /// The HTTP status the original response was served with, when the
+    /// outcome recorded one (stage B2: `201`/`202` mobility routes); a
+    /// replay serves this status instead of the default mapping.
+    pub http_status: Option<u16>,
 }
 
 /// Idempotency-registry view of one operation, derived from replay.
@@ -53,18 +57,23 @@ pub enum IntentAppend {
     /// carrying the recorded outcome.
     ///
     /// `success` lets the caller reconstruct the HTTP status of the
-    /// original response (successes replay as `200`, failures as the
-    /// recorded wire code's status), keeping replays status- and
-    /// byte-compatible with the first caller's response. An earlier
-    /// revision carried `Option<Value>` for outcome kinds "without a
-    /// replayable body"; no such kind exists (every recorded outcome
-    /// carries a JSON body), so the never-`None` `Option` is collapsed
-    /// into this unconditional shape.
+    /// original response (successes replay as `200` unless the outcome
+    /// recorded its own [`http_status`](IntentAppend::Replayed::http_status),
+    /// failures as the recorded wire code's status), keeping replays
+    /// status- and byte-compatible with the first caller's response.
+    /// An earlier revision carried `Option<Value>` for outcome kinds
+    /// "without a replayable body"; no such kind exists (every recorded
+    /// outcome carries a JSON body), so the never-`None` `Option` is
+    /// collapsed into this unconditional shape.
     Replayed {
         /// Whether the recorded mutation succeeded.
         success: bool,
         /// The recorded response body, replayed verbatim.
         response: serde_json::Value,
+        /// The recorded HTTP status, when the outcome carried one
+        /// (stage-B2 mobility routes); `None` replays through the
+        /// default status mapping.
+        http_status: Option<u16>,
     },
     /// The intent is durably recorded but has no outcome yet: the operation
     /// is in flight (or was interrupted before its outcome was journaled).
@@ -257,6 +266,7 @@ impl Journal {
                     Some(outcome) => IntentAppend::Replayed {
                         success: outcome.success,
                         response: outcome.response.clone(),
+                        http_status: outcome.http_status,
                     },
                     None => IntentAppend::AlreadyInFlight,
                 }),
@@ -288,13 +298,33 @@ impl Journal {
         success: bool,
         response: serde_json::Value,
     ) -> Result<(), ApiError> {
+        self.append_outcome_with_status(operation_id, success, response, None)
+    }
+
+    /// Append an outcome record carrying the HTTP status the response was
+    /// served with (stage B2: the mobility routes answer `201` and `202`,
+    /// and an idempotent replay must serve the same status, not the
+    /// default `200`-on-success mapping). Otherwise identical to
+    /// [`Journal::append_outcome`].
+    pub fn append_outcome_with_status(
+        &mut self,
+        operation_id: OperationId,
+        success: bool,
+        response: serde_json::Value,
+        http_status: Option<u16>,
+    ) -> Result<(), ApiError> {
         self.append(JournalRecord::Outcome(Outcome {
             operation_id: operation_id.clone(),
             success,
             response: response.clone(),
+            http_status,
         }))?;
         let entry = self.operations.entry(operation_id).or_default();
-        entry.outcome = Some(RecordedOutcome { success, response });
+        entry.outcome = Some(RecordedOutcome {
+            success,
+            response,
+            http_status,
+        });
         Ok(())
     }
 
@@ -431,6 +461,7 @@ fn apply_record(replayed: &mut Replayed, record: JournalRecord) {
             entry.outcome = Some(RecordedOutcome {
                 success: outcome.success,
                 response: outcome.response,
+                http_status: outcome.http_status,
             });
         }
         JournalRecord::Checkpoint(_) => {}
@@ -662,6 +693,49 @@ mod tests {
             0o600,
             "journal lock must not be readable by other local users"
         );
+    }
+
+    #[test]
+    fn outcome_with_status_replays_status_compatible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = op_id("op-status-replay");
+        let hash = [11; 32];
+        let body = serde_json::json!({"state": "PREPARED"});
+        {
+            let mut journal = Journal::open(dir.path()).expect("open");
+            journal
+                .append_intent(
+                    id.clone(),
+                    hash,
+                    "prepare_nearline_handoff",
+                    serde_json::json!({"migration_id": "mig-1"}),
+                )
+                .expect("intent");
+            journal
+                .append_outcome_with_status(id.clone(), true, body.clone(), Some(201))
+                .expect("outcome with status");
+            // Same-process replay: the recorded status is carried.
+            assert!(matches!(
+                journal.append_intent(
+                    id.clone(),
+                    hash,
+                    "prepare_nearline_handoff",
+                    serde_json::json!({"migration_id": "mig-1"}),
+                ),
+                Ok(IntentAppend::Replayed {
+                    success: true,
+                    http_status: Some(201),
+                    ..
+                })
+            ));
+        }
+        // The status survives a reopen (registry derived from replay).
+        let journal = Journal::open(dir.path()).expect("reopen");
+        let entry = journal.lookup(&id).expect("registry entry");
+        let outcome = entry.outcome.expect("outcome");
+        assert!(outcome.success);
+        assert_eq!(outcome.http_status, Some(201));
+        assert_eq!(outcome.response, body);
     }
 
     #[cfg(feature = "test-faults")]

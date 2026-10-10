@@ -99,6 +99,10 @@ Out (recorded follow-ups; each maps to P4b or later):
 - Witness clustering / multi-witness quorum: P4a ships a single witness per
   authority domain. Its loss degrades to the documented fail-closed lease
   policy (contract §7 row "Witness/quorum lost"), never to weaker fencing.
+- Witness per-client identities: **closed in P4b** (W8 of the P4b plan) —
+  per-host credentials with the legacy shared token demoted to read-only,
+  every holder-asserting mutation bound to the caller's host, no
+  shared-token forge path.
 - Live-attachment I/O statistics, lease history API, audit export tooling.
 
 ## 2. Authority model (contract §2)
@@ -522,7 +526,18 @@ model), so failover is an **adopt-and-promote** admin operation:
   over the real peer where the environment provides it; the kernel
   `--force` gate verification item runs here.
 
-## 9. P4b preview (recorded, not implemented here)
+## 9. P4b preview (superseded — see the P4b plan)
+
+The preview recorded here has been superseded by the accepted P4b plan,
+[2026-10-09-p4b-vmm-storage-handoff.md](2026-10-09-p4b-vmm-storage-handoff.md),
+which specifies and implements the real shapes: the `HandoffSurface`
+provider seam (not a `ReplicationProvider` trait split), the
+`volvisor-handoff` coordinator with the canonical state machine and
+durable cut write-ahead, Cloud Hypervisor coordination through the
+verified `ch-remote` surface, the Volume API v2 mobility operations,
+VM-wide eligibility, and the machine-checked migration barriers that
+unlock `SAFE_CURRENT` without operator attestation. Read the P4b plan
+as normative for all of this; the text below is retained for lineage.
 
 Engine-neutral `ReplicationProvider` trait (ADR-0007's Create/Inspect/
 Seed/Attach/Pause/Promote/Demote/ConfigurePolicy/TrackSync/BeginHandoff/

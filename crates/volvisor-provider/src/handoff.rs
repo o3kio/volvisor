@@ -19,6 +19,11 @@
 //!   migration-cut marker** first (write-ahead: the marker is
 //!   persisted before the suspension command, so a crash in between
 //!   leaves a volume the provider's own reconcile refuses to resume);
+//! - [`HandoffSurface::replica_caught_up`] observes pre-quiesce
+//!   replication convergence while the source is still the writer
+//!   (the contract's `PRECOPY` step) — no proof is minted, because
+//!   no boundary exists yet; it bounds the pause window by waiting
+//!   before the quiesce;
 //! - [`HandoffSurface::track_sync`] proves replication catch-up by
 //!   observation, **only after** the suspension fixed the boundary (a
 //!   catch-up observation taken before the freeze proves nothing about
@@ -161,6 +166,32 @@ pub trait HandoffSurface: Send + Sync {
     /// carried in the report with typed reasons, never an error.
     async fn handoff_eligibility(&self, vm_id: &str) -> Result<EligibilityReport, ApiError>;
 
+    /// Observe whether the replication has caught up **while the
+    /// source is still the writer** — the contract's `PRECOPY` step
+    /// ("source writer; replica catch-up"): peer disk `UpToDate`, no
+    /// resync in progress, connection established.
+    ///
+    /// This is **not** the D2 barrier proof and mints no proof
+    /// object: no boundary exists yet, so the observation claims
+    /// nothing about one. It exists so the coordinator can wait for
+    /// convergence *before* pausing the VM, bounding the pause
+    /// window (the contract's rate-control duty: "prioritize
+    /// convergence and abort before destructive cutover"). The D2
+    /// proof is [`Self::track_sync`], taken strictly after the
+    /// suspension fixed the boundary.
+    ///
+    /// Like `track_sync` this is a single observation: the caller
+    /// owns the bounded wait and retries the typed, retryable
+    /// refusal while the peer lags.
+    ///
+    /// # Errors
+    /// [`ApiError`] with code
+    /// `volvisor_types::ApiErrorCode::ReplicaNotDurable` while the
+    /// peer has not caught up (retryable); typed refusals for an
+    /// unknown volume or a resource that is verifiably down;
+    /// `INTERNAL` when the status query fails.
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+
     /// Suspend one participant's source I/O at the kernel enforcement
     /// point and stamp the durable migration-cut marker (D6a),
     /// write-ahead: the marker is persisted **before** the suspension
@@ -291,6 +322,61 @@ pub trait HandoffSurface: Send + Sync {
         migration_id: &MigrationId,
         attach: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError>;
+
+    /// The destination's `PREPARED` gate (plan §6: "target replica
+    /// verified — resource present, Secondary, connected, no fence
+    /// marker"): verify this host holds the volume's target replica
+    /// from **observed** state, without requiring the volume to be
+    /// tracked in this host's provider state — the P3 peer side is
+    /// operator-provisioned and untracked until the promote adopts it
+    /// (its `promote_target` re-verifies everything under the granted
+    /// lease; this gate refuses an obviously-unready destination
+    /// **before** the source's cut, which is its whole purpose).
+    ///
+    /// A volume this host *does* track must additionally be free of
+    /// the residues that would refuse the promote anyway (a pending
+    /// self-fence, another handoff's cut marker, an unseeded replica)
+    /// — refused here, before any source-side act.
+    ///
+    /// Read-only: a status observation, no mutation.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `INVALID_STATE` when this host
+    /// holds no running, Secondary, connected replica of the volume
+    /// (or its resource definition does not name this host); the
+    /// residue refusals above for a tracked volume; `INTERNAL` for an
+    /// observation that cannot be trusted.
+    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+
+    /// Whether one volume's **local** role is Secondary, from observed
+    /// status (stage B2: the daemon's handoff driver feeds the
+    /// coordinator's `source_secondary` observation, and the
+    /// destination's peer `prepare` verifies the target replica's
+    /// role the same way before the cut).
+    ///
+    /// Read-only: a status observation, no mutation.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// `INTERNAL` for a status observation that cannot be trusted. A
+    /// resource that is verifiably down is a **result** (`false`), not
+    /// an error: "not Secondary" is the observable fact the caller
+    /// reconciles on.
+    async fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError>;
+
+    /// Fail-closed fencing for one participant (stage B2: the daemon
+    /// driver's `fence_source`, the rollback tail whose barrier void
+    /// could not be confirmed): durably self-fence the volume —
+    /// suspend, mark, demote — so it cannot be written again until an
+    /// operator resolves it. Never followed by a resume of anything
+    /// (AGENTS rule 4: fencing is never weakened; rule 5: the fenced
+    /// source is never blindly restarted).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// the fencing act's typed error otherwise (the volume stays
+    /// suspended — never a silent unfenced writer).
+    async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError>;
 }
 
 #[cfg(test)]

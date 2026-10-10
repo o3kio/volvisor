@@ -162,6 +162,55 @@ pub struct Config {
     /// TTL lives on the witness (P4a plan §6); a violating response is
     /// refused there.
     pub witness_renewal_interval_secs: Option<u64>,
+    /// The migration table (P4b plan §6, stage B2): the coordinated
+    /// VMM/storage handoff. Inert until `enabled`; validation of the
+    /// contained fields runs only when it is.
+    #[serde(default)]
+    pub migration: MigrationConfig,
+    /// The VMM table (P4b plan §6, stage B2): the ch-remote adapter's
+    /// knobs. Inert unless `[migration] enabled` (a configured VMM
+    /// alone enables nothing).
+    #[serde(default)]
+    pub vmm: VmmConfig,
+}
+
+/// The `[migration]` table: the coordinated VMM/storage handoff (P4b
+/// plan §6). Cross-host cutover is opt-in — every field is inert until
+/// `enabled`, and enabling requires the drbd provider, a witness and a
+/// configured VMM (validated in the daemon's config validation).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationConfig {
+    /// Whether the migration surface (mobility routes, peer routes,
+    /// the coordinator's retry task) is served. `false` until the
+    /// deployment opts in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The shared snapshot directory (must exist locally; its
+    /// cross-host readability is verified at `PREPARED` by the
+    /// destination daemon, with a typed refusal).
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    /// The peer daemon's base URL (the internal peer API — by design
+    /// colocated with the peer replication end, since the destination
+    /// daemon is the destination VMM's proxy; only the witness is a
+    /// third failure domain in this topology).
+    pub peer_api_url: Option<String>,
+    /// The daemon-to-daemon credential for the peer API (distinct
+    /// from the witness and consumer tokens; never logged).
+    pub peer_api_token: Option<String>,
+}
+
+/// The `[vmm]` table: the ch-remote adapter's knobs (P4b plan §5/§6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmmConfig {
+    /// Path of the `ch-remote` binary (required when migration is
+    /// enabled).
+    pub ch_remote_bin: Option<std::path::PathBuf>,
+    /// Directory holding the per-VM API sockets
+    /// (`{api_socket_dir}/{vm_id}.sock`); required when migration is
+    /// enabled.
+    pub api_socket_dir: Option<std::path::PathBuf>,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -266,7 +315,99 @@ impl Config {
             self.validate_drbd_fields()?;
         }
         self.validate_witness_fields()?;
+        self.validate_migration_fields()?;
         self.validate_field_shapes()
+    }
+
+    /// Migration fields (P4b plan §6, stage B2): the coordinated
+    /// handoff is opt-in. Enabling requires the drbd provider (the
+    /// only nearline class), a witness (the authority substrate the
+    /// cut depends on), a locally-existing snapshot directory, the
+    /// peer daemon's URL and credential, and a configured VMM. An
+    /// inert `[migration]`/`[vmm]` (enabled = false) validates
+    /// nothing further — the fields are dead config until the
+    /// deployment opts in.
+    fn validate_migration_fields(&self) -> Result<(), DaemonError> {
+        if !self.migration.enabled {
+            return Ok(());
+        }
+        if self.provider != ProviderKind::Drbd {
+            return Err(DaemonError::Config(
+                "migration.enabled applies to the drbd provider only (the handoff is the \
+                 nearline replication cutover)"
+                    .to_owned(),
+            ));
+        }
+        if self.witness_url.is_none() {
+            return Err(DaemonError::Config(
+                "migration.enabled requires a witness (the cut's authority substrate: \
+                 barriers, RevokeSet/GrantSet)"
+                    .to_owned(),
+            ));
+        }
+        let snapshot_dir = self.migration.snapshot_dir.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "migration.snapshot_dir is required when migration is enabled".to_owned(),
+            )
+        })?;
+        if !snapshot_dir.is_dir() {
+            return Err(DaemonError::Config(format!(
+                "migration.snapshot_dir {} does not exist or is not a directory (its \
+                 cross-host readability is verified at PREPARED by the destination daemon)",
+                snapshot_dir.display()
+            )));
+        }
+        let peer_url = self.migration.peer_api_url.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "migration.peer_api_url is required when migration is enabled (the \
+                 destination daemon is the destination VMM's proxy)"
+                    .to_owned(),
+            )
+        })?;
+        if !peer_url.starts_with("http://")
+            || peer_url
+                .strip_prefix("http://")
+                .is_some_and(|rest| rest.trim_matches('/').is_empty())
+        {
+            return Err(DaemonError::Config(
+                "migration.peer_api_url must use the http:// scheme and name a host".to_owned(),
+            ));
+        }
+        if self
+            .migration
+            .peer_api_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(DaemonError::Config(
+                "migration.peer_api_token is required when migration is enabled (the \
+                 daemon-to-daemon credential, distinct from the witness and consumer tokens)"
+                    .to_owned(),
+            ));
+        }
+        let vmm_bin = self.vmm.ch_remote_bin.clone().ok_or_else(|| {
+            DaemonError::Config(
+                "vmm.ch_remote_bin is required when migration is enabled".to_owned(),
+            )
+        })?;
+        if vmm_bin.as_os_str().is_empty() {
+            return Err(DaemonError::Config(
+                "vmm.ch_remote_bin must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .vmm
+            .api_socket_dir
+            .as_ref()
+            .is_none_or(|dir| dir.as_os_str().is_empty())
+        {
+            return Err(DaemonError::Config(
+                "vmm.api_socket_dir is required when migration is enabled (the per-VM \
+                 socket convention: {api_socket_dir}/{vm_id}.sock)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Witness fields (P4a plan §3/§6): witness management applies only
@@ -1157,6 +1298,112 @@ provider = \"drbd\"
             Some("host-a-secret"),
             "the host credential parses alongside the shared token"
         );
+    }
+
+    // ------------------------------------------------------ migration
+
+    /// A migration section over the witness fixture: an existing
+    /// snapshot directory (tempdir), the peer daemon's URL and token,
+    /// and a configured VMM.
+    fn migration_toml(snapshot_dir: &std::path::Path) -> String {
+        format!(
+            "{}[migration]\n\
+             enabled = true\n\
+             snapshot_dir = \"{}\"\n\
+             peer_api_url = \"http://10.0.0.2:7780\"\n\
+             peer_api_token = \"peer-secret\"\n\
+             [vmm]\n\
+             ch_remote_bin = \"/usr/bin/ch-remote\"\n\
+             api_socket_dir = \"/run/volvisor/vms\"\n",
+            witness_toml(),
+            snapshot_dir.display()
+        )
+    }
+
+    #[test]
+    fn parses_and_accepts_a_full_migration_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = migration_toml(dir.path());
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate().expect("a full migration section is valid");
+        assert!(cfg.migration.enabled);
+        assert_eq!(
+            cfg.vmm.ch_remote_bin.as_deref(),
+            Some(std::path::Path::new("/usr/bin/ch-remote"))
+        );
+    }
+
+    #[test]
+    fn migration_requires_the_drbd_provider_and_a_witness() {
+        // The handoff is the nearline replication cutover: a non-drbd
+        // provider has no cut, and the cut's authority substrate
+        // (barriers, RevokeSet/GrantSet) is the witness.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut raw = minimal_drbd_toml()
+            + &format!(
+                "[migration]\nenabled = true\nsnapshot_dir = \"{}\"\n",
+                dir.path().display()
+            );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("witness is required");
+        assert!(
+            error.to_string().contains("requires a witness"),
+            "error names the rule: {error}"
+        );
+        raw = minimal_toml() + "[migration]\nenabled = true\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("drbd is required");
+        assert!(
+            error.to_string().contains("drbd provider only"),
+            "error names the rule: {error}"
+        );
+    }
+
+    #[test]
+    fn migration_requires_an_existing_snapshot_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        let raw = migration_toml(&missing);
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("missing snapshot dir");
+        assert!(
+            error.to_string().contains("snapshot_dir"),
+            "error names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn migration_requires_the_peer_url_token_and_vmm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full = migration_toml(dir.path());
+        for removed in [
+            "peer_api_url = \"http://10.0.0.2:7780\"\n",
+            "peer_api_token = \"peer-secret\"\n",
+            "[vmm]\nch_remote_bin = \"/usr/bin/ch-remote\"\napi_socket_dir = \"/run/volvisor/vms\"\n",
+        ] {
+            let raw = full.replace(removed, "");
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg.validate().expect_err("incomplete migration section");
+            assert!(!error.to_string().is_empty(), "a typed refusal is produced");
+        }
+        // An https peer URL is refused (the peer surface is plain
+        // HTTP in this phase, like the witness).
+        let raw = full.replace("http://10.0.0.2:7780", "https://10.0.0.2:7780");
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("https peer url");
+        assert!(
+            error.to_string().contains("peer_api_url"),
+            "error names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn an_inert_migration_section_validates_nothing() {
+        // enabled = false: the fields are dead config — no snapshot
+        // dir, peer or VMM is required until the deployment opts in.
+        let raw = witness_toml() + "[migration]\nenabled = false\nsnapshot_dir = \"/nope\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate().expect("inert migration section");
     }
 
     #[test]

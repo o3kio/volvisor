@@ -1081,13 +1081,16 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
  "tracing",
+ "volvisor-handoff",
  "volvisor-journal",
  "volvisor-provider",
  "volvisor-types",
+ "volvisor-witness",
 ]
 
 [[package]]
@@ -1115,9 +1118,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "volvisor-drbd-testkit",
  "volvisor-provider",
  "volvisor-types",
  "volvisor-witness",
+]
+
+[[package]]
+name = "volvisor-drbd-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "volvisor-drbd",
+ "volvisor-provider",
+ "volvisor-types",
 ]
 
 [[package]]
@@ -1167,6 +1184,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "volvisor-types",
 ]
@@ -1205,9 +1223,15 @@ dependencies = [
 name = "volvisord"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1217,6 +1241,8 @@ dependencies = [
  "volvisor-api",
  "volvisor-ceph",
  "volvisor-drbd",
+ "volvisor-drbd-testkit",
+ "volvisor-handoff",
  "volvisor-journal",
  "volvisor-lvm",
  "volvisor-provider",

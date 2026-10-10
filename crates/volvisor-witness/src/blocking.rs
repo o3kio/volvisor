@@ -25,6 +25,16 @@
 //!   runtime context, e.g. the daemon's async main); the adapter itself
 //!   may then be used from any thread, including outside the runtime.
 //!
+//! The spawn is issued through a **blocking-pool hop**
+//! (`Handle::spawn_blocking` around the `Handle::spawn`): a task
+//! spawned from inside a runtime *worker* lands in that worker's LIFO
+//! slot, which no other worker can steal, so a caller that blocks its
+//! worker while waiting (every daemon HTTP handler does, through the
+//! synchronous engine surfaces) would starve its own witness call
+//! until the bound expires. A blocking-pool thread holds no worker
+//! core, so the spawn lands on the stealable inject queue (with a
+//! parked-worker notify); the hop itself returns immediately.
+//!
 //! ## Honesty
 //!
 //! This is a control-plane convenience, not a data-path component: it is
@@ -186,16 +196,30 @@ where
         T: Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
-        // Spawn failure is not a shape tokio exposes (`Handle::spawn`
-        // returns a `JoinHandle`, never an error); the relevant
-        // failure mode is a runtime shut down mid-wait, which drops
-        // the task without polling it — the sender drops with it and
-        // the `Disconnected` arm below answers immediately, so the
-        // caller never burns the blocking bound on a dead runtime.
-        self.handle.spawn(async move {
+        // The spawn is issued from a blocking-pool thread, never
+        // directly from the calling thread: `Handle::spawn` issued from
+        // inside a runtime **worker** places the task in that worker's
+        // LIFO slot, which no other worker can steal, so a caller that
+        // then blocks its worker in the wait below (as every daemon
+        // HTTP handler does through the synchronous engine surfaces)
+        // would starve its own witness call until the bound expires. A
+        // blocking-pool thread holds no worker core, so the spawn lands
+        // on the stealable inject queue and notifies a parked worker;
+        // the hop itself returns immediately and never blocks.
+        let handle = self.handle.clone();
+        // Spawn failure is not a shape tokio exposes
+        // (`Handle::spawn_blocking` returns a `JoinHandle`, never an
+        // error); the relevant failure mode is a runtime shut down
+        // mid-wait, which drops the task without polling it — the
+        // sender drops with it and the `Disconnected` arm below answers
+        // immediately, so the caller never burns the blocking bound on
+        // a dead runtime.
+        self.handle.spawn_blocking(move || {
             // A send failure only means the caller gave up waiting; the
             // result is then simply dropped.
-            let _ = sender.send(future.await);
+            handle.spawn(async move {
+                let _ = sender.send(future.await);
+            });
         });
         let bound = self.request_timeout + BLOCKING_WAIT_SLACK;
         match receiver.recv_timeout(bound) {
@@ -296,7 +320,7 @@ where
 mod tests {
     use super::*;
     use crate::proto::WITNESS_PROTOCOL_VERSION;
-    use volvisor_types::{BarrierAttestation, HostId};
+    use volvisor_types::{BarrierAttestation, HostId, LeaseState};
 
     /// An async double that never answers: proves the bounded wait
     /// returns a typed Unreachable instead of hanging.
@@ -396,6 +420,119 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50));
         assert!(elapsed < Duration::from_secs(7), "wait took {elapsed:?}");
+    }
+
+    /// A double that answers `inspect` immediately: proves a wait
+    /// issued from inside a runtime worker task completes while that
+    /// worker stays blocked in the wait.
+    struct AnsweringConnection;
+
+    #[async_trait::async_trait]
+    impl WitnessConnection for AnsweringConnection {
+        async fn register(
+            &self,
+            _volume_id: &VolumeId,
+            _request: RegisterRequest,
+        ) -> Result<RegisterResponse, WitnessError> {
+            Err(WitnessError::UnknownVolume)
+        }
+        async fn grant(
+            &self,
+            _volume_id: &VolumeId,
+            _request: GrantRequest,
+        ) -> Result<GrantResponse, WitnessError> {
+            Err(WitnessError::LeaseHeld {
+                current_epoch: volvisor_types::WriterEpoch(0),
+            })
+        }
+        async fn renew(
+            &self,
+            _volume_id: &VolumeId,
+            _request: RenewRequest,
+        ) -> Result<RenewResponse, WitnessError> {
+            Err(WitnessError::StaleEpoch {
+                current_epoch: volvisor_types::WriterEpoch(0),
+            })
+        }
+        async fn revoke(
+            &self,
+            _volume_id: &VolumeId,
+            _request: RevokeRequest,
+        ) -> Result<RevokeResponse, WitnessError> {
+            Err(WitnessError::Unauthorized)
+        }
+        async fn record_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: RecordBarrierRequest,
+        ) -> Result<RecordBarrierResponse, WitnessError> {
+            Err(WitnessError::IdentityRequired)
+        }
+        async fn void_barrier(
+            &self,
+            _volume_id: &VolumeId,
+            _request: VoidBarrierRequest,
+        ) -> Result<VoidBarrierResponse, WitnessError> {
+            Err(WitnessError::IdentityRequired)
+        }
+        async fn revoke_set(
+            &self,
+            _request: RevokeSetRequest,
+        ) -> Result<RevokeSetResponse, WitnessError> {
+            Err(WitnessError::IdentityRequired)
+        }
+        async fn grant_set(
+            &self,
+            _request: GrantSetRequest,
+        ) -> Result<GrantSetResponse, WitnessError> {
+            Err(WitnessError::IdentityRequired)
+        }
+        async fn inspect(&self, volume_id: &VolumeId) -> Result<AuthorityView, WitnessError> {
+            Ok(AuthorityView {
+                volume_id: volume_id.clone(),
+                current_epoch: volvisor_types::WriterEpoch(1),
+                holder: None,
+                lease_state: LeaseState::Live,
+                lease_id: None,
+                lease_remaining_secs: None,
+                commit_index: 0,
+                registration: None,
+                barriers: Vec::new(),
+                retirements: Vec::new(),
+            })
+        }
+    }
+
+    /// Regression: a wait issued from inside a **runtime worker task**
+    /// (exactly how daemon HTTP handlers call the synchronous engine
+    /// surfaces) must complete while that worker stays blocked in the
+    /// wait. A spawn issued from a worker lands in that worker's
+    /// non-stealable LIFO slot, so without the blocking-pool hop the
+    /// call would starve its own future until the full bound expired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_from_a_blocked_worker_task_completes() {
+        let blocking = Arc::new(BlockingWitness::new(
+            Arc::new(AnsweringConnection),
+            tokio::runtime::Handle::current(),
+            Duration::from_secs(5),
+        ));
+        let started = std::time::Instant::now();
+        let call = tokio::spawn({
+            let blocking = Arc::clone(&blocking);
+            async move { blocking.inspect(&volume()).is_ok() }
+        });
+        let answered = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the wait completes well inside its bound")
+            .expect("the calling task joins");
+        assert!(answered, "the immediate answer surfaced");
+        // Nowhere near the 5 s + 5 s bound: only the scheduling hop
+        // sits between the call and the answer.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "wait took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A double that answers with a typed refusal: the blocking

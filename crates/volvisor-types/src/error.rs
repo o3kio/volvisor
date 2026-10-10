@@ -194,6 +194,54 @@ impl ApiError {
     pub fn http_status(&self) -> u16 {
         self.code.http_status()
     }
+
+    /// Decode a wire error body back into a typed error (the client
+    /// mirror of [`From<ApiError> for ApiErrorBody`], stage B2: the
+    /// source daemon's peer client recovers the destination's typed
+    /// refusals instead of flattening them).
+    ///
+    /// A known code string recovers its variant with the message
+    /// verbatim; an unknown code degrades to `INTERNAL` with the
+    /// original code preserved in the detail — never a guess, never a
+    /// dropped error.
+    #[must_use]
+    pub fn from_wire(body: &ApiErrorBody) -> Self {
+        let code = match body.code.as_str() {
+            "UNSUPPORTED_CLASS_OR_POLICY" => ApiErrorCode::UnsupportedClassOrPolicy,
+            "INSUFFICIENT_FAILURE_DOMAINS" => ApiErrorCode::InsufficientFailureDomains,
+            "NO_SAFE_CAPACITY" => ApiErrorCode::NoSafeCapacity,
+            "THIN_METADATA_EXHAUSTED" => ApiErrorCode::ThinMetadataExhausted,
+            "FOREIGN_DEVICE_STATE" => ApiErrorCode::ForeignDeviceState,
+            "STALE_GENERATION" => ApiErrorCode::StaleGeneration,
+            "WRITER_ALREADY_ACTIVE" => ApiErrorCode::WriterAlreadyActive,
+            "LEASE_HELD" => ApiErrorCode::LeaseHeld,
+            "STALE_EPOCH" => ApiErrorCode::StaleEpoch,
+            "FENCE_PENDING" => ApiErrorCode::FencePending,
+            "UNKNOWN_FENCING_AUTHORITY" => ApiErrorCode::UnknownFencingAuthority,
+            "REPLICA_NOT_DURABLE" => ApiErrorCode::ReplicaNotDurable,
+            "MIGRATION_UNSUPPORTED_LOCAL_STORAGE" => ApiErrorCode::MigrationUnsupportedLocalStorage,
+            "VMM_HANDOFF_UNSUPPORTED" => ApiErrorCode::VmmHandoffUnsupported,
+            "OPERATION_IN_DOUBT" => ApiErrorCode::OperationInDoubt,
+            "UNSAFE_DATA_LOSS" => ApiErrorCode::UnsafeDataLoss,
+            "CEPH_CLUSTER_UNHEALTHY" => ApiErrorCode::CephClusterUnhealthy,
+            "INVALID_REQUEST" => ApiErrorCode::InvalidRequest,
+            "NOT_FOUND" => ApiErrorCode::NotFound,
+            "INVALID_STATE" => ApiErrorCode::InvalidState,
+            "IDEMPOTENCY_CONFLICT" => ApiErrorCode::IdempotencyConflict,
+            "FORBIDDEN" => ApiErrorCode::Forbidden,
+            "INTERNAL" => ApiErrorCode::Internal,
+            other => {
+                return Self::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "unrecognized error code {other} (message: {})",
+                        body.message
+                    ),
+                );
+            }
+        };
+        Self::new(code, body.message.clone())
+    }
 }
 
 impl From<ApiError> for ApiErrorBody {
@@ -256,5 +304,50 @@ mod tests {
         assert_eq!(err.code, ApiErrorCode::StaleGeneration);
         assert_eq!(err.http_status(), 409);
         assert!(err.detail.contains("expected generation 3"));
+    }
+
+    #[test]
+    fn from_wire_round_trips_every_code_and_refuses_unknown_ones() {
+        let codes = [
+            ApiErrorCode::UnsupportedClassOrPolicy,
+            ApiErrorCode::InsufficientFailureDomains,
+            ApiErrorCode::NoSafeCapacity,
+            ApiErrorCode::ThinMetadataExhausted,
+            ApiErrorCode::ForeignDeviceState,
+            ApiErrorCode::StaleGeneration,
+            ApiErrorCode::WriterAlreadyActive,
+            ApiErrorCode::LeaseHeld,
+            ApiErrorCode::StaleEpoch,
+            ApiErrorCode::FencePending,
+            ApiErrorCode::UnknownFencingAuthority,
+            ApiErrorCode::ReplicaNotDurable,
+            ApiErrorCode::MigrationUnsupportedLocalStorage,
+            ApiErrorCode::VmmHandoffUnsupported,
+            ApiErrorCode::OperationInDoubt,
+            ApiErrorCode::UnsafeDataLoss,
+            ApiErrorCode::CephClusterUnhealthy,
+            ApiErrorCode::InvalidRequest,
+            ApiErrorCode::NotFound,
+            ApiErrorCode::InvalidState,
+            ApiErrorCode::IdempotencyConflict,
+            ApiErrorCode::Forbidden,
+            ApiErrorCode::Internal,
+        ];
+        for code in codes {
+            let body = ApiErrorBody::from(ApiError::new(code, "detail"));
+            let recovered = ApiError::from_wire(&body);
+            assert_eq!(recovered.code, code, "code {code:?} must round-trip");
+            assert_eq!(recovered.detail, "detail");
+        }
+        // An unknown code never maps to a guess: it degrades typed to
+        // INTERNAL with the original code preserved in the detail.
+        let foreign = ApiErrorBody {
+            code: "SOME_FUTURE_CODE".to_owned(),
+            message: "from a newer daemon".to_owned(),
+        };
+        let recovered = ApiError::from_wire(&foreign);
+        assert_eq!(recovered.code, ApiErrorCode::Internal);
+        assert!(recovered.detail.contains("SOME_FUTURE_CODE"));
+        assert!(recovered.detail.contains("from a newer daemon"));
     }
 }

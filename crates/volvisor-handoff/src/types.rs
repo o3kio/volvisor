@@ -275,10 +275,34 @@ pub struct MigrationRecord {
     pub barrier_proofs: Vec<BarrierProof>,
     /// The abort policy (v1: `AutoBeforeCut` only).
     pub abort_policy: AbortPolicy,
+    /// The consumer's `BarrierAndTransfer` proof, recorded verbatim as
+    /// **corroboration** (stage B2, plan §6): volvisor performs and
+    /// verifies its own pause (§5) and its own suspension proof (D2), so
+    /// the parameter is recorded, never trusted — a false or absent
+    /// proof changes nothing about the drive. The **first** recorded
+    /// corroboration is kept; later proofs never overwrite it (the
+    /// record is append-only in spirit, like the state history).
+    ///
+    /// Additive stage-B2 field: records written by stage B1 decode with
+    /// `None` (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_proof: Option<serde_json::Value>,
     /// Unix epoch seconds at `prepare`.
     pub created_at: u64,
     /// Unix epoch seconds at the last persisted transition.
     pub updated_at: u64,
+    /// Unix epoch seconds when the cut began — the write-ahead's
+    /// first durable step (`Snapshotting`) — the start of the measured
+    /// wall-clock cut duration (plan §8 item 2: the completed
+    /// migration's response carries it). Additive stage-B2 field:
+    /// B1-era records decode with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_started_at: Option<u64>,
+    /// Unix epoch seconds when the state landed at `Complete` — the
+    /// end of the measured cut duration. Additive stage-B2 field:
+    /// B1-era records decode with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_completed_at: Option<u64>,
 }
 
 impl MigrationRecord {
@@ -370,6 +394,10 @@ impl MigrationRecord {
             state_history: self.state_history.clone(),
             participants: self.participants.clone(),
             in_doubt_detail,
+            cut_duration_secs: match (self.cut_started_at, self.cut_completed_at) {
+                (Some(started), Some(completed)) => Some(completed.saturating_sub(started)),
+                _ => None,
+            },
         }
     }
 }
@@ -391,6 +419,12 @@ pub struct MigrationSummary {
     /// The `IN_DOUBT` detail, when the observation is (or carries) an
     /// in-doubt.
     pub in_doubt_detail: Option<String>,
+    /// The measured wall-clock cut duration (plan §8 item 2): seconds
+    /// between the cut write-ahead's first durable step and the
+    /// `Complete` transition, carried on every completed migration's
+    /// observation. `None` before the cut begins and until the
+    /// migration completes.
+    pub cut_duration_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -414,9 +448,30 @@ mod tests {
             state_history: vec![],
             barrier_proofs: vec![],
             abort_policy: AbortPolicy::AutoBeforeCut,
+            consumer_proof: None,
             created_at: 1,
             updated_at: 2,
+            cut_started_at: None,
+            cut_completed_at: None,
         }
+    }
+
+    #[test]
+    fn observe_carries_the_measured_cut_duration_once_complete() {
+        // Plan §8 item 2: a completed migration's observation carries
+        // the measured wall-clock cut duration — the seconds between
+        // the write-ahead's first durable step and `Complete`. Before
+        // the cut begins, and until completion, it is absent.
+        let mut in_flight = record(HandoffState::Quiesced, Some(CutProgress::Snapshotting));
+        in_flight.cut_started_at = Some(100);
+        assert_eq!(in_flight.observe().cut_duration_secs, None);
+        let mut uncut = record(HandoffState::Complete, None);
+        uncut.cut_completed_at = Some(145);
+        assert_eq!(uncut.observe().cut_duration_secs, None, "no cut ever began");
+        let mut complete = record(HandoffState::Complete, None);
+        complete.cut_started_at = Some(100);
+        complete.cut_completed_at = Some(145);
+        assert_eq!(complete.observe().cut_duration_secs, Some(45));
     }
 
     #[test]

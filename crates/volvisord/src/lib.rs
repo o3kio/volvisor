@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod config;
+pub mod handoff;
 pub mod runtime;
 pub mod witness;
 

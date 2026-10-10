@@ -82,6 +82,17 @@ pub trait HandoffDriver: Send + Sync {
     /// Discard the target-side preparation (the pre-cut abort tail).
     async fn discard_target(&self, record: &MigrationRecord) -> Result<(), ApiError>;
 
+    /// Observe pre-quiesce replica catch-up per participant (the
+    /// contract's `PRECOPY` step: "source writer; replica catch-up").
+    /// **Not** the D2 proof and mints none — no boundary exists yet;
+    /// this step exists so the drive waits for convergence *before*
+    /// pausing the VM, bounding the pause window. The D2 boundary
+    /// proof is [`Self::track_sync`], taken strictly after the
+    /// suspension. The driver owns the bounded wait; a timeout is
+    /// its typed error (surfaced at `PREPARED`, before any
+    /// suspension or barrier — the abort path is intact).
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+
     /// Pause the source VM (verified: the adapter requires the
     /// observed `Paused` state, not the command's exit status).
     async fn pause_vm(&self, vm_id: &str) -> Result<(), ApiError>;
@@ -259,6 +270,27 @@ pub fn barrier_operation_id(
     derived_operation_id(migration_id, "record-barrier", &[volume_id.as_str()])
 }
 
+/// Derive the deterministic per-volume operation id for the
+/// `VoidBarrier` that rolls one participant's recorded barrier back
+/// (the same discipline as [`barrier_operation_id`], tag
+/// `void-barrier`).
+///
+/// A stage-B2 driver that voids through a journaled witness mutation
+/// uses this id so a post-crash re-attempt replays the recorded
+/// outcome byte-identically instead of being refused as a fresh
+/// mutation against an already-voided barrier (the round-1 "confirm by
+/// state, not by fresh-mutation success" contract).
+///
+/// # Errors
+/// `INTERNAL` only if the derived string failed identity validation
+/// (unreachable for the fixed tag and hex alphabet).
+pub fn void_barrier_operation_id(
+    migration_id: &MigrationId,
+    volume_id: &VolumeId,
+) -> Result<OperationId, ApiError> {
+    derived_operation_id(migration_id, "void-barrier", &[volume_id.as_str()])
+}
+
 /// The first `bytes * 2` hex characters of a digest, without `format!`
 /// (the house `resource_name_for` discipline).
 fn hex_prefix(digest: &[u8], bytes: usize) -> String {
@@ -387,8 +419,11 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             }],
             barrier_proofs: Vec::new(),
             abort_policy: AbortPolicy::AutoBeforeCut,
+            consumer_proof: None,
             created_at: now,
             updated_at: now,
+            cut_started_at: None,
+            cut_completed_at: None,
         };
         // Side effects first, then persist, then report (plan §3).
         self.driver.prepare_target(&record).await?;
@@ -552,6 +587,71 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             .map(|record| record.map(|record| record.observe()))
     }
 
+    /// Record the consumer's `BarrierAndTransfer` proof for one
+    /// migration — **corroboration, never an input** (plan §6: the
+    /// coordinator performs and verifies its own pause (§5) and its
+    /// own post-suspension durability proof (D2), so the parameter is
+    /// stored verbatim and a false or absent proof changes nothing
+    /// about the drive).
+    ///
+    /// The **first** recorded proof is kept: a later call never
+    /// overwrites it (the field is as append-only in spirit as the
+    /// state history — the corroborator of record is whoever
+    /// corroborated first). Recording is idempotent and permitted in
+    /// any state; it is a pure store mutation, persisted before the
+    /// record is returned.
+    ///
+    /// Stage B2's `POST /v2/migrations/{id}/transfer` calls this
+    /// before spawning the drive, so the proof is durable even if the
+    /// drive never starts (crash between the 202 and the task).
+    ///
+    /// # Errors
+    /// `NOT_FOUND` when the record does not exist (the proof is only
+    /// meaningful attached to a real migration); `INTERNAL` when the
+    /// store lock is poisoned or the atomic save fails.
+    pub fn record_consumer_proof(
+        &self,
+        migration_id: &MigrationId,
+        proof: serde_json::Value,
+    ) -> Result<MigrationRecord, ApiError> {
+        let now = (self.clock)();
+        self.with_store(|store| {
+            let mut record = store.get(migration_id).ok_or_else(|| {
+                ApiError::not_found(format!("migration {migration_id} does not exist"))
+            })?;
+            if record.consumer_proof.is_none() {
+                record.consumer_proof = Some(proof);
+                record.updated_at = now;
+                store.upsert(&record)?;
+            }
+            Ok(record)
+        })
+    }
+
+    /// The migration ids the retry task owns: every record that is
+    /// neither `Complete` nor `Aborted` (plan §3's periodic reconcile —
+    /// including terminal `InDoubt`, whose re-attempt is itself gated
+    /// by witness reachability inside [`Self::resolve`]). Ordered by
+    /// identity.
+    ///
+    /// # Errors
+    /// `INTERNAL` when the store lock is poisoned.
+    pub fn list_ids(&self) -> Result<Vec<MigrationId>, ApiError> {
+        self.with_store(|store| {
+            Ok(store
+                .load_all()
+                .into_iter()
+                .filter(|record| {
+                    !matches!(
+                        record.state,
+                        HandoffState::Complete | HandoffState::Aborted { .. }
+                    )
+                })
+                .map(|record| record.migration_id)
+                .collect())
+        })
+    }
+
     /// The forward drive (steps 1–7 of the cutover sequence). Every
     /// cut step persists its write-ahead **before** the external act;
     /// every re-drive reconciles the external facts and skips what is
@@ -567,16 +667,22 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         Ok(())
     }
 
-    /// `Prepared → Precopy`: observe replication catch-up per
-    /// participant. The driver owns the bounded wait; a timeout is its
-    /// typed error (surfaced here — no state corruption, plan §9 row
-    /// 9).
+    /// `Prepared → Precopy`: observe pre-quiesce replica catch-up per
+    /// participant (the contract's `PRECOPY` step: the source is
+    /// still the writer). This is **not** the D2 boundary proof —
+    /// that is `drive_barriers`'s post-suspension `track_sync`; this
+    /// step waits for convergence *before* the pause to bound the
+    /// pause window. The driver owns the bounded wait; a timeout is
+    /// its typed error (surfaced here — no state corruption, plan §9
+    /// row 9).
     async fn drive_precopy(&self, record: &mut MigrationRecord) -> Result<(), ApiError> {
         if record.state != HandoffState::Prepared {
             return Ok(());
         }
         for participant in &record.participants {
-            self.driver.track_sync(&participant.volume_id).await?;
+            self.driver
+                .replica_caught_up(&participant.volume_id)
+                .await?;
         }
         self.transition(record, HandoffState::Precopy, None, None)
     }
@@ -906,6 +1012,17 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         record.state = state.clone();
         record.cut = cut;
         record.updated_at = now;
+        // The measured cut duration's bounds (plan §8 item 2): the
+        // first durable cut step starts the clock, `Complete` stops
+        // it. Stamped inside the same persist as the transition they
+        // measure — a crash between them loses nothing but a
+        // monotonic bound.
+        if record.cut.is_some() && record.cut_started_at.is_none() {
+            record.cut_started_at = Some(now);
+        }
+        if state == HandoffState::Complete && record.cut_completed_at.is_none() {
+            record.cut_completed_at = Some(now);
+        }
         record.state_history.push(StateHistoryEntry {
             state,
             cut,

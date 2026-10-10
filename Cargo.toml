@@ -7,6 +7,7 @@ members = [
     "crates/volvisor-lvm",
     "crates/volvisor-ceph",
     "crates/volvisor-drbd",
+    "crates/volvisor-drbd-testkit",
     "crates/volvisor-witness",
     "crates/volvisor-handoff",
     "crates/volvisor-api",
@@ -27,6 +28,7 @@ volvisor-provider = { path = "crates/volvisor-provider" }
 volvisor-lvm = { path = "crates/volvisor-lvm" }
 volvisor-ceph = { path = "crates/volvisor-ceph" }
 volvisor-drbd = { path = "crates/volvisor-drbd" }
+volvisor-drbd-testkit = { path = "crates/volvisor-drbd-testkit" }
 volvisor-witness = { path = "crates/volvisor-witness" }
 volvisor-handoff = { path = "crates/volvisor-handoff" }
 volvisor-api = { path = "crates/volvisor-api" }

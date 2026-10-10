@@ -18,14 +18,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use volvisor_handoff::{MobilityRequest, migration_not_enabled};
 use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AdoptVolumeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, GrowVolumeRequest, ListVolumesResponse,
 };
 use volvisor_types::{
-    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, ProjectId, ReleaseDeviceRequest,
-    VolumeId,
+    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, MigrationId, ProjectId,
+    ReleaseDeviceRequest, VolumeId,
 };
 
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
@@ -407,6 +408,244 @@ pub(crate) async fn adopt_volume(
     .map_err(ApiErrorReply::from)
 }
 
+/// `POST /v2/admin/nearline/{volume_id}/clear-cut-marker` — the
+/// operator-driven residue cleanup of an interrupted handoff (P4b plan
+/// §6): clear a stale migration-cut marker once this host provably no
+/// longer writes the volume (it is Secondary here, or the caller
+/// supplies a fencing proof the witness corroborates).
+///
+/// Routed through the journal pipeline like every privileged mutation
+/// (rule 8): the volume id and the (optional) fencing proof are folded
+/// into the request hash, so a replay with a different proof under the
+/// same operation id is an `IDEMPOTENCY_CONFLICT`, never a silent
+/// second clearing. The surface's refusals (a Primary/writer without a
+/// corroborated proof, no marker present) are typed errors and journal
+/// as failures, replaying verbatim — fail-closed, exactly like the
+/// adopt refusals.
+pub(crate) async fn clear_cut_marker(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(volume_id): Path<String>,
+    ValidJson(req): ValidJson<ClearCutMarkerRequest>,
+) -> Result<Response, ApiErrorReply> {
+    // Route-level availability check first (see `claim_device`).
+    let handoff = state
+        .handoff
+        .clone()
+        .ok_or_else(|| ApiErrorReply(handoff_surface_unavailable()))?;
+    volvisor_types::validate_api_version(&req.api_version)?;
+    let volume_id = parse_volume_id(&volume_id)?;
+    tracing::info!(
+        kind = ops::OP_CLEAR_CUT_MARKER,
+        operation_id = %req.operation_id,
+        volume_id = %volume_id,
+        "accepting clear_cut_marker"
+    );
+    let payload = ops::volume_payload(&volume_id, &req)?;
+    let hash = ops::mobility_request_hash("clear-cut-marker", &payload);
+    let proof = req.fencing_proof;
+    ops::execute(
+        &state,
+        ops::OP_CLEAR_CUT_MARKER,
+        req.operation_id.clone(),
+        hash,
+        payload,
+        move || async move { handoff.clear_cut_marker(&volume_id, proof.as_ref()).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+// ---------------------------------------------------------------------------
+// Mobility surface (P4b plan §6, stage B2) — consumer routes
+// ---------------------------------------------------------------------------
+
+/// The typed 404 for the check-mobility route on providers without a
+/// handoff surface (every class without a coordinated-handoff engine).
+fn handoff_surface_unavailable() -> ApiError {
+    ApiError::not_found("handoff surface not available for this provider")
+}
+
+/// `POST /v2/vms/{vm_id}/check-mobility` — `CheckVmStorageMobility`:
+/// the VM-wide eligibility answer across every attached volume this
+/// provider holds (rule 6), read from the provider's handoff surface.
+///
+/// Read-only: no suspension, no witness mutation, no journal record —
+/// there is nothing privileged to replay. Admin token required (the
+/// eligibility answer names a consumer's whole writable set).
+pub(crate) async fn check_mobility(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(vm_id): Path<String>,
+    ValidJson(req): ValidJson<CheckMobilityRequest>,
+) -> Result<Response, ApiErrorReply> {
+    let handoff = state
+        .handoff
+        .clone()
+        .ok_or_else(|| ApiErrorReply(handoff_surface_unavailable()))?;
+    if req.target_host.as_str().is_empty() {
+        return Err(ApiErrorReply(ApiError::invalid_request(
+            "target_host must not be empty",
+        )));
+    }
+    let report = handoff.handoff_eligibility(&vm_id).await?;
+    let body = to_json_value(&report)?;
+    Ok(json_response(StatusCode::OK, &body))
+}
+
+/// `POST /v2/migrations` — `PrepareNearlineHandoff`: verify the
+/// participant set and the destination, then persist the `PREPARED`
+/// migration record. Answers `201`; idempotent by `migration_id`
+/// (identical content re-serves the record, different content is the
+/// typed conflict). Journaled through the shared pipeline with a
+/// derived operation id (`mig-api-prepare-{16hex}`), so a retry after
+/// a lost response replays the recorded outcome byte-for-byte.
+pub(crate) async fn prepare_migration(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    ValidJson(req): ValidJson<MobilityRequest>,
+) -> Result<Response, ApiErrorReply> {
+    let migration = state
+        .migration
+        .clone()
+        .ok_or_else(|| ApiErrorReply(migration_not_enabled()))?;
+    req.validate()?;
+    let operation_id = ops::mobility_operation_id(&req.migration_id, "prepare")?;
+    let payload = to_json_value(&req)?;
+    let hash = ops::mobility_request_hash("prepare", &payload);
+    tracing::info!(
+        kind = ops::OP_MIGRATION_PREPARE,
+        operation_id = %operation_id,
+        migration_id = %req.migration_id,
+        vm_id = %req.vm_id,
+        "accepting prepare_nearline_handoff"
+    );
+    ops::execute_with_status(
+        &state,
+        ops::OP_MIGRATION_PREPARE,
+        operation_id,
+        hash,
+        payload,
+        StatusCode::CREATED,
+        move || async move { migration.prepare(req).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/migrations/{migration_id}/transfer` —
+/// `BarrierAndTransfer`: record the consumer's proof as
+/// **corroboration** (plan §6: recorded, never trusted — volvisor
+/// performs and verifies its own pause and its own suspension proof)
+/// and start the long-running drive. Answers `202` with the
+/// observation at drive start; progress is read through
+/// `GET /v2/migrations/{migration_id}`.
+///
+/// Journaled with the strict in-doubt rule: the drive task may be
+/// mid-flight, so an intent-without-outcome retry fails closed with
+/// `OPERATION_IN_DOUBT` (never a second drive).
+pub(crate) async fn transfer_migration(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(migration_id): Path<String>,
+    ValidJson(req): ValidJson<TransferRequestWire>,
+) -> Result<Response, ApiErrorReply> {
+    let migration = state
+        .migration
+        .clone()
+        .ok_or_else(|| ApiErrorReply(migration_not_enabled()))?;
+    let migration_id = parse_migration_id(&migration_id)?;
+    let operation_id = ops::mobility_operation_id(&migration_id, "transfer")?;
+    let payload = to_json_value(&TransferJournalBody {
+        migration_id: migration_id.clone(),
+        vm_paused_and_io_drained_proof: req.vm_paused_and_io_drained_proof.clone(),
+    })?;
+    let hash = ops::mobility_request_hash("transfer", &payload);
+    tracing::info!(
+        kind = ops::OP_MIGRATION_TRANSFER,
+        operation_id = %operation_id,
+        migration_id = %migration_id,
+        "accepting barrier_and_transfer"
+    );
+    let proof = req.vm_paused_and_io_drained_proof;
+    ops::execute_with_status(
+        &state,
+        ops::OP_MIGRATION_TRANSFER,
+        operation_id,
+        hash,
+        payload,
+        StatusCode::ACCEPTED,
+        move || async move { migration.transfer(&migration_id, proof).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `GET /v2/migrations/{migration_id}` — `ObserveHandoff`: the durable
+/// observation (state, append-only trace, participants, in-doubt
+/// detail), or the typed `NOT_FOUND` for an unknown migration.
+/// Read-only: no journal record.
+pub(crate) async fn observe_migration(
+    State(state): State<SharedState>,
+    Path(migration_id): Path<String>,
+) -> Result<Response, ApiErrorReply> {
+    let migration = state
+        .migration
+        .clone()
+        .ok_or_else(|| ApiErrorReply(migration_not_enabled()))?;
+    let migration_id = parse_migration_id(&migration_id)?;
+    let Some(summary) = migration.observe(&migration_id)? else {
+        return Err(ApiErrorReply(ApiError::not_found(format!(
+            "no migration {migration_id} on this daemon"
+        ))));
+    };
+    let body = to_json_value(&summary)?;
+    Ok(json_response(StatusCode::OK, &body))
+}
+
+/// `POST /v2/migrations/{migration_id}/abort` — the pre-cut abort: the
+/// G5-ordered rollback voids every recorded barrier before anything is
+/// resumed, failing closed into terminal `IN_DOUBT` when the void
+/// cannot be confirmed. The coordinator refuses every cut-or-later
+/// state typed (there is no abort handler past the point of no
+/// return). Journaled like every mobility mutation.
+pub(crate) async fn abort_migration(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(migration_id): Path<String>,
+) -> Result<Response, ApiErrorReply> {
+    let migration = state
+        .migration
+        .clone()
+        .ok_or_else(|| ApiErrorReply(migration_not_enabled()))?;
+    let migration_id = parse_migration_id(&migration_id)?;
+    let operation_id = ops::mobility_operation_id(&migration_id, "abort")?;
+    let payload = serde_json::json!({ "migration_id": migration_id });
+    let hash = ops::mobility_request_hash("abort", &payload);
+    tracing::info!(
+        kind = ops::OP_MIGRATION_ABORT,
+        operation_id = %operation_id,
+        migration_id = %migration_id,
+        "accepting migration abort"
+    );
+    ops::execute(
+        &state,
+        ops::OP_MIGRATION_ABORT,
+        operation_id,
+        hash,
+        payload,
+        move || async move { migration.abort(&migration_id).await },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// Parse and validate the `{migration_id}` path segment.
+fn parse_migration_id(raw: &str) -> Result<MigrationId, ApiError> {
+    MigrationId::try_from(raw.to_owned())
+        .map_err(|err| ApiError::invalid_request(format!("invalid migration_id in path: {err}")))
+}
+
 /// `GET /healthz` — daemon liveness only.
 ///
 /// This says nothing about volume health: a volume's health lives on its
@@ -501,4 +740,51 @@ struct CapabilitiesResponse {
     capabilities: CapabilitySet,
     /// Volume classes served by this provider instance.
     supported_classes: Vec<VolumeClass>,
+}
+
+/// `POST /v2/admin/nearline/{volume_id}/clear-cut-marker` request body.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClearCutMarkerRequest {
+    /// Must equal `volvisor.volume.v2`.
+    api_version: String,
+    /// Idempotency key.
+    operation_id: volvisor_types::OperationId,
+    /// The witness's durable retirement statement that authorizes
+    /// clearing the marker while this host still holds the volume
+    /// Primary (the surface corroborates it against the witness);
+    /// `None` is sufficient only when the volume is Secondary here —
+    /// the surface refuses a live writer typed, never on the
+    /// caller's say-so.
+    fencing_proof: Option<FencingProof>,
+}
+
+/// `POST /v2/vms/{vm_id}/check-mobility` request body.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckMobilityRequest {
+    /// The candidate destination host (diagnostics on the report; the
+    /// eligibility answer itself is target-independent in v1).
+    target_host: volvisor_types::HostId,
+}
+
+/// `POST /v2/migrations/{migration_id}/transfer` request body: the
+/// consumer's pause/drain proof, recorded verbatim as corroboration
+/// (plan §6 — recorded, never trusted; see [`transfer_migration`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransferRequestWire {
+    /// The consumer's proof that the VM is paused and its I/O drained.
+    vm_paused_and_io_drained_proof: serde_json::Value,
+}
+
+/// The journal payload of `BarrierAndTransfer`: the migration identity
+/// (folded into the immutable request hash together with the route
+/// tag) plus the verbatim corroboration proof.
+#[derive(Clone, Debug, Serialize)]
+struct TransferJournalBody {
+    /// The migration being transferred.
+    migration_id: MigrationId,
+    /// The consumer's proof, recorded verbatim.
+    vm_paused_and_io_drained_proof: serde_json::Value,
 }

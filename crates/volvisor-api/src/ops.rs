@@ -33,19 +33,22 @@
 //! dropped inside small blocks, and **never** held across an `.await`.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::MutexGuard;
 
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use volvisor_journal::{IntentAppend, Journal};
 use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
     GrowVolumeRequest,
 };
 use volvisor_types::{
-    ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, DeviceId, OperationId, VolumeId,
+    ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, DeviceId, MigrationId, OperationId,
+    VolumeId,
 };
 
 use crate::error::{json_response, status_for_wire_code, to_json_value};
@@ -67,6 +70,22 @@ pub(crate) const OP_CLAIM_DEVICE: &str = "claim_device";
 pub(crate) const OP_RELEASE_DEVICE: &str = "release_device";
 /// Operation kind: adopt-and-promote a nearline volume (admin surface).
 pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
+/// Operation kind: clear a stale migration-cut marker (admin surface).
+pub(crate) const OP_CLEAR_CUT_MARKER: &str = "clear_cut_marker";
+/// Operation kind: `PrepareNearlineHandoff` (mobility surface).
+pub(crate) const OP_MIGRATION_PREPARE: &str = "migration_prepare";
+/// Operation kind: `BarrierAndTransfer` (mobility surface).
+pub(crate) const OP_MIGRATION_TRANSFER: &str = "migration_transfer";
+/// Operation kind: mobility abort.
+pub(crate) const OP_MIGRATION_ABORT: &str = "migration_abort";
+/// Operation kind: destination-side peer prepare.
+pub(crate) const OP_PEER_PREPARE: &str = "peer_prepare";
+/// Operation kind: destination-side peer grant + promote.
+pub(crate) const OP_PEER_GRANT: &str = "peer_grant";
+/// Operation kind: destination-side peer restore-vm.
+pub(crate) const OP_PEER_RESTORE_VM: &str = "peer_restore_vm";
+/// Operation kind: destination-side peer discard.
+pub(crate) const OP_PEER_DISCARD: &str = "peer_discard";
 
 // ---------------------------------------------------------------------------
 // Payload redaction (SPEC-0002 section 9: no secret material at rest in the
@@ -75,7 +94,12 @@ pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
 
 /// Object keys whose *string* values are credential references and are
 /// replaced with [`REDACTED`] before any payload is journaled.
-const REDACTED_KEYS: [&str; 3] = ["key_ref", "authorization_token", "witness_host_token"];
+const REDACTED_KEYS: [&str; 4] = [
+    "key_ref",
+    "authorization_token",
+    "witness_host_token",
+    "peer_api_token",
+];
 
 /// Replacement value written in place of credential material.
 const REDACTED: &str = "[redacted]";
@@ -127,13 +151,101 @@ pub(crate) async fn execute<R, F, Fut>(
     op_kind: &'static str,
     operation_id: OperationId,
     request_hash: [u8; 32],
-    mut payload: Value,
+    payload: Value,
     run: F,
 ) -> Result<Response, ApiError>
 where
     R: Serialize,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<R, ApiError>>,
+{
+    // The volume operations keep the strict fail-closed in-doubt rule: an
+    // intent without an outcome may be in flight right now, so it is never
+    // re-executed (and never "resolved" by guessing). Successes replay as
+    // plain `200` with no recorded status — byte-identical to the
+    // pre-stage-B2 behavior.
+    let in_doubt_id = operation_id.clone();
+    let in_doubt_state = Arc::clone(state);
+    execute_resolvable(
+        state,
+        op_kind,
+        operation_id,
+        request_hash,
+        payload,
+        None,
+        move || async move { Err(in_doubt_error(&in_doubt_state, op_kind, &in_doubt_id)) },
+        run,
+    )
+    .await
+}
+
+/// Execute one mutating operation that answers a non-`200` success
+/// status (stage B2 mobility routes): `PrepareNearlineHandoff` answers
+/// `201`, `BarrierAndTransfer` answers `202`. The status is journaled
+/// with the outcome so an idempotent replay is status-compatible with
+/// the first caller's response, not just body-compatible. The in-doubt
+/// rule is the strict one (see [`execute`]).
+pub(crate) async fn execute_with_status<R, F, Fut>(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: OperationId,
+    request_hash: [u8; 32],
+    payload: Value,
+    success_status: StatusCode,
+    run: F,
+) -> Result<Response, ApiError>
+where
+    R: Serialize,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<R, ApiError>>,
+{
+    let in_doubt_id = operation_id.clone();
+    let in_doubt_state = Arc::clone(state);
+    execute_resolvable(
+        state,
+        op_kind,
+        operation_id,
+        request_hash,
+        payload,
+        Some(success_status),
+        move || async move { Err(in_doubt_error(&in_doubt_state, op_kind, &in_doubt_id)) },
+        run,
+    )
+    .await
+}
+
+/// The general journal pipeline: [`execute`] and [`execute_with_status`]
+/// (strict in-doubt) and the mobility/peer routes (inspection-resolved
+/// in-doubt) are all this one ordering.
+///
+/// On an intent-without-outcome retry, the `inspect` closure decides:
+/// `Ok(Some(value))` **proves** the act already landed — its result is
+/// journaled as the outcome and served, closing the crash window
+/// between the act and its outcome record; `Ok(None)` reports the act
+/// provably did not land — the mutation is re-executed, and the act's
+/// own first step re-verifies (inspection-gated re-execution, never a
+/// blind one); an `Err` surfaces typed (the in-flight state could not
+/// be resolved, so nothing is guessed). The strict callers pass an
+/// `inspect` that always fails closed with `OPERATION_IN_DOUBT`
+/// (the volume operations: a concurrent caller may be executing
+/// right now, and the mobility transfer whose drive task may be
+/// mid-flight).
+pub(crate) async fn execute_resolvable<R, F, Fut, I, IFut>(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: OperationId,
+    request_hash: [u8; 32],
+    mut payload: Value,
+    success_status: Option<StatusCode>,
+    inspect: I,
+    run: F,
+) -> Result<Response, ApiError>
+where
+    R: Serialize,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<R, ApiError>>,
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = Result<Option<R>, ApiError>>,
 {
     // Redact credential material before the payload is used anywhere: the
     // journaled intent (and any forensic read of the log) must never contain
@@ -149,7 +261,7 @@ where
         if entry.request_hash != request_hash {
             return idempotency_conflict(state, op_kind, &operation_id);
         }
-        return match entry.outcome {
+        match entry.outcome {
             Some(outcome) => {
                 state.metrics.record_operation(op_kind, "replayed");
                 tracing::info!(
@@ -157,47 +269,96 @@ where
                     operation_id = %operation_id,
                     "replaying recorded outcome without executing"
                 );
-                replay_response(outcome.success, &outcome.response)
+                return replay_response(outcome.success, outcome.http_status, &outcome.response);
             }
-            None => operation_in_doubt(state, op_kind, &operation_id),
-        };
-    }
-
-    // (3) Journal the intent durably BEFORE the provider mutation. Between
-    // the lookup above and this append another request may have raced us;
-    // append_intent re-resolves idempotency under the lock, so every outcome
-    // of that race is handled below.
-    let append = {
-        let mut journal = lock_journal(state)?;
-        journal.append_intent(operation_id.clone(), request_hash, op_kind, payload)
-    }?;
-    match append {
-        IntentAppend::New => {}
-        IntentAppend::Replayed { success, response } => {
-            state.metrics.record_operation(op_kind, "replayed");
-            tracing::info!(
-                kind = op_kind,
-                operation_id = %operation_id,
-                "replaying concurrently recorded outcome without executing"
-            );
-            // Same reconstruction as the first-lookup replay above: a
-            // concurrently recorded failure must serve the recorded error
-            // status, never a 200 wrapping the error body.
-            return replay_response(success, &response);
+            None => {
+                // In flight (or interrupted before its outcome was
+                // journaled): the inspect closure resolves it.
+                if let Some(body) =
+                    resolve_in_flight(state, op_kind, &operation_id, success_status, inspect)
+                        .await?
+                {
+                    return Ok(json_response(
+                        success_status.unwrap_or(StatusCode::OK),
+                        &body,
+                    ));
+                }
+            }
         }
-        IntentAppend::AlreadyInFlight => {
-            return operation_in_doubt(state, op_kind, &operation_id);
+    } else {
+        // (3) Journal the intent durably BEFORE the provider mutation.
+        // Between the lookup above and this append another request may
+        // have raced us; append_intent re-resolves idempotency under
+        // the lock, so every outcome of that race is handled below.
+        let append = {
+            let mut journal = lock_journal(state)?;
+            journal.append_intent(operation_id.clone(), request_hash, op_kind, payload)
+        }?;
+        match append {
+            IntentAppend::New => {}
+            IntentAppend::Replayed {
+                success,
+                response,
+                http_status,
+            } => {
+                state.metrics.record_operation(op_kind, "replayed");
+                tracing::info!(
+                    kind = op_kind,
+                    operation_id = %operation_id,
+                    "replaying concurrently recorded outcome without executing"
+                );
+                // Same reconstruction as the first-lookup replay above: a
+                // concurrently recorded failure must serve the recorded error
+                // status, never a 200 wrapping the error body.
+                return replay_response(success, http_status, &response);
+            }
+            IntentAppend::AlreadyInFlight => {
+                if let Some(body) =
+                    resolve_in_flight(state, op_kind, &operation_id, success_status, inspect)
+                        .await?
+                {
+                    return Ok(json_response(
+                        success_status.unwrap_or(StatusCode::OK),
+                        &body,
+                    ));
+                }
+            }
         }
     }
 
     // (4) Execute the mutation. The journal guard is NOT held here.
+    // Reaching this point after an in-flight resolution means the
+    // inspection proved the act had not landed — the act's own first
+    // step re-verifies (never a blind re-execution).
     let result = run().await;
+    finish_outcome(state, op_kind, &operation_id, result, success_status)
+}
+
+/// Journal the outcome of an executed mutation and build the reply
+/// (or propagate the typed failure): the single success/failure tail
+/// of [`execute_resolvable`].
+fn finish_outcome<R>(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: &OperationId,
+    result: Result<R, ApiError>,
+    success_status: Option<StatusCode>,
+) -> Result<Response, ApiError>
+where
+    R: Serialize,
+{
     match result {
         Ok(value) => {
             let body = to_json_value(&value)?;
+            let status = success_status.unwrap_or(StatusCode::OK);
             let journaled = {
                 let mut journal = lock_journal(state)?;
-                journal.append_outcome(operation_id.clone(), true, body.clone())
+                journal.append_outcome_with_status(
+                    operation_id.clone(),
+                    true,
+                    body.clone(),
+                    success_status.map(|status| status.as_u16()),
+                )
             };
             if let Err(journal_error) = journaled {
                 // The mutation DID succeed and the caller must learn the
@@ -212,7 +373,7 @@ where
                 );
             }
             state.metrics.record_operation(op_kind, "success");
-            Ok(json_response(StatusCode::OK, &body))
+            Ok(json_response(status, &body))
         }
         Err(error) => {
             let body = to_json_value(&ApiErrorBody::from(error.clone()))?;
@@ -232,6 +393,67 @@ where
             state.metrics.record_operation(op_kind, "failure");
             Err(error)
         }
+    }
+}
+
+/// Resolve one in-flight (intent-without-outcome) retry through the
+/// caller's inspection: `Ok(Some(body))` journals the proven result as
+/// the outcome (with the caller's success status, so a later replay
+/// through the recorded outcome is status-compatible) and returns it
+/// for serving; `Ok(None)` reports "not landed — re-execute" (the
+/// caller proceeds to `run`); an `Err` propagates typed.
+async fn resolve_in_flight<R, I, IFut>(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: &OperationId,
+    success_status: Option<StatusCode>,
+    inspect: I,
+) -> Result<Option<Value>, ApiError>
+where
+    R: Serialize,
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = Result<Option<R>, ApiError>>,
+{
+    match inspect().await {
+        Ok(Some(value)) => {
+            let body = to_json_value(&value)?;
+            let journaled = {
+                let mut journal = lock_journal(state)?;
+                journal.append_outcome_with_status(
+                    operation_id.clone(),
+                    true,
+                    body.clone(),
+                    success_status.map(|status| status.as_u16()),
+                )
+            };
+            if let Err(journal_error) = journaled {
+                tracing::error!(
+                    kind = op_kind,
+                    operation_id = %operation_id,
+                    error = %journal_error,
+                    "in-flight resolution proved the act landed but its outcome \
+                     could not be journaled; replays will re-resolve by inspection"
+                );
+            }
+            state.metrics.record_operation(op_kind, "resolved");
+            tracing::info!(
+                kind = op_kind,
+                operation_id = %operation_id,
+                "in-flight operation resolved by inspection: the act is proven done"
+            );
+            Ok(Some(body))
+        }
+        Ok(None) => {
+            state.metrics.record_operation(op_kind, "re_drive");
+            tracing::info!(
+                kind = op_kind,
+                operation_id = %operation_id,
+                "in-flight operation proven not landed; re-executing (the act \
+                 re-verifies its own preconditions)"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -264,12 +486,15 @@ fn idempotency_conflict(
     Err(ApiError::idempotency_conflict(operation_id))
 }
 
-/// A typed `OPERATION_IN_DOUBT` rejection (intent without outcome).
-fn operation_in_doubt(
+/// The typed `OPERATION_IN_DOUBT` rejection (intent without outcome)
+/// served to the strict callers of [`execute_resolvable`] (see its
+/// module docs): a concurrent caller may be executing the operation
+/// right now, so the retry fails closed instead of guessing.
+fn in_doubt_error(
     state: &SharedState,
     op_kind: &'static str,
     operation_id: &OperationId,
-) -> Result<Response, ApiError> {
+) -> ApiError {
     state.metrics.record_operation(op_kind, "in_doubt");
     tracing::warn!(
         kind = op_kind,
@@ -277,7 +502,7 @@ fn operation_in_doubt(
         "journaled intent without a recorded outcome; the operation may be in \
          flight and is never re-executed"
     );
-    Err(ApiError::new(
+    ApiError::new(
         ApiErrorCode::OperationInDoubt,
         format!(
             "operation {operation_id} has a journaled intent without a recorded \
@@ -285,19 +510,34 @@ fn operation_in_doubt(
              inspect the current state of the target resource, and if you need to \
              re-attempt the operation use a new operation_id"
         ),
-    ))
+    )
 }
 
 /// Rebuild the HTTP response for a recorded outcome.
 ///
 /// This is the single status-reconstruction path shared by *every* replay:
 /// the first journal lookup before `append_intent`, and the race branch
-/// that re-resolves idempotency inside `append_intent`. Successes replay
-/// as `200` with the stored body; failures replay with the status
-/// reconstructed from the recorded error code and the stored body, so a
-/// replay is status- and byte-compatible with the first caller's response
-/// regardless of which caller executed the mutation.
-fn replay_response(success: bool, response: &Value) -> Result<Response, ApiError> {
+/// that re-resolves idempotency inside `append_intent`. A recorded
+/// `http_status` (stage B2: the mobility routes answer `201` and `202`)
+/// is served verbatim; otherwise successes replay as `200` with the
+/// stored body and failures replay with the status reconstructed from
+/// the recorded error code, so a replay is status- and byte-compatible
+/// with the first caller's response regardless of which caller executed
+/// the mutation.
+fn replay_response(
+    success: bool,
+    http_status: Option<u16>,
+    response: &Value,
+) -> Result<Response, ApiError> {
+    if let Some(status) = http_status {
+        let status = StatusCode::from_u16(status).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "recorded outcome carries an invalid HTTP status",
+            )
+        })?;
+        return Ok(json_response(status, response));
+    }
     if success {
         return Ok(json_response(StatusCode::OK, response));
     }
@@ -388,6 +628,86 @@ pub(crate) fn delete_hash(req: &DeleteVolumeRequest, volume_id: &VolumeId) -> [u
     let mut hashed = req.clone();
     hashed.api_version = folded_domain(&req.api_version, &[volume_id.as_str()]);
     hashed.request_hash()
+}
+
+// ---------------------------------------------------------------------------
+// Mobility and peer-route journal identities (stage B2)
+// ---------------------------------------------------------------------------
+//
+// The mobility routes and the internal peer routes journal through the
+// same pipeline, but their `operation_id`s are **derived**, not
+// consumer-supplied: the mobility request names a `migration_id`, and
+// every act of that migration (consumer-facing or peer) must replay
+// the recorded outcome across a daemon restart without anyone having
+// remembered a random id. The derivation mirrors
+// `volvisor_handoff::batch_operation_id`'s discipline —
+// domain-separated SHA-256 over the migration identity and a route
+// tag, rendered `mig-api-{tag}-{16 hex}` — and the request hash folds
+// the same tag into its domain so two acts of one migration can never
+// collide in the journal (a `prepare` and a `transfer` of the same
+// migration are different operations even though both key on the
+// migration id).
+
+/// Derive the deterministic journal operation id for one mobility or
+/// peer-route act of one migration: `mig-api-{tag}-{16 hex}` over a
+/// domain-separated SHA-256 of the migration id and the route tag.
+///
+/// `tag` must be non-empty and use the identity charset (the fixed
+/// route tags are; a caller-supplied tag is validated by
+/// [`OperationId::new`] on the rendered result regardless).
+///
+/// # Errors
+/// `INTERNAL` only if the derived string failed identity validation
+/// (unreachable for the fixed route tags).
+pub(crate) fn mobility_operation_id(
+    migration_id: &MigrationId,
+    tag: &str,
+) -> Result<OperationId, ApiError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"volvisor.api.mobility.op.v1:");
+    hasher.update(migration_id.as_str().as_bytes());
+    hasher.update(b":");
+    hasher.update(tag.as_bytes());
+    let digest = hasher.finalize();
+    let raw = format!("mig-api-{tag}-{}", hex16(&digest));
+    OperationId::new(raw).map_err(|error| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!("derived mobility operation id failed validation: {error}"),
+        )
+    })
+}
+
+/// The immutable request hash of one mobility or peer-route act: the
+/// canonical JSON serialization of the (typed) request body, folded
+/// with the route tag into one SHA-256 domain. `serde_json`'s `Value`
+/// map ordering is deterministic for a given document, so the same
+/// typed request always hashes identically — and a different body
+/// under the same derived operation id fails closed with
+/// `IDEMPOTENCY_CONFLICT`, exactly like the volume operations.
+pub(crate) fn mobility_request_hash(tag: &str, body: &Value) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"volvisor.api.mobility.hash.v1:");
+    hasher.update(tag.as_bytes());
+    hasher.update(b":");
+    // The canonical serialization of the typed request (deterministic
+    // key order for a given document; `unwrap_or_default` mirrors the
+    // typed requests' own hash discipline — serialization of these
+    // shapes cannot fail in practice).
+    hasher.update(serde_json::to_vec(body).unwrap_or_default());
+    hasher.finalize().into()
+}
+
+/// The first 16 hex characters of a digest (the house
+/// `volvisor-handoff` `hex_prefix` discipline, without `format!`).
+fn hex16(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -367,6 +367,10 @@ impl HandoffSurface for DrbdProvider {
         DrbdProvider::handoff_eligibility(self, vm_id)
     }
 
+    async fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        DrbdProvider::replica_caught_up(self, volume_id)
+    }
+
     async fn quiesce_for_barrier(
         &self,
         volume_id: &VolumeId,
@@ -410,6 +414,18 @@ impl HandoffSurface for DrbdProvider {
         attach: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError> {
         DrbdProvider::promote_target(self, volume_id, migration_id, attach)
+    }
+
+    async fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError> {
+        DrbdProvider::role_secondary(self, volume_id)
+    }
+
+    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        DrbdProvider::verify_target_replica(self, volume_id)
+    }
+
+    async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
+        DrbdProvider::fail_closed_fence(self, volume_id, reason)
     }
 }
 
@@ -4933,6 +4949,190 @@ impl DrbdProvider {
         })
     }
 
+    /// The provider-local participant facts for one migration
+    /// participant (stage B2: the daemon's `PrepareNearlineHandoff`
+    /// enrichment — the consumer's engine-neutral mobility request
+    /// names volumes and expected generations; the resource name and
+    /// DRBD minor each volume's writer identity lives in are derived
+    /// here from provider state, never asserted by the consumer).
+    ///
+    /// Verifies existence, the expected generation (fail-closed on a
+    /// stale generation: the consumer has not seen this volume
+    /// lately) and that the volume's current attachment names `vm_id`
+    /// (rule 6: eligibility is VM-wide, so a volume attached to a
+    /// different VM refuses the whole preparation).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// `STALE_GENERATION` when `expected_generation` does not match
+    /// the current generation; `INVALID_REQUEST` when the volume is
+    /// not attached to `vm_id`.
+    pub fn migration_participant_facts(
+        &self,
+        volume_id: &VolumeId,
+        vm_id: &str,
+        expected_generation: u64,
+    ) -> Result<(String, u32), ApiError> {
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        if expected_generation != stored.entry.generation {
+            return Err(ApiError::stale_generation(
+                expected_generation,
+                stored.entry.generation,
+            ));
+        }
+        let attached_to_vm = stored
+            .runtime
+            .attachment
+            .as_ref()
+            .is_some_and(|record| record.vm_id == vm_id);
+        if !attached_to_vm {
+            return Err(ApiError::invalid_request(format!(
+                "volume {volume_id} is not attached to vm {vm_id}"
+            )));
+        }
+        Ok((stored.entry.resource_name.clone(), stored.entry.minor))
+    }
+
+    /// Whether one volume's local role is Secondary, from observed
+    /// status (stage B2, [`HandoffSurface::role_secondary`]). A
+    /// verifiably down resource is `Ok(false)` — "not Secondary" is
+    /// the observable fact, never a guessed error.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` for an unknown volume; `INTERNAL` when the status
+    /// observation fails.
+    pub fn role_secondary(&self, volume_id: &VolumeId) -> Result<bool, ApiError> {
+        let resource = {
+            let state = self.lock_state()?;
+            let stored = state
+                .volume(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            stored.entry.resource_name.clone()
+        };
+        Ok(self
+            .resource_status(&resource)?
+            .is_some_and(|status| status.role == Role::Secondary))
+    }
+
+    /// The destination's `PREPARED` gate (stage B2,
+    /// [`HandoffSurface::verify_target_replica`]): verify this host
+    /// holds the volume's target replica from **observed** state —
+    /// the resource is present and running, Secondary, connected to
+    /// its peer, and its definition names this host — without
+    /// requiring the volume to be tracked in this host's state. The
+    /// resource is derived from the volume id the way
+    /// [`Self::promote_target`] derives it (the P3 peer side is
+    /// operator-provisioned and untracked until the promote adopts
+    /// it); a volume this host *does* track must be free of the
+    /// residues that would refuse the promote anyway — refused here,
+    /// before the source's cut.
+    ///
+    /// # Errors
+    /// `INVALID_STATE` when this host holds no running, Secondary,
+    /// connected replica of the volume, its resource definition does
+    /// not name this host, or a tracked volume carries a pending
+    /// self-fence / another handoff's cut marker / an unseeded
+    /// replica; `INTERNAL` for an observation that cannot be trusted.
+    pub fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        let resource = resource_name_for(volume_id);
+        let status = self.resource_status(&resource)?.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is down on this host; the target \
+                     replica is not present"
+                ),
+            )
+        })?;
+        if status.role != Role::Secondary {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is {:?}; the target replica must be \
+                     Secondary (a Primary one is someone's live writer)",
+                    status.role
+                ),
+            ));
+        }
+        if !status.connected {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is not connected to its peer; the \
+                     target replica is not established"
+                ),
+            ));
+        }
+        let definition = self.parsed_definition(&resource)?;
+        if !definition
+            .nodes
+            .iter()
+            .any(|node| node.name == self.config.node_name)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the resource definition for {resource} does not name this host ({}); \
+                     this host is not a replication end of {volume_id}",
+                    self.config.node_name
+                ),
+            ));
+        }
+        // The tracked-residue gates (an untracked peer side has none of
+        // these by construction — there is no entry to carry them).
+        if let Some(stored) = self.lock_state()?.volume(volume_id) {
+            if stored.runtime.fence.is_some() {
+                return Err(ApiError::new(
+                    ApiErrorCode::FencePending,
+                    format!(
+                        "volume {volume_id} carries a pending self-fence (its writer \
+                         authority was provably lost); it cannot take a handoff"
+                    ),
+                ));
+            }
+            if stored.runtime.migration.is_some() {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "volume {volume_id} already carries a migration-cut marker (another \
+                         handoff owns its cut)"
+                    ),
+                ));
+            }
+            if !stored.runtime.seeded {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!("volume {volume_id} is not seeded (its replica is not established)"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail-closed fencing for one participant (stage B2,
+    /// [`HandoffSurface::fail_closed_fence`]): the P4a self-fence
+    /// path — suspend, durable marker, demote — under the caller's
+    /// reason. The fenced volume is never resumed by this call; a
+    /// demotion that finds the device still open defers to the
+    /// pending-fence completion path exactly like every other fence.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` for an unknown volume; the fence act's typed error
+    /// otherwise (the volume stays suspended — never a silent
+    /// unfenced writer).
+    pub fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
+        let mut state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        let entry = stored.entry.clone();
+        self.self_fence(&mut state, volume_id, &entry, vec![reason.to_owned()])?;
+        Ok(())
+    }
+
     /// Quiesce one participant's source data path for a migration
     /// barrier (plan §2 D2/D6a): verify the source writer shape
     /// (attached, Primary), stamp the durable cut marker
@@ -5141,6 +5341,61 @@ impl DrbdProvider {
             format!(
                 "the peer of {} has not converged through the barrier yet (peer-disk {:?}, \
                  resync {}, connection {}): retry the observation",
+                entry.resource_name,
+                status.peer_disk,
+                if resync_active { "active" } else { "idle" },
+                if connection_established {
+                    "established"
+                } else {
+                    "not established"
+                },
+            ),
+        ))
+    }
+
+    /// Observe whether the replication has caught up **while the
+    /// source is still the writer** — the contract's `PRECOPY` step
+    /// ("source writer; replica catch-up"): peer disk `UpToDate`, no
+    /// resync in progress, connection established. Unlike
+    /// [`Self::track_sync`] this mints no proof: no boundary exists
+    /// yet, so the observation claims nothing about one; it exists so
+    /// the caller can wait for convergence *before* pausing the VM
+    /// and bound the pause window. A single observation — the caller
+    /// owns the bounded wait and retries the typed
+    /// `REPLICA_NOT_DURABLE` refusal while the peer lags.
+    ///
+    /// # Errors
+    /// [`ApiErrorCode::ReplicaNotDurable`] while the peer has not
+    /// caught up (retryable); `NOT_FOUND` for an unknown volume;
+    /// `INVALID_STATE` when the resource is verifiably down;
+    /// `INTERNAL` when the status query fails.
+    pub fn replica_caught_up(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        let entry = stored.entry.clone();
+        let status = self.resource_status(&entry.resource_name)?;
+        let Some(status) = status else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {} is down; volume {volume_id} requires reconciliation",
+                    entry.resource_name
+                ),
+            ));
+        };
+        let peer_up_to_date = status.peer_disk == Some(DiskState::UpToDate);
+        let resync_active = status.replication.is_some();
+        let connection_established = status.connected;
+        if peer_up_to_date && !resync_active && connection_established {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ApiErrorCode::ReplicaNotDurable,
+            format!(
+                "the peer of {} has not caught up yet (peer-disk {:?}, resync {}, \
+                 connection {}): retry the observation",
                 entry.resource_name,
                 status.peer_disk,
                 if resync_active { "active" } else { "idle" },

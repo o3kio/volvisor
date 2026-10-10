@@ -19,7 +19,13 @@
 //!   `provider_conformance_tests!` macro;
 //! - [`handoff`]: the optional source-side coordinated-handoff surface
 //!   ([`HandoffSurface`], the `AdoptionSurface` pattern) providers
-//!   implement to back the migration coordinator (P4b plan §6).
+//!   implement to back the migration coordinator (P4b plan §6);
+//! - [`vmm`]: the VMM coordination seam of the coordinated handoff
+//!   (P4b plan §5) — the engine-neutral [`vmm::VmmController`] trait,
+//!   the Cloud Hypervisor `ch-remote` adapter
+//!   ([`vmm::ChRemoteVmm`]) over [`CommandRunner`], and the TEST-ONLY
+//!   [`vmm::FakeVmm`] harness that makes the device-open discipline
+//!   provable in tests.
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -35,6 +41,7 @@ pub mod fake;
 pub mod handoff;
 pub mod provider;
 pub mod runner;
+pub mod vmm;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
@@ -43,3 +50,7 @@ pub use handoff::{
 };
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
+pub use vmm::{
+    ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeVmm, PauseProof,
+    VmState, VmmController,
+};

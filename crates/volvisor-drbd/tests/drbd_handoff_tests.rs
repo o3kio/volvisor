@@ -32,6 +32,10 @@
 //!   fail-closed on an unreachable witness;
 //! - eligibility is VM-wide: one unprepared participant refuses the
 //!   whole migration (row 12);
+//! - `verify_target_replica` (§6, the destination's `PREPARED` gate):
+//!   the untracked P3 peer replica passes from observed state, and a
+//!   down / Primary / disconnected replica or a tracked cut-marked
+//!   residue refuses typed before the source's cut;
 //! - the clear-cut-marker admin operation: refuses a Primary/writer,
 //!   clears + reconciles when Secondary, and accepts only a
 //!   witness-corroborated fencing proof of the volume's own retired
@@ -68,7 +72,7 @@ use std::time::Duration;
 
 use common::{
     FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for_peer, fixture, flip_world_to_peer,
-    provider_from_with_authority, seed_volume_with_identity, set_peer_lag,
+    provider_from_with_authority, seed_peer_volume, seed_volume_with_identity, set_peer_lag,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
@@ -814,6 +818,51 @@ async fn a_cut_that_outlives_its_lease_fences_but_keeps_the_marker() {
         .expect("clear the Secondary residue");
     assert_eq!(response.state, volvisor_types::VolumeLifecycle::Ready);
     assert!(cut_marker_of(&state.state_path, &state.volume).is_none());
+}
+
+// ------------------------------------------ replica_caught_up (PRECOPY)
+
+/// The pre-quiesce convergence observation (the contract's `PRECOPY`
+/// step — the source is still the writer): it answers convergence
+/// through the REAL status tokens while nothing is suspended and no
+/// marker exists — minting no proof, claiming nothing about a
+/// boundary — and shares the retryable refusal shape so the driver's
+/// bounded wait treats it exactly like the barrier wait. The D2 proof
+/// stays `track_sync`'s alone (the row-9 test below proves that
+/// split: the pre-freeze `track_sync` is refused outright).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replica_caught_up_observes_convergence_before_the_quiesce() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-precopy").await;
+    // The source is still the writer: no marker, no suspension — and
+    // the observation is served, because it claims nothing about a
+    // boundary (there is none yet).
+    state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect("converged while the source writes");
+    // Peer lag (fake asynchronous apply) is the same typed,
+    // retryable refusal the bounded wait retries.
+    set_peer_lag(&state.world, SEED_MINOR, true);
+    let lagging = state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect_err("the peer has not caught up");
+    assert_eq!(lagging.code, ApiErrorCode::ReplicaNotDurable);
+    assert!(lagging.detail.contains("retry"));
+    // Convergence flips back on.
+    set_peer_lag(&state.world, SEED_MINOR, false);
+    state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect("converged again");
+    // A lost connection is a refusal too, never a silent Ok.
+    state.world.lock().expect("world").peer_online = false;
+    let disconnected = state
+        .provider
+        .replica_caught_up(&state.volume)
+        .expect_err("no connection, no convergence claim");
+    assert_eq!(disconnected.code, ApiErrorCode::ReplicaNotDurable);
 }
 
 // -------------------------------------------------- track_sync (row 9)
@@ -1879,4 +1928,297 @@ async fn a_crashed_promote_is_re_driven_by_provenance_to_completion() {
     let view = kit.client.inspect(&state.volume).await.expect("view");
     assert_eq!(view.lease_state, LeaseState::Live);
     assert_eq!(view.holder.as_ref().expect("holder").as_str(), PEER_NODE);
+}
+
+// ------------------------------------- stage B2: driver-facing additions
+
+/// `migration_participant_facts` (the daemon's prepare enrichment):
+/// derives the resource and minor from provider state, verifying
+/// existence, the expected generation and the vm binding — every
+/// mismatch is a typed refusal, never a guessed fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn participant_facts_verify_identity_generation_and_vm_binding() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-facts").await;
+
+    // The attach bumped the entry generation to 2 (register → 1,
+    // attach → 2): the consumer's expected generation must match it.
+    let (resource, minor) = state
+        .provider
+        .migration_participant_facts(&state.volume, "handoff-vm", 2)
+        .expect("participant facts");
+    assert_eq!(resource, state.resource);
+    assert_eq!(minor, SEED_MINOR);
+
+    // Unknown volume: NOT_FOUND.
+    let error = state
+        .provider
+        .migration_participant_facts(&volume("vol-absent"), "handoff-vm", 2)
+        .expect_err("unknown volume");
+    assert_eq!(error.code, ApiErrorCode::NotFound);
+
+    // Stale generation: the consumer has not seen this volume lately.
+    let error = state
+        .provider
+        .migration_participant_facts(&state.volume, "handoff-vm", 99)
+        .expect_err("stale generation");
+    assert_eq!(error.code, ApiErrorCode::StaleGeneration);
+
+    // A volume attached to a different VM refuses the whole
+    // preparation (rule 6: eligibility is VM-wide).
+    let error = state
+        .provider
+        .migration_participant_facts(&state.volume, "other-vm", 2)
+        .expect_err("wrong vm");
+    assert_eq!(error.code, ApiErrorCode::InvalidRequest);
+}
+
+/// `role_secondary` observes the local role from status: an attached
+/// Primary is `false`, a demoted volume is `true`, a verifiably down
+/// resource is `false` (the observable fact, not an error), an
+/// unknown volume is `NOT_FOUND` and an unreadable status is
+/// `INTERNAL` (never a silent down).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_secondary_reports_the_observed_local_role() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-role").await;
+    let surface: Arc<dyn HandoffSurface> = state.provider.clone();
+
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+    assert!(!surface.role_secondary(&state.volume).await.expect("role"));
+
+    // Demote through the provider's own release tail: the observed
+    // role flips without re-attaching.
+    let attachment = AttachmentId::new("att-vol-role").expect("valid id");
+    state
+        .provider
+        .detach_volume(&state.volume, &attachment, &detach_req("att-vol-role", 1))
+        .await
+        .expect("detach");
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    assert!(surface.role_secondary(&state.volume).await.expect("role"));
+
+    // A verifiably down resource (the resource is gone from the
+    // simulated DRBD): "not Secondary" as a result, never an error.
+    let running = state
+        .world
+        .lock()
+        .expect("world")
+        .resources
+        .remove(&state.resource)
+        .expect("resource running");
+    assert!(!surface.role_secondary(&state.volume).await.expect("role"));
+
+    // An unknown volume: typed NOT_FOUND.
+    let error = surface
+        .role_secondary(&volume("vol-absent"))
+        .await
+        .expect_err("unknown volume");
+    assert_eq!(error.code, ApiErrorCode::NotFound);
+
+    // An unreadable status (a transient failure, not the down
+    // spelling): INTERNAL, never a silent down.
+    state
+        .world
+        .lock()
+        .expect("world")
+        .resources
+        .insert(state.resource.clone(), running);
+    state.world.lock().expect("world").fail_status = true;
+    let error = surface
+        .role_secondary(&state.volume)
+        .await
+        .expect_err("unreadable status");
+    assert_eq!(error.code, ApiErrorCode::Internal);
+}
+
+/// `verify_target_replica` — the destination's `PREPARED` gate (plan
+/// §6: "target replica verified — resource present, Secondary,
+/// connected, no fence marker"): the P3 destination's established
+/// replica passes from OBSERVED state while the volume stays
+/// UNTRACKED on that host (the composition the peer `prepare` route
+/// rests on — its provider answers `NOT_FOUND`, the replica does
+/// not), and every unready shape refuses typed before the source's
+/// cut: a down resource, someone's live Primary writer, and a
+/// disconnected replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_shapes() {
+    let kit = witness_kit().await;
+
+    // The P3 destination: an established replica in a second world
+    // this host never tracked (no state entry at all).
+    let f = fixture();
+    seed_peer_volume(
+        &f.base,
+        &f.world,
+        "vol-vtr",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR,
+        SEED_PORT,
+    );
+    let peer = peer_provider(&kit, &f.base, &f.world);
+    let surface: Arc<dyn HandoffSurface> = peer.clone();
+    let vol = volume("vol-vtr");
+    assert!(
+        DrbdState::load(&f.base.join("state-peer.json"))
+            .expect("peer state")
+            .volume(&vol)
+            .is_none(),
+        "the destination never tracked the volume"
+    );
+    surface
+        .verify_target_replica(&vol)
+        .await
+        .expect("the untracked established Secondary replica passes");
+
+    // Down: the resource is gone from the simulated DRBD — no target
+    // replica is present on this host.
+    let running = f
+        .world
+        .lock()
+        .expect("world")
+        .resources
+        .remove(&resource_of("vol-vtr"))
+        .expect("resource running");
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("down resource");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("is down"),
+        "the down refusal: {error}"
+    );
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .insert(resource_of("vol-vtr"), running);
+
+    // Primary: someone's live writer — never a migration target.
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .get_mut(&resource_of("vol-vtr"))
+        .expect("resource running")
+        .role = Role::Primary;
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("primary resource");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("must be Secondary"),
+        "the primary refusal: {error}"
+    );
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .get_mut(&resource_of("vol-vtr"))
+        .expect("resource running")
+        .role = Role::Secondary;
+
+    // Disconnected: the replica is not established — the gate refuses
+    // a target that cannot be proven current.
+    f.world.lock().expect("world").peer_online = false;
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("disconnected replica");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("not connected"),
+        "the connection refusal: {error}"
+    );
+    f.world.lock().expect("world").peer_online = true;
+    surface
+        .verify_target_replica(&vol)
+        .await
+        .expect("the re-established replica passes");
+}
+
+/// The tracked-residue half of `verify_target_replica`: a cut that
+/// outlived its lease fences the writer but KEEPS the marker on a
+/// Secondary (the row-11 shape) — a mid-handoff residue is never
+/// someone else's target, and the operator's clear (row 16a) is
+/// what reopens the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleared() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-vtr-residue").await;
+    let surface: Arc<dyn HandoffSurface> = state.provider.clone();
+    let mig = migration("mig-vtr");
+    state
+        .provider
+        .quiesce_for_barrier(&state.volume, &mig)
+        .expect("quiesce");
+    kit.server.handle.abort();
+    kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
+    state.provider.renew_leases().expect("renewal pass");
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    assert!(cut_marker_of(&state.state_path, &state.volume).is_some());
+    let error = surface
+        .verify_target_replica(&state.volume)
+        .await
+        .expect_err("cut-marked residue");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("cut marker"),
+        "the residue refusal: {error}"
+    );
+    state
+        .provider
+        .clear_cut_marker(&state.volume, None)
+        .expect("clear the Secondary residue");
+    surface
+        .verify_target_replica(&state.volume)
+        .await
+        .expect("the cleared residue reopens the gate");
+}
+
+/// `fail_closed_fence` (the daemon driver's `fence_source`): the P4a
+/// self-fence path under the caller's reason — the writer is
+/// suspended, demoted and de-authoritied, the attachment record is
+/// dropped and the generation advances. Nothing is left writing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_closed_fence_suspends_demotes_and_de_authorities() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-fence").await;
+    let surface: Arc<dyn HandoffSurface> = state.provider.clone();
+    assert_eq!(role_of(&state.world, &state.resource), Role::Primary);
+
+    surface
+        .fail_closed_fence(&state.volume, "abort void failed; source fenced")
+        .await
+        .expect("fail-closed fence");
+
+    // The writer is gone: Secondary, no attachment, no authority
+    // block, the entry generation advanced by the fence.
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    let stored = DrbdState::load(&state.state_path)
+        .expect("load state")
+        .volume(&state.volume)
+        .expect("volume exists")
+        .clone();
+    assert!(stored.runtime.attachment.is_none());
+    assert!(stored.runtime.authority.is_none());
+    assert!(stored.runtime.fence.is_none(), "the fence completed");
+    // register → 1, attach → 2, the fence's durable marker → 3.
+    assert_eq!(stored.entry.generation, 3);
+    // The fence performs no witness mutation (the P4a discipline: the
+    // durable authority block is dropped, so this host can neither
+    // renew nor re-derive the lease; the witness lease itself retires
+    // through W4 expiry — it is never re-validated from a fenced
+    // host). The stale claim would be the exact opposite of
+    // fail-closed.
+
+    // An unknown volume: typed NOT_FOUND, nothing suspended.
+    let error = surface
+        .fail_closed_fence(&volume("vol-absent"), "reason")
+        .await
+        .expect_err("unknown volume");
+    assert_eq!(error.code, ApiErrorCode::NotFound);
 }

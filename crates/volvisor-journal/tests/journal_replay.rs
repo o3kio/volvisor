@@ -148,7 +148,7 @@ fn idempotent_replay_same_hash_returns_recorded_outcome() {
         // Retry after the outcome: replayed with the recorded response.
         assert!(matches!(
             journal.append_intent(id.clone(), hash, "create_volume", payload.clone()),
-            Ok(IntentAppend::Replayed { success: true, response: ref body }) if *body == response
+            Ok(IntentAppend::Replayed { success: true, response: ref body, .. }) if *body == response
         ));
     }
 
@@ -156,7 +156,7 @@ fn idempotent_replay_same_hash_returns_recorded_outcome() {
     let mut journal = Journal::open(dir.path()).expect("reopen");
     assert!(matches!(
         journal.append_intent(id.clone(), hash, "create_volume", payload),
-        Ok(IntentAppend::Replayed { success: true, response: ref body }) if *body == response
+        Ok(IntentAppend::Replayed { success: true, response: ref body, .. }) if *body == response
     ));
 
     let entry = journal.lookup(&id).expect("registry entry");
@@ -198,7 +198,7 @@ fn failed_outcome_replays_with_the_success_flag() {
                 "create_volume",
                 serde_json::json!({"size_bytes": 1024}),
             ),
-            Ok(IntentAppend::Replayed { success: false, response: ref body }) if *body == error_body
+            Ok(IntentAppend::Replayed { success: false, response: ref body, .. }) if *body == error_body
         ));
     }
 
@@ -211,7 +211,7 @@ fn failed_outcome_replays_with_the_success_flag() {
             "create_volume",
             serde_json::json!({"size_bytes": 1024}),
         ),
-        Ok(IntentAppend::Replayed { success: false, response: ref body }) if *body == error_body
+        Ok(IntentAppend::Replayed { success: false, response: ref body, .. }) if *body == error_body
     ));
 }
 
