@@ -7,9 +7,17 @@
 //! tarball, a vendored copy inside another repository) falls back to
 //! the crate version rather than stamping a foreign or missing
 //! describe. Both paths are honest about what they name: a describe
-//! names the exact source state (the abbreviated commit hash while
-//! the repository carries no tags, per `--always`); the fallback names
-//! only the crate's version.
+//! names the commit and tag reachability `git describe` reports for
+//! the build's checkout (while the repository carries no tags, the
+//! abbreviated commit hash, per `--always`) and appends `-dirty` when
+//! the working tree was dirty at build time; the fallback names only
+//! the crate's version. Freshness is a watched property, not an
+//! intrinsic one: the build script re-runs on git-ref changes
+//! (`.git/HEAD`, `refs/heads`, `refs/tags`, `packed-refs`) and on any
+//! change under this package's root (the dirtiness watch), so a stale
+//! stamp is possible only for edits outside those watches — another
+//! crate's sources, or repository files outside this package — until
+//! the next build-script run.
 
 /// Resolve the version stamp from the build context: the build-time
 /// `git describe --tags --always --dirty` output when one was
@@ -35,11 +43,47 @@ pub const VERSION: &str = stamp(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
     use super::*;
 
     #[test]
     fn the_compiled_in_stamp_is_non_empty() {
         assert_ne!(VERSION, "");
+    }
+
+    /// The live pin (PR #19 review F4): inside a git checkout, the
+    /// compiled-in stamp must equal a fresh `git describe --tags
+    /// --always --dirty` run at test time, so a silent build.rs
+    /// regression — a missed watch, a mistyped env var — fails loudly
+    /// in dev/CI instead of asserting the stamp against itself. A
+    /// source without `.git` (a tarball export) skips cleanly and
+    /// stays green on the fallback path.
+    #[test]
+    fn the_stamp_equals_a_live_describe_inside_a_checkout() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !repo_root.join(".git").exists() {
+            return;
+        }
+        let output = Command::new("git")
+            .args(["describe", "--tags", "--always", "--dirty"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git describe runs inside a checkout");
+        assert!(
+            output.status.success(),
+            "git describe must succeed inside a checkout"
+        );
+        let live = String::from_utf8(output.stdout)
+            .expect("utf8 describe output")
+            .trim()
+            .to_owned();
+        assert_eq!(
+            VERSION, live,
+            "the compiled stamp is stale: either the build.rs rerun wiring regressed, or the \
+             tree changed outside its watches since the last build"
+        );
     }
 
     #[test]

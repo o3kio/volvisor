@@ -24,10 +24,11 @@ volvisor-witnessd --version
 - `--check-config` loads and validates the configuration, logs a
   concise summary through the daemon's structured-JSON tracing stack,
   and **exits 0 without starting the server** — the install smoke
-  surface (ADR-0009): it proves the binary runs and accepts its
-  configuration without devices, journals or network. An invalid
-  configuration prints the typed error to stderr and exits non-zero.
-  The journal is never opened on this path.
+  surface (ADR-0009): the binary runs and accepts its configuration
+  with no server, journal, or outbound connection started, though a
+  hostname (non-IP-literal) `witness_url` is resolved during
+  validation. An invalid configuration prints the typed error to
+  stderr and exits non-zero.
 - `--version` prints the compiled-in version stamp: the repository's
   `git describe --tags --always --dirty` at build time (while the
   repository carries no tags, the abbreviated commit hash), or the

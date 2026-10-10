@@ -37,7 +37,9 @@ release CI.
   target.
 - The version derives from `git describe` and is compiled in at build time;
   a new `volvisord --version` (and `volvisor-witnessd --version`) prints it
-  (P7 scope — no such flag exists today).
+  (P7 scope — no such flag exists today). Version stamping never fails the
+  build: every stamping failure path (git unavailable, not a checkout, a
+  vendored tree) degrades to the crate-version fallback.
 - One package ships both binaries; the service model below separates their
   units.
 

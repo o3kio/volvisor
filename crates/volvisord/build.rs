@@ -2,9 +2,8 @@
 //! `git describe --tags --always --dirty` over the enclosing checkout,
 //! exported to the crate as `VOLVISORD_BUILD_DESCRIBE` (the lib's
 //! [`volvisord::version`] resolves the final stamp; the crate version
-//! is the fallback). Version stamping never fails the build
-//! (ADR-0009's tolerance rule): every failure path here degrades to
-//! the fallback, silently and safely.
+//! is the fallback). Per ADR-0009's rule, version stamping never
+//! fails the build: every failure path here degrades to the fallback.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,11 +11,20 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
     let git_dir = enclosing_git_dir(&manifest_dir);
-    // Rerun policy: the stamp must not go stale. `describe` reads the
-    // current commit (HEAD and the branch tip), the tags and
-    // packed-refs; each is watched best-effort — a path that does not
-    // exist (a packed-refs file that was never packed, a worktree
-    // layout the helper below did not resolve) simply never triggers.
+    // Rerun policy: the stamp must not go stale, in both of its
+    // components. The commit/tag side is repinned by the git-path
+    // watches — HEAD (branch switches), refs/heads (new commits),
+    // refs/tags and packed-refs (tag changes), each best-effort: a
+    // path that does not exist simply never triggers. The -dirty side
+    // reflects the working tree, so the package root must be watched
+    // as well: once any rerun-if-changed is emitted, cargo watches
+    // ONLY the listed paths, and without the package root a source
+    // edit would never re-run this script and the compiled -dirty
+    // suffix would go stale. Watching the package root cannot loop:
+    // the script writes nothing into the package directory, and the
+    // workspace target/ lives outside it (the package holds only
+    // src/, tests/, Cargo.toml and this file).
+    watch(Path::new("."));
     if let Some(git_dir) = &git_dir {
         watch(&git_dir.join("HEAD"));
         watch(&git_dir.join("packed-refs"));
