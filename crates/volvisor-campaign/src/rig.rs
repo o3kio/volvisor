@@ -299,9 +299,27 @@ impl WitnessHandle {
             Arc::new(move || clock.load(Ordering::SeqCst)),
         ));
         let app = volvisor_witness::server::router(state);
-        let serve = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("witness serves");
-        });
+        // The spawn hops through the blocking pool (the same
+        // discipline as `volvisor-witness`'s blocking adapter, for
+        // the same reason): a task spawned directly from a runtime
+        // *worker* lands in that worker's LIFO slot, which no other
+        // worker can steal, so a rig constructed from a spawned
+        // task (the matrix cells) would block its worker in the
+        // seeding's synchronous witness calls before the serve task
+        // is ever polled — starving the very witness it is seeding.
+        // A blocking-pool thread holds no worker core, so the spawn
+        // lands on the stealable inject queue and a parked worker
+        // picks the serve task up immediately.
+        let handle = tokio::runtime::Handle::current();
+        let spawn = handle.clone();
+        let serve = handle
+            .spawn_blocking(move || {
+                spawn.spawn(async move {
+                    axum::serve(listener, app).await.expect("witness serves");
+                })
+            })
+            .await
+            .expect("witness serve spawn hop");
         *lock_slot(&self.serve) = Some(serve);
     }
 
@@ -779,14 +797,20 @@ impl Daemon {
     }
 
     /// Re-serve the SAME durable directories on the SAME address
-    /// after a kill (§3.3's restart): a new journal handle, a new
-    /// migration store (records re-loaded from disk), a fresh
-    /// migration handle, a fresh retry task whose startup pass is
-    /// the recovery. The `Journal::open` inside the launch is the
-    /// flock-freedom proof — it succeeds only when the killed
-    /// daemon's last `AppState` `Arc` unwound.
+    /// after a kill OR a graceful stop (§3.3's restart): a new
+    /// journal handle, a new migration store (records re-loaded from
+    /// disk), a fresh migration handle, a fresh retry task whose
+    /// startup pass is the recovery. `stop` first: a killed daemon's
+    /// group is already aborted and parked (the kill switch's own
+    /// act), while a HEALTHY daemon's group is still live — awaiting
+    /// it without the abort would wait forever, so the restart of a
+    /// healthy daemon (the operator's re-drive action) aborts and
+    /// parks its group exactly like a kill would have. The
+    /// `Journal::open` inside the launch is the flock-freedom proof
+    /// — it succeeds only when the old daemon's last `AppState`
+    /// `Arc` unwound.
     pub async fn restart(&mut self) {
-        self.await_death().await;
+        self.stop().await;
         let listener = TcpListener::bind(self.addr).await.expect("rebind daemon");
         let core = Arc::clone(&self.core);
         *self = Daemon::launch(core, listener).await;
