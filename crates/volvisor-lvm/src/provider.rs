@@ -152,6 +152,20 @@ impl MoveObservation {
     pub(crate) fn source_freed(&self, source_pv: &str) -> bool {
         !self.moving && !self.devices.iter().any(|pv| pv == source_pv)
     }
+
+    /// The relocation proof for the same-VG scope: no move is
+    /// active and the LV's extents sit on **exactly the named
+    /// target** — off the source *and* on the target, never a
+    /// third PV (a foreign relocation is not this move's
+    /// completion, and a completion claim names where the extents
+    /// are).
+    #[must_use]
+    pub(crate) fn relocated_to(&self, source_pv: &str, target_pv: &str) -> bool {
+        !self.moving
+            && self.devices.len() == 1
+            && self.devices[0] == target_pv
+            && source_pv != target_pv
+    }
 }
 
 /// One `move_reconcile_pass` outcome report (the retry task logs it;
@@ -1088,13 +1102,13 @@ impl LvmProvider {
                 );
             }
         };
-        if !verification.source_freed(&record.source_pv) {
+        if !verification.relocated_to(&record.source_pv, &record.target_pv) {
             return self.park_in_doubt(
                 volume_id,
                 format!(
-                    "verification refused: the LV's devices still reference the source \
-                     PV {} after the move ended; the extents were not freed",
-                    record.source_pv
+                    "verification refused: the LV's devices do not verify the relocation \
+                     to {} (observed {:?}); the source PV {} must no longer back the LV",
+                    record.target_pv, verification.devices, record.source_pv
                 ),
             );
         }
@@ -1464,20 +1478,17 @@ impl LvmProvider {
         if let Err(e) =
             self.start_pvmove(&vg_name, &lv_name, &source_pv, &record_for_drive.target_pv)
         {
-            // Honest tail: did it start anyway? A non-zero exit with
-            // a live mirror means the move is running despite the
-            // error — supervise it. Otherwise nothing happened in
-            // the world: drop the record and fail typed.
-            let observation = self.observe_lv(&vg_name, &lv_name)?;
-            if !observation.moving {
-                let mut state = self.lock_state()?;
-                if let Some(record) = state.move_record(volume_id) {
-                    if record.state == MoveVolumeBackingState::Preparing {
-                        state.remove_move(volume_id);
-                        self.persist(&mut state)?;
-                    }
-                }
-                return Err(e);
+            // Honest tail: classify from a fresh observation before
+            // answering.
+            if let Some(answer) = self.classify_failed_start(
+                volume_id,
+                &vg_name,
+                &lv_name,
+                &source_pv,
+                &record_for_drive,
+                e,
+            )? {
+                return Ok(answer);
             }
         }
         {
@@ -1495,6 +1506,60 @@ impl LvmProvider {
         // anything unknown.
         self.supervise_move(volume_id, &vg_name, &lv_name, &source_pv, &record_for_drive)
             .await
+    }
+
+    /// Phase 4's honest tail: a failed `pvmove` start classified
+    /// from a fresh observation before answering —
+    ///
+    /// - a live mirror: the move is running despite the error —
+    ///   `Ok(None)` (fall through to the `COPYING` save and the
+    ///   supervision);
+    /// - a verified relocation: the move already finished (the
+    ///   re-attach race — there was nothing left to move) —
+    ///   complete it;
+    /// - the source freed without the target holding the extents:
+    ///   an unknown placement — park `IN_DOUBT`;
+    /// - a verifiably untouched world: drop a `PREPARING` record
+    ///   and fail typed.
+    fn classify_failed_start(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        source_pv: &str,
+        record: &crate::state::MoveRecord,
+        error: ApiError,
+    ) -> Result<Option<MoveVolumeBackingResponse>, ApiError> {
+        let observation = self.observe_lv(vg_name, lv_name)?;
+        if observation.moving {
+            return Ok(None);
+        }
+        if observation.relocated_to(source_pv, &record.target_pv) {
+            return self
+                .finish_complete(volume_id, vg_name, lv_name, record)
+                .map(Some);
+        }
+        if observation.source_freed(source_pv) {
+            return self
+                .park_in_doubt(
+                    volume_id,
+                    format!(
+                        "the pvmove start refused while the LV's extents sit on \
+                         neither the source PV {source_pv} nor the target PV {} \
+                         (observed {:?}); an unknown outcome, never a silent failure",
+                        record.target_pv, observation.devices
+                    ),
+                )
+                .map(Some);
+        }
+        let mut state = self.lock_state()?;
+        if let Some(record) = state.move_record(volume_id) {
+            if record.state == MoveVolumeBackingState::Preparing {
+                state.remove_move(volume_id);
+                self.persist(&mut state)?;
+            }
+        }
+        Err(error)
     }
 
     /// Phase 5 — supervise the started move within the request's
@@ -1554,7 +1619,7 @@ impl LvmProvider {
                 tokio::time::sleep(self.move_timing.poll_interval).await;
                 continue;
             }
-            if observation.source_freed(source_pv) {
+            if observation.relocated_to(source_pv, &record.target_pv) {
                 return self.finish_complete(volume_id, vg_name, lv_name, record);
             }
             // The move ended without relocating the extents —
@@ -1638,10 +1703,11 @@ impl LvmProvider {
                 report.marked_copying.push(volume_id);
                 continue;
             }
-            if observation.source_freed(&record.source_pv) {
+            if observation.relocated_to(&record.source_pv, &record.target_pv) {
                 // Completion is provable from the world — including
                 // for an IN_DOUBT record ("rolls forward under
-                // reconciled authority").
+                // reconciled authority") — and verified against the
+                // record's own target, never a foreign relocation.
                 self.finish_complete(&volume_id, &vg_name, &lv_name, &record)?;
                 report.completed.push(volume_id);
                 continue;

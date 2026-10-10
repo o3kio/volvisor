@@ -1235,3 +1235,139 @@ async fn the_trait_default_refuses_when_the_capability_is_unadvertised() {
         "the QSD mirror/pivot path is advertised nowhere (ADR-0006)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The honest-answer races the tightened verification closes
+// ---------------------------------------------------------------------------
+
+/// The re-attach race: the move lands during the re-attach's own
+/// phase-2 observation, so the phase-4 pvmove re-run refuses — real
+/// LVM answers `No data to move` (exit 5), the verified 2.03.16
+/// shape — with the relocation verifiably done. The honest answer is
+/// `COMPLETE` (the tail classifies from a fresh observation before
+/// answering), never a start failure over a finished move.
+#[tokio::test]
+async fn a_re_attach_whose_move_lands_during_observation_completes() {
+    let fixture = move_fixture();
+    let volume = "vol-move-landed-race";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // Hold the first move: the window expires and answers COPYING
+    // with the move at 0 percent.
+    fixture.world.lock().expect("world").hold_moves = true;
+    let first = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the first move answers honestly");
+    assert_eq!(first.state, MoveVolumeBackingState::Copying);
+
+    // Position the held move exactly one observation from landing,
+    // then release: the re-attach's first lvs query lands it.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let advance = world.move_advance_percent;
+        let moving = world
+            .moves
+            .get_mut(&lv_path(volume))
+            .expect("the held move");
+        moving.percent = 100 - advance;
+        world.hold_moves = false;
+    }
+
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the re-attach completes the landed move");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2, "one bump across both operations");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()],
+        "the extents really relocated"
+    );
+}
+
+/// A foreign relocation is never this move's completion: while the
+/// daemon is not looking, the extents leave the source PV for a
+/// third PV of the VG (not the record's target). The source is
+/// freed, but the named target does not hold the extents — the
+/// re-attach parks `IN_DOUBT` naming the unknown placement, the
+/// generation never bumps, and the foreign placement is untouched.
+#[tokio::test]
+async fn a_foreign_relocation_off_target_parks_in_doubt() {
+    let fixture = move_fixture();
+    let volume = "vol-move-foreign";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    fixture.world.lock().expect("world").hold_moves = true;
+    let first = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the first move answers honestly");
+    assert_eq!(first.state, MoveVolumeBackingState::Copying);
+
+    // The out-of-band actor: the move is gone and the extents sit on
+    // a third PV of the VG.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.add_pv_to_vg("/dev/pv-c", CLAIMED_VG, common::POOL_BYTES);
+        world.moves.remove(&lv_path(volume));
+        world.place_lv_on(&lv_path(volume), "/dev/pv-c");
+        world.hold_moves = false;
+    }
+
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the re-attach parks instead of guessing");
+    assert_eq!(response.state, MoveVolumeBackingState::InDoubt);
+    assert!(
+        response
+            .detail
+            .as_deref()
+            .expect("the park reason")
+            .contains("neither the source PV"),
+        "the park names the unknown placement: {response:?}"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the record").state,
+        MoveVolumeBackingState::InDoubt
+    );
+    assert_eq!(generation, 1, "no bump for an unverified outcome");
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec!["/dev/pv-c".to_owned()],
+        "the foreign placement is untouched"
+    );
+}
