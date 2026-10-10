@@ -623,7 +623,7 @@ async fn row_8_stale_source_write_after_fence() {
     let w = assert_w1_w5_vol(&rig, &rig.volume_id(), 2, PEER_NODE, true).await;
     evidence.invariant("w1_w5", &w);
     evidence.outcome(
-        "parked safe: the record is in doubt at destination_authorized (the recorded grant_set \
+        "pass: parked safe: the record is in doubt at destination_authorized (the recorded grant_set \
          wedge defect), the destination holds the acknowledged prefix and never promoted, the \
          rogue writes are confined to the fenced source's map, and no route resumes the source \
          without fenced reconciliation",
@@ -1297,7 +1297,7 @@ async fn row_12a_multi_volume_cut_converges() {
     evidence.invariant("w1_w5", &format!("pass: {}", w.join("; ")));
     evidence.invariant("d6a", &format!("pass: {}", d.join("; ")));
     evidence.outcome(
-        "complete: the concurrent multi-volume cut converged — every participant promoted under \
+        "pass: complete: the concurrent multi-volume cut converged — every participant promoted under \
          the set-wide grant, the source destroyed once, every prefix byte-exact",
     );
     let boundary = joined[0].1.clone();
@@ -1583,7 +1583,7 @@ async fn row_12c_multi_volume_source_killed_mid_drive_recovers() {
     );
     evidence.invariant("g5_complete_reissue", &g5);
     evidence.outcome(
-        "recovered by re-issue: the source's death mid-drive parked nothing dangerous (the \
+        "pass: recovered by re-issue: the source's death mid-drive parked nothing dangerous (the \
          startup pass rolled the pre-cut record back) and the consumer's fresh migration \
          converged with every prefix byte-exact",
     );
@@ -1666,7 +1666,7 @@ async fn row_12d_multi_volume_witness_restart_mid_drive_recovers() {
     evidence.invariant("g5_complete", &g5);
     evidence.invariant("w1_w5", &format!("pass: {}", w.join("; ")));
     evidence.outcome(
-        "converged: the witness restart mid-drive lost nothing — the same drive task converged \
+        "pass: converged: the witness restart mid-drive lost nothing — the same drive task converged \
          once the link healed, and the completion claim is byte-backed for every participant",
     );
     let boundary = joined[0].1.clone();
@@ -1769,7 +1769,7 @@ async fn row_12e_resync_under_foreground_never_claims_caught_up() {
     evidence.invariant("g5_complete", &g5);
     evidence.invariant("w1_w5", &w);
     evidence.outcome(
-        "complete and byte-backed: the in-flight resync under foreground writes never produced a \
+        "pass: complete and byte-backed: the in-flight resync under foreground writes never produced a \
          caught-up claim, and the completion covered every acknowledged write",
     );
     let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
@@ -1867,7 +1867,7 @@ async fn row_12f_source_vmm_death_mid_cut_rolls_back_safely() {
     );
     evidence.invariant("w1_w5", &w);
     evidence.outcome(
-        "aborted safely: the source's VMM death inside the cut window left the storage state \
+        "pass: aborted safely: the source's VMM death inside the cut window left the storage state \
          exactly pre-cut (Primary, suspended-then-unsuspended, every byte intact). RECORDED \
          RESIDUE: the volume's attachment to the destroyed VM is the reconcile path's cleanup — \
          out of this row's scope",
@@ -1934,7 +1934,7 @@ async fn row_12g_kill_during_divergence_window_loses_nothing() {
     evidence.invariant("g5_complete", &g5);
     evidence.invariant("w1_w5", &w);
     evidence.outcome(
-        "complete: the kill during the in-flight resync (the dirty-bitmap window) is survivable \
+        "pass: complete: the kill during the in-flight resync (the dirty-bitmap window) is survivable \
          by construction — the queued writes are the bitmap, and the heal delivered every one",
     );
     let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
@@ -2288,11 +2288,15 @@ async fn row_14_abort_storm() {
              observable state is clean)"
         ),
     );
+    // The outcome carries the typed marker ("pass") CG4 matches
+    // against the outcome text alone (round-1 review, MINOR-3): the
+    // storm's honest classification IS a pass — idempotency under
+    // rotation with no residue — and the marker states it.
     evidence.outcome(
-        "idempotent and residue-free in state: 25 abort cycles on one rig left the source \
-         serving, the witness exactly at epoch 1, and every byte intact — the recovery paths \
-         (consumer abort, startup rollback, witness replay and roll-forward) are idempotent \
-         under rotation",
+        "pass: idempotent and residue-free in state: 25 abort cycles on one rig left the \
+         source serving, the witness exactly at epoch 1, and every byte intact — the \
+         recovery paths (consumer abort, startup rollback, witness replay and roll-forward) \
+         are idempotent under rotation",
     );
     let record = emit_oracle(&rig, evidence, &acked, boundary, "source");
     assert!(record.is_file(), "the evidence record landed: {record:?}");

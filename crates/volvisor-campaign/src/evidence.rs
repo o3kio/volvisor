@@ -13,12 +13,21 @@
 //! media, real DRBD, or a real VMM; production support is not
 //! claimed. Every record and the report carry it.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use serde_json::{Value, json};
+
+/// The synthetic-host markers the LIVE Tier R seam refuses (round-1
+/// review, MAJOR-1 — defense in depth): strings a constructed
+/// [`crate::tier_r::RealHost`] carries in the unit tests. A record
+/// mentioning one is a fabricated environmental claim, and the
+/// evidence tree (the shippable artifact) must never hold one —
+/// the scaffold's unit tests persist their claimed-gate records to
+/// a staging directory ([`Evidence::finish_tier_r_at`]), never to
+/// `run_dir()`.
+const SYNTHETIC_HOST_MARKERS: &[&str] = &["DRBDADM_BUILTIN"];
 
 /// The scenario record's log-source directories (copied, never
 /// moved — the rig keeps serving from the originals).
@@ -108,6 +117,10 @@ fn copy_tree(from: &Path, to: &Path) {
 /// finished with the log capture (§6's schema).
 pub struct Evidence {
     scenario: String,
+    /// The record's tier (§0): `S` for the simulation rows, `R` for
+    /// the env-gated real-host scaffolds (whose records are gate
+    /// statements, not observations — see [`Self::finish_tier_r`]).
+    tier: &'static str,
     fault: Option<(String, String)>,
     oracle: Option<Value>,
     invariants: Vec<(String, String)>,
@@ -117,16 +130,31 @@ pub struct Evidence {
 
 impl Evidence {
     /// Begin the record for `scenario` (its name in the run
-    /// directory; distinct per scenario).
+    /// directory; distinct per scenario). Tier S (§0) — the default
+    /// tier of every driven scenario.
     #[must_use]
     pub fn new(scenario: &str) -> Self {
         Self {
             scenario: scenario.to_owned(),
+            tier: "S",
             fault: None,
             oracle: None,
             invariants: Vec::new(),
             outcome: None,
             started: Instant::now(),
+        }
+    }
+
+    /// Begin a Tier R record for `scenario` (§0/§6): the real-host
+    /// scaffolds emit gate statements — explicit `skipped` (or
+    /// `blocked`) records with their reasons — never silent
+    /// absence. Finished with [`Self::finish_tier_r`] (no rig, no
+    /// log capture).
+    #[must_use]
+    pub fn new_tier_r(scenario: &str) -> Self {
+        Self {
+            tier: "R",
+            ..Self::new(scenario)
         }
     }
 
@@ -166,7 +194,7 @@ impl Evidence {
 
         let record = json!({
             "scenario": self.scenario,
-            "tier": "S",
+            "tier": self.tier,
             "commit": git_commit(),
             "kernel": kernel_release(),
             "components": {
@@ -206,6 +234,122 @@ impl Evidence {
         render_report(&dir);
         path
     }
+
+    /// Finish a Tier R record WITHOUT a rig (§0/§6): no log capture
+    /// (no rig exists to capture from), `components` null (the
+    /// record is a gate statement, not an observation of the
+    /// environment — claiming component versions for a scenario
+    /// that did not run would be fabrication), and the outcome,
+    /// reason and documented body carried verbatim. The §6 shapes:
+    ///
+    /// - `("skipped", reason, body)` — the default gate's explicit
+    ///   skip ("not run, no hardware" ≠ "not implemented");
+    /// - `("blocked", reason, body)` — the tier was claimed and the
+    ///   toolchain answered, but the real-host drive is not
+    ///   implemented (the recorded follow-up).
+    ///
+    /// Writes into the LIVE run directory (§6's shippable tree) and
+    /// refreshes the run's `REPORT.md` like any finish. The
+    /// synthetic-host guard lives one layer down, at the write
+    /// choke point (the private `write_tier_r_record`) — a unit
+    /// test exercising the claimed-gate arms persists to a staging
+    /// directory via [`Self::finish_tier_r_at`] instead, never
+    /// here.
+    pub fn finish_tier_r(self, outcome: &str, reason: &str, would_run: &str) -> PathBuf {
+        let dir = run_dir();
+        let path = self.write_tier_r_record(&dir, outcome, reason, would_run);
+        render_report(&dir);
+        path
+    }
+
+    /// Finish a Tier R record into an EXPLICIT directory — the
+    /// staging path for the scaffold's unit tests (the
+    /// claimed-with-hardware arm must exercise the real record
+    /// shape without ever writing a constructed-host claim into
+    /// the live tree). No report refresh: a staging directory is
+    /// not a run directory.
+    pub fn finish_tier_r_at(
+        self,
+        dir: &Path,
+        outcome: &str,
+        reason: &str,
+        would_run: &str,
+    ) -> PathBuf {
+        self.write_tier_r_record(dir, outcome, reason, would_run)
+    }
+
+    /// The §6 Tier R record writer (shared by the live and staging
+    /// seams): the canonical schema with `components` null (a gate
+    /// statement, not an observation). THE CHOKE POINT (round-2
+    /// R2-MINOR-1): a write whose target is the LIVE run directory
+    /// refuses, before any byte is written, a record whose text
+    /// carries a synthetic-host marker — the guard must live here,
+    /// not only on [`Self::finish_tier_r`], because the natural
+    /// fabrication regression is a `drive_with(…, &run_dir())` call
+    /// with a constructed host, which bypasses the finisher
+    /// entirely. Staging directories accept anything (the unit
+    /// tests' constructed hosts are exactly what they exercise).
+    /// One accepted cost, documented: a GENUINE git-built
+    /// `drbdadm` can report a version string containing the marker
+    /// shape — such a record is refused from the live tree too;
+    /// harmless, because the claimed arm always fails loudly
+    /// regardless, and the blocked trace it would have left is a
+    /// courtesy, never a requirement.
+    ///
+    /// # Panics
+    ///
+    /// When `dir` is the live run directory and the record's text
+    /// carries a synthetic-host marker.
+    fn write_tier_r_record(
+        &self,
+        dir: &Path,
+        outcome: &str,
+        reason: &str,
+        would_run: &str,
+    ) -> PathBuf {
+        // The choke-point guard (see the method docs): only the
+        // LIVE run directory is protected — staging directories are
+        // where the constructed hosts live by design.
+        if dir == run_dir() {
+            for marker in SYNTHETIC_HOST_MARKERS {
+                for text in [outcome, reason, would_run] {
+                    assert!(
+                        !text.contains(marker),
+                        "a Tier R record carrying the synthetic-host marker {marker:?} must \
+                         never be written into the live evidence tree (the unit tests \
+                         persist to a staging directory — the live tree is for real \
+                         environments only)"
+                    );
+                }
+            }
+        }
+        let record = json!({
+            "scenario": self.scenario,
+            "tier": self.tier,
+            "commit": git_commit(),
+            "kernel": kernel_release(),
+            "components": null,
+            "fault": null,
+            "oracle": null,
+            "invariants": [],
+            "logs": null,
+            "outcome": outcome,
+            "reason": reason,
+            "would_run": would_run,
+            "duration_ms": u64::try_from(self.started.elapsed().as_millis())
+                .expect("scenario duration fits a u64"),
+        });
+        let path = dir.join(format!("{}.json", self.scenario));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("evidence dir");
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("record JSON"),
+        )
+        .expect("write record");
+        path
+    }
 }
 
 /// The canonical oracle section (§6): acknowledged count, the
@@ -240,114 +384,18 @@ pub fn oracle_value(
     })
 }
 
-/// Collect every scenario record under `dir` (the scenario names
-/// nest — `kill-matrix/transfer/after-intent.json` — so the walk is
-/// recursive over everything except the `logs` capture).
-fn collect_records(dir: &Path, records: &mut Vec<Value>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if entry.file_name() != "logs" {
-                collect_records(&path, records);
-            }
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            if let Ok(body) = std::fs::read_to_string(&path) {
-                if let Ok(record) = serde_json::from_str::<Value>(&body) {
-                    records.push(record);
-                }
-            }
-        }
-    }
-}
-
-/// Render `REPORT.md` from the run directory's records (§6): the
-/// §10 coverage-matrix skeleton for the stage-A rows plus the claim
-/// discipline, verbatim, as the header. Idempotent — every finished
-/// scenario refreshes it, so the file describes the run as far as it
-/// has progressed (parallel finishes race benignly; the last write
-/// wins and includes every record on disk).
+/// Render `REPORT.md` from one run directory's records (§6): the
+/// per-finish refresh, in its final stage-D form — the §10 coverage
+/// matrix (the §9 mapping: Tier S rows with their verdicts, Tier
+/// R-only classes with their recorded gates), the §3.2 budget
+/// adherence, the recorded findings and the §11 completion-gate
+/// checklist. See [`crate::summary`] (the builder) and the
+/// `campaign-summary` binary (the standalone path). A single run
+/// directory holds only its own test binary's records, so absent
+/// rows read `MISSING`, never a silent omission; idempotent — every
+/// finished scenario refreshes it, and parallel finishes race
+/// benignly (the last write wins and includes every record on
+/// disk).
 pub fn render_report(dir: &Path) {
-    let mut records = Vec::new();
-    collect_records(dir, &mut records);
-    records.sort_by(|left, right| {
-        let key = |record: &Value| record["scenario"].as_str().unwrap_or_default().to_owned();
-        key(left).cmp(&key(right))
-    });
-
-    let mut report = String::new();
-    // `write!`/`writeln!` cannot fail on a `String` (its fmt::Write
-    // impl is infallible); the discards keep that explicit.
-    report.push_str("# Volvisor aggressive failure campaign — evidence report\n\n");
-    // The claim discipline, verbatim (§6).
-    report.push_str(
-        "> Tier S proves the implemented logic's behavior under the bounded\n\
-         > injected fault space (§0/§3.2); it proves nothing about real media,\n\
-         > real DRBD, or a real VMM; production support is not claimed.\n\n",
-    );
-    let _ = writeln!(
-        report,
-        "- Run: `{}`\n- Commit: `{}`\n- Kernel: `{}`\n- Records: {}",
-        dir.file_name().map_or_else(
-            || "?".to_owned(),
-            |name| name.to_string_lossy().into_owned()
-        ),
-        records
-            .first()
-            .and_then(|record| record["commit"].as_str())
-            .unwrap_or("unknown"),
-        records
-            .first()
-            .and_then(|record| record["kernel"].as_str())
-            .unwrap_or("unknown"),
-        records.len(),
-    );
-    report.push_str("\n## Coverage matrix (stages A+B: §9 rows 1–7)\n\n");
-    report.push_str(
-        "| Scenario | Fault | Outcome | Acknowledged | Verified | Corrupted | Tail | Duration |\n",
-    );
-    report.push_str("|---|---|---|---|---|---|---|---|\n");
-    for record in &records {
-        let fault = record["fault"]["at"]
-            .as_str()
-            .or_else(|| record["fault"]["kind"].as_str())
-            .unwrap_or("—");
-        let _ = writeln!(
-            report,
-            "| {} | {} | {} | {} | {} | {} | {} | {} ms |",
-            record["scenario"].as_str().unwrap_or("?"),
-            fault,
-            record["outcome"].as_str().unwrap_or("?"),
-            record["oracle"]["acknowledged"].as_u64().unwrap_or(0),
-            record["oracle"]["verified"].as_u64().unwrap_or(0),
-            record["oracle"]["corrupted"].as_u64().unwrap_or(0),
-            record["oracle"]["tail"].as_u64().unwrap_or(0),
-            record["duration_ms"].as_u64().unwrap_or(0),
-        );
-    }
-    report.push_str(
-        "\nStage A proved the oracle, the boundary rules and the\n\
-         kill/recovery machinery on the migration pipeline's own\n\
-         durable-write boundaries (§9 rows 1–3). Stage B added the\n\
-         store-save seams, the generated kill matrix (59 cells) and\n\
-         rows 4–7 — volume mutations, consumer mobility, peer routes\n\
-         and the witness journal, every recovery asserted against the\n\
-         full invariant set. The recorded grant_set wedge (a safe,\n\
-         permanent park at destination_authorized after a witness\n\
-         kill inside the grant commit — the retry task spins at its\n\
-         5s tick) is a product defect this campaign records, not a\n\
-         test weakened. Stage C adds the §5 injections and the abort\n\
-         storm; stage D the Tier R scaffolding and this report's\n\
-         final form.\n",
-    );
-    let path = dir.join("REPORT.md");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("evidence dir");
-    }
-    std::fs::write(&path, report).expect("write report");
+    crate::summary::render_report(dir);
 }
