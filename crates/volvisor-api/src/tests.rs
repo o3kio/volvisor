@@ -1653,3 +1653,1725 @@ async fn adopt_serves_the_typed_404_without_an_adoption_surface() {
         json!("adoption surface not available for this provider")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mobility surface (P4b plan §6, stage B2) — consumer routes
+// ---------------------------------------------------------------------------
+
+/// The daemon-to-daemon credential of the peer-route tests (distinct
+/// from `TEST_TOKEN` by construction — the tests assert the
+/// distinction).
+const PEER_TOKEN: &str = "test-peer-token";
+
+fn volume_id(raw: &str) -> volvisor_types::VolumeId {
+    volvisor_types::VolumeId::new(raw).expect("valid volume id")
+}
+
+fn migration_id(raw: &str) -> volvisor_types::MigrationId {
+    volvisor_types::MigrationId::new(raw).expect("valid migration id")
+}
+
+fn host_id(raw: &str) -> volvisor_types::HostId {
+    volvisor_types::HostId::new(raw).expect("valid host id")
+}
+
+/// A scripted consumer-facing mobility surface: records every call and
+/// answers fixed summaries (the state machine itself is the
+/// `volvisor-handoff` crate's business; these tests pin the HTTP
+/// surface — statuses, journaling, proof corroboration, auth).
+struct FakeMigrationSurface {
+    prepares: std::sync::Mutex<Vec<volvisor_handoff::MobilityRequest>>,
+    transfers: std::sync::Mutex<Vec<(volvisor_types::MigrationId, Value)>>,
+    aborts: std::sync::Mutex<Vec<volvisor_types::MigrationId>>,
+}
+
+impl FakeMigrationSurface {
+    fn new() -> Self {
+        Self {
+            prepares: std::sync::Mutex::new(Vec::new()),
+            transfers: std::sync::Mutex::new(Vec::new()),
+            aborts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn migration_summary(state: volvisor_handoff::HandoffState) -> volvisor_handoff::MigrationSummary {
+    volvisor_handoff::MigrationSummary {
+        state,
+        state_history: Vec::new(),
+        participants: vec![volvisor_handoff::Participant {
+            volume_id: volume_id("vol-m-1"),
+            expected_generation: 1,
+            resource: "vol-m-1-res".to_owned(),
+            minor: 7,
+        }],
+        in_doubt_detail: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl volvisor_handoff::MigrationSurface for FakeMigrationSurface {
+    async fn prepare(
+        &self,
+        request: volvisor_handoff::MobilityRequest,
+    ) -> Result<volvisor_handoff::MigrationSummary, ApiError> {
+        self.prepares.lock().expect("prepares").push(request);
+        Ok(migration_summary(volvisor_handoff::HandoffState::Prepared))
+    }
+
+    async fn transfer(
+        &self,
+        migration_id: &volvisor_types::MigrationId,
+        proof: Value,
+    ) -> Result<volvisor_handoff::MigrationSummary, ApiError> {
+        self.transfers
+            .lock()
+            .expect("transfers")
+            .push((migration_id.clone(), proof));
+        Ok(migration_summary(
+            volvisor_handoff::HandoffState::BarrierDurable,
+        ))
+    }
+
+    fn observe(
+        &self,
+        migration_id: &volvisor_types::MigrationId,
+    ) -> Result<Option<volvisor_handoff::MigrationSummary>, ApiError> {
+        if migration_id.as_str() == "mig-unknown" {
+            return Ok(None);
+        }
+        Ok(Some(migration_summary(
+            volvisor_handoff::HandoffState::Precopy,
+        )))
+    }
+
+    async fn abort(
+        &self,
+        migration_id: &volvisor_types::MigrationId,
+    ) -> Result<volvisor_handoff::MigrationSummary, ApiError> {
+        self.aborts
+            .lock()
+            .expect("aborts")
+            .push(migration_id.clone());
+        Ok(migration_summary(volvisor_handoff::HandoffState::Aborted {
+            reason: "consumer abort".to_owned(),
+            at: 1,
+        }))
+    }
+}
+
+/// Setup with the consumer-facing mobility surface wired.
+fn setup_with_migration() -> (SharedState, Arc<FakeMigrationSurface>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let migration = Arc::new(FakeMigrationSurface::new());
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_migration(migration.clone()),
+    );
+    (state, migration, dir)
+}
+
+fn mobility_request(migration: &str, volumes: &[&str]) -> Value {
+    json!({
+        "migration_id": migration,
+        "vm_id": "vm-m-1",
+        "target_host": "dst-host",
+        "volume_ids": volumes,
+        "expected_generations": vec![1; volumes.len()],
+    })
+}
+
+#[tokio::test]
+async fn mobility_routes_serve_the_typed_404_without_the_surfaces() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            "/v2/migrations",
+            mobility_request("mig-1", &["vol-1"]),
+        ),
+        (
+            Method::POST,
+            "/v2/migrations/mig-1/transfer",
+            json!({"vm_paused_and_io_drained_proof": {}}),
+        ),
+        (Method::GET, "/v2/migrations/mig-1", json!({})),
+        (Method::POST, "/v2/migrations/mig-1/abort", json!({})),
+        (
+            Method::POST,
+            "/v2/vms/vm-1/check-mobility",
+            json!({"target_host": "dst-host"}),
+        ),
+    ] {
+        let (status, not_enabled) = send_json(&app, json_request(method.clone(), uri, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}: {not_enabled}"
+        );
+        assert_eq!(not_enabled["code"], json!("NOT_FOUND"), "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn prepare_migration_answers_201_and_replays_byte_compatible() {
+    let (state, migration, _dir) = setup_with_migration();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/migrations",
+            &mobility_request("mig-p1", &["vol-1"]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], json!("prepared"));
+
+    // The same request replays the recorded outcome byte-for-byte —
+    // status included (201, not 200) — without a second execution.
+    let (status, replayed) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/migrations",
+            &mobility_request("mig-p1", &["vol-1"]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{replayed}");
+    assert_eq!(body, replayed);
+    assert_eq!(
+        migration.prepares.lock().expect("prepares").len(),
+        1,
+        "replays never re-execute"
+    );
+}
+
+#[tokio::test]
+async fn prepare_migration_conflicts_when_the_same_migration_changes_content() {
+    let (state, _migration, _dir) = setup_with_migration();
+    let app = app(&state);
+
+    let (status, _body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/migrations",
+            &mobility_request("mig-p2", &["vol-1"]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A different participant set under the same migration id (the
+    // derived operation id keys on it) is the typed conflict, never a
+    // silent second preparation.
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/migrations",
+            &mobility_request("mig-p2", &["vol-1", "vol-2"]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("IDEMPOTENCY_CONFLICT"));
+}
+
+#[tokio::test]
+async fn transfer_records_the_proof_as_corroboration_and_answers_202() {
+    let (state, migration, _dir) = setup_with_migration();
+    let app = app(&state);
+    let uri = "/v2/migrations/mig-t1/transfer";
+
+    let proof = json!({"kind": "vm_paused", "observed_by": "consumer"});
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            uri,
+            &json!({"vm_paused_and_io_drained_proof": proof}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["state"], json!("barrier_durable"));
+
+    // The proof was recorded verbatim as corroboration.
+    assert_eq!(
+        migration.transfers.lock().expect("transfers").len(),
+        1,
+        "the surface saw exactly one transfer"
+    );
+    let (recorded_id, recorded_proof) = migration.transfers.lock().expect("transfers")[0].clone();
+    assert_eq!(recorded_id, migration_id("mig-t1"));
+    assert_eq!(recorded_proof, proof);
+
+    // The replay is 202 and byte-identical.
+    let (status, replayed) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            uri,
+            &json!({"vm_paused_and_io_drained_proof": proof}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replayed}");
+    assert_eq!(body, replayed);
+    assert_eq!(migration.transfers.lock().expect("transfers").len(), 1);
+}
+
+#[tokio::test]
+async fn transfer_in_flight_intent_fails_closed_as_operation_in_doubt() {
+    let (state, _migration, _dir) = setup_with_migration();
+    let app = app(&state);
+
+    // The derived operation id and the canonical request hash the
+    // handler computes — injected as an intent without an outcome,
+    // exactly like a crash between the intent and the outcome record.
+    let migration = migration_id("mig-t2");
+    let operation_id = ops::mobility_operation_id(&migration, "transfer").expect("op id");
+    let hash_body = json!({
+        "migration_id": "mig-t2",
+        "vm_paused_and_io_drained_proof": {"kind": "vm_paused"},
+    });
+    {
+        let mut journal = state.journal.lock().expect("journal lock in test");
+        journal
+            .append_intent(
+                operation_id,
+                ops::mobility_request_hash("transfer", &hash_body),
+                ops::OP_MIGRATION_TRANSFER,
+                serde_json::json!({"injected": true}),
+            )
+            .expect("append injected intent");
+    }
+
+    // The drive task may be mid-flight right now: the retry fails
+    // closed, never starts a second drive.
+    let (status, in_doubt) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/migrations/mig-t2/transfer",
+            &json!({"vm_paused_and_io_drained_proof": {"kind": "vm_paused"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{in_doubt}");
+    assert_eq!(in_doubt["code"], json!("OPERATION_IN_DOUBT"));
+}
+
+#[tokio::test]
+async fn observe_migration_serves_the_summary_or_the_typed_404() {
+    let (state, _migration, _dir) = setup_with_migration();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::GET, "/v2/migrations/mig-o1", &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("precopy"));
+    assert!(body["participants"].is_array());
+
+    let (status, missing) = send_json(
+        &app,
+        json_request(Method::GET, "/v2/migrations/mig-unknown", &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["code"], json!("NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn abort_migration_journals_and_replays() {
+    let (state, migration, _dir) = setup_with_migration();
+    let app = app(&state);
+    let uri = "/v2/migrations/mig-a1/abort";
+
+    let (status, body) = send_json(&app, json_request(Method::POST, uri, &json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["state"],
+        json!({"aborted": {"reason": "consumer abort", "at": 1}})
+    );
+
+    let (status, replayed) = send_json(&app, json_request(Method::POST, uri, &json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+    assert_eq!(migration.aborts.lock().expect("aborts").len(), 1);
+}
+
+#[tokio::test]
+async fn mobility_mutations_require_the_admin_bearer_token() {
+    let (state, _migration, _dir) = setup_with_migration();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request_without_auth(
+            Method::POST,
+            "/v2/migrations",
+            &mobility_request("mig-auth", &["vol-1"]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], json!("UNAUTHORIZED"));
+
+    let (status, _body) = send_json(
+        &app,
+        json_request_without_auth(
+            Method::POST,
+            "/v2/vms/vm-1/check-mobility",
+            &json!({"target_host": "dst-host"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A scripted handoff surface: records promote calls (with the full
+/// derived attach request) and eligibility queries; everything else
+/// refuses typed (the cutover acts are the `volvisor-drbd` and daemon
+/// tests' business).
+struct FakeHandoffSurface {
+    promotes: std::sync::Mutex<
+        Vec<(
+            volvisor_types::VolumeId,
+            volvisor_types::MigrationId,
+            volvisor_types::request::AttachVolumeRequest,
+        )>,
+    >,
+    eligibility: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeHandoffSurface {
+    fn new() -> Self {
+        Self {
+            promotes: std::sync::Mutex::new(Vec::new()),
+            eligibility: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
+    async fn handoff_eligibility(
+        &self,
+        vm_id: &str,
+    ) -> Result<volvisor_provider::EligibilityReport, ApiError> {
+        self.eligibility
+            .lock()
+            .expect("eligibility")
+            .push(vm_id.to_owned());
+        Ok(volvisor_provider::EligibilityReport {
+            vm_id: vm_id.to_owned(),
+            eligible: true,
+            participants: vec![volvisor_provider::EligibilityParticipant {
+                volume_id: volume_id("vol-e-1"),
+                eligible: true,
+                reasons: Vec::new(),
+            }],
+        })
+    }
+
+    async fn quiesce_for_barrier(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _migration_id: &volvisor_types::MigrationId,
+    ) -> Result<volvisor_provider::QuiesceProof, ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn track_sync(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+    ) -> Result<volvisor_provider::SyncProof, ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn release_source(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _migration_id: &volvisor_types::MigrationId,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn abort_prepare(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _migration_id: &volvisor_types::MigrationId,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn clear_cut_marker(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _proof: Option<&volvisor_types::FencingProof>,
+    ) -> Result<volvisor_types::InspectVolumeResponse, ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn promote_target(
+        &self,
+        volume_id: &volvisor_types::VolumeId,
+        migration_id: &volvisor_types::MigrationId,
+        attach: &volvisor_types::request::AttachVolumeRequest,
+    ) -> Result<volvisor_types::request::AttachVolumeResponse, ApiError> {
+        self.promotes.lock().expect("promotes").push((
+            volume_id.clone(),
+            migration_id.clone(),
+            attach.clone(),
+        ));
+        Ok(volvisor_types::request::AttachVolumeResponse {
+            attachment_id: attach.attachment_id.clone(),
+            attachment_generation: 1,
+            volume_generation: attach.expected_volume_generation + 1,
+            frontend: volvisor_types::Frontend::VirtioBlk {
+                host_device_path: format!("/dev/drbd-by-res/{volume_id}"),
+            },
+            state: volvisor_types::AttachmentState::Prepared,
+        })
+    }
+
+    async fn role_secondary(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+    ) -> Result<bool, ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn fail_closed_fence(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _reason: &str,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::not_found("not scripted"))
+    }
+}
+
+#[tokio::test]
+async fn check_mobility_reads_the_handoff_surface() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_handoff(handoff.clone()),
+    );
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/vms/vm-c-1/check-mobility",
+            &json!({"target_host": "dst-host"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["eligible"], json!(true));
+    assert_eq!(body["vm_id"], json!("vm-c-1"));
+    assert_eq!(
+        *handoff.eligibility.lock().expect("eligibility"),
+        vec!["vm-c-1".to_owned()]
+    );
+    // Read-only: no journal record for an eligibility answer.
+    assert_eq!(journal_record_count(&state), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Internal peer routes (destination host)
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use volvisor_witness::blocking::BlockingWitnessConnection;
+use volvisor_witness::proto::{
+    BatchGrantOutcome, GrantRequest, GrantResponse, GrantSetRequest, GrantSetResponse,
+    RecordBarrierRequest, RecordBarrierResponse, RegisterRequest, RegisterResponse, RenewRequest,
+    RenewResponse, RevokeRequest, RevokeResponse, RevokeSetRequest, RevokeSetResponse,
+    VoidBarrierRequest, VoidBarrierResponse, WitnessError,
+};
+
+use crate::peer::{
+    PeerGrantRequest, PeerRouteContext, PreparedParticipant, TargetPreparation,
+    TargetPreparationStore,
+};
+
+/// One volume's scripted witness authority state.
+#[derive(Clone, Debug)]
+struct FakeWitnessVolume {
+    epoch: u64,
+    lease_id: u64,
+    lease_state: volvisor_types::LeaseState,
+    holder: Option<volvisor_types::HostId>,
+}
+
+/// A scripted witness for the peer routes: `inspect` answers the
+/// scripted views, `grant_set` mints epochs for this host and records
+/// every call (idempotent per operation id, like the real journal);
+/// everything else refuses typed (unused by these routes).
+struct FakePeerWitness {
+    host: volvisor_types::HostId,
+    volumes: std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, FakeWitnessVolume>>,
+    grant_set_calls: std::sync::Mutex<Vec<GrantSetRequest>>,
+    recorded_grants: std::sync::Mutex<BTreeMap<volvisor_types::OperationId, GrantSetResponse>>,
+}
+
+impl FakePeerWitness {
+    fn new(host: volvisor_types::HostId) -> Self {
+        Self {
+            host,
+            volumes: std::sync::Mutex::new(BTreeMap::new()),
+            grant_set_calls: std::sync::Mutex::new(Vec::new()),
+            recorded_grants: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Script a live lease held by `host` at `epoch` (the grant-act
+    /// inspection's proven-landed arrangement).
+    fn set_live(&self, volume: &volvisor_types::VolumeId, epoch: u64, lease_id: u64) {
+        self.volumes.lock().expect("volumes").insert(
+            volume.clone(),
+            FakeWitnessVolume {
+                epoch,
+                lease_id,
+                lease_state: volvisor_types::LeaseState::Live,
+                holder: Some(self.host.clone()),
+            },
+        );
+    }
+}
+
+impl FakePeerWitness {
+    fn view(&self, volume: &volvisor_types::VolumeId) -> volvisor_types::AuthorityView {
+        let volumes = self.volumes.lock().expect("volumes");
+        let entry = volumes.get(volume);
+        volvisor_types::AuthorityView {
+            volume_id: volume.clone(),
+            current_epoch: volvisor_types::WriterEpoch(entry.map_or(0, |v| v.epoch)),
+            holder: entry.and_then(|v| v.holder.clone()),
+            lease_state: entry.map_or(volvisor_types::LeaseState::None, |v| v.lease_state),
+            lease_id: entry.map(|v| volvisor_types::LeaseId(v.lease_id)),
+            lease_remaining_secs: entry.map(|_| 30),
+            commit_index: 1,
+            registration: None,
+            barriers: Vec::new(),
+            retirements: Vec::new(),
+        }
+    }
+}
+
+impl BlockingWitnessConnection for FakePeerWitness {
+    fn register(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: RegisterRequest,
+    ) -> Result<RegisterResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn grant(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: GrantRequest,
+    ) -> Result<GrantResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn renew(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: RenewRequest,
+    ) -> Result<RenewResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn revoke(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: RevokeRequest,
+    ) -> Result<RevokeResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn record_barrier(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: RecordBarrierRequest,
+    ) -> Result<RecordBarrierResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn void_barrier(
+        &self,
+        _volume_id: &volvisor_types::VolumeId,
+        _request: VoidBarrierRequest,
+    ) -> Result<VoidBarrierResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn revoke_set(&self, _request: RevokeSetRequest) -> Result<RevokeSetResponse, WitnessError> {
+        Err(WitnessError::InvalidRequest("not scripted".to_owned()))
+    }
+
+    fn grant_set(&self, request: GrantSetRequest) -> Result<GrantSetResponse, WitnessError> {
+        if request.host_id != self.host {
+            return Err(WitnessError::IdentityRequired);
+        }
+        if let Some(recorded) = self
+            .recorded_grants
+            .lock()
+            .expect("recorded grants")
+            .get(&request.operation_id)
+        {
+            return Ok(recorded.clone());
+        }
+        let mut outcomes = Vec::new();
+        {
+            let mut volumes = self.volumes.lock().expect("volumes");
+            for member in &request.requests {
+                let entry = volumes
+                    .entry(member.volume_id.clone())
+                    .or_insert(FakeWitnessVolume {
+                        epoch: 0,
+                        lease_id: 0,
+                        lease_state: volvisor_types::LeaseState::None,
+                        holder: None,
+                    });
+                entry.epoch += 1;
+                entry.lease_id += 1;
+                entry.lease_state = volvisor_types::LeaseState::Live;
+                entry.holder = Some(self.host.clone());
+                let retired = entry.epoch - 1;
+                outcomes.push(BatchGrantOutcome {
+                    volume_id: member.volume_id.clone(),
+                    epoch: volvisor_types::WriterEpoch(entry.epoch),
+                    lease_id: volvisor_types::LeaseId(entry.lease_id),
+                    lease_ttl_secs: 30,
+                    fencing_proof: volvisor_types::FencingProof {
+                        volume_id: member.volume_id.clone(),
+                        retired_epoch: volvisor_types::WriterEpoch(retired),
+                        commit_index: 1,
+                    },
+                });
+            }
+        }
+        let response = GrantSetResponse { grants: outcomes };
+        self.grant_set_calls
+            .lock()
+            .expect("grant-set calls")
+            .push(request.clone());
+        self.recorded_grants
+            .lock()
+            .expect("recorded grants")
+            .insert(request.operation_id, response.clone());
+        Ok(response)
+    }
+
+    fn inspect(
+        &self,
+        volume: &volvisor_types::VolumeId,
+    ) -> Result<volvisor_types::AuthorityView, WitnessError> {
+        Ok(self.view(volume))
+    }
+}
+
+/// A VMM controller that records every act label and delegates to the
+/// fake VMM (the in-flight resolution tests prove acts were *not*
+/// re-executed by the absence of their labels).
+struct RecordingVmm {
+    inner: Arc<volvisor_provider::FakeVmm>,
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl RecordingVmm {
+    fn new(inner: Arc<volvisor_provider::FakeVmm>) -> Self {
+        Self {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, label: &'static str) {
+        self.calls.lock().expect("calls").push(label);
+    }
+}
+
+impl volvisor_provider::VmmController for RecordingVmm {
+    fn pause(&self, vm_id: &str) -> Result<volvisor_provider::PauseProof, ApiError> {
+        self.record("pause");
+        self.inner.pause(vm_id)
+    }
+
+    fn snapshot(&self, vm_id: &str, dir: &std::path::Path) -> Result<(), ApiError> {
+        self.record("snapshot");
+        self.inner.snapshot(vm_id, dir)
+    }
+
+    fn destroy(&self, vm_id: &str) -> Result<(), ApiError> {
+        self.record("destroy");
+        self.inner.destroy(vm_id)
+    }
+
+    fn restore(
+        &self,
+        vm_id: &str,
+        dir: &std::path::Path,
+        disks: &[volvisor_provider::DiskMapping],
+    ) -> Result<(), ApiError> {
+        self.record("restore");
+        self.inner.restore(vm_id, dir, disks)
+    }
+
+    fn resume(&self, vm_id: &str) -> Result<(), ApiError> {
+        self.record("resume");
+        self.inner.resume(vm_id)
+    }
+
+    fn state(&self, vm_id: &str) -> Result<volvisor_provider::VmState, ApiError> {
+        self.inner.state(vm_id)
+    }
+}
+
+/// The peer-route test kit: the wired state plus every double it
+/// holds, so tests can arrange witness/provider/VMM state directly.
+struct PeerKit {
+    state: SharedState,
+    witness: Arc<FakePeerWitness>,
+    handoff: Arc<FakeHandoffSurface>,
+    vmm: Arc<RecordingVmm>,
+    fake_vmm: Arc<volvisor_provider::FakeVmm>,
+    provider: Arc<FakeProvider>,
+    store: TargetPreparationStore,
+    host: volvisor_types::HostId,
+    snapshot_root: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+fn setup_peer_with_root(snapshot_root: PathBuf) -> PeerKit {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let host = host_id("dst-host");
+    let witness = Arc::new(FakePeerWitness::new(host.clone()));
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    let fake_vmm = Arc::new(volvisor_provider::FakeVmm::new(&snapshot_root));
+    let vmm = Arc::new(RecordingVmm::new(Arc::clone(&fake_vmm)));
+    let store =
+        TargetPreparationStore::open(dir.path().join("peer-preparations")).expect("store open");
+    let context = Arc::new(PeerRouteContext::new(
+        Arc::clone(&witness) as Arc<dyn BlockingWitnessConnection>,
+        Arc::clone(&vmm) as Arc<dyn volvisor_provider::VmmController>,
+        Arc::clone(&handoff) as Arc<dyn volvisor_provider::HandoffSurface>,
+        Arc::clone(&provider) as Arc<dyn volvisor_provider::VolumeProvider>,
+        host.clone(),
+        store.clone(),
+        snapshot_root,
+    ));
+    let state = Arc::new(
+        AppState::new(provider.clone(), None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_peer_routes(Some(PEER_TOKEN.to_owned()), context),
+    );
+    PeerKit {
+        state,
+        witness,
+        handoff,
+        vmm,
+        fake_vmm,
+        provider,
+        store,
+        host,
+        snapshot_root: PathBuf::new(),
+        dir,
+    }
+}
+
+fn setup_peer() -> PeerKit {
+    let dir = tempfile::tempdir().expect("temporary snapshot root");
+    let mut kit = setup_peer_with_root(dir.path().to_path_buf());
+    kit.snapshot_root = dir.path().to_path_buf();
+    // Hold the snapshot root tempdir for the kit's lifetime by leaking
+    // it into the kit's own directory marker (tempdir cleans up on
+    // drop; the journal tempdir lives in `_dir`, the snapshot root is
+    // recreated per test below).
+    std::mem::forget(dir);
+    kit
+}
+
+/// A peer request with the peer credential.
+fn peer_request(method: Method, uri: &str, body: &Value) -> Request<Body> {
+    with_bearer(json_request_without_auth(method, uri, body), PEER_TOKEN)
+}
+
+fn peer_prepare_body(migration: &str, vm: &str, volumes: &[(&str, u64)]) -> Value {
+    json!({
+        "migration_id": migration,
+        "vm_id": vm,
+        "source_host": "src-host",
+        "volume_ids": volumes.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+        "expected_generations": volumes.iter().map(|(_, g)| *g).collect::<Vec<_>>(),
+    })
+}
+
+async fn create_volume(kit: &PeerKit, raw: &str) {
+    kit.provider
+        .create_volume(&fixture_create_request(raw, GIB))
+        .await
+        .expect("create volume");
+}
+
+#[tokio::test]
+async fn peer_routes_fail_closed_without_the_peer_credential() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    let uri = "/v2/internal/peer/health";
+
+    // No token, a wrong token, and — the credential distinction the
+    // plan pins — the ADMIN token: all rejected with 401.
+    let (status, body) = send_json(
+        &app,
+        json_request_without_auth(Method::GET, uri, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], json!("UNAUTHORIZED"));
+
+    let (status, _body) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::GET, uri, &json!({})),
+            "wrong-peer-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _body) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::GET, uri, &json!({})),
+            TEST_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the admin token is not the peer credential"
+    );
+}
+
+#[tokio::test]
+async fn peer_routes_serve_the_typed_404_without_the_peer_context() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-x", "vm-x", &[("vol-x", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn peer_prepare_verifies_volumes_and_persists_idempotently() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-pp1").await;
+
+    // An unknown volume is the typed refusal (nothing journaled beyond
+    // the intent+failure outcome).
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp-unknown", "vm-pp", &[("vol-nope", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+
+    // A stale expected generation is the typed conflict.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp-stale", "vm-pp", &[("vol-pp1", 99)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("STALE_GENERATION"));
+
+    // The honest preparation succeeds and persists.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp1", "vm-pp", &[("vol-pp1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["migration_id"], json!("mig-pp1"));
+    assert_eq!(body["participants"][0]["volume_id"], json!("vol-pp1"));
+    assert!(
+        kit.store
+            .load(&migration_id("mig-pp1"))
+            .expect("store")
+            .is_some(),
+        "the preparation is durable"
+    );
+
+    // The identical request replays byte-for-byte without a second
+    // verification pass (the journal replays the recorded outcome).
+    let (status, replayed) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp1", "vm-pp", &[("vol-pp1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+
+    // Differing content for the same migration is the typed conflict.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp1", "vm-other", &[("vol-pp1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("IDEMPOTENCY_CONFLICT"));
+}
+
+#[tokio::test]
+async fn peer_prepare_rejects_an_unsafe_vm_id_and_an_unusable_snapshot_dir() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-pp2").await;
+
+    // A vm_id that would escape the snapshot root is refused before
+    // anything is journaled.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp-esc", "../escape", &[("vol-pp2", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
+    assert_eq!(journal_record_count(&kit.state), 0, "nothing is journaled");
+
+    // An unusable snapshot root (a file where the directory should
+    // be) refuses the preparation typed: the shared-path boundary is
+    // proven at PREPARED, never at config time.
+    let bad_root = kit.dir.path().join("not-a-dir");
+    std::fs::write(&bad_root, b"file").expect("write blocker file");
+    let blocked = setup_peer_with_root(bad_root);
+    create_volume(&blocked, "vol-pp2").await;
+    let blocked_app = router::router(blocked.state.clone(), ApiConfig::default().max_body_bytes);
+    let (status, body) = send_json(
+        &blocked_app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-pp-blocked", "vm-pp", &[("vol-pp2", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+}
+
+#[tokio::test]
+async fn peer_grant_grants_promotes_and_answers_device_paths() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-g1").await;
+    create_volume(&kit, "vol-g2").await;
+
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-g1", "vm-g", &[("vol-g1", 1), ("vol-g2", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-g1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["migration_id"], json!("mig-g1"));
+    assert_eq!(body["grants"][0]["volume_id"], json!("vol-g1"));
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-g1")
+    );
+    assert_eq!(body["grants"][0]["epoch"], json!(1));
+    assert_eq!(body["grants"][0]["lease_ttl_secs"], json!(30));
+
+    // The witness batch ran exactly once, as this host, for this
+    // migration, under the deterministic batch operation id derived
+    // over the ordered participant set.
+    let calls = kit.witness.grant_set_calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 1, "{body}");
+    assert_eq!(calls[0].host_id, kit.host);
+    assert_eq!(calls[0].migration_id, Some(migration_id("mig-g1")));
+    let id_participants: Vec<volvisor_handoff::Participant> = ["vol-g1", "vol-g2"]
+        .iter()
+        .map(|raw| volvisor_handoff::Participant {
+            volume_id: volume_id(raw),
+            expected_generation: 1,
+            resource: String::new(),
+            minor: 0,
+        })
+        .collect();
+    let expected_op = volvisor_handoff::batch_operation_id(
+        &migration_id("mig-g1"),
+        volvisor_handoff::BatchStep::GrantSet,
+        &id_participants,
+    )
+    .expect("derive op id");
+    assert_eq!(calls[0].operation_id, expected_op);
+
+    // The promote ran per participant with the derived attach
+    // identity, this host, and the preparation's vm.
+    let promotes = kit.handoff.promotes.lock().expect("promotes").clone();
+    assert_eq!(promotes.len(), 2);
+    for (volume, migration, attach) in &promotes {
+        assert_eq!(migration, &migration_id("mig-g1"));
+        assert_eq!(attach.vm_id, "vm-g");
+        assert_eq!(attach.host_id, kit.host);
+        // The deterministic per-(migration, volume) attach identity:
+        // the operation id and the attachment id are the same derived
+        // string (distinct namespaces, one derivation).
+        assert_eq!(attach.operation_id.as_str(), attach.attachment_id.as_str());
+        assert!(attach.operation_id.as_str().starts_with("mig-attach-"));
+        assert!(matches!(volume.as_str(), "vol-g1" | "vol-g2"));
+    }
+
+    // The device paths are durable (the restore's verification reads
+    // them).
+    let preparation = kit
+        .store
+        .load(&migration_id("mig-g1"))
+        .expect("store")
+        .expect("prepared");
+    for participant in &preparation.participants {
+        assert_eq!(
+            participant.device_path.as_deref(),
+            Some(format!("/dev/drbd-by-res/{}", participant.volume_id).as_str())
+        );
+    }
+
+    // The replay is byte-identical and re-executes nothing.
+    let (status, replayed) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-g1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        1,
+        "replays never re-execute"
+    );
+}
+
+#[tokio::test]
+async fn peer_grant_without_a_preparation_is_the_typed_not_found() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-absent"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+}
+
+/// Inject an intent-without-outcome for a peer route's derived journal
+/// operation id — exactly like a crash between the journaling of the
+/// intent and the recording of the outcome.
+fn inject_peer_intent(
+    kit: &PeerKit,
+    migration: &volvisor_types::MigrationId,
+    tag: &str,
+    op_kind: &'static str,
+    body: &Value,
+) {
+    let operation_id = ops::mobility_operation_id(migration, tag).expect("derived op id");
+    let hash = ops::mobility_request_hash(tag, body);
+    let mut journal = kit.state.journal.lock().expect("journal lock in test");
+    journal
+        .append_intent(
+            operation_id,
+            hash,
+            op_kind,
+            serde_json::json!({"injected": true}),
+        )
+        .expect("append injected intent");
+}
+
+#[tokio::test]
+async fn peer_grant_resolves_an_in_flight_intent_by_inspection() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-r1").await;
+
+    // Arrange the proven-landed state directly: a preparation whose
+    // device paths are on record, and a witness lease live and held
+    // by this host on every participant.
+    let migration = migration_id("mig-resolve");
+    kit.store
+        .install(&TargetPreparation {
+            migration_id: migration.clone(),
+            vm_id: "vm-r".to_owned(),
+            source_host: host_id("src-host"),
+            target_host: kit.host.clone(),
+            participants: vec![PreparedParticipant {
+                volume_id: volume_id("vol-r1"),
+                expected_generation: 1,
+                device_path: Some("/dev/drbd-by-res/vol-r1".to_owned()),
+            }],
+            created_at: 1,
+        })
+        .expect("install preparation");
+    kit.witness.set_live(&volume_id("vol-r1"), 4, 9);
+
+    inject_peer_intent(
+        &kit,
+        &migration,
+        "peer-grant",
+        ops::OP_PEER_GRANT,
+        &serde_json::to_value(PeerGrantRequest {
+            migration_id: migration.clone(),
+        })
+        .expect("serialize"),
+    );
+
+    // The inspection proves the act landed: the response is served
+    // from the proven facts and the witness batch is NOT re-issued.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-resolve"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-r1")
+    );
+    assert_eq!(body["grants"][0]["epoch"], json!(4));
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        0,
+        "a proven-landed grant is resolved by inspection, never re-executed"
+    );
+    assert!(
+        kit.handoff.promotes.lock().expect("promotes").is_empty(),
+        "the promote is not re-driven either"
+    );
+
+    // A later retry now replays the journaled resolution outcome.
+    let (status, replayed) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-resolve"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+    assert_eq!(kit.witness.grant_set_calls.lock().expect("calls").len(), 0);
+}
+
+#[tokio::test]
+async fn peer_grant_re_drives_an_in_flight_intent_that_did_not_land() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-r2").await;
+
+    let migration = migration_id("mig-re-drive");
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-re-drive", "vm-r2", &[("vol-r2", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // No witness lease, no device paths: the inspection proves the
+    // act did NOT land, and the re-drive re-executes — the witness
+    // batch under its deterministic operation id, the promote
+    // re-verifying its own preconditions.
+    inject_peer_intent(
+        &kit,
+        &migration,
+        "peer-grant",
+        ops::OP_PEER_GRANT,
+        &serde_json::to_value(PeerGrantRequest {
+            migration_id: migration.clone(),
+        })
+        .expect("serialize"),
+    );
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-re-drive"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["grants"][0]["device_path"],
+        json!("/dev/drbd-by-res/vol-r2")
+    );
+    assert_eq!(
+        kit.witness.grant_set_calls.lock().expect("calls").len(),
+        1,
+        "the re-drive re-executed the witness batch exactly once"
+    );
+    assert_eq!(kit.handoff.promotes.lock().expect("promotes").len(), 1);
+}
+
+/// Write a minimal snapshot directory the fake VMM's restore can
+/// genuinely read (the same artifacts the verified `ch-remote
+/// snapshot` surface produces).
+fn write_snapshot(dir: &std::path::Path, declared_paths: &[&str]) {
+    std::fs::create_dir_all(dir).expect("create snapshot dir");
+    let config = json!({
+        "disks": declared_paths
+            .iter()
+            .map(|path| json!({ "path": path }))
+            .collect::<Vec<_>>(),
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).expect("write config");
+    std::fs::write(dir.join("memory-ranges"), b"fake-memory-ranges").expect("write memory");
+    std::fs::write(dir.join("state.json"), b"{\"vm_state\":\"Paused\"}").expect("write state");
+}
+
+#[tokio::test]
+async fn peer_restore_vm_restores_and_resumes_under_verified_disk_mappings() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-v1").await;
+
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-v1", "vm-v", &[("vol-v1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, granted) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-v1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let device_path = granted["grants"][0]["device_path"]
+        .as_str()
+        .expect("path")
+        .to_owned();
+
+    let snapshot_dir = kit.snapshot_root.join("vm-v");
+    write_snapshot(&snapshot_dir, &["/dev/source/vol-v1"]);
+
+    // The honest restore-then-resume first: the destination VM lands
+    // running with the mapped device.
+    let restore_body = json!({
+        "migration_id": "mig-v1",
+        "snapshot_dir": snapshot_dir.display().to_string(),
+        "disks": [{"declared_path": "/dev/source/vol-v1", "device_path": device_path}],
+        "resume": true,
+    });
+    let (status, body) = send_json(
+        &app,
+        peer_request(Method::POST, "/v2/internal/peer/restore-vm", &restore_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["vm_state"], json!("running"));
+    assert_eq!(
+        kit.fake_vmm.vm_state("vm-v").expect("state"),
+        volvisor_provider::VmState::Running
+    );
+    assert_eq!(
+        kit.fake_vmm.vm_devices("vm-v").expect("devices"),
+        vec![device_path.clone()]
+    );
+    assert_eq!(
+        *kit.vmm.calls.lock().expect("calls"),
+        vec!["restore", "resume"],
+        "the absent-VMM forward path is restore then resume"
+    );
+
+    // The replay re-executes nothing.
+    let calls_before = kit.vmm.calls.lock().expect("calls").len();
+    let (status, replayed) = send_json(
+        &app,
+        peer_request(Method::POST, "/v2/internal/peer/restore-vm", &restore_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+    assert_eq!(kit.vmm.calls.lock().expect("calls").len(), calls_before);
+
+    // A disk mapping that does not match the promoted participant set
+    // is the typed refusal, before any VMM act — proven on a second
+    // migration (the first one's restore-vm operation id now carries
+    // its recorded outcome, and a different body under it is the
+    // journal's idempotency conflict, exactly as designed).
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-v1m", "vm-v", &[("vol-v1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-v1m"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let calls_before = kit.vmm.calls.lock().expect("calls").len();
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/restore-vm",
+            &json!({
+                "migration_id": "mig-v1m",
+                "snapshot_dir": snapshot_dir.display().to_string(),
+                "disks": [{"declared_path": "/dev/source/vol-v1", "device_path": "/dev/smuggled"}],
+                "resume": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+    assert_eq!(
+        kit.vmm.calls.lock().expect("calls").len(),
+        calls_before,
+        "no VMM act runs for a mismatched mapping"
+    );
+}
+
+#[tokio::test]
+async fn peer_restore_vm_resolves_an_in_flight_intent_by_the_observed_vm_state() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-v2").await;
+
+    let migration = migration_id("mig-v2");
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-v2", "vm-v2", &[("vol-v2", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, granted) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-v2"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let device_path = granted["grants"][0]["device_path"]
+        .as_str()
+        .expect("path")
+        .to_owned();
+
+    let snapshot_dir = kit.snapshot_root.join("vm-v2");
+    write_snapshot(&snapshot_dir, &["/dev/source/vol-v2"]);
+    let restore_body = json!({
+        "migration_id": "mig-v2",
+        "snapshot_dir": snapshot_dir.display().to_string(),
+        "disks": [{"declared_path": "/dev/source/vol-v2", "device_path": device_path}],
+        "resume": true,
+    });
+
+    // Arrange the proven-landed state: the destination VM is already
+    // running with the mapped device (a completed prior restore).
+    kit.fake_vmm
+        .create("vm-v2", &[&device_path])
+        .expect("create vm");
+    kit.fake_vmm.start("vm-v2").expect("start vm");
+
+    inject_peer_intent(
+        &kit,
+        &migration,
+        "peer-restore-vm",
+        ops::OP_PEER_RESTORE_VM,
+        &restore_body,
+    );
+
+    // The inspection proves the act from the observed VM state: no
+    // destroy, no restore, no resume is issued.
+    let (status, body) = send_json(
+        &app,
+        peer_request(Method::POST, "/v2/internal/peer/restore-vm", &restore_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["vm_state"], json!("running"));
+    assert!(
+        kit.vmm.calls.lock().expect("calls").is_empty(),
+        "a proven-landed restore is resolved by inspection, never re-executed"
+    );
+}
+
+#[tokio::test]
+async fn peer_restore_vm_refuses_a_created_destination_vm_on_the_resume_path() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-v3").await;
+
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-v3", "vm-v3", &[("vol-v3", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, granted) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-v3"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let device_path = granted["grants"][0]["device_path"]
+        .as_str()
+        .expect("path")
+        .to_owned();
+
+    let snapshot_dir = kit.snapshot_root.join("vm-v3");
+    write_snapshot(&snapshot_dir, &["/dev/source/vol-v3"]);
+
+    // A defined, not-booted destination VM is a foreign shape the
+    // resume path refuses typed (never destroys a VM the migration
+    // did not put there).
+    kit.fake_vmm
+        .create("vm-v3", &[&device_path])
+        .expect("create vm");
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/restore-vm",
+            &json!({
+                "migration_id": "mig-v3",
+                "snapshot_dir": snapshot_dir.display().to_string(),
+                "disks": [{"declared_path": "/dev/source/vol-v3", "device_path": device_path}],
+                "resume": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+}
+
+#[tokio::test]
+async fn peer_discard_drops_the_preparation_idempotently() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-d1").await;
+
+    let (status, _body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-d1", "vm-d", &[("vol-d1", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/discard",
+            &json!({"migration_id": "mig-d1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["discarded"], json!(true));
+
+    // The same request replays the recorded outcome byte-for-byte
+    // (the journal's discipline — the discard's operation id is
+    // derived from the migration id).
+    let (status, replayed) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/discard",
+            &json!({"migration_id": "mig-d1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, replayed);
+
+    // An absent preparation is the honest idempotent answer on a
+    // fresh operation id (a discard of a migration that was never
+    // prepared).
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/discard",
+            &json!({"migration_id": "mig-never-prepared"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["discarded"], json!(false));
+
+    // With the preparation gone, the grant is the typed not-found.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/grant",
+            &json!({"migration_id": "mig-d1"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn peer_health_reports_the_honest_snapshot_dir_answer() {
+    let kit = setup_peer();
+    let app = app(&kit.state);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(Method::GET, "/v2/internal/peer/health", &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["host_id"], json!("dst-host"));
+    assert_eq!(body["snapshot_dir_readable"], json!(true));
+
+    // A root that cannot be probed is reported false — honestly, at
+    // call time.
+    let bad_root = kit.dir.path().join("blocked-root");
+    std::fs::write(&bad_root, b"file").expect("write blocker file");
+    let blocked = setup_peer_with_root(bad_root);
+    let blocked_app = router::router(blocked.state.clone(), ApiConfig::default().max_body_bytes);
+    let (status, body) = send_json(
+        &blocked_app,
+        peer_request(Method::GET, "/v2/internal/peer/health", &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["snapshot_dir_readable"], json!(false));
+}

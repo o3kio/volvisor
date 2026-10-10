@@ -16,6 +16,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 
 use crate::handlers;
+use crate::peer;
 use crate::state::SharedState;
 
 /// Build the Volume API v2 router.
@@ -62,6 +63,37 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             "/v2/admin/nearline/{volume_id}/adopt",
             post(handlers::adopt_volume),
         )
+        // Consumer-facing mobility (P4b plan §6, stage B2): the four
+        // journaled migration routes plus the read-only eligibility
+        // check. Admin token required like every mutation; a daemon
+        // without the surfaces serves the typed 404s.
+        .route(
+            "/v2/vms/{vm_id}/check-mobility",
+            post(handlers::check_mobility),
+        )
+        .route("/v2/migrations", post(handlers::prepare_migration))
+        .route(
+            "/v2/migrations/{migration_id}",
+            get(handlers::observe_migration),
+        )
+        .route(
+            "/v2/migrations/{migration_id}/transfer",
+            post(handlers::transfer_migration),
+        )
+        .route(
+            "/v2/migrations/{migration_id}/abort",
+            post(handlers::abort_migration),
+        )
+        // Internal peer routes (P4b plan §6, stage B2): the
+        // destination-side surface, guarded by the daemon-to-daemon
+        // peer credential (distinct from the admin token — see
+        // `peer::RequirePeer`). A daemon without the peer context
+        // serves the typed 404 on every route.
+        .route("/v2/internal/peer/prepare", post(peer::prepare))
+        .route("/v2/internal/peer/grant", post(peer::grant))
+        .route("/v2/internal/peer/restore-vm", post(peer::restore_vm))
+        .route("/v2/internal/peer/discard", post(peer::discard))
+        .route("/v2/internal/peer/health", get(peer::health))
         // Liveness is exposed on /healthz (task requirement); the
         // implementation plan section 5.5 also lists /v2/healthz, so both
         // spellings serve the same liveness-only response.

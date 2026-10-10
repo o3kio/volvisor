@@ -1081,13 +1081,16 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
  "tracing",
+ "volvisor-handoff",
  "volvisor-journal",
  "volvisor-provider",
  "volvisor-types",
+ "volvisor-witness",
 ]
 
 [[package]]
