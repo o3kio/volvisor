@@ -251,7 +251,9 @@ pub struct VmmVersionGate {
 impl VmmVersionGate {
     /// Probe and cache the verdict: run `<cloud_hypervisor>
     /// --version` through `runner` when both the binary and the
-    /// minimum are configured, compare, cache.
+    /// minimum are configured, compare, cache. The banner is scanned
+    /// from both output streams (stdout first; some builds print it
+    /// to stderr).
     ///
     /// Nothing configured is a **refused** verdict with the recorded
     /// reason (the fail-closed default), never a proven-by-omission:
@@ -302,10 +304,17 @@ impl VmmVersionGate {
                 output.stderr_excerpt()
             ));
         }
-        let Some(observed) = parse_version_output(&output.stdout) else {
+        // The banner is scanned from both streams, stdout first: some
+        // builds print it to stderr (a noisy init before the banner,
+        // or a fully stderr banner) — the tolerant parser accepts a
+        // version token on either.
+        let Some(observed) =
+            parse_version_output(&output.stdout).or_else(|| parse_version_output(&output.stderr))
+        else {
             return Self::refused(format!(
-                "the cloud-hypervisor version output could not be parsed: {:?}",
-                output.stdout
+                "the cloud-hypervisor version output could not be parsed (stdout and \
+                 stderr both scanned): {:?} / {:?}",
+                output.stdout, output.stderr
             ));
         };
         if observed >= minimum {
@@ -546,6 +555,25 @@ mod tests {
             gate(|_program, _args| Some(CommandOutput::success("cloud-hypervisor\n")));
         let error = gate.check().expect_err("unparseable is refused");
         assert!(error.detail.contains("could not be parsed"), "{error}");
+    }
+
+    #[test]
+    fn a_banner_on_stderr_only_proves_the_gate() {
+        // Some builds print the version banner to stderr: the scan
+        // accepts it there (stdout first, stderr as the fallback).
+        let (gate, _runner) = gate(|_program, _args| {
+            let mut output = CommandOutput::success("loading device model\n");
+            output.stderr = "cloud-hypervisor v37.1\n".to_owned();
+            Some(output)
+        });
+        match gate.verdict() {
+            GateVerdict::Proven { observed } => {
+                assert_eq!(*observed, version("37.1").expect("parses"));
+            }
+            GateVerdict::Refused { reason } => {
+                unreachable!("the stderr banner must prove the gate: {reason}");
+            }
+        }
     }
 
     #[test]

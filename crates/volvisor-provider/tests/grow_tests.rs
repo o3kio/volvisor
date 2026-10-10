@@ -112,6 +112,10 @@ impl Rig {
         let vmm = Arc::new(FakeVmm::new(dir.path().join("snapshots")));
         vmm.create("vm-1", &["/dev/vg/vol-1"])
             .expect("create the VM");
+        // A second VM: the re-attach rows move the volume between
+        // frontends (the identity-keying regression).
+        vmm.create("vm-2", &["/dev/vg/vol-1"])
+            .expect("create the second VM");
         let facts: Facts = Arc::new(Mutex::new(BTreeMap::new()));
         let store = GrowNotificationStore::open(dir.path().join("grow-notifications.json"))
             .expect("open the store");
@@ -133,16 +137,23 @@ impl Rig {
 
     /// Attach the volume, addressable at `size`.
     fn attach(&self, size: u64) {
-        self.attach_as(size, Some("disk-vol-1".to_owned()));
+        self.attach_to("vm-1", Some("disk-vol-1".to_owned()), size);
     }
 
     /// Attach the volume at `size`, with (`Some`) or without (`None`)
     /// a recorded VMM disk id.
     fn attach_as(&self, size: u64, disk_id: Option<String>) {
+        self.attach_to("vm-1", disk_id, size);
+    }
+
+    /// Attach the volume to `vm_id` at `size`, with (`Some`) or
+    /// without (`None`) a recorded VMM disk id — the identity-keying
+    /// rows move the volume between frontends.
+    fn attach_to(&self, vm_id: &str, disk_id: Option<String>, size: u64) {
         let mut facts = self.facts.lock().expect("facts lock");
         let entry = match disk_id {
             Some(vmm_disk_id) => AttachmentForGrow::Addressable {
-                vm_id: "vm-1".to_owned(),
+                vm_id: vm_id.to_owned(),
                 vmm_disk_id,
                 current_size_bytes: size,
             },
@@ -266,6 +277,92 @@ fn a_detached_grow_reports_not_applicable_and_resolves_any_pending_record() {
     // a dead socket forever.
     assert_eq!(rig.record(), None, "the detached pending is removed");
     assert_eq!(rig.vmm.resize_calls().expect("resizes"), Vec::new());
+}
+
+#[test]
+fn a_re_attached_volume_re_drives_under_a_new_attachment_identity() {
+    // The identity-keying regression (review finding F1): a retained
+    // notified record must not satisfy the invariant for a DIFFERENT
+    // attachment. The record proves "that VM, that disk id, was told
+    // that size" — nothing about a frontend the volume re-attached
+    // to after the detach.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rig = Rig::new(dir);
+    rig.attach_to("vm-1", Some("disk-a".to_owned()), 2_147_483_648);
+
+    assert_eq!(
+        rig.engine.notify_grow(&volume(), 2_147_483_648),
+        GrowGuestNotification::Notified
+    );
+    assert_eq!(
+        rig.vmm.resize_calls().expect("resizes"),
+        vec![FakeResizeCall {
+            vm_id: "vm-1".to_owned(),
+            disk_id: "disk-a".to_owned(),
+            new_size_bytes: 2_147_483_648,
+        }]
+    );
+
+    // Detach: the notified record is deliberately retained (the
+    // module docs' normative pending-only rule — it is evidence, not
+    // an outstanding obligation), and the pass neither drives
+    // anything nor reports a resolution while no attachment exists.
+    rig.detach();
+    let report = rig.engine.retry_pass().expect("the pass");
+    assert_eq!(report.notified, Vec::new());
+    assert_eq!(
+        report.not_applicable,
+        Vec::new(),
+        "a retained notified record is not a pending obligation"
+    );
+    assert!(
+        rig.record().is_some(),
+        "the notified record survives the detach (identity-keyed evidence)"
+    );
+
+    // Re-attach to a different VM and disk id at the SAME size: the
+    // retained record's identity does not match, the invariant is
+    // unsatisfied for vm-2's frontend, and the pass re-drives.
+    rig.attach_to("vm-2", Some("disk-b".to_owned()), 2_147_483_648);
+    let report = rig.engine.retry_pass().expect("the pass");
+    assert_eq!(report.notified, vec![(volume(), 2_147_483_648)]);
+    assert_eq!(
+        report.retry_required,
+        Vec::new(),
+        "the re-drive converges in one pass"
+    );
+    assert_eq!(
+        rig.vmm.resize_calls().expect("resizes"),
+        vec![
+            FakeResizeCall {
+                vm_id: "vm-1".to_owned(),
+                disk_id: "disk-a".to_owned(),
+                new_size_bytes: 2_147_483_648,
+            },
+            FakeResizeCall {
+                vm_id: "vm-2".to_owned(),
+                disk_id: "disk-b".to_owned(),
+                new_size_bytes: 2_147_483_648,
+            },
+        ],
+        "exactly the two identity-correct drives: no wrong VMM, no wrong size"
+    );
+    let record = rig.record().expect("the record exists");
+    assert_eq!(record.vm_id, "vm-2");
+    assert_eq!(record.vmm_disk_id, "disk-b");
+    assert!(!record.is_pending());
+
+    // The benign side of the keying: re-attaching the SAME identity
+    // at the same size drives nothing — that VMM was already told.
+    rig.detach();
+    rig.attach_to("vm-2", Some("disk-b".to_owned()), 2_147_483_648);
+    let report = rig.engine.retry_pass().expect("the pass");
+    assert_eq!(report.notified, Vec::new());
+    assert_eq!(
+        rig.vmm.resize_calls().expect("resizes").len(),
+        2,
+        "the same-identity re-attach is correctly suppressed"
+    );
 }
 
 #[test]

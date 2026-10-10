@@ -18,7 +18,7 @@ use volvisor_lvm::{LvmProvider, RealRunner};
 use volvisor_provider::vmm::{ChRemoteConfig, ChRemoteVmm, VmmController};
 use volvisor_provider::{
     AdminSurface, AdoptionSurface, GrowAttachmentFacts, GrowNotificationEngine,
-    GrowNotificationStore, VmmVersionGate, grow::Clock,
+    GrowNotificationStore, GrowRetryReport, VmmVersionGate, grow::Clock,
 };
 use volvisor_types::{ApiError, HostId};
 use volvisor_witness::client::HttpWitnessConnection;
@@ -246,22 +246,29 @@ fn wire_grow_notification(
 /// that spawned it.
 fn spawn_grow_retry_task(engine: Arc<GrowNotificationEngine>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        grow_retry_pass(&engine);
+        // The pass runs on the blocking pool, never on a runtime
+        // worker: the engine's pass is synchronous and bounded per
+        // volume by the resize-disk timeout, and the handle is
+        // shareable, so the whole pass moves to `spawn_blocking`.
+        // Non-overlap is preserved — the task awaits each pass
+        // before sleeping the next tick.
         loop {
+            let engine = Arc::clone(&engine);
+            let pass = tokio::task::spawn_blocking(move || engine.retry_pass()).await;
+            log_grow_pass(pass);
             tokio::time::sleep(GROW_RETRY_TICK).await;
-            grow_retry_pass(&engine);
         }
     })
 }
 
-/// One grow-notification reconcile pass (see
-/// [`spawn_grow_retry_task`]). The engine's pass is synchronous and
-/// bounded per volume by the resize-disk timeout — the same
-/// control-path blocking class as the renewal task's witness waits.
-/// Every outcome is a structured event, never a crash.
-fn grow_retry_pass(engine: &GrowNotificationEngine) {
-    match engine.retry_pass() {
-        Ok(report) => {
+/// Log one grow-notification reconcile pass's outcome (see
+/// [`spawn_grow_retry_task`]) — the pass itself having run on the
+/// blocking pool. Every outcome is a structured event, never a
+/// crash: a failed pass (typed) and a failed pass task (the join
+/// error) are both logged and retried on the next tick.
+fn log_grow_pass(pass: Result<Result<GrowRetryReport, ApiError>, tokio::task::JoinError>) {
+    match pass {
+        Ok(Ok(report)) => {
             for (volume_id, size_bytes) in &report.notified {
                 tracing::info!(
                     kind = "grow_notify",
@@ -286,10 +293,15 @@ fn grow_retry_pass(engine: &GrowNotificationEngine) {
                 );
             }
         }
-        Err(error) => tracing::error!(
+        Ok(Err(error)) => tracing::error!(
             kind = "grow_retry",
             error = %error,
             "grow reconcile pass failed; retried next pass"
+        ),
+        Err(error) => tracing::error!(
+            kind = "grow_retry",
+            error = %error,
+            "grow reconcile pass task failed; retried next pass"
         ),
     }
 }

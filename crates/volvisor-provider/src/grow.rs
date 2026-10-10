@@ -21,8 +21,12 @@
 //! # The invariant
 //!
 //! The engine maintains one invariant over every attached,
-//! addressable volume: **the VMM has been told a size at least the
-//! volume's current size.** Everything follows from it:
+//! addressable volume: **the VMM of the volume's current attachment
+//! has been told a size at least the volume's current size.** A
+//! durable record proves that only when it carries the current
+//! attachment's identity — the same VM id and VMM disk id the
+//! enumeration reports — and a target at least the current size;
+//! anything else re-drives. Everything follows from it:
 //!
 //! - [`GrowNotifier::notify_grow`] runs inside the grow
 //!   operation (the API layer composes it around the provider's
@@ -34,8 +38,12 @@
 //!   and the startup reconcile, one and the same pass — restores the
 //!   invariant for **every** attached volume: a pending record is
 //!   re-driven, a record whose target is below the volume's current
-//!   size is re-driven, and a volume with no record at all is driven
-//!   (a fresh attach therefore receives one idempotent no-op resize
+//!   size is re-driven, a record whose recorded identity (VM id,
+//!   VMM disk id) is not the current attachment's is re-driven (a
+//!   volume that detached and re-attached to a different VM or disk
+//!   id — the retained record proves nothing about the new
+//!   frontend), and a volume with no record at all is driven (a
+//!   fresh attach therefore receives one idempotent no-op resize
 //!   on the first pass — the price of a reconcile that cannot miss a
 //!   crash between the backing grow and the intent journal, and the
 //!   mechanism that heals volumes grown under the pre-P6-B
@@ -43,7 +51,15 @@
 //! - a pending record whose volume lost its attachment resolves
 //!   `not_applicable` and is removed (a detached frontend learned
 //!   the device's size when the VM next opened it; retrying against
-//!   a dead socket would never converge).
+//!   a dead socket would never converge). A **notified** record is
+//!   deliberately retained across the detach: it is evidence tied
+//!   to its recorded identity, and the identity keying above
+//!   decides its relevance on re-attach (the same VM and disk id —
+//!   that VMM already knows a size at least the current one; a
+//!   different identity — re-drive). This pending-only rule is
+//!   normative on both detached-resolution paths: the grow path's
+//!   detached answer and the pass's detached sweep apply exactly
+//!   the same one.
 //!
 //! The never-shrink rule holds structurally: the pass drives the
 //! volume's **current** size, which only grows (grow-only is the
@@ -428,10 +444,19 @@ impl GrowNotificationEngine {
     }
 
     /// Resolve a detached volume's pending record (`not_applicable`,
-    /// removed — the module docs).
+    /// removed — the module docs). A **notified** record is
+    /// deliberately retained: it is evidence tied to its recorded
+    /// identity, and the pass's identity keying decides its
+    /// relevance on re-attach. Pending-only is the normative rule —
+    /// the retry pass's detached sweep applies exactly the same one.
     fn resolve_detached(&self, volume_id: &VolumeId) {
         if let Ok(mut store) = self.lock_store() {
-            drop(store.remove(volume_id));
+            let pending = store
+                .get(volume_id)
+                .is_some_and(|record| record.is_pending());
+            if pending {
+                drop(store.remove(volume_id));
+            }
         }
     }
 
@@ -474,7 +499,15 @@ impl GrowNotificationEngine {
                 // crash-window and pre-P6-B healing case).
                 None => true,
                 Some(record) => {
-                    record.is_pending() || record.target_size_bytes < *current_size_bytes
+                    // A record satisfies the invariant only for its
+                    // own attachment identity and a target at least
+                    // the current size: pending, a stale target, or
+                    // a different identity (a detach-and-re-attach
+                    // to another VM or disk id) each re-drive.
+                    record.is_pending()
+                        || record.target_size_bytes < *current_size_bytes
+                        || record.vm_id != *vm_id
+                        || record.vmm_disk_id != *vmm_disk_id
                 }
             };
             if !needs_drive {
@@ -502,7 +535,9 @@ impl GrowNotificationEngine {
             }
         }
         // Detached resolution: pending records whose volume has no
-        // attachment anymore.
+        // attachment anymore (the normative pending-only rule — the
+        // grow path's `resolve_detached` applies the same one; a
+        // notified record is retained as identity-keyed evidence).
         let detached: Vec<VolumeId> = self
             .lock_store()?
             .records()

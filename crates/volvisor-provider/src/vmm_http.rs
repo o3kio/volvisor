@@ -89,6 +89,15 @@ pub struct VmmHttpResponse {
 /// by `timeout` for the write and read phases (the connect phase is
 /// bounded by [`CONNECT_BOUND`]).
 ///
+/// The exchange terminates per HTTP/1.1, not per the peer's whim:
+/// after the status line and headers, a 204/304 (no body by
+/// definition), a `Content-Length: 0`, or a fully-read
+/// `Content-Length` body completes it — the peer may hold the
+/// connection open afterward (a VMM that does not rush its close is
+/// not a transport failure). A response with neither a body-defining
+/// status nor a `Content-Length` is close-delimited (the HTTP/1.1
+/// rule) and still ends at the peer's close.
+///
 /// # Errors
 /// [`ApiError`] typed `INTERNAL` for every transport failure (the
 /// socket cannot be connected within the bound, the write or read
@@ -129,6 +138,11 @@ pub fn put_json(
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
+        if exchange_complete(&raw) {
+            // The exchange is complete per HTTP/1.1 (the module
+            // docs): success does not wait for the peer's close.
+            break;
+        }
         let read = stream
             .read(&mut chunk)
             .map_err(|e| internal(format!("failed to read the response: {e}")))?;
@@ -144,6 +158,46 @@ pub fn put_json(
         raw.extend_from_slice(&chunk[..read]);
     }
     parse_status_line(&raw).map_err(internal)
+}
+
+/// Whether `raw` completes the HTTP/1.1 exchange: the status line,
+/// the headers, and — per the status and `Content-Length` — the full
+/// body. A 204/304 carries no body by definition; a
+/// `Content-Length: 0` exchange ends at the headers; a
+/// `Content-Length: N` body is complete at `N` bytes past the
+/// header block. A response that is neither body-less by status nor
+/// `Content-Length`-delimited is close-delimited (the HTTP/1.1
+/// rule) and completes only at the peer's close — which the read
+/// loop's `read == 0` handles. A malformed status line is not
+/// decided here: the final [`parse_status_line`] fails typed on it.
+/// All arithmetic is over bytes — the lossily-decoded text is used
+/// only to read the (ASCII, in practice) header fields.
+fn exchange_complete(raw: &[u8]) -> bool {
+    let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&raw[..header_end]);
+    let Some(status) = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    if status == 204 || status == 304 {
+        return true;
+    }
+    let length = headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())?
+    });
+    match length {
+        Some(0) => true,
+        Some(length) => raw.len() >= header_end + 4 + length,
+        None => false,
+    }
 }
 
 /// Connect to `socket`, bounded by [`CONNECT_BOUND`].
@@ -282,6 +336,58 @@ mod tests {
         (socket, handle)
     }
 
+    /// Run a one-shot fake UDS HTTP server that answers `response`
+    /// and then **never closes** the connection (the peer holds it
+    /// open): the exchange must complete on the protocol's own
+    /// terms, never on the close.
+    fn serve_holding(
+        dir: &Path,
+        name: &str,
+        response: &str,
+    ) -> (PathBuf, std::thread::JoinHandle<Served>) {
+        let socket = dir.join(name);
+        let listener = UnixListener::bind(&socket).expect("bind the fake api socket");
+        let response = response.to_owned();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one connection");
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read the request");
+                raw.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let headers = &text[..header_end];
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            (name.eq_ignore_ascii_case("content-length"))
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or_default();
+                    if raw.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+                if read == 0 {
+                    break;
+                }
+            }
+            stream
+                .write_all(response.as_bytes())
+                .expect("write the scripted response");
+            // Deliberately never close: the write already delivered
+            // the bytes; the peer's close must not be the
+            // exchange's terminator.
+            std::mem::forget(stream);
+            Served {
+                request: String::from_utf8_lossy(&raw).into_owned(),
+            }
+        });
+        (socket, handle)
+    }
+
     #[test]
     fn put_json_writes_the_exact_request_bytes_and_parses_204() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -372,6 +478,43 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the read timeout bounds the exchange"
         );
+    }
+
+    #[test]
+    fn put_json_completes_on_a_content_length_body_without_waiting_for_the_close() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (socket, server) = serve_holding(
+            dir.path(),
+            "hold-body.sock",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let started = Instant::now();
+        let response = put_json(&socket, "/api/v1/vm.resize-disk", "{}", TIMEOUT)
+            .expect("a complete Content-Length exchange succeeds without the peer's close");
+        assert_eq!(response.status, 200);
+        assert!(response.rest.contains("ok"));
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "the exchange completed on the protocol's terms, not by waiting out the timeout"
+        );
+        server.join().expect("the server thread");
+    }
+
+    #[test]
+    fn put_json_completes_on_204_without_waiting_for_the_close() {
+        // The verified resize-disk success shape: a VMM that answers
+        // 204 and then holds the connection open is not a transport
+        // failure — 204 completes the exchange by definition.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (socket, server) = serve_holding(
+            dir.path(),
+            "hold-204.sock",
+            "HTTP/1.1 204 No Content\r\n\r\n",
+        );
+        let response = put_json(&socket, "/api/v1/vm.resize-disk", "{}", TIMEOUT)
+            .expect("204 completes without the close");
+        assert_eq!(response.status, 204);
+        server.join().expect("the server thread");
     }
 
     #[test]
