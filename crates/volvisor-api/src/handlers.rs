@@ -23,6 +23,7 @@ use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AdoptVolumeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, GrowVolumeRequest, GrowVolumeResponse, ListVolumesResponse,
+    MoveVolumeBackingRequest,
 };
 use volvisor_types::{
     ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, MigrationId, ProjectId,
@@ -223,6 +224,53 @@ pub(crate) async fn grow_volume(
                 ..response
             })
         },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/volumes/{volume_id}/move-backing` — MoveVolumeBackingOnline
+/// (contract section 4A).
+///
+/// Terminal-class volume op: consumer-supplied `operation_id`, the
+/// journaled outcome replays byte-for-byte. The state-independent
+/// envelope validates before the journal (rejections leave no record
+/// and the `operation_id` stays reusable); every scope/capacity/
+/// state check lives in the provider under its lock, where a typed
+/// refusal is journaled and replays byte-compatibly.
+///
+/// The response reports the state the move reached **inside this
+/// call's supervision window**: `COMPLETE` (verified — the source
+/// freed only then), `COPYING` (the window expired with the move
+/// progressing; a fresh `operation_id` re-attaches to the same move
+/// and the daemon's retry reconcile completes it independently), or
+/// `IN_DOUBT` (an unverified outcome with the source intact). A
+/// `COPYING` outcome is a truthful observation of that call's
+/// window, not a claim that the move finished.
+pub(crate) async fn move_volume_backing(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(volume_id): Path<String>,
+    ValidJson(req): ValidJson<MoveVolumeBackingRequest>,
+) -> Result<Response, ApiErrorReply> {
+    let volume_id = parse_volume_id(&volume_id)?;
+    req.validate_envelope()?;
+    tracing::info!(
+        kind = ops::OP_MOVE_VOLUME_BACKING,
+        operation_id = %req.operation_id,
+        volume_id = %volume_id,
+        target_pool_id = %req.target_pool_id,
+        "accepting move_volume_backing"
+    );
+    let payload = ops::path_payload(&volume_id, &req)?;
+    let provider = state.provider.clone();
+    ops::execute(
+        &state,
+        ops::OP_MOVE_VOLUME_BACKING,
+        req.operation_id.clone(),
+        ops::move_hash(&req, &volume_id),
+        payload,
+        move || async move { provider.move_volume_backing(&volume_id, &req).await },
     )
     .await
     .map_err(ApiErrorReply::from)

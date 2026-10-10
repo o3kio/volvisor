@@ -299,14 +299,19 @@ pub struct Gap {
     pub reason: &'static str,
 }
 
-/// The operation kinds no matrix cell drives, with reasons. All
-/// four are the admin device/adoption surface: they share the
-/// identical journaled pipeline (`ops::execute` → the strict
-/// in-doubt rule) and the identical `DrbdState` save seam the five
-/// driven volume kinds prove, but they are not on the nearline
-/// handoff path the campaign targets (§1's scope), and driving
-/// them would need adoption fixtures (a foreign resource to adopt)
-/// the rig does not model.
+/// The operation kinds no matrix cell drives, with reasons. Four
+/// are the admin device/adoption surface: they share the identical
+/// journaled pipeline (`ops::execute` → the strict in-doubt rule)
+/// and the identical `DrbdState` save seam the five driven volume
+/// kinds prove, but they are not on the nearline handoff path the
+/// campaign targets (§1's scope), and driving them would need
+/// adoption fixtures (a foreign resource to adopt) the rig does not
+/// model. The fifth is the P6-C same-VG move: the rig's daemon is
+/// DRBD-backed (the move route's provider refuses
+/// `MOVE_UNSUPPORTED_SCOPE` there), so the move's own durable
+/// boundaries — the `LvmState` move-record saves — are carried by
+/// §9 row 16 (this crate's `move_rows` binary, the LVM sibling
+/// surface) instead of a matrix cell.
 #[must_use]
 pub fn recorded_gaps() -> Vec<Gap> {
     vec![
@@ -333,6 +338,15 @@ pub fn recorded_gaps() -> Vec<Gap> {
             reason: "cut-marker hygiene route: exercised indirectly by every rollback \
                      recovery cell (the abort path clears the markers); not separately \
                      driven to keep the family budgets",
+        },
+        Gap {
+            op: op_kinds::OP_MOVE_VOLUME_BACKING,
+            reason: "P6-C same-VG extent move: the rig's daemon is DRBD-backed and refuses \
+                     the route typed, so no matrix cell can drive its provider drive; the \
+                     route's journal pipeline is the same ops::execute the volume-mutation \
+                     family proves, and the move's own durable boundaries (the LvmState \
+                     move-record saves, pvmove start, verified completion) are carried by \
+                     §9 row 16 (move_rows, the LVM sibling fault rows)",
         },
     ]
 }

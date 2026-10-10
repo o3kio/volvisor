@@ -13,7 +13,7 @@ use crate::domain::{
 };
 use crate::error::ApiError;
 use crate::id::{AttachmentId, HostId, OperationId, ProjectId, VolumeId};
-use crate::state::VolumeLifecycle;
+use crate::state::{MoveVolumeBackingState, VolumeLifecycle};
 
 /// Provider-facing API version literal.
 pub const PROVIDER_API_VERSION: &str = crate::API_VERSION;
@@ -403,6 +403,93 @@ pub struct GrowVolumeResponse {
     pub effective_size_bytes: u64,
 }
 
+/// MoveVolumeBackingOnline request (contract section 4A).
+///
+/// `target_pool_id` names the move target. In the
+/// `same_vg_extent_move` scope it is the **target PV** inside the
+/// volume's own volume group — a cross-VG or cross-pool target is a
+/// typed `MOVE_UNSUPPORTED_SCOPE` refusal, never a silent
+/// degradation.
+///
+/// The response's [`MoveVolumeBackingState`](crate::state::MoveVolumeBackingState)
+/// carries the contract's full vocabulary; a same-VG extent move
+/// passes through the honest subset `PREPARING | COPYING | COMPLETE |
+/// IN_DOUBT` — `MIRROR_READY`/`PIVOTED` belong to the mirror-and-pivot
+/// path (the LV's dm identity is stable across a `pvmove`, so there
+/// is no pivot to observe) and a generic `FAILED` is never reported:
+/// an unknown mid-move outcome is `IN_DOUBT` (the source stays intact
+/// and serving) and every deterministic rejection is a typed refusal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveVolumeBackingRequest {
+    /// Must equal `volvisor.volume.v2`.
+    pub api_version: String,
+    /// Idempotency key (the volume-op Terminal class).
+    pub operation_id: OperationId,
+    /// The move target: the target PV's name (e.g. `/dev/sdb`) in
+    /// this scope.
+    pub target_pool_id: String,
+    /// Expected current volume generation.
+    pub expected_generation: u64,
+    /// Optional copy-rate limit. No same-VG `pvmove` implementation
+    /// in this version can honor a rate limit, so a set value is a
+    /// typed `UNSUPPORTED_CLASS_OR_POLICY` refusal naming this
+    /// parameter — never silently ignored.
+    pub max_copy_bytes_per_sec: Option<u64>,
+}
+
+impl MoveVolumeBackingRequest {
+    /// Validate the state-independent envelope (api version and
+    /// target shape) — the part that runs BEFORE the journal's
+    /// idempotency lookup, so rejections leave no journal record and
+    /// the `operation_id` stays reusable for a corrected retry.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] when `api_version` is unsupported or
+    /// `target_pool_id` is empty.
+    pub fn validate_envelope(&self) -> Result<(), ApiError> {
+        crate::validate_api_version(&self.api_version)?;
+        if self.target_pool_id.trim().is_empty() {
+            return Err(ApiError::invalid_request(
+                "target_pool_id must name the target PV (non-empty)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical request hash for idempotency.
+    #[must_use]
+    pub fn request_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"volvisor.volume.v2:move:");
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        hasher.update(&body);
+        hasher.finalize().into()
+    }
+}
+
+/// MoveVolumeBackingOnline response (contract section 4A).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveVolumeBackingResponse {
+    /// The state the move reached inside this call's supervision
+    /// window. A same-VG extent move reports the honest subset
+    /// `PREPARING | COPYING | COMPLETE | IN_DOUBT` (see the request
+    /// documentation for why `MIRROR_READY`/`PIVOTED`/`FAILED` are
+    /// never entered by this scope).
+    pub state: MoveVolumeBackingState,
+    /// The volume's generation after the operation (`Complete` bumps
+    /// it; every other state reports the unchanged current one).
+    pub generation: u64,
+    /// The PV the extents were moved from (diagnostics).
+    pub source_pv: String,
+    /// The PV the extents were moved to.
+    pub target_pv: String,
+    /// Honest detail for non-complete states (the `InDoubt` reason,
+    /// or the supervision note for `Copying`).
+    pub detail: Option<String>,
+}
+
 /// Data-erasure policy for DeleteVolume (contract section 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -679,6 +766,81 @@ mod tests {
         assert_eq!(
             req.validate(1024).unwrap_err().code,
             crate::error::ApiErrorCode::UnsupportedClassOrPolicy
+        );
+    }
+
+    fn move_req() -> MoveVolumeBackingRequest {
+        serde_json::from_value::<MoveVolumeBackingRequest>(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-move",
+            "target_pool_id": "/dev/disk/by-id/wwn-0x5000c500target01",
+            "expected_generation": 2
+        }))
+        .expect("valid")
+    }
+
+    #[test]
+    fn move_request_envelope_and_hash() {
+        let req = move_req();
+        assert!(req.validate_envelope().is_ok());
+        assert_eq!(req.request_hash(), move_req().request_hash());
+
+        // Envelope rejections stay typed and pre-journal: a wrong
+        // api version and an empty target are the caller's to fix,
+        // and the operation_id remains reusable.
+        let mut bad = move_req();
+        bad.api_version = "volvisor.volume.v1".to_owned();
+        assert_eq!(
+            bad.validate_envelope().unwrap_err().code,
+            crate::error::ApiErrorCode::UnsupportedClassOrPolicy
+        );
+        let mut empty = move_req();
+        empty.target_pool_id = "   ".to_owned();
+        assert_eq!(
+            empty.validate_envelope().unwrap_err().code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+
+        // The hash is payload-sensitive: a different target or a
+        // set rate limit is a different operation under the same
+        // operation_id (IDEMPOTENCY_CONFLICT territory).
+        let mut other = move_req();
+        other.target_pool_id = "/dev/other".to_owned();
+        assert_ne!(req.request_hash(), other.request_hash());
+        other = move_req();
+        other.max_copy_bytes_per_sec = Some(1024);
+        assert_ne!(req.request_hash(), other.request_hash());
+    }
+
+    #[test]
+    fn move_request_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-move",
+            "target_pool_id": "/dev/t",
+            "expected_generation": 1,
+            "surprise_field": true
+        });
+        assert!(serde_json::from_value::<MoveVolumeBackingRequest>(json).is_err());
+    }
+
+    #[test]
+    fn move_response_carries_the_contract_state_vocabulary() {
+        // The wire states are the contract's SCREAMING_SNAKE spellings
+        // (section 4A); the same-VG scope uses the honest subset but
+        // the wire shape is the full vocabulary's.
+        let response: MoveVolumeBackingResponse = serde_json::from_value(serde_json::json!({
+            "state": "COPYING",
+            "generation": 4,
+            "source_pv": "/dev/a",
+            "target_pv": "/dev/b",
+            "detail": null
+        }))
+        .expect("valid");
+        assert_eq!(response.state, MoveVolumeBackingState::Copying);
+        assert_eq!(
+            serde_json::to_value(&response).expect("serializes")["state"],
+            "COPYING"
         );
     }
 }

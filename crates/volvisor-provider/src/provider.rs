@@ -5,8 +5,9 @@ use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
+    MoveVolumeBackingRequest, MoveVolumeBackingResponse,
 };
-use volvisor_types::{ApiError, AttachmentId, CapabilitySet, ProjectId, VolumeId};
+use volvisor_types::{ApiError, ApiErrorCode, AttachmentId, CapabilitySet, ProjectId, VolumeId};
 
 /// An engine-neutral storage backend driving the Volume API v2 surface.
 ///
@@ -122,4 +123,59 @@ pub trait VolumeProvider: Send + Sync {
         volume_id: &VolumeId,
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError>;
+
+    /// Move a volume's backing extents online (contract section 4A:
+    /// `MoveVolumeBackingOnline`).
+    ///
+    /// **Binding semantics for every implementation:**
+    ///
+    /// 1. **Capability-gated scope.** Only a provider advertising
+    ///    [`Capability::SameVgExtentMove`] may serve the move; the
+    ///    default implementation refuses every request with
+    ///    `MOVE_UNSUPPORTED_SCOPE`. Cross-VG, cross-pool and
+    ///    cross-class targets are typed refusals of the same code —
+    ///    never silent degradations, and the current extents are
+    ///    never touched by a refusal.
+    /// 2. **Generation fencing** applies exactly as on every other
+    ///    mutation; a completed move bumps the volume's generation
+    ///    (the relocation is a fenced mutation of the volume's
+    ///    placement, while its dm identity, LV path and data are
+    ///    unchanged).
+    /// 3. **Source-extent freedom is a post-condition, not an
+    ///    assumption.** The extents on the source PV are declared
+    ///    freed only after the move's completion is *verified* by
+    ///    observation (the LV's device list no longer references the
+    ///    source PV). A failed verification never frees and reports
+    ///    [`MoveVolumeBackingState::InDoubt`].
+    /// 4. **Never a generic `FAILED`.** An unknown mid-move outcome
+    ///    (observation failure, or the move ending without relocating
+    ///    the extents) reads `IN_DOUBT` with the source intact and
+    ///    serving; deterministic rejections are typed errors, not
+    ///    states. `failed_reportable` remains the vocabulary's own
+    ///    rule.
+    /// 5. **`max_copy_bytes_per_sec` is honored or refused.** A
+    ///    provider that cannot rate-limit the copy (no same-VG
+    ///    `pvmove` implementation can) refuses a set value with
+    ///    `UNSUPPORTED_CLASS_OR_POLICY` naming the parameter — the
+    ///    fail-closed field-negotiation rule, never a silent ignore.
+    ///
+    /// The default implementation is the fail-closed refusal: a
+    /// provider that has not qualified the move scope answers every
+    /// request with `MOVE_UNSUPPORTED_SCOPE`.
+    async fn move_volume_backing(
+        &self,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        Err(ApiError::new(
+            ApiErrorCode::MoveUnsupportedScope,
+            format!(
+                "provider {} does not advertise same_vg_extent_move; moving {} to \
+                 {} is outside every qualified move scope",
+                self.name(),
+                volume_id.as_str(),
+                req.target_pool_id
+            ),
+        ))
+    }
 }

@@ -47,6 +47,12 @@ pub enum ApiErrorCode {
     ReplicaNotDurable,
     /// Cross-host migration unsupported for native-local storage.
     MigrationUnsupportedLocalStorage,
+    /// The requested backing move is outside the provider's
+    /// advertised, qualified move scope (volume API v2 section 4A:
+    /// cross-VG, cross-pool, cross-class targets, a spread LV, or a
+    /// provider that does not advertise `same_vg_extent_move`). The
+    /// current extents are never touched by a refusal.
+    MoveUnsupportedScope,
     /// VMM handoff path not implemented/qualified.
     VmmHandoffUnsupported,
     /// Commit outcome unknown; observable retriable state.
@@ -90,6 +96,7 @@ impl ApiErrorCode {
             Self::UnknownFencingAuthority => "UNKNOWN_FENCING_AUTHORITY",
             Self::ReplicaNotDurable => "REPLICA_NOT_DURABLE",
             Self::MigrationUnsupportedLocalStorage => "MIGRATION_UNSUPPORTED_LOCAL_STORAGE",
+            Self::MoveUnsupportedScope => "MOVE_UNSUPPORTED_SCOPE",
             Self::VmmHandoffUnsupported => "VMM_HANDOFF_UNSUPPORTED",
             Self::OperationInDoubt => "OPERATION_IN_DOUBT",
             Self::UnsafeDataLoss => "UNSAFE_DATA_LOSS",
@@ -109,6 +116,7 @@ impl ApiErrorCode {
         match self {
             Self::UnsupportedClassOrPolicy
             | Self::MigrationUnsupportedLocalStorage
+            | Self::MoveUnsupportedScope
             | Self::UnsafeDataLoss
             | Self::InvalidRequest => 400,
             Self::NotFound => 404,
@@ -258,6 +266,7 @@ impl ApiError {
             "UNKNOWN_FENCING_AUTHORITY" => ApiErrorCode::UnknownFencingAuthority,
             "REPLICA_NOT_DURABLE" => ApiErrorCode::ReplicaNotDurable,
             "MIGRATION_UNSUPPORTED_LOCAL_STORAGE" => ApiErrorCode::MigrationUnsupportedLocalStorage,
+            "MOVE_UNSUPPORTED_SCOPE" => ApiErrorCode::MoveUnsupportedScope,
             "VMM_HANDOFF_UNSUPPORTED" => ApiErrorCode::VmmHandoffUnsupported,
             "OPERATION_IN_DOUBT" => ApiErrorCode::OperationInDoubt,
             "UNSAFE_DATA_LOSS" => ApiErrorCode::UnsafeDataLoss,
@@ -320,6 +329,7 @@ mod tests {
             ApiErrorCode::UnknownFencingAuthority,
             ApiErrorCode::ReplicaNotDurable,
             ApiErrorCode::MigrationUnsupportedLocalStorage,
+            ApiErrorCode::MoveUnsupportedScope,
             ApiErrorCode::VmmHandoffUnsupported,
             ApiErrorCode::OperationInDoubt,
             ApiErrorCode::UnsafeDataLoss,
@@ -392,6 +402,7 @@ mod tests {
             ApiErrorCode::UnknownFencingAuthority,
             ApiErrorCode::ReplicaNotDurable,
             ApiErrorCode::MigrationUnsupportedLocalStorage,
+            ApiErrorCode::MoveUnsupportedScope,
             ApiErrorCode::VmmHandoffUnsupported,
             ApiErrorCode::OperationInDoubt,
             ApiErrorCode::UnsafeDataLoss,

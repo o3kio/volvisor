@@ -214,6 +214,7 @@ mod tests {
                 "detach_volume",
                 "grow_volume",
                 "delete_volume",
+                "move_volume_backing",
                 "claim_device",
                 "release_device",
                 "adopt_volume",
