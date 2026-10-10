@@ -1127,9 +1127,16 @@ const FINDINGS: &[(&str, &str)] = &[
          'resolvable' reading: its park reported 'stalled' forever while the migration \
          was permanently parked. The wedge fix RESOLVES the question in the contract's \
          favor: a destination_authorized-shaped stall is now self-resolvable by \
-         construction (the retry re-issues the failed peer act and converges — proven by \
-         the healed row-7 cells and row 8), so the canonical-state-plus-stall-detail \
-         reading holds for it, and IN_DOUBT stays reserved for genuinely unresolvable \
+         construction while the witness-side grant remains live (the 60 s lease TTL — \
+         the retry re-issues the failed peer act and converges, proven by the healed \
+         row-7 cells and row 8); a park that outlives the minted leases (an unpromoted \
+         grant-hold lease is never renewed — the renewal pass iterates only the \
+         provider's own volumes) spins honestly with no re-mint path, the remedy \
+         directions (renewing unpromoted grant-hold leases during a park, or a \
+         fresh-grant epoch when the recorded grant's lease is provably dead) being a \
+         recorded follow-up, not shipped. Within that horizon the \
+         canonical-state-plus-stall-detail \
+         reading holds, and IN_DOUBT stays reserved for genuinely unresolvable \
          stalls — row 12b's shape (a stable typed promote refusal the operator must \
          clear), which parks IN_DOUBT through the observe mapping of SOURCE_REVOKED \
          ('source revoked; destination grant not yet authorized'). No contract change \

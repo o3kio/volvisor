@@ -334,7 +334,17 @@ fn minor_of(index: usize) -> u32 {
 /// The W1-W5 check (the witness side) for one volume: the authority
 /// view's epoch, holder and lease state are exactly as the recovery
 /// implies — no authority without a live lease, no unexpected epoch
-/// (a double grant would show as epoch 3).
+/// (a double grant would show as epoch 3). The view is read with
+/// bounded polling to the FULL expected shape: the recovery's
+/// record-level waits do not cover an in-flight lease-state
+/// transition (a failed promote's fail-closed release, Live →
+/// Revoked, can land after the epochs are observed — the row-12b
+/// observation race, seen twice in isolated/parallel contexts), so a
+/// single-shot read could catch the pre-transition state. The poll
+/// predicate is the whole expected view — epoch and holder included
+/// — so the strength is the single-shot assert's: a wrong epoch or
+/// holder never satisfies it, and the bound expires into a failure
+/// carrying the last observed state.
 async fn assert_w1_w5_vol(
     rig: &Rig,
     vol: &VolumeId,
@@ -342,26 +352,31 @@ async fn assert_w1_w5_vol(
     holder: &str,
     live: bool,
 ) -> String {
-    let view = witness_view(&rig.witness, vol).await;
-    assert_eq!(
-        view.current_epoch.0, epoch,
-        "the witness epoch is exactly {epoch}: {:?}",
-        view.lease_state
-    );
-    assert_eq!(
-        view.holder.as_ref().map(HostId::as_str),
-        Some(holder),
-        "the epoch-{epoch} holder is {holder}"
-    );
     let expected = if live {
         LeaseState::Live
     } else {
         LeaseState::Revoked
     };
-    assert_eq!(
-        view.lease_state, expected,
-        "the epoch-{epoch} lease state is {expected:?}"
-    );
+    let deadline = Instant::now() + POLL_BOUND;
+    loop {
+        let view = witness_view(&rig.witness, vol).await;
+        if view.current_epoch.0 == epoch
+            && view.holder.as_ref().map(HostId::as_str) == Some(holder)
+            && view.lease_state == expected
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness view of {vol} never reached epoch {epoch} held by {holder} \
+             with a {expected:?} lease within {POLL_BOUND:?} (W1-W5); last observed: \
+             epoch {} held by {:?} with a {:?} lease",
+            view.current_epoch.0,
+            view.holder.as_ref().map(HostId::as_str),
+            view.lease_state,
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
     format!("pass: epoch {epoch} at {holder}, lease {expected:?} (W1-W5)")
 }
 

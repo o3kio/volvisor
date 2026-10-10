@@ -95,12 +95,15 @@ the readiness plan §6):
   reason — **the F1 re-check shipped in PR #22 (P6-A part 2) and the
   `IN_DOUBT` stall-nuance question is resolved by PR #23's wedge fix
   (P6-A part 3): with a destination_authorized-shaped stall
-  self-resolvable by construction (the retry re-issues the failed peer
-  act and converges), the nearline §6 reading holds as written — the
-  canonical state plus a stall detail for resolvable stalls, `IN_DOUBT`
-  reserved for genuinely unresolvable ones (row 12b's shape); no
-  contract change is needed, and the campaign's findings record the
-  resolution**.
+  self-resolvable by construction while the witness-side grant
+  remains live (the 60 s lease TTL; a park that outlives the minted
+  leases spins honestly with no re-mint path — the remedy
+  directions are a recorded follow-up, see the diagnosis doc's
+  convergence-horizon section), the nearline §6 reading holds as
+  written — the canonical state plus a stall detail for resolvable
+  stalls, `IN_DOUBT` reserved for genuinely unresolvable ones (row
+  12b's shape); no contract change is needed, and the campaign's
+  findings record the resolution**.
 
 **Test/evidence shape.** A fix lands with a test that fails on the old
 behavior (a reproduction for the flakes; a wedge-recovery scenario for the

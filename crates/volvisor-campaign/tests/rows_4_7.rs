@@ -378,28 +378,40 @@ async fn assert_d6a(rig: &Rig, addr: std::net::SocketAddr, epoch: u64, holder: &
 /// The W1–W5 check (the witness side): the authority view's epoch,
 /// holder and lease state are exactly as the recovery implies — no
 /// authority without a live lease, no unexpected epoch (a double
-/// grant would show as epoch 3).
+/// grant would show as epoch 3). Read with bounded polling to the
+/// FULL expected shape (the same discipline as `assert_w1_w5_vol`
+/// in rows_8_14 — the row-12b observation race's class): the poll
+/// predicate is the whole expected view, so the strength is the
+/// single-shot assert's; every current call site here asserts a
+/// transition-free shape (an abort's epoch-1 rollback or a
+/// completed migration's epoch-2 lease), so this is class
+/// hardening, not a reproduced flake.
 async fn assert_w1_w5(rig: &Rig, epoch: u64, holder: &str, live: bool) -> String {
-    let view = witness_view(&rig.witness, &rig.volume_id()).await;
-    assert_eq!(
-        view.current_epoch.0, epoch,
-        "the witness epoch is exactly {epoch}: {:?}",
-        view.lease_state
-    );
-    assert_eq!(
-        view.holder.as_ref().map(volvisor_types::HostId::as_str),
-        Some(holder),
-        "the epoch-{epoch} holder is {holder}"
-    );
     let expected = if live {
         LeaseState::Live
     } else {
         LeaseState::Revoked
     };
-    assert_eq!(
-        view.lease_state, expected,
-        "the epoch-{epoch} lease state is {expected:?}"
-    );
+    let deadline = Instant::now() + POLL_BOUND;
+    loop {
+        let view = witness_view(&rig.witness, &rig.volume_id()).await;
+        if view.current_epoch.0 == epoch
+            && view.holder.as_ref().map(volvisor_types::HostId::as_str) == Some(holder)
+            && view.lease_state == expected
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness view never reached epoch {epoch} held by {holder} with a \
+             {expected:?} lease within {POLL_BOUND:?} (W1-W5); last observed: epoch {} \
+             held by {:?} with a {:?} lease",
+            view.current_epoch.0,
+            view.holder.as_ref().map(volvisor_types::HostId::as_str),
+            view.lease_state,
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
     format!("pass: epoch {epoch} at {holder}, lease {expected:?} (W1-W5)")
 }
 

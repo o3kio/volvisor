@@ -102,3 +102,47 @@ inspection's job (proving the grant landed before promoting) in a
 second code path, and would leave the recorded failure sitting in the
 journal as a landmine for the next same-id caller. Re-resolvability
 fixes the class, not the symptom.
+
+## The convergence horizon (the live-lease assumption)
+
+The re-issue's convergence relies on one world fact: the witness-side
+grant remaining live. The minted grant-hold leases carry the 60 s TTL
+(`DEFAULT_LEASE_TTL_SECS`), and an unpromoted grant is never renewed —
+the destination's renewal pass (`renew_leases`) iterates only its own
+volumes (the ones with authority blocks), and a grant-hold lease for a
+volume the destination never promoted has none. A park that outlives
+the TTL therefore has no re-mint path: the deterministic operation id
+replays the expired grant forever (the witness journal re-serves the
+recorded grant outcome), and `promote_target` refuses over the
+non-live lease — the spin stays honest and fail-closed, but the
+migration no longer self-resolves. The remedy directions — renewing
+unpromoted grant-hold leases while a park is being retried, or minting
+a fresh-grant epoch when the recorded grant's lease is provably dead —
+are a recorded follow-up (readiness plan §1), not shipped in this fix.
+
+## Review notes (PR #23's review)
+
+Three properties the review asked to have named in this record:
+
+- **Response divergence across callers of one operation id.** The same
+  peer-act operation id can serve `INTERNAL` to its first caller and
+  `200` to a later retry (the supersede path journals and serves the
+  proven outcome); safe today because the only consumer — the source
+  daemon's drive — treats peer-act failure as retryable, but a future
+  consumer treating peer-act failure as terminal would diverge from
+  the later state.
+- **The restore act is not internally serialized at the VMM layer**,
+  unlike the witness layer's single-guard serialization (the batch
+  replays under one operation id). Concurrent restore re-issues
+  converge to exactly one fully-restored VM by construction: the
+  destroy arm targets only the non-serving `Created`/`Paused` shapes
+  (this migration's own half-restore, bounded by the prepare act's
+  emptiness proof — the socket was proven empty before the source's
+  cut), never a serving VM.
+- **The discard advisory field diverges on re-issue**: an
+  already-landed discard re-issued serves `discarded:false` (the
+  inspection's proven answer — the preparation is absent) where the
+  original call served `discarded:true` (it removed a present
+  preparation). Idempotent semantics — the preparation is gone either
+  way — and metadata-only: the divergence is in the advisory field,
+  not in any state the caller acts on.
