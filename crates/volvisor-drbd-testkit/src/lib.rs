@@ -75,7 +75,10 @@
 //! rule 16): the bytes land in the source's map **and** in the
 //! resource's async peer-apply queue ([`QueuedApply`]), and reach the
 //! peer's map only when the queue drains — through the campaign's
-//! [`apply_peer_writes`] (pre-quiesce lag shaping only) or the fake's
+//! [`apply_peer_writes`] (pre-quiesce lag shaping only), the fake's
+//! steady-state protocol-A transport ([`spawn_peer_transport`], the
+//! lagged link a live writer needs for convergence to be observable
+//! at all) or the fake's
 //! content-copying resync (the system path: the post-barrier drain at
 //! `suspend-io` and the completing seeding resync). The
 //! data-bearing status tokens the convergence gate reads
@@ -105,7 +108,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
@@ -1849,6 +1854,91 @@ pub fn apply_peer_writes(
     };
     apply_at_peer(world, &resource, &entries);
     Ok(())
+}
+
+/// The fake's steady-state protocol-A transport (P5 plan §2.1): a
+/// background thread that drains `minor`'s peer-apply queue with a
+/// real-time `lag`, modeling the asynchronous peer apply the real
+/// stack performs continuously — "asynchronous peer apply is real
+/// time" ([`volvisor_drbd`]'s convergence gate retries the typed
+/// `REPLICA_NOT_DURABLE` refusal while the peer lags). Without it a
+/// live writer would hold the queue non-empty forever and even a
+/// happy-path migration could never observe convergence; with it the
+/// peer-apply window is genuinely open for at most `lag` after every
+/// write (a real, nonzero tail mid-flight) and closes on its own.
+///
+/// This is a DATA-PATH component of the fake (the replication link
+/// itself — it lives below the daemons and survives their kills,
+/// exactly as a real link would), not a campaign injection: the
+/// post-barrier drain at `suspend-io` remains the fake's only
+/// SYSTEM-path window closer (`resync_to_peer`), and stopping the
+/// transport is how a rig models the link's steady state ending
+/// (a frozen tail for lag shaping). It races nothing: queue drains
+/// are idempotent and the world lock is never held across a drain.
+///
+/// The thread is detached on drop (it exits within one `lag`); call
+/// [`PeerTransport::join`] to observe the exit deterministically.
+pub fn spawn_peer_transport(
+    world: &Arc<Mutex<FakeDrbd>>,
+    minor: u32,
+    lag: Duration,
+) -> PeerTransport {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let world = Arc::clone(world);
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name(format!("peer-transport-drbd{minor}"))
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(lag);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // A `u64::MAX` bound drains everything queued —
+                    // the transport's lag IS the bound.
+                    let _ = apply_peer_writes(&world, minor, u64::MAX);
+                }
+            })
+            .expect("spawn peer transport")
+    };
+    PeerTransport {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// One running [`spawn_peer_transport`] link (see its docs): stop it
+/// to freeze the peer-apply window (the queue stops draining), join
+/// it to observe the exit.
+pub struct PeerTransport {
+    /// The stop flag the thread polls between lags.
+    stop: Arc<AtomicBool>,
+    /// The transport thread; `None` once joined.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeerTransport {
+    /// Ask the link to stop (it exits within one lag); idempotent.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop and wait for the thread's exit — after this the queue is
+    /// definitively frozen (no in-flight drain can land afterwards).
+    pub fn join(mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PeerTransport {
+    fn drop(&mut self) {
+        // Detach: the thread exits within one lag on its own.
+        self.stop();
+    }
 }
 
 /// Post-mortem read of one logical block (P5 plan §2.1's escape

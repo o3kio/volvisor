@@ -534,3 +534,79 @@ fn the_block_type_carries_payload_lineage_and_apply_state() {
     assert_eq!(block.payload[0], 0x5a);
     assert!(!block.applied_at_peer);
 }
+
+/// The steady-state protocol-A transport (P5 plan §2.1): while the
+/// link runs, a live writer's queued writes reach the linked peer's
+/// map within a bounded real-time lag (the convergence gate's
+/// premise — "asynchronous peer apply is real time"); once the link
+/// stops, the queue freezes exactly as [`apply_peer_writes`'s] lag
+/// shaping needs (a stopped transport is a frozen window, not a
+/// closed one).
+#[test]
+fn the_peer_transport_drains_with_a_lag_and_freezes_when_stopped() {
+    use std::time::{Duration, Instant};
+
+    use volvisor_drbd_testkit::spawn_peer_transport;
+
+    let (base, world_a, _runner, resource) = seeded_world("vol-transport");
+    let base_b = host_dir();
+    let world_b = Arc::new(Mutex::new(FakeDrbd::default()));
+    seed_peer_volume(
+        &base_b,
+        &world_b,
+        "vol-transport",
+        MIB,
+        ReplicationMode::A,
+        SEED_MINOR,
+        volvisor_drbd_testkit::SEED_PORT,
+    );
+    link_replication_peers(&world_a, &world_b);
+
+    // The source is the writer (the seeded plain promote).
+    let runner = FakeDrbd::runner(&world_a);
+    promote(&runner, &base, &resource);
+    let device = open_device(&world_a, SEED_MINOR).expect("open device");
+
+    // No transport: a queued write stays queued (the window is open).
+    device.write(0, &[1_u8; BLOCK_SIZE]).expect("write 1");
+    assert!(
+        read_raw(&world_b, SEED_MINOR, 0)
+            .expect("read peer")
+            .payload
+            .iter()
+            .all(|byte| *byte == 0),
+        "without the link the write has not reached the peer"
+    );
+
+    // The link runs: the write drains within a generous bound over
+    // the 1-ms lag (real time, so the bound is slack, not tight).
+    let transport = spawn_peer_transport(&world_a, SEED_MINOR, Duration::from_millis(1));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let drained = read_raw(&world_b, SEED_MINOR, 0)
+            .expect("read peer")
+            .payload[0]
+            == 1;
+        if drained {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the transport drained the queued write within the bound"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The link stops: the window freezes (a later write stays
+    // queued at the source, absent at the peer).
+    transport.join();
+    device.write(1, &[2_u8; BLOCK_SIZE]).expect("write 2");
+    assert!(
+        read_raw(&world_b, SEED_MINOR, 1)
+            .expect("read peer")
+            .payload
+            .iter()
+            .all(|byte| *byte == 0),
+        "after the link stops the queue no longer drains"
+    );
+}
