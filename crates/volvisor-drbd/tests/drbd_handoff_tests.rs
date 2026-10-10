@@ -63,7 +63,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -71,8 +70,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{
-    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for_peer, fixture, flip_world_to_peer,
-    provider_from_with_authority, seed_peer_volume, seed_volume_with_identity, set_peer_lag,
+    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, Server, WitnessTokens, config_for_peer,
+    fixture, flip_world_to_peer, provider_from_with_authority, seed_peer_volume,
+    seed_volume_with_identity, set_peer_lag, spawn_witness,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
@@ -92,8 +92,6 @@ use volvisor_witness::proto::{
     BatchGrantVolume, BatchRelease, GrantRequest, GrantSetRequest, RecordBarrierRequest,
     RevokeSetRequest, VoidBarrierRequest, WITNESS_PROTOCOL_VERSION,
 };
-use volvisor_witness::registry::{WitnessCore, WitnessCoreConfig};
-use volvisor_witness::server::{WitnessServerState, router};
 
 mod common;
 
@@ -139,41 +137,9 @@ const SECOND_MINOR: u32 = 12;
 const SECOND_PORT: u16 = 7901;
 
 // ---------------------------------------------------------------- kit
-
-struct Server {
-    addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
-    let core = WitnessCore::open(
-        dir,
-        WitnessCoreConfig {
-            lease_ttl_secs: TTL,
-            lease_grace_secs: 5,
-            suspend_budget_secs: 5,
-        },
-    )
-    .expect("witness core opens");
-    let mut host_tokens = std::collections::BTreeMap::new();
-    host_tokens.insert(NODE.to_owned(), NODE_TOKEN.to_owned());
-    host_tokens.insert(PEER_NODE.to_owned(), PEER_TOKEN.to_owned());
-    let state = Arc::new(WitnessServerState::with_clock(
-        core,
-        Some(TOKEN.to_owned()),
-        host_tokens,
-        Arc::new(move || clock.load(Ordering::SeqCst)),
-    ));
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server serves");
-    });
-    Server { addr, handle }
-}
+// The loopback witness server is shared with the authority kit
+// (`tests/common`): its `stop` is the deterministic unreachability
+// gate, not an abort.
 
 /// The legacy shared-token client (read-only on a v2 witness: used for
 /// witness-side inspection).
@@ -211,7 +177,16 @@ struct WitnessKit {
 async fn witness_kit() -> WitnessKit {
     let dir = tempfile::tempdir().expect("witness dir");
     let witness_clock = Arc::new(AtomicU64::new(START));
-    let server = spawn_witness(dir.path(), Arc::clone(&witness_clock)).await;
+    let server = spawn_witness(
+        dir.path(),
+        Arc::clone(&witness_clock),
+        WitnessTokens {
+            shared: TOKEN,
+            node: NODE_TOKEN,
+            peer: PEER_TOKEN,
+        },
+    )
+    .await;
     let client = client_for(&server);
     WitnessKit {
         server,
@@ -811,7 +786,7 @@ async fn attach_and_detach_of_a_cut_marked_volume_are_refused_typed() {
 /// resolves — the fence never silently concludes the migration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cut_that_outlives_its_lease_fences_but_keeps_the_marker() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-deadline-cut").await;
     let mig = migration("mig-deadline-cut");
     state
@@ -819,8 +794,14 @@ async fn a_cut_that_outlives_its_lease_fences_but_keeps_the_marker() {
         .quiesce_for_barrier(&state.volume, &mig)
         .expect("quiesce");
     // Past the W5 local deadline (the witness is irrelevant here: the
-    // deadline is the bound the writer promised).
-    kit.server.handle.abort();
+    // deadline is the bound the writer promised). A locally-bounded
+    // site — the Phase-1 fence runs before any witness call, so the
+    // stop's unreachability proof is not load-bearing for the oracle
+    // — converted anyway so every site shares the one stop shape.
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
     let report = state.provider.renew_leases().expect("renewal pass");
     assert_eq!(report.fenced.len(), 1);
@@ -1038,7 +1019,7 @@ async fn release_source_without_a_marker_is_refused_typed() {
 /// suspended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_prepare_is_gated_on_voided_barriers_and_fails_closed() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-abort").await;
     let mig = migration("mig-abort");
     state
@@ -1055,9 +1036,15 @@ async fn abort_prepare_is_gated_on_voided_barriers_and_fails_closed() {
     assert!(suspended(&state.world, SEED_MINOR), "never a silent resume");
     assert!(cut_marker_of(&state.state_path, &state.volume).is_some());
     // An unreachable witness refuses fail-closed too (the gate cannot
-    // be evaluated): still suspended, still marked.
+    // be evaluated): still suspended, still marked. An
+    // unreachability-dependent site: the refusal below must come from
+    // the witness being GONE — a lingering connection would let the
+    // gate evaluate (and possibly resume the device).
     void_barriers(&kit, &state.volume, &mig).await;
-    kit.server.handle.abort();
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     let unreachable = state
         .provider
         .abort_prepare(&state.volume, &mig)
@@ -1236,7 +1223,7 @@ async fn clear_cut_marker_refuses_a_writer_and_clears_a_secondary() {
 /// fail-closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clear_cut_marker_accepts_only_a_corroborated_fencing_proof() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-proof").await;
     let mig = migration("mig-proof");
     state
@@ -1264,8 +1251,14 @@ async fn clear_cut_marker_accepts_only_a_corroborated_fencing_proof() {
     assert!(cut_marker_of(&state.state_path, &state.volume).is_some());
     assert!(suspended(&state.world, SEED_MINOR));
     // An unreachable witness refuses fail-closed (the proof cannot be
-    // verified): the marker stays.
-    kit.server.handle.abort();
+    // verified): the marker stays. An unreachability-dependent site:
+    // the refusal below must come from the witness being GONE — a
+    // lingering connection would let the proof verify (and clear the
+    // marker).
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     let unreachable = state
         .provider
         .clear_cut_marker(&state.volume, Some(&grant.fencing_proof))
@@ -2171,7 +2164,7 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
 /// what reopens the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleared() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-vtr-residue").await;
     let surface: Arc<dyn HandoffSurface> = state.provider.clone();
     let mig = migration("mig-vtr");
@@ -2179,7 +2172,15 @@ async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleare
         .provider
         .quiesce_for_barrier(&state.volume, &mig)
         .expect("quiesce");
-    kit.server.handle.abort();
+    // A locally-bounded site: the renewal's fence is the Phase-1
+    // local W5 deadline (it runs before any witness call), and the
+    // residue refusals that follow read local state — the stop's
+    // unreachability proof is not load-bearing for the oracle.
+    // Converted anyway so every site shares the one stop shape.
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
     state.provider.renew_leases().expect("renewal pass");
     assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);

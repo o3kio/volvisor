@@ -101,6 +101,15 @@ const PEER_NODE_TOKEN: &str = "migration-e2e-node-b-witness";
 /// `START` ends at `START + TTL + 5 + 5`.
 const START: u64 = 1_000;
 const TTL: u64 = 100;
+/// The bound on `WitnessHandle::stop`'s drain: hyper 1.x graceful
+/// shutdown has no internal deadline, so a wedged in-flight
+/// connection would otherwise hang the stop forever. Every witness
+/// request is awaited before a stop, so the drain only closes idle
+/// keep-alive connections — milliseconds — and five seconds stays
+/// generous under parallel-suite load; expiring it is a kit failure
+/// (the drain did not complete — unreachability is NOT proven),
+/// never a pass.
+const WITNESS_DRAIN_BOUND: Duration = Duration::from_secs(5);
 /// One gibibyte (extent-aligned under the fixture's 4-MiB extents).
 const GIB: u64 = 1 << 30;
 /// The writer renewal cadence (well under ttl/2; nothing renews on
@@ -201,6 +210,10 @@ struct WitnessHandle {
     addr: SocketAddr,
     clock: Arc<AtomicU64>,
     dir: PathBuf,
+    /// The graceful-shutdown trigger of the current serve: dropped by
+    /// [`WitnessHandle::stop`] to start the drain. `None` once
+    /// stopped (or before the first launch).
+    shutdown: Option<tokio::sync::watch::Sender<()>>,
     serve: Option<JoinHandle<()>>,
 }
 
@@ -216,6 +229,7 @@ impl WitnessHandle {
             addr,
             clock,
             dir,
+            shutdown: None,
             serve: None,
         };
         witness.launch(listener);
@@ -244,17 +258,52 @@ impl WitnessHandle {
             Arc::new(move || clock.load(Ordering::SeqCst)),
         ));
         let app = volvisor_witness::server::router(state);
+        // Graceful shutdown over a watch trigger: `stop` drops the
+        // sender, the serve loop stops accepting, tells every
+        // connection task to drain, and waits for all of them — the
+        // drain barrier `stop` awaits (the deterministic
+        // unreachability gate).
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(());
         let serve = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("witness serves");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await
+                .expect("witness serves");
         });
+        self.shutdown = Some(shutdown);
         self.serve = Some(serve);
     }
 
-    /// Stop serving (the durable directory survives).
+    /// Stop serving (the durable directory survives) and PROVE the
+    /// stop: drop the graceful-shutdown trigger, then await the serve
+    /// future to completion — the listener is dropped AND every
+    /// already-accepted connection task has exited (in-flight
+    /// requests drained; no idle keep-alive connection is left
+    /// serviceable), so after this returns no request can complete
+    /// against the witness, whatever the client does with its pooled
+    /// connections. The abort shape this replaces closed the pooled
+    /// connections only asynchronously — a request dispatched right
+    /// after the abort could still be answered inside the close
+    /// window (the same race the drbd kits' shared `Server::stop`
+    /// gate removed).
+    ///
+    /// The drain is bounded (hyper 1.x graceful shutdown has no
+    /// internal deadline, so a wedged in-flight connection would
+    /// otherwise hang this forever): expiring [`WITNESS_DRAIN_BOUND`]
+    /// is a kit failure — the stop did NOT prove unreachability —
+    /// never a pass.
     async fn stop(&mut self) {
+        drop(self.shutdown.take());
         if let Some(serve) = self.serve.take() {
-            serve.abort();
-            let _ = serve.await;
+            let drained = tokio::time::timeout(WITNESS_DRAIN_BOUND, serve).await;
+            assert!(
+                drained.is_ok(),
+                "the witness drain did not complete within {WITNESS_DRAIN_BOUND:?}: a \
+                 connection task is wedged (an in-flight request never finished) — \
+                 the stop did NOT prove unreachability; a kit failure, never a pass"
+            );
         }
     }
 
