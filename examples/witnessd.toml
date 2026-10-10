@@ -1,0 +1,50 @@
+# Volvisor witness daemon example configuration (P7-A, ADR-0009).
+#
+# Must always pass `volvisor-witnessd --check-config
+# examples/witnessd.toml` — a repository test pins that, so the
+# example and the validator cannot drift apart. Full field
+# documentation: docs/configuration.md.
+#
+# The witness is the third-party writer-authority service (P4a plan
+# §3): it owns the durable epoch/lease registry and is deliberately
+# not a storage daemon. It must be a third failure domain by
+# deployment — volvisor cannot verify physical placement.
+#
+# The token values below are placeholders: replace with generated
+# secrets in any real deployment. Secrets are never logged.
+
+# HTTP bind address of the witness surface. Without auth_token the
+# witness refuses non-loopback binds (fail closed); this example is
+# the third-host deployment shape.
+listen = "10.0.0.3:9101"
+
+# Directory holding the witness journal and lock file (a competing
+# witness on the same directory fails at startup).
+state_dir = "/var/lib/volvisor-witness/state"
+
+# Shared bearer token. Required for non-loopback binds. On the v2
+# witness protocol this token is read-only (inspect/health); every
+# mutation requires a host credential below. Never logged.
+auth_token = "replace-with-a-generated-secret"
+
+# Lease time-to-live in seconds (W5/W7; default 60). A writer's lease
+# expires after this; renewals keep it alive.
+lease_ttl_secs = 60
+
+# Response-latency bound the fence window assumes (W5; default 5
+# seconds). Must cover witness round-trip latency under load — an
+# operator network responsibility.
+lease_grace_secs = 5
+
+# Self-fencing suspend budget in seconds (W7; default 5): the assumed
+# time for a writer to freeze its data path (drbdsetup suspend-io).
+suspend_budget_secs = 5
+
+# Per-host credentials (W8): each storage daemon's mutating calls
+# (grant/renew/revoke/register) authenticate with its own token; the
+# witness resolves the token to the host identity. Keys must be valid
+# host ids; token values must be unique and distinct from auth_token.
+# Never logged.
+[host_tokens]
+host-a = "replace-with-host-a-secret"
+host-b = "replace-with-host-b-secret"

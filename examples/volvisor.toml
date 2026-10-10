@@ -1,0 +1,123 @@
+# Volvisor storage daemon example configuration (P7-A, ADR-0009).
+#
+# This is the annotated shape of the future /etc/volvisor/ content. It
+# must always pass `volvisord --check-config examples/volvisor.toml` —
+# a repository test pins that, so the example and the validator cannot
+# drift apart. Full field documentation: docs/configuration.md.
+#
+# The example shows the richest validating shape: the drbd nearline
+# provider with witness-managed writer authority and the (here inert)
+# migration section. Well-formed fields of the other providers are
+# simply ignored when they do not apply; their shapes are documented in
+# docs/configuration.md.
+#
+# Every token value below is a placeholder: replace with generated
+# secrets in any real deployment. Secrets are never logged.
+
+# HTTP bind address of the Volume API v2 surface. Without admin_token
+# the daemon refuses non-loopback binds (fail closed, SPEC-0002
+# section 9); this example binds loopback and still sets a token.
+listen = "127.0.0.1:8787"
+
+# Directory holding the intent journal and its lock file. A second
+# daemon on the same directory fails at startup, not mid-flight.
+journal_dir = "/var/lib/volvisor/journal"
+
+# Provider backend: "lvm" (native-local), "ceph" (external-cluster
+# RBD adapter), "drbd" (nearline replication baseline) or "fake"
+# (in-memory, testing only).
+provider = "drbd"
+
+# Static bearer token guarding the privileged surface (every mutating
+# endpoint and the whole /v2/admin route group, GET included). Leave
+# unset for the loopback-only fail-closed mode. Never logged.
+admin_token = "replace-with-a-generated-secret"
+
+# Maximum accepted request body in bytes (default 1 MiB).
+max_body_bytes = 1048576
+
+# ------------------------------------------------------------- drbd fields
+# Required for provider = "drbd"; ignored (when well-formed) by the
+# other providers.
+
+# Volume group holding the nearline backing LVs. Must exist; foreign
+# LVs inside it are never touched.
+drbd_vg_name = "volvisor-nearline"
+
+# Directory for the generated volvisor-<resource>.res files
+# (default /etc/drbd.d).
+drbd_config_dir = "/etc/drbd.d"
+
+# This host's DRBD `on` node name. Validated against `uname -n` at
+# startup so a wrong-host daemon never adopts a peer's resources.
+drbd_node_name = "host-a"
+
+# The local replication address: an IPv4 dotted quad, no port.
+drbd_local_address = "10.0.0.1"
+
+# The peer end's node name, and its <ipv4>:<port> address
+# (operator-provisioned out of band in this phase).
+drbd_peer_name = "host-b"
+drbd_peer_address = "10.0.0.2:7100"
+
+# Path of the peer shared secret, an owner-only file (required; peer
+# authentication is a binding invariant). Read at resource-generation
+# time; never configured inline, never logged.
+drbd_shared_secret_file = "/etc/volvisor/drbd-peer-secret"
+
+# Inclusive local replication port range (defaults 7100..=7199).
+drbd_port_min = 7100
+drbd_port_max = 7199
+
+# Inclusive DRBD minor range (defaults 100..=999; the maximum is 4095,
+# the kernel minor space).
+drbd_minor_min = 100
+drbd_minor_max = 999
+
+# Durable provider state path (default <journal_dir>/drbd-state.json).
+drbd_state_path = "/var/lib/volvisor/journal/drbd-state.json"
+
+# --------------------------------------------------------- witness fields
+# The writer-authority witness (drbd provider only). It must be a
+# THIRD failure domain: the daemon refuses a loopback witness and one
+# colocated with either replication end.
+
+# Base URL of the witness surface (plain http:// in this phase).
+witness_url = "http://10.0.0.3:9101"
+
+# The shared bearer token; required for a non-loopback witness. On a
+# v2 witness this token is read-only (inspect/health). Never logged.
+witness_token = "replace-with-a-generated-secret"
+
+# This host's per-host credential (W8): every mutating witness call
+# (grant/renew/revoke/register) authenticates as drbd_node_name.
+# Required whenever witness_url is set. Never logged.
+witness_host_token = "replace-with-a-generated-host-secret"
+
+# Writer lease renewal interval in seconds; must stay under half the
+# witness's lease_ttl_secs (checked against every grant/renew
+# response).
+witness_renewal_interval_secs = 15
+
+# ------------------------------------------------------- migration and vmm
+# The coordinated VMM/storage handoff (P4b). Inert until
+# enabled = true; enabling requires the drbd provider, a witness, an
+# EXISTING snapshot_dir (create it first), the peer daemon's URL and
+# credential, and a configured VMM.
+
+[migration]
+enabled = false
+# Shared snapshot directory; must exist when enabled (its cross-host
+# readability is verified at PREPARED by the destination daemon).
+snapshot_dir = "/var/lib/volvisor/snapshots"
+# The peer daemon's base URL (plain http:// in this phase) and the
+# daemon-to-daemon credential (distinct from the witness and consumer
+# tokens). Never logged.
+peer_api_url = "http://10.0.0.2:7780"
+peer_api_token = "replace-with-a-generated-secret"
+
+[vmm]
+# The ch-remote binary and the per-VM API socket directory
+# ({api_socket_dir}/{vm_id}.sock). Required when migration is enabled.
+ch_remote_bin = "/usr/bin/ch-remote"
+api_socket_dir = "/run/volvisor/vms"
