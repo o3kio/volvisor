@@ -132,13 +132,49 @@ ObserveHandoff(migration_id) -> PREPARED | PRECOPY | QUIESCED | BARRIER_DURABLE 
                                  VM_RESUMED | COMPLETE | ABORTED
 ```
 
-The observation states are the canonical migration states of the nearline contract section 6. Authority transfer is deliberately observable as two steps (`SOURCE_REVOKED`, then `DESTINATION_AUTHORIZED`) with `IN_DOUBT` between them; an implementation must never collapse them into a single atomic status.
+The observation states are the canonical migration states of the nearline contract section 6. Authority transfer is deliberately observable as two steps (`SOURCE_REVOKED`, then `DESTINATION_AUTHORIZED`); an implementation must never collapse them into a single atomic status. `IN_DOUBT` is reachable once the cut is entered (the durable point of no return, at or after the source-side barrier), when a pre-cut rollback cannot complete safely (a failed barrier void — fail-closed, the source is never resumed), and through any unresolvable post-authorization stall before `COMPLETE` (e.g. a dead destination VMM; a resolvable stall is reported as the canonical state plus a stall detail); it must never be reported as a generic `ABORTED`.
 
 These calls are conceptual, not a license to implement handoff as two independent `detach/attach` operations. The consumer and provider must agree on a durable cutover identity and a consistent **all-writable-volume** boundary. Successful handoff requires exact-source-epoch durable target data and enforced source write revocation before target admission.
 
 Native-local attached storage returns `MIGRATION_UNSUPPORTED_LOCAL_STORAGE`. Ceph RBD migration requires VMM/frontend interoperability and safe writer/lock handoff, not nearline replica convergence. Ordinary PCI passthrough migration remains unsupported by default unless precise migratable-device capability is proven.
 
 Never emit a generic `ABORTED` when authority has moved. State becomes `IN_DOUBT` or rolls forward under fenced recovery.
+
+Concrete v2 routes (nearline class only; a daemon without the migration
+surface serves typed errors on all of them):
+
+```text
+POST /v2/vms/{vm_id}/check-mobility           200 {eligible, reasons[], participants[]}
+POST /v2/migrations                           201 {migration_id, state, participants[]}   (PrepareNearlineHandoff)
+POST /v2/migrations/{migration_id}/transfer   202 {state}                                  (BarrierAndTransfer)
+GET  /v2/migrations/{migration_id}            200 {state, state_history[], in_doubt_detail?} (ObserveHandoff)
+POST /v2/migrations/{migration_id}/abort      200 {state}
+```
+
+- The mutating routes are privileged and journaled. A byte-identical
+  replay of `POST /v2/migrations` returns the recorded response; a
+  differing body under the same `migration_id` is a typed conflict —
+  never a silent second migration.
+- `transfer` returns **202 Accepted**: the cut is accepted for
+  processing and driven asynchronously; the outcome is observed, not
+  returned. Volvisor pauses and verifies the VM itself: the caller's
+  `vm_paused_and_io_drained_proof` is **recorded as corroboration
+  only** — an absent or false proof never substitutes for volvisor's
+  own verified pause, and never changes the drive's behavior.
+- **Downtime statement**: this is a stop-and-copy cutover, not a live
+  migration. The guest is paused for the barrier, cut, restore and
+  resume; the window between `BarrierAndTransfer` and `VM_RESUMED` is
+  guest-visible downtime. Memory pre-copy and any dual-primary I/O
+  path remain out of scope (nearline contract section 6).
+- **Snapshot-dir sharing**: the deployment provisions a snapshot
+  directory readable and writable by both hosts' volvisor daemons (the
+  source writes the VM snapshot; the destination reads it). The
+  destination verifies cross-host readability at `PREPARED` and
+  refuses typed otherwise — an unreadable snapshot dir fails the
+  migration before any cut, never mid-cut.
+- `abort` is refused typed once the cut is entered (the write-ahead's
+  durable point of no return); before that it rolls the preparation
+  back in the fenced order the nearline contract prescribes.
 
 ## 6. Local vs remote protection capability
 

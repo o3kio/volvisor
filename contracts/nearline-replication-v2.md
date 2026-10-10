@@ -20,8 +20,15 @@ replicas[] {
   received_prefix, applied_prefix, durable_prefix,
   resync_baseline, dirty_ranges_or_log_cursor, health
 }
-handoff {state, source_epoch, destination_epoch, barrier, outcome}
+handoff {state, source_epoch, destination_epoch, barrier, outcome,
+         migration_record_ref}
 ```
+
+The `handoff` fields are a projection of the migration coordinator's
+durable record (append-only state history plus the cut write-ahead);
+`migration_record_ref` identifies that record — the authoritative
+recoverable form of the cutover, from which the summarized `handoff`
+block is derived rather than independently maintained.
 
 Sequence numbers without a lineage/epoch are not enough. `local_protection_health` is the runtime health of that replica's `local_protection` policy (section 3). A replica's `durable_prefix` must be a **contiguous exact-lineage prefix**; holes and reordered writes may never be declared durable merely because a later sequence reached disk. Durable metadata and payload must survive loss of the processes or host according to the published ACK contract.
 
@@ -84,7 +91,7 @@ PREPARED (destination replica and readonly endpoint)
  -> COMPLETE
 ```
 
-This is the **canonical** migration state vocabulary. SPEC-0002 section 7 and the Volume API v2 `ObserveHandoff` use these canonical states; the API additionally exposes the terminal `IN_DOUBT` and `ABORTED` outcomes. `IN_DOUBT` is a legitimate fail-closed state reachable after `SOURCE_REVOKED` and before `DESTINATION_AUTHORIZED`; it must never be reported as a generic `ABORTED`. ADR-0004 Decision 3 phase names map onto these states as follows:
+This is the **canonical** migration state vocabulary. SPEC-0002 section 7 and the Volume API v2 `ObserveHandoff` use these canonical states; the API additionally exposes the terminal `IN_DOUBT` and `ABORTED` outcomes. `IN_DOUBT` is a legitimate fail-closed state: reachable once the cut is entered (the durable point of no return, at or after the source-side barrier), when a pre-cut rollback cannot complete safely (a failed barrier void — fail-closed, the source is never resumed), and through any unresolvable post-authorization stall before `COMPLETE` (e.g. a dead destination VMM; a resolvable stall is reported as the canonical state plus a stall detail); it must never be reported as a generic `ABORTED`. ADR-0004 Decision 3 phase names map onto these states as follows:
 
 | ADR-0004 phase | Canonical state |
 |---|---|
@@ -103,6 +110,16 @@ The `SOURCE_REVOKED -> DESTINATION_AUTHORIZED` transaction needs authoritative d
 A migration with multiple writable nearline volumes must coordinate a **single VM I/O cut** and prove all target barriers and fencing actions before destination resume. If atomic multi-volume authorization is unavailable, the VM migration feature must remain disabled.
 
 Rate control: isolate three streams—foreground guest writes, replica catch-up, and VMM memory copying (plus optional local mirror rebuild). Lowering all replication traffic is not a migration strategy. The coordinator must estimate dirty-rate/catch-up, bound downtime, prioritize convergence and abort before destructive cutover if deadlines cannot be met.
+
+Implementation status: the canonical state machine above is served by
+volvisor's migration coordinator (P4b) — durable per-migration record,
+append-only state history, cut write-ahead, witness-backed barriers and
+batch authority transfer, with `ObserveHandoff` exposing exactly these
+states. Two elements remain deliberately out of scope with their
+section-1 reasons: VMM memory pre-copy (the cutover is stop-and-copy —
+the guest is paused for the barrier/cut/restore/resume window) and any
+temporary dual-primary I/O path (section 9A: forbidden absent a
+separately accepted, fenced handoff proof).
 
 ## 7. Failure behavior
 
