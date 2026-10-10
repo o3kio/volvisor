@@ -1040,10 +1040,17 @@ async fn mobility_prepare_cell(cell: Cell) {
     // The killed attempt's record, where it landed (the before/after
     // journal points and the renamed record save), resolved to ABORTED
     // by the startup pass — observable, terminal, honest; where it
-    // never landed, the id observes 404.
-    let (status, body) = get_migration(rig.a.addr, "mig-x")
-        .await
-        .served("observe the old id");
+    // never landed, the id observes 404. The resolution races this
+    // observation by design: the retry task's startup pass is spawned
+    // alongside the serve (it may not have been polled yet when the
+    // re-POST and the fresh prepare arrive), and its `try_lock` skips
+    // itself while the fresh prepare's drive holds the surface —
+    // deferring the rollback to the next 5 s tick. The landed case
+    // therefore polls the deterministic terminal shape (the same
+    // bounded poll the transfer and abort cells use; the recorded
+    // row-5 startup-race flake was exactly this single-shot
+    // observation); the un-landed case is already deterministic — no
+    // record landed, and nothing creates one.
     let landed = !matches!(
         &cell.hook,
         Hook::Journal(CrashPoint::AfterIntent)
@@ -1053,13 +1060,16 @@ async fn mobility_prepare_cell(cell: Cell) {
             )
     );
     if landed {
-        assert_eq!(status, 200, "the landed record observes: {body}");
+        let summary = poll_migration(rig.a.addr, "mig-x", "aborted").await;
         assert_eq!(
-            state_name(&body_json(&body)),
+            state_name(&summary),
             "aborted",
-            "the startup pass rolled the landed record back: {body}"
+            "the startup pass rolled the landed record back: {summary}"
         );
     } else {
+        let (status, body) = get_migration(rig.a.addr, "mig-x")
+            .await
+            .served("observe the old id");
         assert_eq!(
             status, 404,
             "no record exists for the un-landed prepare: {body}"

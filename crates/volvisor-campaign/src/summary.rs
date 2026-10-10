@@ -88,8 +88,13 @@ struct RowSpec {
     coverage: Coverage,
     /// The §3.2 per-family budget in milliseconds, when the plan
     /// states one for this row's family (the kill families and the
-    /// oracle families are ≤ 5s; the storm ≤ 10s; the injection
-    /// rows carry no stated bound and show durations only).
+    /// oracle families are ≤ 5s; row 3 — the kill-and-recover oracle
+    /// rows — is ≤ 8s: its peer-grant cells' recovery waits one full
+    /// migration-retry tick (5 s, the production recovery path the
+    /// row exists to prove) plus the re-drive and observation, so the
+    /// original 5 s bound sat on top of the designed wait with no
+    /// headroom; the storm ≤ 10s; the injection rows carry no stated
+    /// bound and show durations only).
     budget_ms: Option<u64>,
 }
 
@@ -120,7 +125,17 @@ const ROWS: &[RowSpec] = &[
             "kill-matrix/peer-grant/after-intent",
             "kill-matrix/peer-grant/before-outcome",
         ]),
-        budget_ms: Some(5_000),
+        // 8 s, not 5 s (the P5 plan §3.2 amendment): the peer-grant
+        // cells (k4/k5) recover through the production migration
+        // retry task, whose tick is 5 s — the designed wait the row
+        // PROVES — plus the re-drive, the bounded observation poll
+        // and load slop. The original 5 s bound sat on top of that
+        // designed wait with zero headroom (isolated runs measured
+        // 4955-4960 ms; one full-suite run 5031 ms — the PR #20
+        // disclosure). Derived: one full tick (5 s) + ~3 s of
+        // re-drive/observation/load headroom — a budget, not a
+        // tightrope.
+        budget_ms: Some(8_000),
     },
     RowSpec {
         row: 4,

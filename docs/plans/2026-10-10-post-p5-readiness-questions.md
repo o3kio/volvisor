@@ -90,12 +90,30 @@ evidence status stated honestly:
   root cause (the kit's `server.handle.abort()` aborts the axum serve
   without draining in-flight renewals) is unproven, so the fix must start
   from either a reproduction or a drain fix that is provably correct
-  regardless;
+  regardless — **resolved in PR #21 (P6-A part 1): the suspicion was
+  right in class, refined in mechanism (the abort's close of the
+  lingering keep-alive connections is asynchronous, so a renewal
+  dispatched over the client's pooled connection could complete inside
+  that window); the kit's abort is replaced by a graceful-shutdown drain
+  whose completion proves no connection remains serviceable**;
 - the **kill-matrix startup race** in the campaign suite
   (`row_5_consumer_mobility_kill_matrix`, the post-restart "rolled back to
   aborted" assertion in `rows_4_7.rs`): reproduced roughly 2–3 of 6
   full-suite runs during this plan's review round — the assertion races
-  the daemon's async startup reconciliation;
+  the daemon's async startup reconciliation — **resolved in PR #21
+  (P6-A part 1): the retry task's startup pass runs concurrently with
+  the serve and its `try_lock` defers behind the test's own fresh-prepare
+  drive, so the single-shot observation became the same bounded poll the
+  transfer and abort cells already use**;
+- the **row-3 oracle budget sensitivity** (disclosed in PR #20's
+  certification, not previously pinned here): the §3.2 budget bound for
+  the kill-and-recover oracle rows (5 s) sat on top of the peer-grant
+  cells' designed duration — one full migration-retry tick (5 s, the
+  production recovery path the row proves) — with zero headroom, so
+  suite-load excursions crossed it (5031 ms against the 5000 ms bound;
+  4955–4960 ms isolated). **Resolved in PR #21 (P6-A part 1): the P5
+  plan §3.2 bound for row 3 is amended to 8 s with the derivation
+  recorded there; every other row's bound is unchanged.**
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 

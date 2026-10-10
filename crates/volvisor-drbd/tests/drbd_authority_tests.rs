@@ -28,7 +28,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -36,9 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{
-    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for, config_for_peer, fixture,
-    flip_world_to_peer, provider_from_with_authority, seed_volume, seed_volume_with_identity,
-    seed_volume_with_protocol,
+    FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, Server, WitnessTokens, config_for,
+    config_for_peer, fixture, flip_world_to_peer, provider_from_with_authority, seed_volume,
+    seed_volume_with_identity, seed_volume_with_protocol, spawn_witness,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
@@ -56,8 +55,6 @@ use volvisor_types::{
 use volvisor_witness::BlockingWitness;
 use volvisor_witness::client::{HttpWitnessConnection, WitnessConnection};
 use volvisor_witness::proto::{GrantRequest, WITNESS_PROTOCOL_VERSION};
-use volvisor_witness::registry::{WitnessCore, WitnessCoreConfig};
-use volvisor_witness::server::{WitnessServerState, router};
 
 mod common;
 
@@ -78,41 +75,8 @@ const START: u64 = 1_000;
 const INTERVAL: u64 = 20;
 
 // ---------------------------------------------------------------- kit
-
-struct Server {
-    addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-async fn spawn_witness(dir: &Path, clock: Arc<AtomicU64>) -> Server {
-    let core = WitnessCore::open(
-        dir,
-        WitnessCoreConfig {
-            lease_ttl_secs: TTL,
-            lease_grace_secs: 5,
-            suspend_budget_secs: 5,
-        },
-    )
-    .expect("witness core opens");
-    let mut host_tokens = std::collections::BTreeMap::new();
-    host_tokens.insert(NODE.to_owned(), NODE_TOKEN.to_owned());
-    host_tokens.insert(PEER_NODE.to_owned(), PEER_TOKEN.to_owned());
-    let state = Arc::new(WitnessServerState::with_clock(
-        core,
-        Some(TOKEN.to_owned()),
-        host_tokens,
-        Arc::new(move || clock.load(Ordering::SeqCst)),
-    ));
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server serves");
-    });
-    Server { addr, handle }
-}
+// The loopback witness server (the deterministic unreachability
+// gate included) is shared with the handoff kit: `tests/common`.
 
 /// The legacy shared-token client (read-only on a v2 witness: used for
 /// witness-side inspection).
@@ -150,7 +114,16 @@ struct WitnessKit {
 async fn witness_kit() -> WitnessKit {
     let dir = tempfile::tempdir().expect("witness dir");
     let witness_clock = Arc::new(AtomicU64::new(START));
-    let server = spawn_witness(dir.path(), Arc::clone(&witness_clock)).await;
+    let server = spawn_witness(
+        dir.path(),
+        Arc::clone(&witness_clock),
+        WitnessTokens {
+            shared: TOKEN,
+            node: NODE_TOKEN,
+            peer: PEER_TOKEN,
+        },
+    )
+    .await;
     let client = client_for(&server);
     WitnessKit {
         server,
@@ -431,13 +404,16 @@ async fn attach_without_registration_is_refused_typed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_witness_refuses_attach_typed() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let f = fixture();
     seed_volume(&f.base, &f.world, "vol-down", GIB);
     let provider = authority_provider(&kit, &f.state_path, &f.world);
     let vol = volume("vol-down");
     provider.register_volume(&vol, None).expect("register");
-    kit.server.handle.abort();
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     let error = provider
         .attach_volume(&vol, &attach_req("vol-down", 1))
         .await
@@ -517,9 +493,12 @@ async fn a_superseded_epoch_self_fences() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_passed_deadline_self_fences_even_with_the_witness_down() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-deadline").await;
-    kit.server.handle.abort();
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     // Past the W5 deadline: the writer fences itself without asking.
     kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
     let report = state.provider.renew_leases().expect("renewal pass");
@@ -537,9 +516,12 @@ async fn a_passed_deadline_self_fences_even_with_the_witness_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_witness_defers_renewal_until_the_deadline() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-defer").await;
-    kit.server.handle.abort();
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     // Renewal is due, the witness is down, but the W5 deadline has not
     // passed: keep serving (the deferred entry carries the bound).
     kit.writer_clock
@@ -560,6 +542,51 @@ async fn an_unreachable_witness_defers_renewal_until_the_deadline() {
         .await
         .expect("inspect");
     assert!(inspect.authority.is_some(), "the block survives a deferral");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_witness_is_deterministically_unreachable() {
+    // The unreachability gate's own contract, pinned: after
+    // `Server::stop` returns, NO request can complete against the
+    // witness — through the provider's error mapping and over the
+    // client's pooled keep-alive connection at the transport level
+    // alike. The drain proof makes that a deterministic invariant,
+    // not an assumption: the graceful-shutdown await returns only
+    // after the listener is dropped and every already-accepted
+    // connection task has exited, so no serviceable connection
+    // remains. (The gate exists because the abort shape it replaced
+    // closed lingering connections only asynchronously — the
+    // recorded renewal-deadline flake; see `Server::stop`'s docs.)
+    let mut kit = witness_kit().await;
+    let state = attached(&kit, "vol-gate").await;
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
+    // The provider path: a due renewal defers (the local W5 deadline
+    // is the bound), never renews, never fences.
+    kit.writer_clock
+        .store(START + INTERVAL + 1, Ordering::SeqCst);
+    let report = state.provider.renew_leases().expect("renewal pass");
+    assert_eq!(report.renewed, Vec::<volvisor_types::VolumeId>::new());
+    assert_eq!(
+        report.fenced,
+        Vec::<volvisor_drbd::state::FencedVolume>::new()
+    );
+    assert_eq!(report.deferred.len(), 1);
+
+    // The client path: a direct request over the very connection the
+    // attach pooled cannot complete either — the gate holds at the
+    // transport level, not just through the provider's error mapping.
+    let error = kit
+        .client
+        .inspect(&state.volume)
+        .await
+        .expect_err("a stopped witness answers nothing");
+    assert!(
+        matches!(error, volvisor_witness::proto::WitnessError::Unreachable(_)),
+        "the direct request is a transport unreachability: {error:?}"
+    );
 }
 
 // ----------------------------------------------------------- detach
@@ -629,9 +656,12 @@ async fn startup_validation_resumes_a_proven_primary() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_with_the_witness_down_stays_suspended_and_failed() {
-    let kit = witness_kit().await;
+    let mut kit = witness_kit().await;
     let state = attached(&kit, "vol-stalled").await;
-    kit.server.handle.abort();
+    kit.server
+        .stop()
+        .await
+        .expect("the witness drain completes");
     let provider = authority_provider(&kit, &state.state_path, &state.world);
     // Fail-closed: the unproven writer stays frozen, never resumed.
     assert_eq!(role_of(&state.world, &state.resource), Role::Primary);

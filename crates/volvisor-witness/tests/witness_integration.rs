@@ -57,8 +57,49 @@ fn host_tokens() -> BTreeMap<String, String> {
 
 struct Server {
     addr: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
+    /// The graceful-shutdown trigger: dropped by [`Server::stop`] to
+    /// start the drain. `None` once stopped.
+    shutdown: Option<tokio::sync::watch::Sender<()>>,
+    /// The serve task: taken and awaited by [`Server::stop`] (the
+    /// drain barrier). `None` once stopped.
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
+
+impl Server {
+    /// Stop the server deterministically and PROVE it: drop the
+    /// graceful-shutdown trigger, then await the serve future to
+    /// completion — the serve future returns only after the listener
+    /// is dropped (new connections are refused) AND every
+    /// already-accepted connection's task has exited, so the core —
+    /// and with it the journal's flock — is gone once this returns,
+    /// and no request can complete against the server. (The old
+    /// shape — `handle.abort()` plus a fixed 50 ms sleep — only
+    /// HOPED the asynchronous close had finished; a restart racing
+    /// it would hit the still-held flock.)
+    ///
+    /// The drain is bounded (hyper 1.x graceful shutdown has no
+    /// internal deadline, so a wedged in-flight connection would
+    /// otherwise hang this forever): expiring [`DRAIN_BOUND`] is a
+    /// kit failure — the core is not provably gone — never a pass.
+    async fn stop(&mut self) {
+        drop(self.shutdown.take());
+        if let Some(handle) = self.handle.take() {
+            let drained = tokio::time::timeout(DRAIN_BOUND, handle).await;
+            assert!(
+                drained.is_ok(),
+                "the witness drain did not complete within {DRAIN_BOUND:?}: a connection \
+                 task is wedged — the core (and its journal flock) is not provably gone; \
+                 a kit failure, never a pass"
+            );
+        }
+    }
+}
+
+/// The bound on [`Server::stop`]'s drain: every witness request is
+/// awaited before a stop, so the drain only closes idle keep-alive
+/// connections — milliseconds — and five seconds stays generous
+/// under parallel-suite load.
+const DRAIN_BOUND: Duration = Duration::from_secs(5);
 
 async fn spawn_witness(
     dir: &Path,
@@ -78,10 +119,24 @@ async fn spawn_witness(
         .await
         .expect("ephemeral bind");
     let addr = listener.local_addr().expect("local addr");
+    // Graceful shutdown over a watch trigger: dropping the sender
+    // (`Server::stop`) completes the signal future, the serve loop
+    // stops accepting, tells every connection task to drain, and
+    // waits for all of them — the drain barrier `stop` awaits.
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("server serves");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await
+            .expect("server serves");
     });
-    Server { addr, handle }
+    Server {
+        addr,
+        shutdown: Some(shutdown),
+        handle: Some(handle),
+    }
 }
 
 /// A witness with both host credentials and the legacy shared token.
@@ -545,7 +600,7 @@ async fn protocol_version_mismatch_is_refused() {
 async fn restart_preserves_authority_mid_traffic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let clock = Arc::new(AtomicU64::new(1_000));
-    let server = standard_witness(dir.path(), clock.clone()).await;
+    let mut server = standard_witness(dir.path(), clock.clone()).await;
     let client = host_client(&server, 1);
     client
         .register(&volume(1), register_request(1))
@@ -556,11 +611,14 @@ async fn restart_preserves_authority_mid_traffic() {
         .await
         .expect("grant");
 
-    // "Crash": drop the server (and with it the core holding the flock),
-    // restart on the same journal directory.
-    server.handle.abort();
-    // Give the aborted task a moment to release the listener/lock.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // "Crash": stop the server (and with it the core holding the
+    // flock), restart on the same journal directory. The stop is the
+    // deterministic drain — it returns only after the listener is
+    // dropped and every connection task has exited, so the journal
+    // flock is provably free for the restart's `WitnessCore::open`
+    // (the abort-plus-fixed-sleep shape it replaced only hoped the
+    // asynchronous close had finished).
+    server.stop().await;
 
     clock.store(1_050, Ordering::SeqCst);
     let server = standard_witness(dir.path(), clock.clone()).await;
@@ -737,7 +795,7 @@ async fn w9_record_and_void_barriers_over_http() {
 async fn w9_barriers_and_retirements_survive_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let clock = Arc::new(AtomicU64::new(1_000));
-    let server = standard_witness(dir.path(), clock.clone()).await;
+    let mut server = standard_witness(dir.path(), clock.clone()).await;
     let host_1 = host_client(&server, 1);
 
     let grant = granted_to_host_1(&host_1, &volume(1), 1, 2).await;
@@ -746,8 +804,10 @@ async fn w9_barriers_and_retirements_survive_restart() {
         .await
         .expect("record barrier");
 
-    server.handle.abort();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // "Crash": the deterministic drain (see
+    // `restart_preserves_authority_mid_traffic`) — the journal flock
+    // is provably free for the restart's core open.
+    server.stop().await;
 
     let server = standard_witness(dir.path(), clock.clone()).await;
     let host_1 = host_client(&server, 1);
