@@ -17,6 +17,11 @@ volvisor-provider = { workspace = true }
 volvisor-drbd = { workspace = true }
 volvisor-drbd-testkit = { workspace = true }
 volvisor-handoff = { workspace = true }
+# The P6-C move fault rows (§9 row 16): the sibling harness drives a
+# real LvmProvider over a scripted LVM world — the campaign is
+# test-only (never a dependency of anything), so the dependency
+# never reaches a production build that does not already carry it.
+volvisor-lvm = { workspace = true }
 # The journal's `test-faults` feature gates the rollback injection
 # (P5 plan §5.4): the campaign is a test-only crate (never a
 # dependency of anything), so the feature never reaches a production
@@ -30,3 +35,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+# The move fault rows' rigs (the e2e precedent): one isolated
+# directory tree per scenario.
+tempfile = { workspace = true }

@@ -1442,8 +1442,13 @@ impl LvmProvider {
         // Phase 3 — journal the intent. The record is the
         // reconciliation anchor: after this save, a daemon death
         // anywhere below leaves a durable fact to classify against.
+        // A re-attach reusing an unchanged record saves nothing —
+        // an unchanged state has no durable boundary to write, and
+        // the operation_id refresh lands with phase 4's COPYING
+        // save.
         let (source_pv, record_for_drive) = {
             let mut state = self.lock_state()?;
+            let mut inserted = false;
             let (source, record) = match state.move_record(volume_id) {
                 Some(record)
                     if matches!(
@@ -1463,10 +1468,13 @@ impl LvmProvider {
                         detail: None,
                     };
                     state.insert_move(volume_id.clone(), record.clone());
+                    inserted = true;
                     (source, record)
                 }
             };
-            self.persist(&mut state)?;
+            if inserted {
+                self.persist(&mut state)?;
+            }
             (source, record)
         };
 

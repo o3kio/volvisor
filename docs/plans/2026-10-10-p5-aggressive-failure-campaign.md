@@ -573,6 +573,7 @@ the report):
 | 13 | replication partition mid-migration | storage network disconnect | no caught-up claim over a partition; cut refuses/parks; async tail covered |
 | 14 | abort storm (25 cycles, rotating pre-cut faults) | repeated migration aborts | no state residue, no lease leak, terminal records immutable, fresh-id recovery idempotent |
 | 15 | evidence bundle + summary render | exact versions, independent harness, full logs | the coverage matrix exists, is budget-adherent, and the completion gates pass over it |
+| 16 | same-VG move durable boundaries (P6-C; the LVM sibling harness — a real LvmProvider over a scripted LVM world through the full daemon composition, the campaign's evidence discipline) | SIGKILL at the move's journaled boundaries: journal append, PREPARING save, pvmove start, completion/verification save, after-COMPLETE save; plus the out-of-band `pvmove --abort` class | every boundary recovers by restart → reconcile → intent-resolution into the contract's honest vocabulary: re-drive, roll to `COPYING`, roll-forward completion with one bump, idempotent re-observation — and the abort-while-down parks `IN_DOUBT` with the source intact, refusing new work typed |
 
 Tier R rows (env-gated, `skipped` records until hardware): the same
 families against real DRBD/CH, plus the rows with no Tier S

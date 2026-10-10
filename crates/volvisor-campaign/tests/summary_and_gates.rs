@@ -113,6 +113,7 @@ fn complete_fixture() -> PathBuf {
     fixture_matrix(&dir);
     fixture_oracle_rows(&dir);
     fixture_injections(&dir);
+    fixture_move_rows(&dir);
     fixture_tier_r_gates(&dir);
     write_record(
         &dir,
@@ -123,6 +124,43 @@ fn complete_fixture() -> PathBuf {
         ),
     );
     dir
+}
+
+/// Row 16 (P6-C): the same-VG move's durable-boundary scenarios —
+/// one fixture record per boundary, with the outcomes the sibling
+/// harness's real records carry (the fixture only stands in for
+/// the render/gate machinery; the real rows live in
+/// `tests/move_rows.rs`).
+fn fixture_move_rows(dir: &Path) {
+    let rows = [
+        (
+            "row-16/move-killed-after-journal-intent",
+            "recovered: COMPLETE (the fresh operation re-drove the journaled intent)",
+        ),
+        (
+            "row-16/move-killed-at-preparing-save",
+            "recovered: COMPLETE (the re-driven journaled intent)",
+        ),
+        (
+            "row-16/move-killed-after-pvmove-start",
+            "recovered: COMPLETE (the rolled record resolved under a fresh operation)",
+        ),
+        (
+            "row-16/move-pass-killed-at-verification",
+            "recovered: COMPLETE (the roll-forward at startup, one bump)",
+        ),
+        (
+            "row-16/move-pass-killed-after-complete-save",
+            "recovered: COMPLETE (nothing to resolve — the durable fact stood)",
+        ),
+        (
+            "row-16/move-aborted-out-of-band-while-down",
+            "parked: IN_DOUBT with the source intact (the operator resolves it)",
+        ),
+    ];
+    for (scenario, outcome) in rows {
+        write_record(dir, &tier_s(scenario, outcome, 120));
+    }
 }
 
 /// Rows 4-7: every generated cell, plus the four family aggregates
