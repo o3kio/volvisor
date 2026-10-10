@@ -29,7 +29,11 @@
 //! - [`vmm_http`]: the hand-rolled HTTP/1.1 `PUT` over a unix domain
 //!   socket behind [`vmm::VmmController::resize_disk`] (P6-B — the
 //!   REST-only resize-disk call; `ch-remote` has no such
-//!   subcommand).
+//!   subcommand);
+//! - [`vmm_version`]: the Cloud Hypervisor version gate (P6-B) — the
+//!   semver type, the tolerant `--version` output scan and the
+//!   startup probe caching the fail-closed verdict the
+//!   grow-notification consults.
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -47,6 +51,7 @@ pub mod provider;
 pub mod runner;
 pub mod vmm;
 pub mod vmm_http;
+pub mod vmm_version;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
@@ -60,3 +65,4 @@ pub use vmm::{
     PauseProof, VmState, VmmController,
 };
 pub use vmm_http::{MAX_RESPONSE_BYTES, VmmHttpResponse};
+pub use vmm_version::{GateVerdict, Semver, VmmVersionGate, parse_version_output};
