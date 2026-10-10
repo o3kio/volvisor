@@ -206,12 +206,14 @@ real; both are deliverables of stage A:
   write is acked when it lands in the source's block map, and is
   applied to the peer's map only when the queue drains. **The coupling
   rule (stage A's deliverable, the anti-circularity hinge):** the
-  status tokens the convergence gate reads (`connected`,
-  `peer_disk == UpToDate`, "no active resync" — what
+  data-bearing status tokens the convergence gate reads
+  (`peer_disk == UpToDate`, "no active resync" — what
   `track_sync`/`replica_caught_up` observe) are **derived from the
   queue's block-apply state**, not set independently — a resource
   reads `UpToDate` only when the queue is fully drained, and
-  "resyncing" is true while content-copying is in flight. Post-barrier
+  "resyncing" is true while content-copying is in flight.
+  (`connected` remains the independent link-state knob — the
+  partition injection of §5.5.) Post-barrier
   drain is performed by the fake's content-copying resync (the system
   path, §2.4), never by the campaign; the campaign's queue control
   (`apply_peer_writes(minor, up_to)`) exists only to shape the
@@ -321,8 +323,9 @@ model):
   perform the actual cut. Stage A includes one small, behavior-neutral
   runtime change for this: the drive task is spawned into a **tracked
   registry** on the migration handle (the `JoinHandle` is recorded;
-  nothing else changes — graceful paths behave identically), so the
-  supervisor can abort it with the group. Without this, a mid-cut kill
+  completed handles are dropped when the drive finishes, so the
+  registry never grows; nothing else changes — graceful paths behave
+  identically), so the supervisor can abort it with the group. Without this, a mid-cut kill
   would leave a live drive task mutating witness and migration state
   after the "kill" — an interleaving a real `kill -9` cannot produce.
 - **in-flight request tasks**: axum handler tasks are not children of
@@ -569,7 +572,9 @@ The house per-stage adversarial review process applies:
   peer-apply queue with the gate-coupling rule), the boundary rules,
   the oracle library, the campaign rig (the complete task-group kill
   model of §3.3, including the behavior-neutral drive-task registry
-  change and the rig-side renewal loop), rows 1–3, the evidence
+  change and the rig-side renewal loop), rows 1–3 (row 3 implements
+  the armed-hook subset it needs — the full generated matrix is
+  stage B's), the evidence
   emitter + `REPORT.md` template.
 - **Stage B (PR: the kill matrix)**: §3 — the armed hooks (journal
   append, store-save, witness), the generated matrix, rows 4–7.
