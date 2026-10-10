@@ -115,8 +115,9 @@ MoveVolumeBackingOnline(volume_id, target_pool_id, expected_generation,
      FAILED | IN_DOUBT
 ```
 
-- Grow-only by default; backend may grow before the VMM/guest is notified. The provider must retry notification, not automatically shrink. Guest filesystem expansion is not implied.
+- Grow-only by default; backend may grow before the VMM/guest is notified. The provider must retry notification, not automatically shrink. Guest filesystem expansion is not implied. For an **attached** volume the notification is version-gated per [ADR-0006](../docs/adr/0006-online-resize-and-live-local-block-relocation.md): it is issued through the VMM's resize-disk API only on a pinned, startup-verified version (upstream PR #7948 for externally grown host block devices); when the version is not proven, the grow of an attached volume refuses typed rather than growing silently un-notified. The `guest_notification_status` field records the outcome — `notified`, `retry_required` (pending or failed notification; the retry rule above) or `not_applicable` (no frontend).
 - `MoveVolumeBackingOnline` does not change compute host or guest disk identity. Backends advertise `same_vg_extent_move` and `same_host_live_backing_move` separately, bound to actual LV layout/VMM/frontend/QSD qualification.
+- **P6 implementation scope (ADR-0006 first slice):** only `same_vg_extent_move` is implemented and advertised; `same_host_live_backing_move` is advertised nowhere until the QSD mirror/pivot acceptance suite passes. Any move outside the advertised, qualified capability scope — cross-VG, cross-pool, cross-class, or a capability the backend does not qualify — is refused typed with `MOVE_UNSUPPORTED_SCOPE` (fail-closed, never silent, never a generic `FAILED`).
 - Native LVM `pvmove` is restricted to supported physical extent migrations within the same VG, and should not be presented as arbitrary per-thin-LV cross-pool movement.
 - General online same-host move via QEMU Storage Daemon vhost-user-blk is an **experimental** capability until mirror, pivot, reattach/restart, writer fencing, guest flush/FUA, idempotency and in-doubt recovery pass fault injection.
 - Source deletion must only occur after the target pivot and persistent ownership reconciliation; an unknown result is not a safe reason to revert authority or delete either copy. Never report a generic `FAILED` after the pivot: the outcome is `IN_DOUBT` or rolls forward under reconciled authority, mirroring the cross-host handoff rules in section 5.
@@ -211,8 +212,8 @@ Common errors:
 `NO_SAFE_CAPACITY`, `THIN_METADATA_EXHAUSTED`, `FOREIGN_DEVICE_STATE`,
 `STALE_GENERATION`, `WRITER_ALREADY_ACTIVE`, `UNKNOWN_FENCING_AUTHORITY`,
 `REPLICA_NOT_DURABLE`, `MIGRATION_UNSUPPORTED_LOCAL_STORAGE`,
-`VMM_HANDOFF_UNSUPPORTED`, `OPERATION_IN_DOUBT`, `UNSAFE_DATA_LOSS`,
-`CEPH_CLUSTER_UNHEALTHY`.
+`MOVE_UNSUPPORTED_SCOPE`, `VMM_HANDOFF_UNSUPPORTED`, `OPERATION_IN_DOUBT`,
+`UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`.
 
 Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID.
 
