@@ -73,7 +73,12 @@ the readiness plan §6):
   task spins at its 5 s tick. Fail-closed, but a stall: the fix is a design
   change (re-resolvable peer acts, or a promote path that does not route
   through the failed grant op), restoring the honest "migration completes
-  under witness faults" claim;
+  under witness faults" claim — **delivered in PR #23 (P6-A part 3):
+  re-resolvable peer acts (the precise diagnosis is
+  `docs/plans/2026-10-10-grant-set-wedge-diagnosis.md`), with the row-7
+  wedge cells and row 8 re-derived to prove the convergence and the
+  campaign findings recording the fix; the recorded `IN_DOUBT`
+  stall-nuance question is resolved by the same delivery (see below)**;
 - the **renewal-deadline flake** (`an_unreachable_witness_defers_renewal_until_the_deadline`,
   `volvisor-drbd`): observed ~1-in-20 in earlier full-suite runs, 0/15 in
   isolation, not reproduced in the readiness review; the suspected root
@@ -87,7 +92,15 @@ the readiness plan §6):
 - the **`IN_DOUBT` stall-nuance question** and the **F1 barrier-time
   lineage re-check** (both recorded in the campaign report's findings
   section): triaged the same way — fixed or declined with a recorded
-  reason.
+  reason — **the F1 re-check shipped in PR #22 (P6-A part 2) and the
+  `IN_DOUBT` stall-nuance question is resolved by PR #23's wedge fix
+  (P6-A part 3): with a destination_authorized-shaped stall
+  self-resolvable by construction (the retry re-issues the failed peer
+  act and converges), the nearline §6 reading holds as written — the
+  canonical state plus a stall detail for resolvable stalls, `IN_DOUBT`
+  reserved for genuinely unresolvable ones (row 12b's shape); no
+  contract change is needed, and the campaign's findings record the
+  resolution**.
 
 **Test/evidence shape.** A fix lands with a test that fails on the old
 behavior (a reproduction for the flakes; a wedge-recovery scenario for the

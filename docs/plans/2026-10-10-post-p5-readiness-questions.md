@@ -82,7 +82,29 @@ evidence status stated honestly:
   a migration safely at `destination_authorized` forever while the retry
   task spins at its 5 s tick (fail-closed stall; remedy is a design change:
   re-resolvable peer acts, or a promote path that does not route through
-  the failed grant op);
+  the failed grant op) — **resolved in PR #23 (P6-A part 3): the remedy
+  taken is re-resolvable peer acts — a recorded failure of a re-issuable
+  peer act (the four internal peer routes: migration-derived operation
+  ids, a total landed-ness inspection, an idempotent re-execution at
+  every layer) is re-evaluated through that inspection instead of
+  replayed verbatim: proven landed → the proven outcome supersedes the
+  recorded failure; proven not landed → the act re-executes under its
+  idempotency discipline (the witness batch replays its recorded
+  outcome — never a second epoch); an inspection error surfaces typed
+  (the stale failure is never re-served as a terminal answer). The
+  strict routes (volume and mobility operations: consumer-supplied ids,
+  operator-judgment refusals) keep verbatim failure replay; genuinely
+  unresolvable failures (row 12b's stable typed promote refusal) still
+  park, through honest re-execution reproducing the refusal. The
+  campaign's row-7 wedge cells and row 8 now prove the convergence
+  (epoch exactly 2, the acknowledged prefix byte-exact through the
+  healed completion), restoring the honest "migration completes under
+  witness faults" claim; the same PR resolves the recorded `IN_DOUBT`
+  stall-nuance question in the contract's favor (a
+  destination_authorized-shaped stall is self-resolvable by
+  construction, so the canonical-state-plus-stall-detail reading holds
+  and `IN_DOUBT` stays reserved for genuinely unresolvable stalls) —
+  the diagnosis is `docs/plans/2026-10-10-grant-set-wedge-diagnosis.md`**;
 - the **renewal-deadline flake** in `volvisor-drbd`
   (`an_unreachable_witness_defers_renewal_until_the_deadline`): observed
   intermittently in earlier full-suite runs (roughly 1-in-20; 0/15 in
