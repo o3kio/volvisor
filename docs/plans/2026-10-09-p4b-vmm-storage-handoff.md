@@ -558,7 +558,7 @@ POST /v2/migrations/{migration_id}/transfer BarrierAndTransfer
   {vm_paused_and_io_drained_proof}
   -> 202 {state}                                    # long-running; proof recorded as corroboration
 GET  /v2/migrations/{migration_id}          ObserveHandoff
-  -> {state, state_history[], participants[], in_doubt_detail?}
+  -> {state, state_history[], participants[], in_doubt_detail?, cut_duration_secs?}
 POST /v2/migrations/{migration_id}/abort
   -> {state}                                        # typed refusal once the cut began
 ```

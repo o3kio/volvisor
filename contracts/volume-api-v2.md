@@ -175,6 +175,14 @@ POST /v2/migrations/{migration_id}/abort      200 {state}
   destination verifies cross-host readability at `PREPARED` and
   refuses typed otherwise — an unreadable snapshot dir fails the
   migration before any cut, never mid-cut.
+- **Destination socket ownership**: the destination daemon verifies
+  its VMM socket empty for the migrated VM id at `PREPARED` (a
+  squatted id is refused typed, before the source's cut). After a
+  successful preparation that socket is owned by the migration:
+  whatever VM appears on it before the restore is treated as the
+  migration's own half-restore and destroyed first (the re-drive
+  rule) — a VM id must not be reused on the destination while one of
+  its migrations is in flight.
 - `abort` is refused typed once the cut is entered (the write-ahead's
   durable point of no return); before that it rolls the preparation
   back in the fenced order the nearline contract prescribes.

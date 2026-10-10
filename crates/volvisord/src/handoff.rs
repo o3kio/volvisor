@@ -35,7 +35,7 @@
 //! | `quiesce_source` | `HandoffSurface::quiesce_for_barrier` |
 //! | `track_sync` | `HandoffSurface::track_sync`, bounded retry over the retryable `REPLICA_NOT_DURABLE` refusal |
 //! | `record_barrier` | witness `RecordBarrier` (the coordinator's deterministic op id, the inspected current epoch, the all-true attestation of the already-proven pause/suspension/sync chain) |
-//! | `void_barriers` | per recorded proof: witness `inspect` → **confirm by state**; void unvoided entries under the deterministic `void-barrier` op id |
+//! | `void_barriers` | per **participant**: witness log → void every unvoided barrier of this migration under the deterministic `void-barrier` op id → **re-inspect confirm** (a recorded proof the witness cannot present refuses typed; a proof-less participant with no barrier is the crash window's nothing-to-void) |
 //! | `unsuspend_source` | `HandoffSurface::abort_prepare` |
 //! | `resume_vm` | dual meaning by the observed local VM state (below) |
 //! | `demote_source` | `HandoffSurface::release_source` |
