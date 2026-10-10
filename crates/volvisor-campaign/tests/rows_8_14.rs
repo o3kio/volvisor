@@ -32,7 +32,6 @@
 #![allow(clippy::panic)] // row-dispatch assertions (see above)
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -41,7 +40,8 @@ use volvisor_api::crash::CrashPoint;
 use volvisor_api::op_kinds;
 use volvisor_campaign::evidence::{Evidence, LogSources, oracle_value};
 use volvisor_campaign::oracle::{
-    AckedWrite, ClockBudget, StopReason, WRITER_ID, WriterHandle, tag_block, verify_against,
+    AckedWrite, StopReason, WRITER_ID, WriterHandle, barrier_timestamp, boundary_skew, tag_block,
+    verify_against,
 };
 use volvisor_campaign::rig::{
     POLL_BOUND, POLL_STEP, Reply, Rig, admin, body_json, campaign_rig, campaign_rig_volumes,
@@ -107,13 +107,20 @@ fn emit_rig(rig: &Rig, evidence: Evidence) -> PathBuf {
 
 /// Emit a single-volume row's evidence record: the oracle section
 /// from the byte-level verdicts (the acknowledged prefix verified at
-/// `verified_side`, the honest tail and corruption counts).
+/// `verified_side`, the honest tail and corruption counts). The
+/// boundary cross-check (§2.3 rule 1) is computed HERE from the
+/// migration summary whenever the coordinator recorded a barrier
+/// (the comprehensive review's S6: every barrier-bearing row's
+/// oracle section carries the cross-check) — a summary without a
+/// `BARRIER_DURABLE` entry, or `None` for scenarios that drove no
+/// migration, records no barrier and no skew, honestly.
 fn emit_oracle(
     rig: &Rig,
     mut evidence: Evidence,
     acked: &[AckedWrite],
     boundary: Option<(u64, StopReason)>,
     verified_side: &str,
+    summary: Option<&serde_json::Value>,
 ) -> PathBuf {
     let verdict_source = verify_against(&rig.world_a, SEED_MINOR, acked, WRITER_ID);
     let verdict_peer = verify_against(&rig.world_b, SEED_MINOR, acked, WRITER_ID);
@@ -133,6 +140,8 @@ fn emit_oracle(
                 },
             )
         });
+    let barrier_at = summary.and_then(barrier_timestamp);
+    let skew = barrier_at.and_then(|at| boundary_skew(acked, at));
     evidence.oracle(oracle_value(
         acked.len() as u64,
         verified,
@@ -142,21 +151,24 @@ fn emit_oracle(
         boundary_seq,
         "data-path",
         &stop_reason,
-        None,
-        None,
+        barrier_at,
+        skew,
     ));
     emit_rig(rig, evidence)
 }
 
 /// Emit a multi-volume row's evidence record: one oracle value per
 /// participant (each writer's acknowledged prefix verified at
-/// `verified_side`).
+/// `verified_side`), each carrying the boundary cross-check against
+/// the migration's barrier when one was recorded (S6 — the barrier
+/// is per migration, the skew is per participant's journal).
 fn emit_oracle_n(
     rig: &Rig,
     mut evidence: Evidence,
     acked: &[Vec<AckedWrite>],
     boundary: Option<(u64, StopReason)>,
     verified_side: &str,
+    summary: Option<&serde_json::Value>,
 ) -> PathBuf {
     let (boundary_seq, stop_reason) =
         boundary.map_or((None, "nothing-acked".to_owned()), |(seq, reason)| {
@@ -169,6 +181,7 @@ fn emit_oracle_n(
                 },
             )
         });
+    let barrier_at = summary.and_then(barrier_timestamp);
     let mut values = Vec::with_capacity(acked.len());
     for (index, acked_i) in acked.iter().enumerate() {
         let minor = minor_of(index);
@@ -179,6 +192,7 @@ fn emit_oracle_n(
         } else {
             (verdict_source.present, verdict_peer.tail())
         };
+        let skew = barrier_at.and_then(|at| boundary_skew(acked_i, at));
         values.push(oracle_value(
             acked_i.len() as u64,
             verified,
@@ -188,8 +202,8 @@ fn emit_oracle_n(
             boundary_seq,
             "data-path",
             &stop_reason,
-            None,
-            None,
+            barrier_at,
+            skew,
         ));
     }
     evidence.oracle(json!(values));
@@ -219,7 +233,13 @@ fn assert_refusal(status: u16, body: &str, code: &str, context: &str) {
 /// steady-state transport — the cut-crossing rows' shape).
 async fn live_scenario(prefix: &str) -> (Rig, WriterHandle, volvisor_drbd_testkit::PeerTransport) {
     let rig = campaign_rig(&format!("vm-{prefix}"), &format!("vol-{prefix}")).await;
-    let writer = WriterHandle::start(&rig.world_a, &rig.vmm_a, &rig.vm, SEED_MINOR, &rig.clock);
+    let writer = WriterHandle::start(
+        &rig.world_a,
+        &rig.vmm_a,
+        &rig.vm,
+        SEED_MINOR,
+        &rig.stamp_clock,
+    );
     let transport = spawn_peer_transport(&rig.world_a, SEED_MINOR, TRANSPORT_LAG);
     tokio::time::sleep(WRITER_WARMUP).await;
     (rig, writer, transport)
@@ -228,9 +248,10 @@ async fn live_scenario(prefix: &str) -> (Rig, WriterHandle, volvisor_drbd_testki
 /// The multi-volume scenario opening (§9 row 12): one rig, `count`
 /// participants each with its own writer and transport link (the
 /// kit's links are per-minor; one wired VMM covers every device).
-/// The writers SHARE one clock-advance budget (the cap is per
-/// scenario — N writers each burning it would expire the lease as a
-/// rig artifact; see `CLOCK_ADVANCE_CAP`).
+/// The writers SHARE the rig's stamp clock (`fetch_add` hands every
+/// ack a unique tick — the journal is strictly monotonic across all
+/// participants; the lease clock is never touched, so N writers can
+/// never expire a lease as a rig artifact).
 async fn live_scenario_n(
     prefix: &str,
     count: usize,
@@ -242,16 +263,14 @@ async fn live_scenario_n(
     let volumes: Vec<String> = (0..count).map(|i| format!("vol-{prefix}-{i}")).collect();
     let refs: Vec<&str> = volumes.iter().map(String::as_str).collect();
     let rig = campaign_rig_volumes(&format!("vm-{prefix}"), &refs).await;
-    let budget: ClockBudget = Arc::new(AtomicU64::new(0));
     let writers = (0..count)
         .map(|i| {
-            WriterHandle::start_shared(
+            WriterHandle::start(
                 &rig.world_a,
                 &rig.vmm_a,
                 &rig.vm,
                 minor_of(i),
-                &rig.clock,
-                &budget,
+                &rig.stamp_clock,
             )
         })
         .collect();
@@ -485,7 +504,7 @@ async fn row_8_stale_source_write_after_fence() {
     await_kill(|| rig.witness.is_killed(), "witness grant_set commit").await;
     rig.witness.restart().await;
     rig.a.restart().await;
-    poll_migration(rig.a.addr, "mig-r8", "destination_authorized").await;
+    let summary = poll_migration(rig.a.addr, "mig-r8", "destination_authorized").await;
 
     // The writer stopped at the cut (the VM is Absent); the
     // acknowledged prefix is fixed.
@@ -628,7 +647,14 @@ async fn row_8_stale_source_write_after_fence() {
          rogue writes are confined to the fenced source's map, and no route resumes the source \
          without fenced reconciliation",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -806,7 +832,7 @@ async fn row_9_wrong_lineage_data_at_target() {
         "refused typed: the wrong-lineage target never entered a migration — the cut that would \
          have crossed foreign data never started",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "source");
+    let record = emit_oracle(&rig, evidence, &acked, boundary, "source", None);
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -971,7 +997,7 @@ async fn row_10_forged_barrier_proofs() {
         )
         .await
         .expect("the recording holder voids the foreign barrier");
-    poll_migration(rig.a.addr, "mig-r10", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-r10", "aborted").await;
 
     // The G5-aborted shape (the real barrier voided, the source
     // legitimately resumed) and the W1-W5 set.
@@ -1013,7 +1039,7 @@ async fn row_10_forged_barrier_proofs() {
          and never voided by another migration's abort; and the epoch-wide resume gate parked the \
          real migration's abort until the recording holder voided the foreign barrier",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "source");
+    let record = emit_oracle(&rig, evidence, &acked, boundary, "source", Some(&summary));
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1059,7 +1085,7 @@ async fn row_11_witness_journal_rollback() {
     prepare(&rig, "mig-r11").await;
     let (status, body) = transfer(&rig, "mig-r11").await;
     assert_eq!(status, 202, "the transfer spawns the drive: {body}");
-    poll_migration(rig.a.addr, "mig-r11", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r11", "complete").await;
     let (acked, boundary) = writer.join().await;
     let verdict = verify_against(&rig.world_b, SEED_MINOR, &acked, WRITER_ID);
     assert!(
@@ -1242,7 +1268,14 @@ async fn row_11_witness_journal_rollback() {
          over the stale view could mint a second epoch 2 for the source — the daemons' \
          fail-closed checks, not the witness's journal, are what keep the divergence safe",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1268,7 +1301,7 @@ async fn row_12a_multi_volume_cut_converges() {
     prepare(&rig, "mig-r12a").await;
     let (status, body) = transfer(&rig, "mig-r12a").await;
     assert_eq!(status, 202, "the transfer spawns the drive: {body}");
-    poll_migration(rig.a.addr, "mig-r12a", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12a", "complete").await;
 
     let g5 = assert_g5_complete_n(&rig, "mig-r12a").await;
     let mut w = Vec::new();
@@ -1301,7 +1334,14 @@ async fn row_12a_multi_volume_cut_converges() {
          the set-wide grant, the source destroyed once, every prefix byte-exact",
     );
     let boundary = joined[0].1.clone();
-    let record = emit_oracle_n(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle_n(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1349,7 +1389,7 @@ async fn row_12b_multi_volume_one_fails_promote_parks_exactly() {
     // the witness) but B's grant route failed at the second
     // participant's promote: the drive's fail-closed observation is
     // "source revoked; destination grant not yet authorized".
-    poll_migration(rig.a.addr, "mig-r12b", "in_doubt").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12b", "in_doubt").await;
 
     // The IN_DOUBT observation is mapped from SourceRevoked the
     // moment the REVOKE lands — which can precede the witness
@@ -1496,7 +1536,14 @@ async fn row_12b_multi_volume_one_fails_promote_parks_exactly() {
          the failure at its 5s tick); never weakened to make this row pass",
     );
     let boundary = joined[0].1.clone();
-    let record = emit_oracle_n(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle_n(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1560,7 +1607,7 @@ async fn row_12c_multi_volume_source_killed_mid_drive_recovers() {
         status, 202,
         "the re-issued transfer spawns the drive: {body}"
     );
-    poll_migration(rig.a.addr, "mig-r12c-reissue", "complete").await;
+    let reissued = poll_migration(rig.a.addr, "mig-r12c-reissue", "complete").await;
 
     let g5 = assert_g5_complete_n(&rig, "mig-r12c-reissue").await;
     let mut joined = Vec::new();
@@ -1588,7 +1635,14 @@ async fn row_12c_multi_volume_source_killed_mid_drive_recovers() {
          converged with every prefix byte-exact",
     );
     let boundary = joined[0].1.clone();
-    let record = emit_oracle_n(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle_n(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&reissued),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1633,7 +1687,7 @@ async fn row_12d_multi_volume_witness_restart_mid_drive_recovers() {
     rig.witness.stop().await;
     rig.witness.restart().await;
     set_partition(&rig, true);
-    poll_migration(rig.a.addr, "mig-r12d", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12d", "complete").await;
 
     let g5 = assert_g5_complete_n(&rig, "mig-r12d").await;
     let mut w = Vec::new();
@@ -1670,7 +1724,14 @@ async fn row_12d_multi_volume_witness_restart_mid_drive_recovers() {
          once the link healed, and the completion claim is byte-backed for every participant",
     );
     let boundary = joined[0].1.clone();
-    let record = emit_oracle_n(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle_n(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1736,7 +1797,7 @@ async fn row_12e_resync_under_foreground_never_claims_caught_up() {
     // dirty window, the gate passes over the drained state, and the
     // completion claim covers exactly the partition-period writes.
     set_partition(&rig, true);
-    poll_migration(rig.a.addr, "mig-r12e", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12e", "complete").await;
 
     let (acked, boundary) = writer.join().await;
     let verdict = verify_against(&rig.world_b, SEED_MINOR, &acked, WRITER_ID);
@@ -1772,7 +1833,14 @@ async fn row_12e_resync_under_foreground_never_claims_caught_up() {
         "pass: complete and byte-backed: the in-flight resync under foreground writes never produced a \
          caught-up claim, and the completion covered every acknowledged write",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1822,7 +1890,7 @@ async fn row_12f_source_vmm_death_mid_cut_rolls_back_safely() {
         status, 200,
         "the abort rolls the pre-cut record back: {body}"
     );
-    poll_migration(rig.a.addr, "mig-r12f", "aborted").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12f", "aborted").await;
 
     // The safety set: the barrier is voided (G5's no-unvoided rule),
     // the source never demoted (still Primary — the revoke never
@@ -1872,7 +1940,7 @@ async fn row_12f_source_vmm_death_mid_cut_rolls_back_safely() {
          RESIDUE: the volume's attachment to the destroyed VM is the reconcile path's cleanup — \
          out of this row's scope",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "source");
+    let record = emit_oracle(&rig, evidence, &acked, boundary, "source", Some(&summary));
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -1911,7 +1979,7 @@ async fn row_12g_kill_during_divergence_window_loses_nothing() {
     // The heal: the data plane drains the window regardless of the
     // control-plane death, and the drive converges.
     set_partition(&rig, true);
-    poll_migration(rig.a.addr, "mig-r12g", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r12g", "complete").await;
 
     let (acked, boundary) = writer.join().await;
     assert!(
@@ -1937,7 +2005,14 @@ async fn row_12g_kill_during_divergence_window_loses_nothing() {
         "pass: complete: the kill during the in-flight resync (the dirty-bitmap window) is survivable \
          by construction — the queued writes are the bitmap, and the heal delivered every one",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -2021,7 +2096,7 @@ async fn row_13_replication_partition_mid_migration() {
     // The heal: the same drive converges, and the completion's tail
     // claim covers exactly the partition-period writes.
     set_partition(&rig, true);
-    poll_migration(rig.a.addr, "mig-r13", "complete").await;
+    let summary = poll_migration(rig.a.addr, "mig-r13", "complete").await;
 
     let (acked, boundary) = writer.join().await;
     let verdict = verify_against(&rig.world_b, SEED_MINOR, &acked, WRITER_ID);
@@ -2060,7 +2135,14 @@ async fn row_13_replication_partition_mid_migration() {
          foreground never stopped acknowledging, and the completion is byte-backed over the \
          healed link",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "destination");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "destination",
+        Some(&summary),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
@@ -2114,6 +2196,11 @@ async fn row_14_abort_storm() {
         .len();
 
     let storm_start = Instant::now();
+    // The LAST cycle's terminal summary (the cross-check's source —
+    // S6): each cycle aborts pre-cut, so no barrier exists and the
+    // emitted section honestly records none; the summary is carried
+    // anyway so a future mid-cut fault shape cross-checks for free.
+    let mut last_summary: Option<serde_json::Value> = None;
     for cycle in 0..STORM_CYCLES {
         let mig = format!("mig-storm-{cycle}");
 
@@ -2208,7 +2295,7 @@ async fn row_14_abort_storm() {
                 assert_eq!(status, 200, "cycle {cycle}: the abort: {body}");
             }
         }
-        poll_migration(rig.a.addr, &mig, "aborted").await;
+        last_summary = Some(poll_migration(rig.a.addr, &mig, "aborted").await);
 
         // The cheap per-cycle residue checks: the source is serving
         // (VM Running, resource Primary) and the witness is exactly
@@ -2298,6 +2385,13 @@ async fn row_14_abort_storm() {
          recovery paths (consumer abort, startup rollback, witness replay and roll-forward) \
          are idempotent under rotation",
     );
-    let record = emit_oracle(&rig, evidence, &acked, boundary, "source");
+    let record = emit_oracle(
+        &rig,
+        evidence,
+        &acked,
+        boundary,
+        "source",
+        last_summary.as_ref(),
+    );
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }

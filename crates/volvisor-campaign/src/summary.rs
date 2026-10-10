@@ -509,6 +509,25 @@ const TYPED_MARKERS: [&str; 4] = ["refus", "UNSAFE", "IN_DOUBT", "pass"];
 /// computed from the records alone (§6's reproducibility); a gate
 /// that cannot be verified from what is present reads `incomplete`
 /// with the exact gap named, never a pass by absence.
+///
+/// # What the gates certify (the comprehensive review's U6, stated
+/// honestly)
+///
+/// CG2 and CG3 are record-SHAPE gates: they verify that every
+/// expected record EXISTS, carries the canonical non-null fields
+/// (the oracle sections with their byte-verdict counts and
+/// cross-checks, the kill-matrix cells with their invariant sets),
+/// that the stated budgets adhere and that no recorded verdict
+/// contradicts the discipline (a negative boundary skew, an
+/// unmarked injection outcome). They do NOT re-run the scenarios or
+/// re-verify the bytes: the behavioral verification lives in the
+/// tests that EMIT the records (the scenario rows' own assertions);
+/// the gates certify the evidence bundle's coherence — that what
+/// the campaign claims to have proven is all present, well-formed
+/// and honest in shape. A record whose fields lie (a hand-tuned
+/// count, a fabricated verdict) is beyond the gates' letter; the
+/// defense there is the record's provenance (one commit, the
+/// rendering pipeline) and the tests themselves.
 #[must_use]
 pub fn completion_gates(records: &[Value]) -> Vec<GateStatus> {
     vec![
@@ -543,15 +562,60 @@ fn cg1_class_coverage(records: &[Value]) -> GateStatus {
             missing.push(format!("tier-r/{} (no gate record)", scenario.name));
         }
     }
+    // The single-commit certification (the comprehensive review's
+    // U3): the gates certify ONE campaign at ONE commit. The `--all`
+    // merge is latest-wins per scenario (a feature — a partial
+    // re-run heals an older tree), but a WINNING set that still
+    // mixes commits is a frankenstein: a scenario the newest run
+    // does not re-emit survives from an older commit, and no gate
+    // can honestly certify over records from different revisions.
+    // A mixed-commit tree reads INCOMPLETE here, with the distinct
+    // commits named — the merge itself stays, only the
+    // certification tightens.
+    let mut commits: Vec<&str> = records
+        .iter()
+        .map(|record| record["commit"].as_str().unwrap_or("unknown"))
+        .collect();
+    commits.sort_unstable();
+    commits.dedup();
+    if commits.len() > 1 {
+        missing.push(format!(
+            "the winning records mix {} commits ({}) — the certification covers one \
+             campaign at one commit; re-run the full suite at a single revision and \
+             certify with --all",
+            commits.len(),
+            commits.join(", ")
+        ));
+    }
+    // The unknown-commit guard (the comprehensive substrate round-2
+    // R2-1): an unreadable commit cannot certify a single revision.
+    // `git_commit()` resolves the loose ref and packed-refs; when
+    // even that fails, "all at one commit (unknown)" would be a
+    // tautology — a tree mixing two unverifiable revisions would
+    // pass the exact clause that exists to catch it. The honest
+    // gate is INCOMPLETE: the certification must NAME the revision
+    // it covers.
+    if commits.len() == 1 && commits[0] == "unknown" {
+        missing.push(
+            "every winning record's commit is unknown (the git ref was unreadable — \
+             packed beyond the resolver, or absent) — the certification cannot name \
+             the revision it covers; re-run from a checkout whose HEAD resolves"
+                .to_owned(),
+        );
+    }
     GateStatus {
         gate: "CG1",
         complete: missing.is_empty(),
         detail: if missing.is_empty() {
             format!(
                 "every §9 Tier S row (1-15) has its records and every Tier R-only class \
-                 carries its gate record ({} skipped records); the §9 mapping is realized \
-                 in the coverage matrix",
-                tier_r::SCENARIOS.len()
+                 carries its gate record ({} skipped records), all at one commit ({}); \
+                 the §9 mapping is realized in the coverage matrix",
+                tier_r::SCENARIOS.len(),
+                records
+                    .first()
+                    .and_then(|record| record["commit"].as_str())
+                    .unwrap_or("unknown")
             )
         } else {
             format!(
@@ -627,6 +691,50 @@ fn cg2_oracle_verdicts(records: &[Value]) -> GateStatus {
     if !cross_checked {
         problems.push("no record carries the barrier/boundary cross-check".to_owned());
     }
+    // S6 (the comprehensive review): a section that records a
+    // barrier over acknowledged writes MUST also carry the
+    // cross-check — a barrier without its skew is a gap, never a
+    // pass. Sections with no acknowledged writes are exempt (there
+    // is nothing to cross-check against).
+    let un_cross_checked: Vec<String> = sections
+        .iter()
+        .filter(|(_, oracle)| {
+            !oracle["barrier_durable_at"].is_null()
+                && oracle["acknowledged"].as_u64().unwrap_or(0) > 0
+                && oracle["boundary_skew_ticks"].is_null()
+        })
+        .map(|(scenario, _)| scenario.clone())
+        .collect();
+    if !un_cross_checked.is_empty() {
+        problems.push(format!(
+            "records carry a barrier over acknowledged writes without the boundary \
+             cross-check: {}",
+            un_cross_checked.join(", ")
+        ));
+    }
+    // S1 (the comprehensive review): the cross-check must be LIVE,
+    // not a recorded tautology — a NEGATIVE skew (a barrier stamped
+    // before the last acknowledged write it should have covered) is
+    // the §2.3 rule-1 violation, and it fails the gate wherever it
+    // appears. Under the old frozen-clock design every past-cap
+    // record read a mechanical 0 and this clause could never fire;
+    // with the monotonic stamp clock it is checkable per record.
+    let negative_skew: Vec<String> = sections
+        .iter()
+        .filter(|(_, oracle)| {
+            oracle["boundary_skew_ticks"]
+                .as_i64()
+                .is_some_and(|skew| skew < 0)
+        })
+        .map(|(scenario, _)| scenario.clone())
+        .collect();
+    if !negative_skew.is_empty() {
+        problems.push(format!(
+            "records carry a barrier stamped BEFORE the last acknowledged write it should \
+             have covered (negative boundary skew): {}",
+            negative_skew.join(", ")
+        ));
+    }
     GateStatus {
         gate: "CG2",
         complete: problems.is_empty(),
@@ -634,7 +742,7 @@ fn cg2_oracle_verdicts(records: &[Value]) -> GateStatus {
             format!(
                 "{} oracle sections across {} records: the complete-migration prefix is \
                  byte-verified, aborts quantify their tails, every boundary is data-path \
-                 derived and the barrier cross-check is present",
+                 derived and every barrier-bearing section carries its cross-check",
                 sections.len(),
                 oracle_records.len()
             )
@@ -762,21 +870,175 @@ fn cg4_injection_outcomes(records: &[Value]) -> GateStatus {
     }
 }
 
+/// The forbidden claim phrases (CG5, the comprehensive review's
+/// U1): plan §11's letter forbids claiming "production support
+/// **or real-host durability**" from Tier S evidence, so the scan
+/// matches this vocabulary, case-insensitively. Scoped to TIER S
+/// records: a Tier R record legitimately discusses real hosts —
+/// that is its job, stating the gate that was NOT run (and its
+/// outcome vocabulary is separately gated; see
+/// [`cg5_claim_discipline`]'s Tier R clause below and the Tier R
+/// outcome gate).
+const CLAIM_PHRASES: [&str; 5] = [
+    "production support",
+    "real-host",
+    "real drbd",
+    "real vmm",
+    "proven on hardware",
+];
+
+/// The Tier R claim vocabulary (the comprehensive surface round-2
+/// N1): a gate statement never needs to claim PRODUCTION SUPPORT —
+/// its whole job is to state what was NOT run — so that one phrase
+/// stays forbidden in Tier R records too, while the real-host
+/// phrases are Tier R's legitimate vocabulary (its scenario names
+/// literally carry them).
+const TIER_R_CLAIM_PHRASES: [&str; 1] = ["production support"];
+
+/// The negations that can open a DISCLAIMER (the comprehensive
+/// surface round-2 N3): a Tier S record stating the discipline ("no
+/// real-host claim is made") upholds the very rule this gate
+/// enforces — the scan must not fail it.
+const DISCLAIMING_PREFIXES: [&str; 5] = ["no ", "not ", "never ", "n't ", "nor "];
+
+/// The claim-ACT words that complete a disclaimer (round-3 R3-1):
+/// a negation before a NOUN-phrase claim ("production support",
+/// "real-host", …) disclaims only when the phrase is the object
+/// being disclaimed — "no real-host CLAIM is made". The negation +
+/// "no <phrase> GAP remains" shape is a claim wearing a negation
+/// (it asserts the property was verified), so the words that may
+/// follow a disclaimed noun phrase name the claim act itself.
+/// ("proven on hardware" — a verb phrase — is its own claim act:
+/// see [`carries_claim`].)
+const DISCLAIMING_ACTS: [&str; 6] = [
+    "claim", "claimed", "is made", "implied", "asserted", "inferred",
+];
+
+/// How far after a noun-phrase occurrence the completing claim act
+/// may sit ("no real-host OR PRODUCTION-SUPPORT claim is made" —
+/// the act lands past the second phrase).
+const DISCLAIMING_WINDOW: usize = 48;
+
+/// Does `text` carry `phrase` as a CLAIM? Every occurrence is
+/// examined: the first may be a disclaimer ("no real-host claim…")
+/// while a later one is the claim itself, so the scan walks all
+/// matches. An occurrence is the DISCLAIMER shape only when a
+/// negation immediately precedes the phrase AND the phrase is
+/// disclaimed as an act — either the phrase is itself the claim act
+/// (the "proven on hardware" verb phrase: negating it disclaims),
+/// or a claim-act word follows a noun phrase within the window.
+/// The boundary is deliberately fail-safe: any other negated shape
+/// (including honest wordings like "no real drbd involved") reads
+/// as a claim and fails the gate — a human then rewords the record;
+/// the discipline sentence lives in the report header by design,
+/// never inside a record.
+fn carries_claim(text: &str, phrase: &str) -> bool {
+    // The verb-phrase claim: its own act, so a negation before it
+    // disclaims unconditionally ("never proven on hardware").
+    let self_acting = phrase == "proven on hardware";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(phrase) {
+        let at = from + found;
+        let head = &text[..at];
+        let tail = &text[at + phrase.len()..];
+        let negated = DISCLAIMING_PREFIXES
+            .iter()
+            .any(|negation| head.ends_with(negation));
+        if !negated {
+            return true;
+        }
+        // A negated occurrence disclaims only as an act: the verb
+        // phrase is its own; a noun phrase needs the act named
+        // after it ("no real-host claim is made"). A negated noun
+        // phrase without an act — "no production support gap
+        // remains" — is the claim frame wearing a negation.
+        let window: String = tail.chars().take(DISCLAIMING_WINDOW).collect();
+        let act_completes = self_acting || DISCLAIMING_ACTS.iter().any(|act| window.contains(act));
+        if !act_completes {
+            return true;
+        }
+        from = at + phrase.len();
+    }
+    false
+}
+
 /// CG5: the claim discipline holds everywhere — no record claims
-/// production support (the discipline sentence lives in the report
-/// header, never in a record), and the open hardware gate is
-/// stated, not silent (every Tier R scenario carries its record).
+/// production support OR real-host durability from Tier S evidence
+/// (the discipline sentence lives in the report header, never in a
+/// record), and the open hardware gate is stated, not silent (every
+/// Tier R scenario carries its record).
+///
+/// The claim vocabulary (the comprehensive review's U1): the plan's
+/// §11 letter forbids claiming "production support **or real-host
+/// durability**" — the scan matches a small vocabulary of such
+/// phrases, case-insensitively, over the WHOLE serialized record
+/// (outcome, reason, invariants, scenario name — wherever a claim
+/// could hide), with PER-TIER vocabularies (round-2 N1): Tier S
+/// records are scanned for the full set; Tier R records for
+/// `production support` only (a gate statement never needs that
+/// phrase, while "real-host" is its legitimate vocabulary). A
+/// record with NO tier field is scanned as Tier S (round-2 N2): the
+/// write seams always emit `tier`, so a missing field is a
+/// hand-authored shape, and an unmarked record claiming support
+/// must not slip the scan. A phrase occurrence preceded by a
+/// negation reads as the disclaimer shape and is not a claim
+/// (round-2 N3). Tier R's outcome vocabulary is gated separately in
+/// this same gate — an outcome outside {skipped, blocked} is a loud
+/// failure. The vocabulary is deliberately explicit: adding a
+/// phrase is a conscious gate decision, never an accident.
 fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
     let mut problems: Vec<String> = Vec::new();
     for record in records {
-        let text = serde_json::to_string(record).unwrap_or_default();
-        if text.to_lowercase().contains("production support") {
+        // A missing tier field scans as Tier S (round-2 N2): the
+        // write seams always emit it, so its absence is a
+        // hand-authored record — the stricter reading, not a bypass.
+        // A Tier R record naming the real-host gate is the
+        // discipline WORKING, not violating it — hence the per-tier
+        // vocabulary (round-2 N1).
+        let tier = record["tier"].as_str().unwrap_or("S");
+        let vocabulary: &[&str] = if tier == "S" {
+            &CLAIM_PHRASES
+        } else {
+            &TIER_R_CLAIM_PHRASES
+        };
+        let text = serde_json::to_string(record)
+            .unwrap_or_default()
+            .to_lowercase();
+        let claim = vocabulary
+            .iter()
+            .find(|phrase| carries_claim(&text, phrase));
+        if let Some(claim) = claim {
             let scenario = record["scenario"].as_str().unwrap_or("?");
             problems.push(format!(
-                "record {scenario} mentions production support (the claim discipline \
-                 lives in the report header, never in a record)"
+                "record {scenario} carries a forbidden claim phrase ({claim:?}: the claim \
+                 discipline lives in the report header, never in a record)"
             ));
         }
+    }
+    // The Tier R outcome vocabulary (the comprehensive review's U2,
+    // gate side): a Tier R record is a gate statement — skipped or
+    // blocked, never a pass. A hand-authored "pass" record fails
+    // the gate loudly instead of rendering as a matrix pass.
+    let claimed: Vec<String> = records
+        .iter()
+        .filter(|record| {
+            record["tier"].as_str() == Some("R")
+                && !matches!(
+                    record["outcome"]
+                        .as_str()
+                        .map(str::to_ascii_lowercase)
+                        .as_deref(),
+                    Some("skipped" | "blocked")
+                )
+        })
+        .map(|record| record["scenario"].as_str().unwrap_or("?").to_owned())
+        .collect();
+    if !claimed.is_empty() {
+        problems.push(format!(
+            "Tier R records claim an outcome outside the gate vocabulary \
+             (skipped/blocked) — a Tier R record is a gate statement, never a pass: {}",
+            claimed.join(", ")
+        ));
     }
     let ungated: Vec<String> = tier_r::SCENARIOS
         .iter()
@@ -794,8 +1056,9 @@ fn cg5_claim_discipline(records: &[Value]) -> GateStatus {
         complete: problems.is_empty(),
         detail: if problems.is_empty() {
             format!(
-                "no record claims production support and every Tier R scenario states its \
-                 gate ({} records); the report header carries the discipline verbatim and \
+                "no record claims production support or real-host durability from Tier S \
+                 evidence, every Tier R scenario states its gate as a gate statement \
+                 ({} records); the report header carries the discipline verbatim and \
                  the not-delivered §10 rows are enumerated in the nearline §10 note",
                 tier_r::SCENARIOS.len()
             )
@@ -909,10 +1172,16 @@ pub fn build_campaign_report(dirs: &[PathBuf]) -> String {
 /// so instead of silently showing one kernel).
 fn render_provenance(report: &mut String, campaign: &Campaign) {
     let records = &campaign.records;
-    let mut commits: Vec<&str> = campaign
-        .runs
+    // The Commit cell comes from the WINNING RECORDS, not the run
+    // directories (round-2 N5): the `--all` merge is latest-wins, so
+    // superseded run dirs can carry other commits while the
+    // certified winning set is uniform — the header must agree with
+    // CG1's single-commit clause, not visibly contradict it. The
+    // full run-directory provenance stays in the "Runs" cell below,
+    // where a stale dir is named as what it is.
+    let mut commits: Vec<&str> = records
         .iter()
-        .map(|run| run.commit.as_str())
+        .map(|record| record["commit"].as_str().unwrap_or("unknown"))
         .collect();
     commits.sort_unstable();
     commits.dedup();
@@ -956,7 +1225,18 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
         campaign
             .runs
             .iter()
-            .map(|run| format!("`{}`", run.name))
+            .map(|run| {
+                // A run whose commit is not in the certified winning
+                // set is named as the stale dir it is (round-2 N5:
+                // the header must agree with CG1, and the run
+                // provenance stays visible here, never averaged
+                // away).
+                if commits.contains(&run.commit.as_str()) {
+                    format!("`{}`", run.name)
+                } else {
+                    format!("`{}` (stale: `{}`)", run.name, run.commit)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", "),
         commit_cell,
@@ -1092,6 +1372,12 @@ fn render_gates(report: &mut String, records: &[Value]) {
             gate.detail,
         );
     }
+    line!(
+        report,
+        "CG2/CG3 are record-shape gates: they verify every expected record exists with \
+         its canonical fields, budgets and markers — the behavioral verification lives \
+         in the scenario tests that emit the records, not in this summary"
+    );
 }
 
 /// Render one run directory's final-form report and write it to
@@ -1173,6 +1459,230 @@ mod tests {
         assert!(cg5.detail.contains("planted/claim"));
     }
 
+    /// CG5's vocabulary (the comprehensive review's U1): the plan
+    /// §11 letter forbids claiming "production support **or
+    /// real-host durability**" — EVERY phrase in the vocabulary
+    /// fails the gate when planted in a Tier S record, and a Tier R
+    /// record naming real hosts is exempt (that is the discipline
+    /// working, not violating).
+    #[test]
+    fn cg5_flags_every_claim_phrase_and_exempts_tier_r() {
+        let claims = [
+            "pass: production support",
+            "pass: real-host durability proven",
+            "pass: verified on real drbd media",
+            "pass: verified on a real vmm",
+            "pass: proven on hardware",
+        ];
+        for claim in claims {
+            let planted = json!({
+                "scenario": "planted/vocabulary",
+                "tier": "S",
+                "outcome": claim,
+            });
+            let gates = completion_gates(&[planted]);
+            assert!(
+                !gates[4].complete,
+                "the planted claim {claim:?} must fail CG5: {}",
+                gates[4].detail
+            );
+            assert!(
+                gates[4].detail.contains("forbidden claim phrase"),
+                "the failure is the claim phrase, not the absent rows: {}",
+                gates[4].detail
+            );
+        }
+
+        // The Tier R exemption: a gate record naming real hosts (the
+        // scenario names and skip reasons do, by design) is not a
+        // claim — only its OUTCOME vocabulary is gated (see the U2
+        // test below).
+        let honest = json!({
+            "scenario": "tier-r/same-families-on-real-hosts",
+            "tier": "R",
+            "outcome": "skipped",
+            "reason": "no real DRBD/CH hardware in this environment",
+        });
+        let gates = completion_gates(&[honest]);
+        assert!(
+            !gates[4].detail.contains("forbidden claim phrase"),
+            "the Tier R gate statement is exempt from the phrase scan: {}",
+            gates[4].detail
+        );
+    }
+
+    /// CG5's Tier R outcome vocabulary (the comprehensive review's
+    /// U2, gate side): a Tier R record is a gate statement — an
+    /// outcome outside {skipped, blocked} (a hand-authored "pass"
+    /// over the full matrix, for example) fails the gate loudly
+    /// instead of rendering as a matrix pass.
+    #[test]
+    fn cg5_fails_a_tier_r_record_that_claims_a_pass() {
+        let fabricated = json!({
+            "scenario": "tier-r/same-families-on-real-hosts",
+            "tier": "R",
+            "outcome": "pass: full §9 matrix against real DRBD 9",
+            "reason": "claimed",
+            "would_run": "the full §9 matrix",
+        });
+        let gates = completion_gates(&[fabricated]);
+        assert!(
+            !gates[4].complete,
+            "the fabricated Tier R pass must fail CG5: {}",
+            gates[4].detail
+        );
+        assert!(
+            gates[4].detail.contains("outside the gate vocabulary"),
+            "the failure is the outcome vocabulary: {}",
+            gates[4].detail
+        );
+
+        // The honest vocabulary passes the clause (blocked, like
+        // skipped, is a gate statement).
+        let blocked = json!({
+            "scenario": "tier-r/same-families-on-real-hosts",
+            "tier": "R",
+            "outcome": "blocked",
+            "reason": "the host cannot run DRBD 9",
+        });
+        let gates = completion_gates(&[blocked]);
+        assert!(
+            !gates[4].detail.contains("outside the gate vocabulary"),
+            "blocked is a gate statement: {}",
+            gates[4].detail
+        );
+    }
+
+    /// The per-tier vocabulary (round-2 N1): a Tier R record's FREE
+    /// TEXT is not exempt from the one phrase a gate statement
+    /// never needs — "production support" in a Tier R reason fails
+    /// the gate exactly as it would in a Tier S outcome, while the
+    /// real-host phrases remain Tier R's legitimate vocabulary.
+    #[test]
+    fn cg5_flags_a_tier_r_record_claiming_production_support() {
+        let claiming = json!({
+            "scenario": "tier-r/same-families-on-real-hosts",
+            "tier": "R",
+            "outcome": "skipped",
+            "reason": "production support is proven on real hardware",
+        });
+        let gates = completion_gates(&[claiming]);
+        assert!(
+            !gates[4].complete,
+            "a Tier R reason claiming production support must fail CG5: {}",
+            gates[4].detail
+        );
+        assert!(
+            gates[4].detail.contains("forbidden claim phrase"),
+            "the failure is the claim phrase, not the outcome vocabulary: {}",
+            gates[4].detail
+        );
+    }
+
+    /// The missing-tier reading (round-2 N2): a record with NO tier
+    /// field is scanned as Tier S — the write seams always emit
+    /// `tier`, so its absence is a hand-authored shape, and an
+    /// unmarked record claiming support must not slip the scan.
+    #[test]
+    fn cg5_scans_an_unmarked_record_as_tier_s() {
+        let unmarked = json!({
+            "scenario": "planted/unmarked",
+            "outcome": "pass: production support proven",
+        });
+        let gates = completion_gates(&[unmarked]);
+        assert!(
+            !gates[4].complete,
+            "the unmarked claiming record must fail CG5: {}",
+            gates[4].detail
+        );
+        assert!(
+            gates[4].detail.contains("planted/unmarked"),
+            "the failure names the record: {}",
+            gates[4].detail
+        );
+    }
+
+    /// The disclaimer shape (round-2 N3): a record STATING the
+    /// discipline ("no real-host claim is made") upholds the rule
+    /// and must not fail the gate that enforces it — the negation
+    /// immediately before the phrase reads as the disclaimer, while
+    /// the same phrase un-negated elsewhere in the record is still
+    /// a claim.
+    #[test]
+    fn a_disclaimed_phrase_is_not_a_claim() {
+        // The pure disclaimer: the phrase appears only negated.
+        let disciplined = json!({
+            "scenario": "planted/disciplined",
+            "tier": "S",
+            "outcome": "pass: the prefix is intact",
+            "invariants": ["no real-host or production-support claim is made"],
+        });
+        let gates = completion_gates(&[disciplined]);
+        assert!(
+            !gates[4].detail.contains("forbidden claim phrase"),
+            "the disclaimer must not read as a claim: {}",
+            gates[4].detail
+        );
+
+        // The disclaimer AND the claim: the first occurrence is
+        // negated, a later one is not — the claim is caught
+        // (every occurrence is examined, not just the first).
+        let sneaky = json!({
+            "scenario": "planted/sneaky",
+            "tier": "S",
+            "outcome": "pass: the prefix is intact",
+            "invariants": [
+                "no real-host claim is made",
+                "real-host durability was verified"
+            ],
+        });
+        let gates = completion_gates(&[sneaky]);
+        assert!(
+            !gates[4].complete,
+            "the un-negated second occurrence is a claim: {}",
+            gates[4].detail
+        );
+    }
+
+    /// `carries_claim` walks every occurrence (the unit behind the
+    /// disclaimer test above): a first disclaimed match does not
+    /// hide a later real one, the negation must be IMMEDIATELY
+    /// before the phrase, and — round-3 R3-1 — a negation only
+    /// disclaims an ACT: "no <phrase> gap remains" is the claim
+    /// frame wearing a negation, not a disclaimer.
+    #[test]
+    fn carries_claim_walks_every_occurrence() {
+        assert!(!carries_claim("no real-host claim is made", "real-host"));
+        assert!(!carries_claim(
+            "no real-host or production-support claim is made",
+            "real-host"
+        ));
+        assert!(carries_claim(
+            "no real-host claim is made, but real-host durability was proven",
+            "real-host"
+        ));
+        assert!(carries_claim("not now: real-host durability", "real-host"));
+        assert!(!carries_claim(
+            "never proven on hardware",
+            "proven on hardware"
+        ));
+        assert!(carries_claim("proven on hardware", "proven on hardware"));
+        // R3-1's demonstrated shape: the negation asserts the
+        // property HOLDS — a claim, never a disclaimer.
+        assert!(carries_claim(
+            "no production support gap remains",
+            "production support"
+        ));
+        assert!(carries_claim(
+            "pass: no production support gap remains, no real-host gap remains",
+            "real-host"
+        ));
+        // The fail-safe boundary, documented on carries_claim: an
+        // honest wording without the claim act still reads as a
+        // claim — the record is reworded, the gate is never quiet.
+        assert!(carries_claim("no real drbd involved", "real drbd"));
+    }
+
     /// A record-free view is honestly incomplete, never a pass by
     /// absence: CG1 names the gap, CG3 names the cells.
     #[test]
@@ -1224,6 +1734,161 @@ mod tests {
                 .contains("2 oracle sections across 1 records"),
             "the flattened section count appears in the detail: {}",
             gates[1].detail
+        );
+    }
+
+    /// CG2's S6 clause: a section that records a barrier over
+    /// acknowledged writes MUST also carry the cross-check — a
+    /// barrier without its skew is a gap, never a pass (the
+    /// comprehensive review: rows 8-14 and the kill cells hardcoded
+    /// `skew: None` and the gate could not see the omission).
+    #[test]
+    fn cg2_fails_a_barrier_without_its_cross_check() {
+        let gapped = json!({
+            "scenario": "row-12/multi-volume-cut/converges",
+            "tier": "S",
+            "oracle": {
+                "acknowledged": 27, "verified": 27, "corrupted": 0, "tail": 0,
+                "boundary_source": "data-path",
+                "barrier_durable_at": 1010,
+                "boundary_skew_ticks": null
+            },
+        });
+        let gates = completion_gates(&[gapped]);
+        assert!(!gates[1].complete, "the barrier without a skew fails CG2");
+        assert!(
+            gates[1]
+                .detail
+                .contains("barrier over acknowledged writes without the boundary cross-check"),
+            "the failure is the gap, not the absent rows: {}",
+            gates[1].detail
+        );
+
+        // The exempt shape: a section with NO acknowledged writes has
+        // nothing to cross-check against — the barrier alone is not a
+        // gap.
+        let empty_journal = json!({
+            "scenario": "row-12/multi-volume-cut/converges",
+            "tier": "S",
+            "oracle": {
+                "acknowledged": 0, "verified": 0, "corrupted": 0, "tail": 0,
+                "boundary_source": "data-path",
+                "barrier_durable_at": 1010,
+                "boundary_skew_ticks": null
+            },
+        });
+        let gates = completion_gates(&[empty_journal]);
+        assert!(
+            !gates[1].detail.contains("without the boundary cross-check"),
+            "the empty journal is exempt: {}",
+            gates[1].detail
+        );
+    }
+
+    /// CG2's S1 clause: the cross-check must be LIVE, not a recorded
+    /// tautology — a NEGATIVE skew (a barrier stamped before the
+    /// last acknowledged write it should have covered) is the §2.3
+    /// rule-1 violation and fails the gate. Under the old
+    /// frozen-clock design every past-cap record read a mechanical 0
+    /// and this clause could never fire.
+    #[test]
+    fn cg2_fails_a_negative_boundary_skew() {
+        let early_barrier = json!({
+            "scenario": "row-1/happy-path-cut",
+            "tier": "S",
+            "oracle": {
+                "acknowledged": 10, "verified": 10, "corrupted": 0, "tail": 0,
+                "boundary_source": "data-path",
+                "barrier_durable_at": 1005,
+                "boundary_skew_ticks": -5
+            },
+        });
+        let gates = completion_gates(&[early_barrier]);
+        assert!(!gates[1].complete, "the negative skew fails CG2");
+        assert!(
+            gates[1].detail.contains("(negative boundary skew)"),
+            "the failure names the rule-1 violation: {}",
+            gates[1].detail
+        );
+    }
+
+    /// CG1's single-commit certification (the comprehensive review's
+    /// U3): the `--all` merge is latest-wins per scenario (a
+    /// feature), but the GATES must refuse to certify a winning set
+    /// that mixes commits — a scenario the newest run does not
+    /// re-emit survives from an older revision, and no gate can
+    /// honestly certify over that frankenstein. Mixed commits read
+    /// INCOMPLETE with the commits named.
+    #[test]
+    fn cg1_fails_a_mixed_commit_winning_set() {
+        // Two records, two commits: the older one survives the
+        // latest-wins merge because the newer run does not re-emit
+        // its scenario — exactly the frankenstein shape.
+        let older = json!({
+            "scenario": "row-2/abort-shaped-lag",
+            "tier": "S",
+            "commit": "1402a80the-older-revision",
+            "outcome": "aborted: the tail is reported",
+        });
+        let newer = json!({
+            "scenario": "row-1/happy-path-cut",
+            "tier": "S",
+            "commit": "a99390athe-newer-revision",
+            "outcome": "complete: the prefix is intact",
+        });
+        let gates = completion_gates(&[older, newer.clone()]);
+        assert!(
+            !gates[0].complete,
+            "the mixed-commit set must fail CG1: {}",
+            gates[0].detail
+        );
+        assert!(
+            gates[0].detail.contains("mix 2 commits"),
+            "the failure names the mixed commits: {}",
+            gates[0].detail
+        );
+
+        // The same records at ONE commit pass the clause (the gate
+        // may still be incomplete over the other rows' absence —
+        // never over the commit coherence).
+        let same = json!({
+            "scenario": "row-2/abort-shaped-lag",
+            "tier": "S",
+            "commit": "a99390athe-newer-revision",
+            "outcome": "aborted: the tail is reported",
+        });
+        let gates = completion_gates(&[same, newer]);
+        assert!(
+            !gates[0].detail.contains("mix"),
+            "one commit is coherent: {}",
+            gates[0].detail
+        );
+    }
+
+    /// The unknown-commit guard (the comprehensive substrate
+    /// round-2 R2-1): a winning set whose every record's commit is
+    /// UNKNOWN cannot certify a single revision — "all at one
+    /// commit (unknown)" would be a tautology over a tree that
+    /// could mix two unverifiable revisions. The gate reads
+    /// INCOMPLETE and names the unreadable ref.
+    #[test]
+    fn cg1_refuses_to_certify_an_unknown_commit() {
+        let unreadable = json!({
+            "scenario": "row-1/happy-path-cut",
+            "tier": "S",
+            "commit": "unknown",
+            "outcome": "complete: the prefix is intact",
+        });
+        let gates = completion_gates(&[unreadable]);
+        assert!(
+            !gates[0].complete,
+            "an unknown commit cannot certify: {}",
+            gates[0].detail
+        );
+        assert!(
+            gates[0].detail.contains("commit is unknown"),
+            "the failure names the unreadable ref: {}",
+            gates[0].detail
         );
     }
 

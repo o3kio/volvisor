@@ -67,9 +67,16 @@ pub fn run_dir() -> PathBuf {
         .join(run_id())
 }
 
-/// The workspace's git commit, read hermetically from `.git`
-/// (`.git/HEAD` → the ref file it names; `unknown` when packed,
-/// detached or absent — no `git` subprocess, no network).
+/// The workspace's git commit, read hermetically from `.git` (no
+/// `git` subprocess, no network): `.git/HEAD` → the ref file it
+/// names, falling back to `.git/packed-refs` when the branch tip
+/// was packed by `git gc`; a detached HEAD carries the sha itself;
+/// `unknown` only when none of that resolves. KNOWN LIMIT (the
+/// comprehensive surface round-2 N6, documented): the stamp reads
+/// HEAD at record time — a run produced from UNCOMMITTED
+/// working-tree changes is stamped with the previous commit; the
+/// CG1 single-commit clause certifies string-consistency, not that
+/// the bytes match the stamped revision.
 fn git_commit() -> String {
     let git = workspace_root().join(".git");
     let head = std::fs::read_to_string(git.join("HEAD")).unwrap_or_default();
@@ -83,8 +90,24 @@ fn git_commit() -> String {
             "unknown".to_owned()
         };
     };
-    std::fs::read_to_string(git.join(reference))
-        .map_or_else(|_| "unknown".to_owned(), |sha| sha.trim().to_owned())
+    // The loose ref first; a packed tip (post-`git gc`) leaves no
+    // loose file, so fall back to `packed-refs`' `<sha> <ref>` lines
+    // (the comprehensive substrate round-2 R2-1 — an `unknown` stamp
+    // degrades CG1's single-commit certification to a tautology, so
+    // the resolver must survive packing).
+    if let Ok(sha) = std::fs::read_to_string(git.join(reference)) {
+        let sha = sha.trim();
+        if !sha.is_empty() {
+            return sha.to_owned();
+        }
+    }
+    let packed = std::fs::read_to_string(git.join("packed-refs")).unwrap_or_default();
+    packed
+        .lines()
+        .find_map(|line| line.strip_suffix(reference))
+        .map(|prefix| prefix.trim().to_owned())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// The kernel release (`uname -r`'s source; `unknown` off Linux).
@@ -191,7 +214,37 @@ impl Evidence {
         copy_tree(sources.a_journal, &scenario_logs.join("a"));
         copy_tree(sources.b_journal, &scenario_logs.join("b"));
         copy_tree(sources.witness, &scenario_logs.join("witness"));
+        let logs = json!({
+            "journal": scenario_logs.join("a").join("journal.log"),
+            "migration_records": scenario_logs.join("a").join("migrations"),
+            "peer_preparations": scenario_logs.join("b").join("peer-preparations"),
+            "destination_journal": scenario_logs.join("b").join("journal.log"),
+            "witness": scenario_logs.join("witness"),
+        });
+        let path = self.write_record(&dir, Some(&logs));
+        render_report(&dir);
+        path
+    }
 
+    /// Finish a ROLLUP record — a family aggregate (§3.2), the
+    /// comprehensive review's U4: the aggregate is COMPUTED, not
+    /// observed, so there is no log capture — the per-cell records
+    /// carry the real sources, and this record's `logs` field is
+    /// null (the truthful-logs standard: a path in the record must
+    /// resolve to real captured bytes, never to an empty
+    /// placeholder implying a capture that did not happen — the
+    /// old finish-with-placeholder shape wrote five paths that
+    /// resolved to nothing).
+    pub fn finish_rollup(self) -> PathBuf {
+        let dir = run_dir();
+        let path = self.write_record(&dir, None);
+        render_report(&dir);
+        path
+    }
+
+    /// The §6 record writer shared by the observed and rollup
+    /// finishes: `logs` is `Some` exactly when a capture happened.
+    fn write_record(self, dir: &Path, logs: Option<&Value>) -> PathBuf {
         let record = json!({
             "scenario": self.scenario,
             "tier": self.tier,
@@ -211,13 +264,7 @@ impl Evidence {
             "invariants": self.invariants.iter()
                 .map(|(name, verdict)| json!({name: verdict}))
                 .collect::<Vec<_>>(),
-            "logs": {
-                "journal": scenario_logs.join("a").join("journal.log"),
-                "migration_records": scenario_logs.join("a").join("migrations"),
-                "peer_preparations": scenario_logs.join("b").join("peer-preparations"),
-                "destination_journal": scenario_logs.join("b").join("journal.log"),
-                "witness": scenario_logs.join("witness"),
-            },
+            "logs": logs,
             "outcome": self.outcome,
             "duration_ms": u64::try_from(self.started.elapsed().as_millis())
                 .expect("scenario duration fits a u64"),
@@ -231,7 +278,6 @@ impl Evidence {
             serde_json::to_string_pretty(&record).expect("record JSON"),
         )
         .expect("write record");
-        render_report(&dir);
         path
     }
 
@@ -307,6 +353,23 @@ impl Evidence {
         reason: &str,
         would_run: &str,
     ) -> PathBuf {
+        // The outcome vocabulary (the comprehensive review's U2): a
+        // Tier R record IS a gate statement — skipped or blocked,
+        // never a pass. A record claiming any other outcome would
+        // render as a matrix pass in the summary, so it is refused
+        // here at the write, for BOTH seams (the fabrication shape
+        // is wrong in staging exactly as in the live tree; the
+        // summary's gate layer rejects it again on read —
+        // defense in depth). Case-normalized (round-2 N4): the gate
+        // layer lowercases before matching, and the write seam must
+        // not be the STRICTER of the two for the wrong reason —
+        // "Skipped" is a skip either way; only the outcome's
+        // meaning is policed here.
+        assert!(
+            matches!(outcome.to_ascii_lowercase().as_str(), "skipped" | "blocked"),
+            "a Tier R record's outcome must be a gate statement (skipped/blocked), \
+             never {outcome:?} — a Tier R record cannot claim a pass"
+        );
         // The choke-point guard (see the method docs): only the
         // LIVE run directory is protected — staging directories are
         // where the constructed hosts live by design.

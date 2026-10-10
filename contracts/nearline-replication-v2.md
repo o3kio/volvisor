@@ -188,6 +188,8 @@ The §10 rows this campaign does **not** deliver, each recorded as a gate in the
 - Saturated disk/network, multi-TB seed, growing dirty rate — Tier S covers the convergence-gating *logic* (row 12's resync-under-foreground); the real scale and wall-clock behavior is the `tier-r/saturation-multitb` gate.
 - Media-level flush/FUA and host power loss — Tier S covers the flush *protocol* (barrier and suspension proofs); the media level is the `tier-r/media-flush-fua` and `tier-r/power-cut` gates.
 - The durable dirty-bitmap/meta boundary — no persisted bitmap exists; Tier S covers kills during an *in-flight* resync only (row 12). The durable boundary is the `tier-r/durable-dirty-bitmap-meta` gate.
+- Separate SSD loss — the fake's storage is a block map with no device granule; a separate-SSD loss fault class cannot be injected below it. The gate is `tier-r/ssd-loss`.
+- Kill-timing races (SIGKILL during ACK, WAL/meta commit, peer stream and replay) — Tier S kills at *journaled, deterministic* stages (the crash-hook points); the sub-journal timing races a real process's SIGKILL produces are the `tier-r/kill-timing-races` gate.
 - Storage Cell crash — no cell class exists in the campaign (see `rook-cell-experimental-v0`); no gate is claimed for it.
 - O3K control-plane disconnect — covered in Tier S only through the witness-divergence proxy (row 11), which models the journal rollback of a control-plane authority; the real control-plane disconnect is part of the `tier-r/same-families-on-real-hosts` gate.
 
