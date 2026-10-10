@@ -44,6 +44,20 @@ pub const POOL_BYTES: u64 = 1 << 40;
 /// Default simulated physical extent size (4 MiB), as in real LVM.
 pub const EXTENT_BYTES: u64 = 4 << 20;
 
+/// One simulated `pvmove` (keyed by LV path): the deterministic
+/// relocation the fake world performs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeMove {
+    /// The PV the extents are evacuated from.
+    pub source: String,
+    /// The PV the extents are evacuated to.
+    pub target: String,
+    /// Sync percentage (0–100). Advances by
+    /// [`FakeLvm::move_advance_percent`] on every `lvs` query — the
+    /// deterministic clock the drive's poll loop observes.
+    pub percent: u64,
+}
+
 /// The simulated LVM world shared between the provider and assertions.
 pub struct FakeLvm {
     /// LV full path (`vg/lv`) to size in bytes.
@@ -57,6 +71,51 @@ pub struct FakeLvm {
     pub vg_free: BTreeMap<String, u64>,
     /// VG name to total size in bytes.
     pub vg_size: BTreeMap<String, u64>,
+    /// PV device path to its volume group (the `pvs` `vg_name` column).
+    pub pv_vg: BTreeMap<String, String>,
+    /// PV device path to total size in bytes.
+    pub pv_size: BTreeMap<String, u64>,
+    /// PV device path to free bytes — the per-PV capacity model:
+    /// `lvcreate`/`lvextend` consume from the LV's placement PV, a
+    /// completed move transfers the LV's extents source→target, and
+    /// `lvremove` returns them. The same-VG move's target check reads
+    /// exactly this.
+    pub pv_free: BTreeMap<String, u64>,
+    /// LV path to its backing PVs (the placement model; `lvcreate`
+    /// places on the VG's first PV in report order). The `lvs`
+    /// `devices` column derives from this — a `pvmove*` mirror
+    /// segment reference while a move is active (the verified
+    /// LVM 2.03.16 shape).
+    pub lv_devices: BTreeMap<String, Vec<String>>,
+    /// Active pvmove simulations, keyed by LV path.
+    pub moves: BTreeMap<String, FakeMove>,
+    /// Completed moves, kept for inspection and the
+    /// deceptive-completion injection (the extents were observed
+    /// relocated; whether they STAY relocated is what the completion
+    /// verification checks).
+    pub landed_moves: BTreeMap<String, FakeMove>,
+    /// When > 0: once an LV that landed has been observed with its
+    /// source freed this many times, the NEXT `lvs` query restores its
+    /// placement to the source — the deterministic shape of "the world
+    /// disagrees with itself between two consecutive observations"
+    /// (an out-of-band reverse relocation racing the verification).
+    /// The completion verification must refuse it and never free the
+    /// source. 0 = never.
+    pub restore_source_after_freed_sightings: u32,
+    /// Per-LV counter of source-freed sightings (the knob's state).
+    pub freed_sightings: BTreeMap<String, u32>,
+    /// LVs whose placement restores to the source on the next `lvs`
+    /// query (the scheduled half of the knob).
+    pub pending_restore: Vec<String>,
+    /// Sync percentage advanced per `lvs` query per active move (the
+    /// deterministic clock; default 50 — two queries complete a move).
+    pub move_advance_percent: u64,
+    /// When true, active moves never advance (the supervision-window
+    /// exhaustion shape).
+    pub hold_moves: bool,
+    /// When true, `pvmove` fails before starting anything (the
+    /// start-failure crash window).
+    pub fail_pvmove: bool,
     /// LV paths `lvremove` should report as missing (error injection).
     pub fail_lvremove_for: Vec<String>,
     /// When true, `blkdiscard` fails (error injection for ZeroDiscard).
@@ -79,6 +138,9 @@ pub struct FakeLvm {
     /// When true, `vgs` fails (honest-unknown injection for device-claim
     /// reconciliation).
     pub fail_vgs: bool,
+    /// When true, `lvs` fails (honest-unknown injection for the move
+    /// supervision: an unobservable world mid-move).
+    pub fail_lvs: bool,
 }
 
 impl Default for FakeLvm {
@@ -88,6 +150,18 @@ impl Default for FakeLvm {
             pvs: Vec::new(),
             vg_free: BTreeMap::new(),
             vg_size: BTreeMap::new(),
+            pv_vg: BTreeMap::new(),
+            pv_size: BTreeMap::new(),
+            pv_free: BTreeMap::new(),
+            lv_devices: BTreeMap::new(),
+            moves: BTreeMap::new(),
+            landed_moves: BTreeMap::new(),
+            restore_source_after_freed_sightings: 0,
+            freed_sightings: BTreeMap::new(),
+            pending_restore: Vec::new(),
+            move_advance_percent: 50,
+            hold_moves: false,
+            fail_pvmove: false,
             fail_lvremove_for: Vec::new(),
             fail_blkdiscard: false,
             lvcreate_silent: false,
@@ -97,6 +171,7 @@ impl Default for FakeLvm {
             fail_pvremove: false,
             fail_vgremove: false,
             fail_vgs: false,
+            fail_lvs: false,
         }
     }
 }
@@ -109,6 +184,25 @@ impl FakeLvm {
         world.vg_free.insert(CLAIMED_VG.to_owned(), POOL_BYTES);
         world.vg_size.insert(CLAIMED_VG.to_owned(), POOL_BYTES);
         world
+    }
+
+    /// Register a PV in `vg` with `size` bytes free (the move world's
+    /// second PV, or a hand-seeded placement).
+    pub fn add_pv_to_vg(&mut self, pv: &str, vg: &str, size: u64) {
+        self.pvs.push(pv.to_owned());
+        self.pv_vg.insert(pv.to_owned(), vg.to_owned());
+        self.pv_size.insert(pv.to_owned(), size);
+        self.pv_free.insert(pv.to_owned(), size);
+    }
+
+    /// Place an existing LV on `pv` and consume its extents from the
+    /// PV's free space (hand-seeding a placement).
+    pub fn place_lv_on(&mut self, path: &str, pv: &str) {
+        let size = self.lvs.get(path).copied().unwrap_or_default();
+        self.lv_devices.insert(path.to_owned(), vec![pv.to_owned()]);
+        if let Some(free) = self.pv_free.get_mut(pv) {
+            *free = (*free).saturating_sub(size);
+        }
     }
 
     /// A scripted runner wired to this world (closure mode).
@@ -128,20 +222,128 @@ fn report(key: &str, rows: &[serde_json::Value]) -> CommandOutput {
 }
 
 /// The `lvs` report rows for the simulated world.
-fn lvs_report(world: &FakeLvm) -> CommandOutput {
-    let rows: Vec<serde_json::Value> = world
-        .lvs
-        .iter()
-        .map(|(path, size)| {
-            let (vg, lv) = path.split_once('/').expect("path is vg/lv");
-            serde_json::json!({
-                "vg_name": vg,
-                "lv_name": lv,
-                "lv_size": size.to_string(),
-            })
-        })
-        .collect();
+///
+/// Also the deterministic move clock: every `lvs` query advances each
+/// active move by [`FakeLvm::move_advance_percent`] (unless held), and
+/// a move that reaches 100% lands — the LV's placement becomes the
+/// target PV, the per-PV free accounts transfer, and the move ends.
+/// While a move is active the row carries the **verified LVM 2.03.16
+/// mid-move shape**: the `devices` column references the `pvmove0`
+/// mirror segment and `copy_percent` is empty (the progress lives on
+/// the hidden segment, not the LV row).
+fn lvs_report(world: &mut FakeLvm) -> CommandOutput {
+    advance_moves(world);
+    // The deceptive-completion knob's scheduled half: placements that
+    // restore on this query, before the rows are reported.
+    let restoring: Vec<String> = std::mem::take(&mut world.pending_restore);
+    for path in restoring {
+        let Some(move_) = world.landed_moves.remove(&path) else {
+            continue;
+        };
+        let size = world.lvs.get(&path).copied().unwrap_or_default();
+        world
+            .lv_devices
+            .insert(path.clone(), vec![move_.source.clone()]);
+        if let Some(free) = world.pv_free.get_mut(&move_.source) {
+            *free = (*free).saturating_sub(size);
+        }
+        if let Some(free) = world.pv_free.get_mut(&move_.target) {
+            *free = (*free).saturating_add(size);
+        }
+        world.freed_sightings.remove(&path);
+    }
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for (path, size) in &world.lvs {
+        let (vg, lv) = path.split_once('/').expect("path is vg/lv");
+        let moving = world.moves.contains_key(path);
+        let mut devices = if moving {
+            "pvmove0(0)".to_owned()
+        } else {
+            world
+                .lv_devices
+                .get(path)
+                .map(|pvs| {
+                    pvs.iter()
+                        .map(|pv| format!("{pv}(0)"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        };
+        // The knob's counting half: a landed LV observed with its
+        // source freed counts toward the restore threshold.
+        if let Some(move_) = world.landed_moves.get(path) {
+            let freed = !devices.contains(&move_.source);
+            if freed {
+                let sightings = world.freed_sightings.entry(path.clone()).or_insert(0);
+                *sightings += 1;
+                if world.restore_source_after_freed_sightings > 0
+                    && *sightings >= world.restore_source_after_freed_sightings
+                {
+                    world.pending_restore.push(path.clone());
+                }
+            }
+        }
+        if !moving {
+            // Re-derive in case the row above was mutated by the
+            // counting half (the placement is stable within a query).
+            devices = world
+                .lv_devices
+                .get(path)
+                .map(|pvs| {
+                    pvs.iter()
+                        .map(|pv| format!("{pv}(0)"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+        }
+        rows.push(serde_json::json!({
+            "vg_name": vg,
+            "lv_name": lv,
+            "lv_size": size.to_string(),
+            "lv_attr": if moving { "-wI-a-----" } else { "-wi-a-----" },
+            "copy_percent": "",
+            "devices": devices,
+        }));
+    }
     report("lv", &rows)
+}
+
+/// Advance the deterministic move clock (called once per `lvs`
+/// query): every active move advances; a move that reaches 100%
+/// completes — the LV's placement becomes the target, the free
+/// accounts transfer source→target, the move record ends.
+fn advance_moves(world: &mut FakeLvm) {
+    if world.hold_moves {
+        return;
+    }
+    let advance = world.move_advance_percent;
+    for move_ in world.moves.values_mut() {
+        move_.percent = move_.percent.saturating_add(advance);
+    }
+    let landed: Vec<String> = world
+        .moves
+        .iter()
+        .filter(|(_, move_)| move_.percent >= 100)
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in landed {
+        let Some(move_) = world.moves.remove(&path) else {
+            continue;
+        };
+        let size = world.lvs.get(&path).copied().unwrap_or_default();
+        world
+            .lv_devices
+            .insert(path.clone(), vec![move_.target.clone()]);
+        if let Some(free) = world.pv_free.get_mut(&move_.target) {
+            *free = (*free).saturating_sub(size);
+        }
+        if let Some(free) = world.pv_free.get_mut(&move_.source) {
+            *free = (*free).saturating_add(size);
+        }
+        world.landed_moves.insert(path, move_);
+    }
 }
 
 /// The `vgs` report rows for the simulated world.
@@ -181,20 +383,46 @@ fn vgs_report(world: &FakeLvm) -> CommandOutput {
     report("vg", &rows)
 }
 
-/// The `pvs` report rows for the simulated world.
+/// The `pvs` report rows for the simulated world: PV → VG membership
+/// plus the per-PV size/free columns (the verified LVM 2.03.16
+/// default column set). A PV registered without a VG reports an empty
+/// `vg_name`, as real `pvs` does.
 fn pvs_report(world: &FakeLvm) -> CommandOutput {
     let rows: Vec<serde_json::Value> = world
         .pvs
         .iter()
-        .map(|path| serde_json::json!({ "pv_name": path }))
+        .map(|path| {
+            serde_json::json!({
+                "pv_name": path,
+                "vg_name": world.pv_vg.get(path).cloned().unwrap_or_default(),
+                "pv_size": world
+                    .pv_size
+                    .get(path)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
+                "pv_free": world
+                    .pv_free
+                    .get(path)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
         .collect();
     report("pv", &rows)
 }
 
 /// The scripted behavior for one command.
+#[allow(clippy::too_many_lines)] // one arm per LVM verb — the kit's table
 fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
     match program {
-        "lvs" => Some(lvs_report(world)),
+        "lvs" => {
+            if world.fail_lvs {
+                return Some(CommandOutput::failure("lvs: simulated failure"));
+            }
+            Some(lvs_report(world))
+        }
         "vgs" => {
             if world.fail_vgs {
                 return Some(CommandOutput::failure("vgs: simulated failure"));
@@ -219,7 +447,20 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             if !world.lvcreate_silent {
                 // Real LVM rounds the requested size up to whole extents.
                 let effective = round_up_to_extent(size, world.extent_size);
-                world.lvs.insert(path, effective);
+                world.lvs.insert(path.clone(), effective);
+                // Placement: the VG's first PV in report order (the
+                // single-PV worlds unchanged; the move world's source).
+                let placement = world
+                    .pv_vg
+                    .iter()
+                    .find(|(_, pv_vg)| pv_vg == &vg)
+                    .map(|(pv, _)| pv.clone());
+                if let Some(pv) = placement {
+                    world.lv_devices.insert(path.clone(), vec![pv.clone()]);
+                    if let Some(free) = world.pv_free.get_mut(&pv) {
+                        *free = (*free).saturating_sub(effective);
+                    }
+                }
             }
             Some(CommandOutput::success(String::new()))
         }
@@ -230,7 +471,19 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             let path = *args.last()?;
             if !world.lvextend_silent {
                 let effective = round_up_to_extent(size, world.extent_size);
+                let previous = world.lvs.get(path).copied().unwrap_or_default();
                 world.lvs.insert(path.to_owned(), effective);
+                // Consume the growth from the LV's placement PV.
+                let delta = effective.saturating_sub(previous);
+                let placement = world
+                    .lv_devices
+                    .get(path)
+                    .and_then(|pvs| pvs.first().cloned());
+                if let Some(pv) = placement {
+                    if let Some(free) = world.pv_free.get_mut(&pv) {
+                        *free = (*free).saturating_sub(delta);
+                    }
+                }
             }
             Some(CommandOutput::success(String::new()))
         }
@@ -241,11 +494,78 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
                 return Some(CommandOutput::failure("lvremove: device is busy"));
             }
             // Real lvremove of a missing LV fails loudly.
-            if world.lvs.remove(path).is_none() {
+            if let Some(size) = world.lvs.remove(path) {
+                // Return the extents to the placement PVs (the
+                // per-PV capacity model stays honest).
+                let placement = world.lv_devices.remove(path).unwrap_or_default();
+                for pv in placement {
+                    if let Some(free) = world.pv_free.get_mut(&pv) {
+                        *free = (*free).saturating_add(size);
+                    }
+                }
+            } else {
                 return Some(CommandOutput::failure(format!(
                     "lvremove: {path} not found"
                 )));
             }
+            Some(CommandOutput::success(String::new()))
+        }
+        "pvmove" => {
+            // pvmove [--abort] | --background --noudevsync -n <vg>/<lv> <source> <target>
+            if args.contains(&"--abort") {
+                // Verified LVM 2.03.16 behavior: the abort abandons
+                // every active move back to its source (the LV's
+                // placement never changed mid-move) and exits 0,
+                // including when nothing is moving.
+                world.moves.clear();
+                return Some(CommandOutput::success(String::new()));
+            }
+            if world.fail_pvmove {
+                return Some(CommandOutput::failure("pvmove: simulated failure"));
+            }
+            let path = arg_after(args, "-n")?.to_owned();
+            let source = (*args.get(args.len().saturating_sub(2))?).to_owned();
+            let target = (*args.last()?).to_owned();
+            // Verified LVM 2.03.16 behavior: a re-run while the source
+            // PV carries an active move attaches to it, IGNORES the
+            // remaining arguments, and exits 0 — the silent no-op the
+            // provider's one-move-per-source-PV refusal exists for.
+            if world.moves.values().any(|move_| move_.source == source) {
+                return Some(CommandOutput::success(format!(
+                    "  Detected pvmove in progress for {source}.\n  WARNING: Ignoring \
+                     remaining command line arguments.\n"
+                )));
+            }
+            // Verified: a scoped pvmove whose LV holds no extents on
+            // the source fails ("No data to move", exit 5).
+            let on_source = world
+                .lv_devices
+                .get(&path)
+                .is_some_and(|pvs| pvs.iter().any(|pv| pv == &source));
+            if !on_source {
+                return Some(CommandOutput::failure(format!(
+                    "  No data to move for {}.\n",
+                    path.split_once('/').map_or(path.as_str(), |(vg, _)| vg)
+                )));
+            }
+            // Real LVM refuses a move whose extents do not fit in the
+            // target's free space (insufficient free extents).
+            let size = world.lvs.get(&path).copied().unwrap_or_default();
+            let target_free = world.pv_free.get(&target).copied().unwrap_or_default();
+            if target_free < size {
+                return Some(CommandOutput::failure(format!(
+                    "  Insufficient free space: {size} bytes needed, {target_free} \
+                     available on {target}\n"
+                )));
+            }
+            world.moves.insert(
+                path,
+                FakeMove {
+                    source,
+                    target,
+                    percent: 0,
+                },
+            );
             Some(CommandOutput::success(String::new()))
         }
         "blkdiscard" => {
@@ -265,10 +585,15 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             if world.fail_vgcreate {
                 return Some(CommandOutput::failure("vgcreate: simulated failure"));
             }
-            // vgcreate --yes <vg> <path>
+            // vgcreate --yes <vg> <path...>
             let vg = (*args.get(1)?).to_owned();
             world.vg_free.insert(vg.clone(), POOL_BYTES);
-            world.vg_size.insert(vg, POOL_BYTES);
+            world.vg_size.insert(vg.clone(), POOL_BYTES);
+            // Every PV handed to vgcreate joins it with the pool's
+            // capacity free (the per-PV model mirrors the VG model).
+            for pv in args.iter().skip(2) {
+                world.add_pv_to_vg(pv, &vg, POOL_BYTES);
+            }
             Some(CommandOutput::success(String::new()))
         }
         "vgremove" => {
@@ -294,6 +619,9 @@ fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOu
             // pvremove --yes <path>
             let path = *args.last()?;
             world.pvs.retain(|pv| pv != path);
+            world.pv_vg.remove(path);
+            world.pv_size.remove(path);
+            world.pv_free.remove(path);
             Some(CommandOutput::success(String::new()))
         }
         _ => None,
@@ -419,6 +747,16 @@ pub fn provider_from(
     state_path: &std::path::Path,
     world: &Arc<Mutex<FakeLvm>>,
 ) -> Arc<LvmProvider> {
+    provider_from_with_timing(state_path, world, default_move_timing())
+}
+
+/// [`provider_from`] with explicit move timing (the fault rows' restarts
+/// keep the fast knobs of the incarnation they replace).
+pub fn provider_from_with_timing(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<FakeLvm>>,
+    timing: volvisor_lvm::provider::MoveTiming,
+) -> Arc<LvmProvider> {
     let runner = FakeLvm::runner(world);
     LvmProvider::new(
         runner,
@@ -427,7 +765,7 @@ pub fn provider_from(
         VG_PREFIX.to_owned(),
         AUTH_TOKEN.to_owned(),
     )
-    .map(Arc::new)
+    .map(|provider| Arc::new(provider.with_move_timing(timing)))
     .expect("provider construction")
 }
 
@@ -457,6 +795,31 @@ pub fn seed_volume(state_path: &std::path::Path, volume_id: &str, vg_name: &str,
         },
     );
     state.save(state_path).expect("seed volume state");
+}
+
+/// Seed a move record directly into a state file (crash-model tests:
+/// the durable record a dead incarnation left behind).
+pub fn seed_move(
+    state_path: &std::path::Path,
+    volume_id: &str,
+    source_pv: &str,
+    target_pv: &str,
+    move_state: volvisor_types::MoveVolumeBackingState,
+) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let mut state = LvmState::load(state_path).expect("load state");
+    state.insert_move(
+        volume_id,
+        volvisor_lvm::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-seeded-move")
+                .expect("valid fixture operation id"),
+            source_pv: source_pv.to_owned(),
+            target_pv: target_pv.to_owned(),
+            state: move_state,
+            detail: None,
+        },
+    );
+    state.save(state_path).expect("seed move state");
 }
 
 /// Build a fixture over the simulated LVM with a pre-claimed pool.
@@ -507,4 +870,63 @@ pub fn real_provider(state_path: PathBuf) -> Result<Arc<LvmProvider>, ApiError> 
         "integration-token".to_owned(),
     )
     .map(Arc::new)
+}
+
+// ---------------------------------------------------------------------------
+// The same-VG move fixtures (P6-C)
+// ---------------------------------------------------------------------------
+
+/// The move world's source PV (the claimed pool's first PV in report
+/// order — `lvcreate` places there).
+pub const MOVE_SOURCE_PV: &str = "/dev/pv-a";
+/// The move world's evacuation target PV.
+pub const MOVE_TARGET_PV: &str = "/dev/pv-b";
+
+/// The move tests' default fast timing: a 10 ms poll and a 250 ms
+/// supervision window (the deterministic world completes a move in two
+/// `lvs` queries; a held move exhausts the window in ~25 polls).
+pub fn default_move_timing() -> volvisor_lvm::provider::MoveTiming {
+    volvisor_lvm::provider::MoveTiming {
+        poll_interval: std::time::Duration::from_millis(10),
+        supervision_window: std::time::Duration::from_millis(250),
+    }
+}
+
+/// A fixture for the same-VG move tests: the claimed pool's VG spread
+/// over two PVs — `lvcreate` places volumes on
+/// [`MOVE_SOURCE_PV`], and [`MOVE_TARGET_PV`] is the evacuation
+/// target — with the fast move timing.
+pub fn move_fixture() -> Fixture {
+    move_fixture_with_timing(default_move_timing())
+}
+
+/// [`move_fixture`] with explicit move timing.
+pub fn move_fixture_with_timing(timing: volvisor_lvm::provider::MoveTiming) -> Fixture {
+    let state_path = leak_tempdir().join("state.json");
+    seed_claimed_state(&state_path);
+    let world = Arc::new(Mutex::new(FakeLvm::with_claimed_pool()));
+    {
+        let mut world = world.lock().expect("world lock");
+        world.add_pv_to_vg(MOVE_SOURCE_PV, CLAIMED_VG, POOL_BYTES);
+        world.add_pv_to_vg(MOVE_TARGET_PV, CLAIMED_VG, POOL_BYTES);
+        // Two PVs of `POOL_BYTES` each: the VG's own baseline follows.
+        world.vg_free.insert(CLAIMED_VG.to_owned(), 2 * POOL_BYTES);
+        world.vg_size.insert(CLAIMED_VG.to_owned(), 2 * POOL_BYTES);
+    }
+    let runner = FakeLvm::runner(&world);
+    let provider = LvmProvider::new(
+        Arc::clone(&runner) as Arc<dyn CommandRunner>,
+        state_path.clone(),
+        leak_tempdir(),
+        VG_PREFIX.to_owned(),
+        AUTH_TOKEN.to_owned(),
+    )
+    .map(|provider| Arc::new(provider.with_move_timing(timing)))
+    .expect("provider construction");
+    Fixture {
+        provider,
+        world,
+        runner,
+        state_path,
+    }
 }

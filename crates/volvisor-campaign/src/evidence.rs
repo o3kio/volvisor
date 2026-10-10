@@ -146,6 +146,12 @@ pub struct Evidence {
     tier: &'static str,
     fault: Option<(String, String)>,
     oracle: Option<Value>,
+    /// The components claim override: `None` (the default) records
+    /// the nearline DRBD rig's composition; a rig whose composition
+    /// differs (the P6-C move harness: a single LVM daemon over a
+    /// scripted LVM world, no witness) labels what actually ran —
+    /// never the nearline labels for components that did not.
+    components: Option<Value>,
     invariants: Vec<(String, String)>,
     outcome: Option<String>,
     started: Instant,
@@ -162,6 +168,7 @@ impl Evidence {
             tier: "S",
             fault: None,
             oracle: None,
+            components: None,
             invariants: Vec::new(),
             outcome: None,
             started: Instant::now(),
@@ -191,6 +198,19 @@ impl Evidence {
     /// [`oracle_value`] for the canonical shape.
     pub fn oracle(&mut self, value: Value) -> &mut Self {
         self.oracle = Some(value);
+        self
+    }
+
+    /// Override the record's `components` claim (§6): a rig whose
+    /// composition differs from the nearline DRBD shape — the P6-C
+    /// move harness is a single LVM daemon over a scripted LVM
+    /// world, with no witness and no destination daemon — labels
+    /// what actually ran. The default (no call) records the
+    /// nearline rig's composition; a claim like
+    /// `"witness": "in-process"` for a rig without a witness would
+    /// be fabrication.
+    pub fn components(&mut self, value: Value) -> &mut Self {
+        self.components = Some(value);
         self
     }
 
@@ -226,6 +246,28 @@ impl Evidence {
         path
     }
 
+    /// Finish a single-daemon rig's observed record (the P6-C move
+    /// harness): one LVM daemon, one journal directory — no
+    /// destination daemon and no witness exist to capture, so the
+    /// record references exactly the sources that ran: the journal
+    /// log and the LVM provider's durable state (the recovery story
+    /// turns on that file). The truthful-logs standard cuts both
+    /// ways — no placeholder paths for captures that did not
+    /// happen, and no silent omission of the durable state the
+    /// fault rows classify against.
+    pub fn finish_single_daemon(self, journal_dir: &Path) -> PathBuf {
+        let dir = run_dir();
+        let scenario_logs = dir.join("logs").join(&self.scenario);
+        copy_tree(journal_dir, &scenario_logs.join("a"));
+        let logs = json!({
+            "journal": scenario_logs.join("a").join("journal.log"),
+            "lvm_state": scenario_logs.join("a").join("lvm-state.json"),
+        });
+        let path = self.write_record(&dir, Some(&logs));
+        render_report(&dir);
+        path
+    }
+
     /// Finish a ROLLUP record — a family aggregate (§3.2), the
     /// comprehensive review's U4: the aggregate is COMPUTED, not
     /// observed, so there is no log capture — the per-cell records
@@ -245,17 +287,20 @@ impl Evidence {
     /// The §6 record writer shared by the observed and rollup
     /// finishes: `logs` is `Some` exactly when a capture happened.
     fn write_record(self, dir: &Path, logs: Option<&Value>) -> PathBuf {
+        // The components claim: the rig's override when it labeled
+        // its own composition, else the nearline DRBD rig's.
+        let components = self.components.unwrap_or(json!({
+            "volvisord": env!("CARGO_PKG_VERSION"),
+            "drbd-tooling": "fake",
+            "vmm": "fake",
+            "witness": "in-process",
+        }));
         let record = json!({
             "scenario": self.scenario,
             "tier": self.tier,
             "commit": git_commit(),
             "kernel": kernel_release(),
-            "components": {
-                "volvisord": env!("CARGO_PKG_VERSION"),
-                "drbd-tooling": "fake",
-                "vmm": "fake",
-                "witness": "in-process",
-            },
+            "components": components,
             "fault": self.fault.as_ref().map(|(kind, at)| json!({
                 "kind": kind,
                 "at": at,

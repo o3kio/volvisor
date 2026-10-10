@@ -43,6 +43,10 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             post(handlers::detach_volume),
         )
         .route("/v2/volumes/{volume_id}/grow", post(handlers::grow_volume))
+        .route(
+            "/v2/volumes/{volume_id}/move-backing",
+            post(handlers::move_volume_backing),
+        )
         .route("/v2/capabilities", get(handlers::capabilities))
         // Admin surface (device enrollment): every route requires the admin
         // token, GET included — device inventory is privileged. Providers

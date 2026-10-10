@@ -17,9 +17,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
 use volvisor_types::{
-    AccessMode, ApiError, ApiErrorCode, AttachmentId, DeviceId, DeviceRole, HostId, ProjectId,
-    VolumeId, VolumeLifecycle,
+    AccessMode, ApiError, ApiErrorCode, AttachmentId, DeviceId, DeviceRole, HostId,
+    MoveVolumeBackingState, OperationId, ProjectId, VolumeId, VolumeLifecycle,
 };
 
 /// The volume→LV cross-reference plus the durable volume attributes.
@@ -113,11 +114,52 @@ pub struct DeviceEntry {
     pub owner_generation: u64,
 }
 
+/// One journaled online move of a volume's backing extents
+/// (contract section 4A, `same_vg_extent_move` scope).
+///
+/// The record is the **reconciliation anchor**: the daemon can die
+/// at any boundary of the move, and the kernel-side `pvmove` mirror
+/// plus this record are what survive. The record's state is the
+/// honest subset of [`MoveVolumeBackingState`] — `PREPARING`,
+/// `COPYING`, `COMPLETE`, `IN_DOUBT` — never `MIRROR_READY`/
+/// `PIVOTED` (mirror-path states; a same-VG extent move never
+/// pivots, the LV's dm identity is stable) and never `FAILED` (an
+/// unknown outcome is `IN_DOUBT`; deterministic rejections are typed
+/// errors, not states).
+///
+/// Keyed by volume: at most one move record exists per volume. A
+/// `COMPLETE` record for the same source/target answers re-issues
+/// idempotently; an `IN_DOUBT` record parks further moves typed
+/// until reconciliation proves completion or an operator resolves
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveRecord {
+    /// The operation that started (or most recently re-attached to)
+    /// this move — diagnostics only; the API-layer idempotency
+    /// journal is the replay authority.
+    pub operation_id: OperationId,
+    /// The PV the extents are being evacuated from.
+    pub source_pv: String,
+    /// The PV the extents are being evacuated to.
+    pub target_pv: String,
+    /// The move's current state (the honest subset — see the type
+    /// documentation).
+    pub state: MoveVolumeBackingState,
+    /// Honest detail for non-complete states (the `IN_DOUBT` reason,
+    /// or the supervision note for `COPYING`).
+    pub detail: Option<String>,
+}
+
 /// The whole durable provider state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LvmState {
     volumes: BTreeMap<VolumeId, StoredVolume>,
     devices: BTreeMap<DeviceId, DeviceEntry>,
+    /// Online-move records, keyed by volume (at most one per
+    /// volume). Defaulted so state files written before P6-C load
+    /// unchanged.
+    #[serde(default)]
+    moves: BTreeMap<VolumeId, MoveRecord>,
 }
 
 impl LvmState {
@@ -151,8 +193,22 @@ impl LvmState {
     /// file is removed and an `INTERNAL` error is returned; the previous
     /// state file remains intact.
     pub fn save(&mut self, path: &Path) -> Result<(), ApiError> {
+        self.save_with_hooks(path, None)
+    }
+
+    /// [`Self::save`] with the store-save crash seam armed: the
+    /// boundaries (after the tmp content write, after its fsync,
+    /// after the rename) consult `crash` exactly like the grow
+    /// store's saves, so a rig can kill the daemon at any commit
+    /// split of a move-record mutation. The seam is inert unless the
+    /// rig armed this store's points.
+    pub fn save_with_hooks(
+        &mut self,
+        path: &Path,
+        crash: Option<&StoreCrashHooks>,
+    ) -> Result<(), ApiError> {
         let tmp_path = sibling_tmp_path(path);
-        let result = self.save_to(&tmp_path, path);
+        let result = self.save_to(&tmp_path, path, crash);
         if result.is_err() {
             // Best-effort cleanup: never leave a stale .tmp behind.
             drop(fs::remove_file(&tmp_path));
@@ -160,24 +216,37 @@ impl LvmState {
         result
     }
 
-    fn save_to(&mut self, tmp_path: &Path, path: &Path) -> Result<(), ApiError> {
+    fn save_to(
+        &mut self,
+        tmp_path: &Path,
+        path: &Path,
+        crash: Option<&StoreCrashHooks>,
+    ) -> Result<(), ApiError> {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
         let path_display = path.display();
+        let consult = |point: StoreSavePoint| {
+            if let Some(crash) = crash {
+                crash.consult(STORE_LVM_STATE, point);
+            }
+        };
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         file.write_all(&data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
+        consult(StoreSavePoint::AfterTmpWrite);
         file.sync_all()
             .map_err(|e| internal(format!("failed to fsync {tmp_display}: {e}")))?;
         drop(file);
+        consult(StoreSavePoint::AfterFsyncBeforeRename);
         fs::rename(tmp_path, path).map_err(|e| {
             internal(format!(
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
+        consult(StoreSavePoint::AfterRename);
         // fsync the directory so the rename itself is durable.
         let dir = fs::File::open(
             path.parent()
@@ -242,6 +311,34 @@ impl LvmState {
     /// Remove a claimed device.
     pub fn remove_device(&mut self, id: &DeviceId) -> Option<DeviceEntry> {
         self.devices.remove(id)
+    }
+
+    /// All online-move records, ordered by volume identity.
+    #[must_use]
+    pub fn moves(&self) -> &BTreeMap<VolumeId, MoveRecord> {
+        &self.moves
+    }
+
+    /// Look up one volume's move record.
+    #[must_use]
+    pub fn move_record(&self, id: &VolumeId) -> Option<&MoveRecord> {
+        self.moves.get(id)
+    }
+
+    /// Look up one volume's move record for mutation.
+    pub fn move_record_mut(&mut self, id: &VolumeId) -> Option<&mut MoveRecord> {
+        self.moves.get_mut(id)
+    }
+
+    /// Insert or replace one volume's move record.
+    pub fn insert_move(&mut self, id: VolumeId, record: MoveRecord) -> Option<MoveRecord> {
+        self.moves.insert(id, record)
+    }
+
+    /// Remove one volume's move record (a failed start with a
+    /// verified-untouched world leaves nothing to reconcile).
+    pub fn remove_move(&mut self, id: &VolumeId) -> Option<MoveRecord> {
+        self.moves.remove(id)
     }
 }
 

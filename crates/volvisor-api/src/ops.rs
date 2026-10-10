@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 use volvisor_journal::{IntentAppend, Journal};
 use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
-    GrowVolumeRequest,
+    GrowVolumeRequest, MoveVolumeBackingRequest,
 };
 use volvisor_types::{
     ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, DeviceId, MigrationId, OperationId,
@@ -71,6 +71,9 @@ pub const OP_DETACH_VOLUME: &str = "detach_volume";
 pub const OP_GROW_VOLUME: &str = "grow_volume";
 /// Operation kind: delete volume.
 pub const OP_DELETE_VOLUME: &str = "delete_volume";
+/// Operation kind: move volume backing online (contract section
+/// 4A, `same_vg_extent_move` scope).
+pub const OP_MOVE_VOLUME_BACKING: &str = "move_volume_backing";
 /// Operation kind: claim a device for a pool (admin surface).
 pub const OP_CLAIM_DEVICE: &str = "claim_device";
 /// Operation kind: release a claimed device (admin surface).
@@ -101,12 +104,13 @@ pub const OP_PEER_DISCARD: &str = "peer_discard";
 /// either a matrix cell drives the kind, or the kind appears in the
 /// campaign's recorded-gaps table with its reason (never a silent
 /// cut).
-pub const ALL_OP_KINDS: [&str; 16] = [
+pub const ALL_OP_KINDS: [&str; 17] = [
     OP_CREATE_VOLUME,
     OP_ATTACH_VOLUME,
     OP_DETACH_VOLUME,
     OP_GROW_VOLUME,
     OP_DELETE_VOLUME,
+    OP_MOVE_VOLUME_BACKING,
     OP_CLAIM_DEVICE,
     OP_RELEASE_DEVICE,
     OP_ADOPT_VOLUME,
@@ -836,6 +840,14 @@ pub(crate) fn grow_hash(req: &GrowVolumeRequest, volume_id: &VolumeId) -> [u8; 3
 
 /// Immutable request hash for DeleteVolume (path target folded in).
 pub(crate) fn delete_hash(req: &DeleteVolumeRequest, volume_id: &VolumeId) -> [u8; 32] {
+    let mut hashed = req.clone();
+    hashed.api_version = folded_domain(&req.api_version, &[volume_id.as_str()]);
+    hashed.request_hash()
+}
+
+/// Immutable request hash for MoveVolumeBackingOnline (path target
+/// folded in).
+pub(crate) fn move_hash(req: &MoveVolumeBackingRequest, volume_id: &VolumeId) -> [u8; 32] {
     let mut hashed = req.clone();
     hashed.api_version = folded_domain(&req.api_version, &[volume_id.as_str()]);
     hashed.request_hash()

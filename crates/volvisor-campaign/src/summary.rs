@@ -98,7 +98,8 @@ struct RowSpec {
     budget_ms: Option<u64>,
 }
 
-/// The §9 Tier S rows (1-15), in row order.
+/// The §9 Tier S rows (1-16, row 16 being the P6-C move family
+/// the post-P5 plan added), in row order.
 const ROWS: &[RowSpec] = &[
     RowSpec {
         row: 1,
@@ -236,6 +237,20 @@ const ROWS: &[RowSpec] = &[
         class: "exact versions, independent harness, full logs",
         coverage: Coverage::Names(&["row-15/summary-and-completion-gates"]),
         budget_ms: None,
+    },
+    RowSpec {
+        row: 16,
+        family: "same-VG move durable boundaries",
+        class: "SIGKILL at the move's journaled boundaries; out-of-band pvmove abort (P6-C)",
+        coverage: Coverage::Names(&[
+            "row-16/move-killed-after-journal-intent",
+            "row-16/move-killed-at-preparing-save",
+            "row-16/move-killed-after-pvmove-start",
+            "row-16/move-pass-killed-at-verification",
+            "row-16/move-pass-killed-after-complete-save",
+            "row-16/move-aborted-out-of-band-while-down",
+        ]),
+        budget_ms: Some(10_000),
     },
 ];
 
@@ -629,7 +644,7 @@ fn cg1_class_coverage(records: &[Value]) -> GateStatus {
         complete: missing.is_empty(),
         detail: if missing.is_empty() {
             format!(
-                "every §9 Tier S row (1-15) has its records and every Tier R-only class \
+                "every §9 Tier S row (1-16) has its records and every Tier R-only class \
                  carries its gate record ({} skipped records), all at one commit ({}); \
                  the §9 mapping is realized in the coverage matrix",
                 tier_r::SCENARIOS.len(),
@@ -1447,14 +1462,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Every §9 row 1-15 appears exactly once in the mapping (the
-    /// executable §9 table is complete — CG1's static half).
+    /// Every §9 row 1-16 appears exactly once in the mapping (the
+    /// executable §9 table is complete — CG1's static half; row 16
+    /// is the P6-C move family the post-P5 plan added).
     #[test]
     fn the_row_mapping_is_complete_and_unique() {
         let mut rows: Vec<u8> = ROWS.iter().map(|spec| spec.row).collect();
         rows.sort_unstable();
-        let expected: Vec<u8> = (1..=15).collect();
-        assert_eq!(rows, expected, "the §9 rows 1-15 map exactly once each");
+        let expected: Vec<u8> = (1..=16).collect();
+        assert_eq!(rows, expected, "the §9 rows 1-16 map exactly once each");
     }
 
     /// No scenario name is claimed by two rows (a record

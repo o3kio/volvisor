@@ -125,6 +125,24 @@ pub struct LvRow {
     /// Logical volume size in bytes.
     #[serde(default)]
     pub lv_size: Option<FlexibleNumber>,
+    /// The `lv_attr` state string (10 characters; permissive — only
+    /// diagnostics read it, never a decision).
+    #[serde(default)]
+    pub lv_attr: Option<String>,
+    /// Mirror/raid sync percentage (`copy_percent`). Empty on LVM
+    /// 2.03.x while a `pvmove` runs (the progress lives on the
+    /// hidden `pvmove` segment, not the LV row) — parsed
+    /// permissively, never required.
+    #[serde(default)]
+    pub copy_percent: Option<String>,
+    /// The LV's backing devices, comma-separated `pv(extent)`
+    /// entries (e.g. `/dev/sda(0),/dev/sdb(12)`). While a `pvmove`
+    /// is active the entries reference the temporary mirror segment
+    /// (e.g. `pvmove0(0)`) instead of the real PVs — that reference
+    /// is the reliable "a move is in progress" observation on LVM
+    /// 2.03.x.
+    #[serde(default)]
+    pub devices: Option<String>,
 }
 
 impl LvRow {
@@ -142,6 +160,61 @@ impl LvRow {
     pub fn size_bytes(&self) -> Option<u64> {
         self.lv_size.as_ref().and_then(FlexibleNumber::to_u64)
     }
+
+    /// The distinct backing PV names of this row's device list, in
+    /// report order, with the `(extent)` suffixes stripped.
+    ///
+    /// `pvmove` mirror segments (`pvmove0`, ...) are **kept** as
+    /// names: callers distinguish "still moving" (a `pvmove*` name
+    /// present) from "moved" (only real PV names, none of them the
+    /// source) by inspection.
+    #[must_use]
+    pub fn device_pvs(&self) -> Vec<&str> {
+        let Some(devices) = self.devices.as_deref() else {
+            return Vec::new();
+        };
+        let mut names: Vec<&str> = Vec::new();
+        for entry in devices.split(',') {
+            let name = entry.split('(').next().unwrap_or(entry).trim();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Whether a `pvmove` mirror segment is active for this LV (the
+    /// device list references a `pvmove*` segment).
+    ///
+    /// This is the honest "moving" observation on LVM 2.03.x: the
+    /// LV-row `copy_percent` stays empty during a background move
+    /// and the `lv_attr` change is a subtle case shift, but the
+    /// devices column verifiably references the temporary segment
+    /// until the move lands.
+    #[must_use]
+    pub fn move_segment_active(&self) -> bool {
+        self.device_pvs()
+            .iter()
+            .any(|name| name.starts_with("pvmove"))
+    }
+
+    /// The sync percentage when reported as a plain number (empty
+    /// during background moves on LVM 2.03.x — diagnostics only).
+    #[must_use]
+    /// The sync percentage, truncated toward zero (LVM prints two
+    /// decimals, e.g. `12.34` → 12 — the conservative read: a
+    /// supervision loop is never more done than reported). An empty
+    /// column — the LV row during a background move, the shape
+    /// verified against LVM 2.03.16 (the progress lives on the
+    /// hidden mirror segment) — is `None`.
+    pub fn copy_percent(&self) -> Option<u64> {
+        let text = self.copy_percent.as_deref()?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let (whole, _frac) = text.split_once('.')?;
+        whole.parse().ok()
+    }
 }
 
 /// One `pvs` report row.
@@ -150,6 +223,31 @@ pub struct PvRow {
     /// Physical volume device path.
     #[serde(default)]
     pub pv_name: Option<String>,
+    /// The volume group this PV belongs to (empty/absent when the PV
+    /// is not in any VG).
+    #[serde(default)]
+    pub vg_name: Option<String>,
+    /// Total PV size in bytes.
+    #[serde(default)]
+    pub pv_size: Option<FlexibleNumber>,
+    /// Free space on this PV in bytes (the same-VG move's target
+    /// capacity check).
+    #[serde(default)]
+    pub pv_free: Option<FlexibleNumber>,
+}
+
+impl PvRow {
+    /// Free bytes on this PV, when reported and parseable.
+    #[must_use]
+    pub fn free_bytes(&self) -> Option<u64> {
+        self.pv_free.as_ref().and_then(FlexibleNumber::to_u64)
+    }
+
+    /// Total bytes of this PV, when reported and parseable.
+    #[must_use]
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.pv_size.as_ref().and_then(FlexibleNumber::to_u64)
+    }
 }
 
 /// Root of `lsblk --json --bytes` output.
@@ -273,5 +371,57 @@ mod tests {
             Some("0x5000c50015ead127")
         );
         assert_eq!(parsed.blockdevices[1].model, None);
+    }
+
+    /// The move-observation columns, shaped on real LVM 2.03.16 JSON
+    /// (verified against a loop-device VG): a mid-move LV references
+    /// the `pvmove` segment in `devices` with an empty
+    /// `copy_percent`; a settled LV lists its real PVs.
+    #[test]
+    fn lv_row_parses_move_observation_columns() {
+        let moving = r#"{"report":[{"lv":[
+            {"vg_name":"testvg","lv_name":"biglv","lv_attr":"-wI-a-----",
+             "copy_percent":"","devices":"pvmove0(0)"}
+        ]}]}"#;
+        let rows: Vec<LvRow> = parse_report(moving, "lv").expect("parse");
+        assert!(rows[0].move_segment_active(), "the mirror segment is named");
+        assert_eq!(rows[0].device_pvs(), vec!["pvmove0"]);
+        assert_eq!(rows[0].copy_percent(), None, "empty string parses to None");
+
+        let settled = r#"{"report":[{"lv":[
+            {"vg_name":"testvg","lv_name":"biglv","lv_attr":"-wi-a-----",
+             "copy_percent":"100.00","devices":"/dev/loop1(0)"}
+        ]}]}"#;
+        let rows: Vec<LvRow> = parse_report(settled, "lv").expect("parse");
+        assert!(!rows[0].move_segment_active());
+        assert_eq!(rows[0].device_pvs(), vec!["/dev/loop1"]);
+        assert_eq!(rows[0].copy_percent(), Some(100));
+
+        // A multi-PV spread lists every distinct PV once, extent
+        // suffixes stripped — the single-source scope check reads
+        // exactly this list.
+        let spread = r#"{"report":[{"lv":[
+            {"vg_name":"testvg","lv_name":"lv2","lv_attr":"-wi-a-----",
+             "copy_percent":"","devices":"/dev/sda(0),/dev/sdb(12),/dev/sda(32)"}
+        ]}]}"#;
+        let rows: Vec<LvRow> = parse_report(spread, "lv").expect("parse");
+        assert_eq!(rows[0].device_pvs(), vec!["/dev/sda", "/dev/sdb"]);
+    }
+
+    /// The pvs move-validation columns (real LVM 2.03.16 default
+    /// column set): PV → VG membership plus per-PV free space.
+    #[test]
+    fn pv_row_parses_vg_and_free_columns() {
+        let stdout = r#"{"report":[{"pv":[
+            {"pv_name":"/dev/loop0","vg_name":"testvg","pv_size":"130023424",
+             "pv_free":"113246208"},
+            {"pv_name":"/dev/loop1","vg_name":"testvg","pv_size":"130023424",
+             "pv_free":"130023424"}
+        ]}]}"#;
+        let rows: Vec<PvRow> = parse_report(stdout, "pv").expect("parse");
+        assert_eq!(rows[0].vg_name.as_deref(), Some("testvg"));
+        assert_eq!(rows[0].free_bytes(), Some(113_246_208));
+        assert_eq!(rows[1].free_bytes(), Some(130_023_424));
+        assert_eq!(rows[1].size_bytes(), Some(130_023_424));
     }
 }

@@ -329,8 +329,17 @@ Evidence:
   - **Same-host relocation, Option A (LVM `pvmove`, same VG)**: online by
     LVM's design — the dm identity stays stable, the VMM never pivots.
     Volvisor's job is orchestration + the safety contract (journal,
-    verify, source extents freed only after verified relocation). Not
-    implemented.
+    verify, source extents freed only after verified relocation).
+    **Delivered in P6-C (PR #24)**: `POST /v2/volumes/{volume_id}/move-backing`
+    under the advertised `same_vg_extent_move` capability —
+    journal-before-mutate, the honest state subset
+    `PREPARING | COPYING | COMPLETE | IN_DOUBT` (the kernel-internal
+    mirror makes `MIRROR_READY`/`PIVOTED` unobservable through `lvs`;
+    scope refusals are typed errors before any state exists), one fenced
+    generation bump landing with the verified `COMPLETE` record, unknown
+    outcomes — an out-of-band `pvmove --abort` included — parked
+    `IN_DOUBT` with the source intact and new work refused typed, and no
+    consumer abort route in this slice.
   - **Option B (QSD `blockdev-mirror` + pivot over vhost-user-blk)**:
     general per-volume pool-to-pool moves. Explicitly gated: "QSD command
     availability is not sufficient evidence… a proof-of-concept must show
@@ -342,7 +351,8 @@ Evidence:
 
 So the honest answer to "without interruption": **yes for same-VG extent
 evacuation** (`pvmove` is an online kernel operation — no interruption by
-construction, once volvisor orchestrates it), **yes for online grow with
+construction, and volvisor now orchestrates it: P6-C, PR #24), **yes for
+online grow with
 notification** (small, version-gated), and **not yet claimable for
 cross-VG/pool whole-volume moves** (QSD path needs its POC first).
 

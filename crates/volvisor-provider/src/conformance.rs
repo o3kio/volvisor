@@ -13,7 +13,10 @@
 //! idempotent create, payload-conflict detection, single-writer enforcement,
 //! generation fencing on attach/detach/grow/delete, detach drain
 //! preconditions, grow-only resize, delete preconditions, project-scoped
-//! listing, capability gating and missing-volume handling.
+//! listing, capability gating and missing-volume handling, plus the
+//! MoveVolumeBackingOnline contract pins (capability-gated scope,
+//! the rate-limit honored-or-refused rule, observed-target
+//! validation).
 //!
 //! The kit targets the P0 `native-local` profile: fixtures build
 //! `native-local` thick volumes, and post-create evidence is asserted to be
@@ -29,10 +32,11 @@ use volvisor_types::domain::{EvidenceStatus, Health, VolumeClass};
 use volvisor_types::request::{
     AccessModeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, ErasurePolicy, GrowGuestNotification, GrowVolumeRequest,
+    MoveVolumeBackingRequest,
 };
 use volvisor_types::{
-    ApiErrorCode, AttachmentId, AttachmentState, Capability, Frontend, HostId, OperationId,
-    ProjectId, VolumeId, VolumeLifecycle,
+    ApiErrorCode, AttachmentId, AttachmentState, Capability, Frontend, HostId,
+    MoveVolumeBackingState, OperationId, ProjectId, VolumeId, VolumeLifecycle,
 };
 
 /// Fixture size used by the kit (1 GiB, 512-aligned).
@@ -693,6 +697,102 @@ pub async fn check_attach_missing_volume(provider: &dyn VolumeProvider) -> Resul
     }
 }
 
+/// Check: the MoveVolumeBackingOnline contract (section 4A).
+///
+/// Two binding rules every provider obeys regardless of scope:
+///
+/// - **Capability gating**: a provider that does not advertise
+///   `same_vg_extent_move` refuses every move with
+///   `MOVE_UNSUPPORTED_SCOPE` (the fail-closed trait default is the
+///   pin — no silent degradation, and the current extents are never
+///   touched by a refusal).
+/// - **`max_copy_bytes_per_sec` is honored or refused**: a provider
+///   that advertises the move but cannot rate-limit the copy refuses
+///   a set value with `UNSUPPORTED_CLASS_OR_POLICY` **naming the
+///   parameter** — never a silent ignore. (A provider that CAN honor
+///   it passes by honoring it; no current one can.)
+///
+/// A qualified provider additionally answers a nonexistent target
+/// with `NOT_FOUND` — the target is validated against the observed
+/// world, never assumed.
+pub async fn check_move_contract(provider: &dyn VolumeProvider) -> Result<(), String> {
+    let move_req = MoveVolumeBackingRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: OperationId::new("op-cc-move-contract").expect("valid fixture operation id"),
+        target_pool_id: "/dev/nonexistent-move-target".to_owned(),
+        expected_generation: 1,
+        max_copy_bytes_per_sec: None,
+    };
+    if !provider
+        .capabilities()
+        .contains(Capability::SameVgExtentMove)
+    {
+        // No volume is created for the unqualified path: the
+        // fail-closed refusal precedes any volume lookup (and a
+        // shared-instance suite must not spend provider resources on
+        // it).
+        let missing = VolumeId::new("cc-never-created").expect("valid fixture volume id");
+        return match provider.move_volume_backing(&missing, &move_req).await {
+            Err(e) if e.code == ApiErrorCode::MoveUnsupportedScope => Ok(()),
+            Err(e) => Err(format!(
+                "move without the same_vg_extent_move capability must fail with \
+                 MOVE_UNSUPPORTED_SCOPE, got {e}"
+            )),
+            Ok(_) => Err(
+                "move without the same_vg_extent_move capability must not succeed \
+                 (fail-closed)"
+                    .to_owned(),
+            ),
+        };
+    }
+    // Qualified: the target is validated against the observed world.
+    let req = fixture_create_request("cc-move-contract", GIB);
+    provider
+        .create_volume(&req)
+        .await
+        .map_err(|e| format!("create_volume: {e}"))?;
+    match provider
+        .move_volume_backing(&req.volume_id, &move_req)
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "a move to a nonexistent target must fail with NOT_FOUND, got {e}"
+            ));
+        }
+        Ok(_) => {
+            return Err(
+                "a move to a nonexistent target must not succeed (the target is \
+                 observed, never assumed)"
+                    .to_owned(),
+            );
+        }
+    }
+    // Honored or refused, never ignored: the rate limit names itself.
+    let mut rate_limited = move_req;
+    rate_limited.max_copy_bytes_per_sec = Some(1024 * 1024);
+    match provider
+        .move_volume_backing(&req.volume_id, &rate_limited)
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::UnsupportedClassOrPolicy => require(
+            e.detail.contains("max_copy_bytes_per_sec"),
+            "the rate-limit refusal must name the parameter",
+        ),
+        Err(e) => Err(format!(
+            "an unhonorable max_copy_bytes_per_sec must fail with \
+             UNSUPPORTED_CLASS_OR_POLICY, got {e}"
+        )),
+        Ok(response) => require(
+            response.state != MoveVolumeBackingState::Preparing
+                && response.state != MoveVolumeBackingState::Copying,
+            "a rate-limited move that succeeded must have completed (a set limit \
+             is never silently ignored mid-flight)",
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Suite entry points
 // ---------------------------------------------------------------------------
@@ -736,6 +836,9 @@ pub async fn run_conformance(provider: &dyn VolumeProvider) -> Vec<String> {
     }
     if let Err(failure) = check_attach_missing_volume(provider).await {
         failures.push(format!("attach_missing_volume: {failure}"));
+    }
+    if let Err(failure) = check_move_contract(provider).await {
+        failures.push(format!("move_contract: {failure}"));
     }
     failures
 }
@@ -869,6 +972,14 @@ macro_rules! provider_conformance_tests {
                 let provider = $make_provider();
                 let provider: &dyn $crate::VolumeProvider = &*provider;
                 let outcome = $crate::conformance::check_attach_missing_volume(provider).await;
+                assert_eq!(outcome, Ok(()), "conformance failure");
+            }
+
+            #[tokio::test]
+            async fn move_contract() {
+                let provider = $make_provider();
+                let provider: &dyn $crate::VolumeProvider = &*provider;
+                let outcome = $crate::conformance::check_move_contract(provider).await;
                 assert_eq!(outcome, Ok(()), "conformance failure");
             }
         }

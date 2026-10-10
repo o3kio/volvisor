@@ -185,6 +185,32 @@ durable-boundary fault tests green; the refusal table pinned; the campaign
 (or a sibling harness with the same evidence discipline) carries the move's
 fault rows; the contract letter and the implementation agree.
 
+**Delivered in PR #24 (P6-C).** The route is
+`POST /v2/volumes/{volume_id}/move-backing` (journaled, idempotent by
+`operation_id`) over the LVM provider's five-phase drive — admission,
+target qualification, source derivation, pvmove start with the honest
+failed-start classification, and supervision — plus the daemon's 5-s move
+retry reconcile pass. The state map is the honest subset
+`PREPARING | COPYING | COMPLETE | IN_DOUBT` (`MIRROR_READY`/`PIVOTED` are
+kernel-internal and unobservable through `lvs`; scope and admission
+refusals are typed errors raised before any state exists — no `FAILED`
+move record is ever written); the completion verifies the relocation to
+the record's **own** target PV (a foreign off-target relocation parks
+`IN_DOUBT`, never a completion), and one fenced generation bump lands
+with the verified `COMPLETE` record. The evidence: 26 provider-semantics
+tests (`move_tests.rs`, argv-exact FakeRunner), 5 daemon-level e2e rows
+(`move_e2e.rs`), the campaign's row 16 (six durable-boundary kill/abort
+scenarios in `move_rows.rs`, the LVM sibling harness with the campaign's
+`Evidence` records), and four env-gated real-LVM integration tests
+(`VOLVISOR_TEST_LVM=1`, LVM 2.03.16(2)): evacuation under concurrent
+guest I/O with byte-exact checksum verification, the restart-mid-move
+re-attach through pvmove's own "Detected pvmove in progress" semantics,
+the out-of-band abort while down parking `IN_DOUBT` with the source
+intact, and the mid-supervision abort parking without ever freeing the
+source. The stage used the real-LVM integration path for the world and
+the fake for the deterministic fault clock — both, recorded here per the
+test/evidence clause.
+
 ## 2. P7 — packaging and distribution (ADR-0009)
 
 ### P7-A: `--version`, `--check-config`, config documentation

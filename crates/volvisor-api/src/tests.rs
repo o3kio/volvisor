@@ -554,6 +554,179 @@ async fn grow_composes_the_notifier_status_inside_the_journaled_outcome() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// MoveVolumeBackingOnline (contract section 4A): the route layer over the
+// fail-closed trait default. The FakeProvider does not advertise
+// `same_vg_extent_move`, so these pin the unqualified-provider refusal and
+// the journal discipline around it; the qualified provider's own move
+// semantics (the pvmove drive, its state machine and its fault rows) live
+// in volvisor-lvm and the volvisord move e2e.
+// ---------------------------------------------------------------------------
+
+fn move_request(operation_id: &str, target: &str, generation: u64) -> Value {
+    json!({
+        "api_version": "volvisor.volume.v2",
+        "operation_id": operation_id,
+        "target_pool_id": target,
+        "expected_generation": generation,
+    })
+}
+
+/// An unqualified provider answers `MOVE_UNSUPPORTED_SCOPE` — the
+/// typed scope refusal, journaled and replayed verbatim like every
+/// Terminal-class volume-op failure, with the volume untouched.
+#[tokio::test]
+async fn move_refuses_unqualified_providers_typed() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-move-refuse", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let move_req = move_request(
+        "op-move-refuse",
+        "/dev/disk/by-id/wwn-0x5000c500target01",
+        1,
+    );
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-refuse/move-backing",
+            &move_req,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "move: {body}");
+    assert_eq!(body["code"], json!("MOVE_UNSUPPORTED_SCOPE"));
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("same_vg_extent_move"),
+        "the refusal names the unadvertised capability: {body}"
+    );
+
+    // The refusal is journaled and replays byte-identically (the
+    // Terminal failure-replay class), with no provider re-execution.
+    let records_after_refusal = journal_record_count(&state);
+    let (status, replay) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-refuse/move-backing",
+            &move_req,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(replay, body, "the refusal replays verbatim");
+    assert_eq!(journal_record_count(&state), records_after_refusal);
+
+    // The volume is untouched by the refusal: same generation, no
+    // state change (the extents were never a party to it).
+    let (status, inspected) =
+        send_json(&app, request(Method::GET, "/v2/volumes/vol-move-refuse")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inspected["generation"], json!(1));
+}
+
+/// Envelope rejections happen before the journal: no record, and the
+/// `operation_id` stays reusable for a corrected request.
+#[tokio::test]
+async fn move_envelope_rejections_leave_no_journal_record() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-move-envelope", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let records_after_create = journal_record_count(&state);
+
+    let malformed = move_request("op-move-envelope", "   ", 1);
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-envelope/move-backing",
+            &malformed,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "envelope: {body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
+    assert_eq!(journal_record_count(&state), records_after_create);
+
+    // The same operation_id, now with a well-formed envelope,
+    // proceeds to the provider (and its typed refusal) — the
+    // rejected attempt left nothing behind.
+    let corrected = move_request(
+        "op-move-envelope",
+        "/dev/disk/by-id/wwn-0x5000c500target01",
+        1,
+    );
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-envelope/move-backing",
+            &corrected,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], json!("MOVE_UNSUPPORTED_SCOPE"));
+}
+
+/// The same `operation_id` with a different payload is the immutable
+/// wire-request conflict, exactly as on every volume op.
+#[tokio::test]
+async fn move_operation_id_reuse_with_a_different_payload_conflicts() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-move-conflict", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let first = move_request(
+        "op-move-conflict",
+        "/dev/disk/by-id/wwn-0x5000c500target01",
+        1,
+    );
+    let (status, _) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-conflict/move-backing",
+            &first,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST); // the recorded refusal
+
+    let second = move_request(
+        "op-move-conflict",
+        "/dev/disk/by-id/wwn-0x5000c500other02",
+        1,
+    );
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-move-conflict/move-backing",
+            &second,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "conflict: {body}");
+    assert_eq!(body["code"], json!("IDEMPOTENCY_CONFLICT"));
+}
+
 #[tokio::test]
 async fn attach_reused_across_volume_targets_is_a_conflict() {
     let (state, _provider, _dir) = setup();

@@ -54,7 +54,8 @@ pub use id::{
 pub use request::{
     AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse, CreateVolumeRequest,
     DeleteVolumeRequest, DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, PROVIDER_API_VERSION,
+    GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, MoveVolumeBackingRequest,
+    MoveVolumeBackingResponse, PROVIDER_API_VERSION,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 
