@@ -743,6 +743,17 @@ async fn happy_path_drives_every_transition_in_order() {
     assert_eq!(history_pairs(&final_record), expected_happy_history());
     assert_eq!(final_record.barrier_proofs.len(), VOLS.len());
 
+    // Plan §8 item 2: the completed migration's observation carries
+    // the measured cut duration — the ticking clock advanced across
+    // the cut's transitions, so the measurement is real and positive.
+    let summary = final_record.observe();
+    assert!(
+        summary.cut_duration_secs.is_some_and(|secs| secs > 0),
+        "the cut duration is measured: {:?}",
+        summary.cut_duration_secs
+    );
+    assert_eq!(summary.state, HandoffState::Complete);
+
     // The world reflects the cut: VM gone, source Secondary, leases
     // migrated to the target.
     {

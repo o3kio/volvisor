@@ -782,42 +782,53 @@ impl HandoffDriver for DaemonHandoffDriver {
 
     async fn void_barriers(&self, record: &MigrationRecord) -> Result<(), ApiError> {
         // Confirm by state, never by fresh-mutation success (the B2
-        // seam contract): for every recorded proof, the witness's
-        // barrier log must show this migration's barriers voided; an
-        // unvoided entry is voided under the deterministic op id (a
-        // lost response replays the recorded outcome) and the response
-        // itself must carry `voided: true`.
-        for proof in &record.barrier_proofs {
-            let view = self.view(&proof.volume_id).await?;
+        // seam contract) — and enumerate the PARTICIPANTS, not the
+        // recorded proofs. A crash inside the barrier drive can leave
+        // the durable record with an empty or partial proof set while
+        // the witness already holds live barriers of this migration;
+        // iterating the proofs alone would return vacuous success and
+        // the rollback would resume the source over unvoided barriers
+        // — exactly the false-SAFE_CURRENT shape G5 exists to exclude.
+        for participant in &record.participants {
+            let view = self.view(&participant.volume_id).await?;
             let mut unvoided = Vec::new();
+            let mut present = false;
             for barrier in &view.barriers {
-                if barrier.migration_id.as_ref() == Some(&record.migration_id) {
-                    if barrier.voided {
-                        continue;
-                    }
+                if barrier.migration_id.as_ref() != Some(&record.migration_id) {
+                    continue;
+                }
+                present = true;
+                if !barrier.voided {
                     unvoided.push(barrier.clone());
                 }
             }
-            if view
-                .barriers
-                .iter()
-                .all(|barrier| barrier.migration_id.as_ref() != Some(&record.migration_id))
-            {
-                // The proof references a barrier the witness does not
-                // hold: never guess (a re-recorded journal, a foreign
-                // witness) — refuse typed so the rollback fails closed
-                // into the fence path.
-                return Err(ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!(
-                        "the witness holds no barrier of migration {} for {} (proof references \
-                         commit index {})",
-                        record.migration_id, proof.volume_id, proof.boundary_commit_index
-                    ),
-                ));
+            if !present {
+                // Belt-and-suspenders for the proof-present case only:
+                // a recorded proof the witness cannot show means a
+                // re-recorded journal or a foreign witness — never
+                // guess, refuse typed so the rollback fails closed
+                // into the fence path. Without a proof (the crash
+                // window) an empty set simply means nothing was
+                // recorded before the crash: nothing to void.
+                if let Some(proof) = record
+                    .barrier_proofs
+                    .iter()
+                    .find(|proof| proof.volume_id == participant.volume_id)
+                {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "the witness holds no barrier of migration {} for {} (proof \
+                             references commit index {})",
+                            record.migration_id, participant.volume_id, proof.boundary_commit_index
+                        ),
+                    ));
+                }
+                continue;
             }
-            for barrier in unvoided {
-                let op_id = void_barrier_operation_id(&record.migration_id, &proof.volume_id)?;
+            for barrier in &unvoided {
+                let op_id =
+                    void_barrier_operation_id(&record.migration_id, &participant.volume_id)?;
                 let request = VoidBarrierRequest {
                     protocol_version: WITNESS_PROTOCOL_VERSION,
                     operation_id: op_id,
@@ -827,7 +838,7 @@ impl HandoffDriver for DaemonHandoffDriver {
                 };
                 let response = self
                     .witness
-                    .void_barrier(&proof.volume_id, request)
+                    .void_barrier(&participant.volume_id, request)
                     .await
                     .map_err(|error| witness_api_error(&error))?;
                 if !response.barrier.voided {
@@ -836,10 +847,27 @@ impl HandoffDriver for DaemonHandoffDriver {
                         format!(
                             "the witness voided the barrier of {} (migration {}) without \
                              reporting it voided",
-                            proof.volume_id, record.migration_id
+                            participant.volume_id, record.migration_id
                         ),
                     ));
                 }
+            }
+            // The seam contract's confirmation is state, not the
+            // mutation's response: after voiding, every barrier of
+            // this migration must read voided (G5's hard gate on any
+            // source resume).
+            let rechecked = self.view(&participant.volume_id).await?;
+            if rechecked.barriers.iter().any(|barrier| {
+                barrier.migration_id.as_ref() == Some(&record.migration_id) && !barrier.voided
+            }) {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "an unvoided barrier of migration {} for {} survives the void (G5: \
+                         the source cannot resume)",
+                        record.migration_id, participant.volume_id
+                    ),
+                ));
             }
         }
         Ok(())
@@ -1482,6 +1510,8 @@ mod tests {
             consumer_proof: None,
             created_at: 0,
             updated_at: 0,
+            cut_started_at: None,
+            cut_completed_at: None,
         }
     }
 

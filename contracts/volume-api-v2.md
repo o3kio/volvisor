@@ -147,7 +147,7 @@ surface serves typed errors on all of them):
 POST /v2/vms/{vm_id}/check-mobility           200 {eligible, reasons[], participants[]}
 POST /v2/migrations                           201 {migration_id, state, participants[]}   (PrepareNearlineHandoff)
 POST /v2/migrations/{migration_id}/transfer   202 {state}                                  (BarrierAndTransfer)
-GET  /v2/migrations/{migration_id}            200 {state, state_history[], in_doubt_detail?} (ObserveHandoff)
+GET  /v2/migrations/{migration_id}            200 {state, state_history[], in_doubt_detail?, cut_duration_secs?} (ObserveHandoff)
 POST /v2/migrations/{migration_id}/abort      200 {state}
 ```
 
@@ -160,7 +160,10 @@ POST /v2/migrations/{migration_id}/abort      200 {state}
   returned. Volvisor pauses and verifies the VM itself: the caller's
   `vm_paused_and_io_drained_proof` is **recorded as corroboration
   only** — an absent or false proof never substitutes for volvisor's
-  own verified pause, and never changes the drive's behavior.
+  own verified pause, and never changes the drive's behavior. A
+  completed migration's observation carries the measured wall-clock
+  cut duration (`cut_duration_secs`: the seconds between the cut
+  write-ahead's first durable step and `COMPLETE`).
 - **Downtime statement**: this is a stop-and-copy cutover, not a live
   migration. The guest is paused for the barrier, cut, restore and
   resume; the window between `BarrierAndTransfer` and `VM_RESUMED` is

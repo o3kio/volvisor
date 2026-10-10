@@ -422,6 +422,8 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             consumer_proof: None,
             created_at: now,
             updated_at: now,
+            cut_started_at: None,
+            cut_completed_at: None,
         };
         // Side effects first, then persist, then report (plan §3).
         self.driver.prepare_target(&record).await?;
@@ -1010,6 +1012,17 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         record.state = state.clone();
         record.cut = cut;
         record.updated_at = now;
+        // The measured cut duration's bounds (plan §8 item 2): the
+        // first durable cut step starts the clock, `Complete` stops
+        // it. Stamped inside the same persist as the transition they
+        // measure — a crash between them loses nothing but a
+        // monotonic bound.
+        if record.cut.is_some() && record.cut_started_at.is_none() {
+            record.cut_started_at = Some(now);
+        }
+        if state == HandoffState::Complete && record.cut_completed_at.is_none() {
+            record.cut_completed_at = Some(now);
+        }
         record.state_history.push(StateHistoryEntry {
             state,
             cut,

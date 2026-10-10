@@ -1545,20 +1545,28 @@ async fn row_16_abort_with_witness_down_fails_closed() {
     poll_migration(rig.a.addr, "mig-16", "quiesced", None).await;
     drive_settled(&rig.a).await;
 
-    // The abort's G5 gate cannot be evaluated: typed refusal, nothing
-    // resumed, replayed byte-identically.
+    // The abort's G5 gate cannot be evaluated: the void fails closed —
+    // the source is fenced, never resumed — and the abort reports the
+    // terminal doubt honestly as its outcome.
     let (status, body) = post_abort(rig.a.addr, "mig-16").await;
-    assert_eq!(status, 409, "abort refusal: {body}");
-    assert_error_code(&body, "UNKNOWN_FENCING_AUTHORITY");
+    assert_eq!(status, 200, "abort: {body}");
+    let observed = body_json(&body);
+    assert_eq!(state_name(&observed), "in_doubt");
+    assert_eq!(
+        observed["in_doubt_detail"],
+        serde_json::json!("abort void failed; source fenced"),
+        "{body}"
+    );
+    // The journaled outcome replays byte-identically.
     let (status_replay, body_replay) = post_abort(rig.a.addr, "mig-16").await;
-    assert_eq!(status_replay, 409);
-    assert_eq!(body, body_replay, "the refusal replays byte-identically");
+    assert_eq!(status_replay, 200);
+    assert_eq!(body, body_replay, "the outcome replays byte-identically");
 
-    // The durable shape is untouched: quiesced, paused, suspended,
-    // marked.
+    // The durable shape is untouched by doubt-resolution: paused,
+    // suspended, marked — the fence holds the source.
     let (status, body) = get_migration(rig.a.addr, "mig-16").await;
     assert_eq!(status, 200, "observe: {body}");
-    assert_eq!(state_name(&body_json(&body)), "quiesced");
+    assert_eq!(state_name(&body_json(&body)), "in_doubt");
     assert_eq!(
         rig.a.core.vmm.vm_state("vm-16").expect("vm state"),
         VmState::Paused
@@ -1566,16 +1574,17 @@ async fn row_16_abort_with_witness_down_fails_closed() {
     assert!(suspended(&rig.a.core.world, SEED_MINOR));
     assert!(cut_marker_of(&rig.a.core.state_path, &volume("vol-16")).is_some());
 
-    // The witness returns; the same abort completes — the source
-    // resumes only after the (empty) barrier set is confirmed.
+    // The witness returns; the recovery completes the rollback — the
+    // source resumes only after the (empty) barrier set is confirmed
+    // voided.
     rig.witness.restart().await;
     let record = rig
         .a
         .handle
         .coordinator()
-        .abort(&migration("mig-16"))
+        .resolve(&migration("mig-16"))
         .await
-        .expect("abort");
+        .expect("resolve");
     assert!(matches!(record.state, HandoffState::Aborted { .. }));
     assert_eq!(
         rig.a.core.vmm.vm_state("vm-16").expect("vm state"),
@@ -1785,6 +1794,88 @@ async fn row_16b_terminal_in_doubt_recovers_after_void() {
         stored.runtime.fence.is_some(),
         "the pending-fence residue stays recorded"
     );
+}
+
+/// Row 16c — the G5 regression for a crash INSIDE the barrier drive
+/// (round-1 review, finding 1): the durable record parks at `QUIESCED`
+/// with an **empty proof set** while the witness already holds a live
+/// barrier of this migration. The rollback's void must enumerate the
+/// participants and void by the witness's own barrier log — a vacuous
+/// success over the empty proof list would resume the source over a
+/// live barrier, the exact false-`SAFE_CURRENT` shape G5 excludes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_16c_void_covers_a_crash_inside_the_barrier_drive() {
+    let mut rig = rig_with(&Seeds {
+        vols: vec![vol("vol-16c", SEED_MINOR, SEED_PORT)],
+        vms: vec![vm("vm-16c", &["vol-16c"])],
+        ..Seeds::default()
+    })
+    .await;
+    // Park the record at QUIESCED with the witness down: the barrier
+    // drive cannot run, so nothing is persisted.
+    rig.witness.stop().await;
+    let (status, body) = post_prepare(
+        rig.a.addr,
+        &serde_json::json!({
+            "migration_id": "mig-16c",
+            "vm_id": "vm-16c",
+            "target_host": PEER_NODE,
+            "volume_ids": ["vol-16c"],
+            "expected_generations": [2],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "prepare: {body}");
+    let (status, body) = post_transfer(rig.a.addr, "mig-16c").await;
+    assert_eq!(status, 202, "transfer: {body}");
+    poll_migration(rig.a.addr, "mig-16c", "quiesced", None).await;
+    drive_settled(&rig.a).await;
+
+    // The witness returns and the crash window is simulated exactly:
+    // the barrier lands on the WITNESS (as the interrupted drive's
+    // first external act), while the STORE never persists the proof —
+    // the record still reads QUIESCED with an empty proof set.
+    rig.witness.restart().await;
+    let mig = migration("mig-16c");
+    record_barrier(&rig.witness, &volume("vol-16c"), &mig).await;
+    let stored: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(record_file(&rig.a.core.journal_dir, &mig))
+            .expect("read the stored record"),
+    )
+    .expect("parse the stored record");
+    assert_eq!(state_name(&stored), "quiesced", "the record is pre-barrier");
+    assert_eq!(
+        stored["barrier_proofs"].as_array().map(Vec::len),
+        Some(0),
+        "the proof set is empty — the crash window"
+    );
+    let view = witness_view(&rig.witness, &volume("vol-16c")).await;
+    assert!(
+        view.barriers
+            .iter()
+            .any(|barrier| barrier.migration_id.as_ref() == Some(&mig) && !barrier.voided),
+        "the witness holds the drive's live barrier"
+    );
+
+    // The abort's void enumerates the participants and voids the
+    // proof-less live barrier from the witness log; only then does
+    // the source resume.
+    let record = rig.a.handle.coordinator().abort(&mig).await.expect("abort");
+    assert!(matches!(record.state, HandoffState::Aborted { .. }));
+    let view = witness_view(&rig.witness, &volume("vol-16c")).await;
+    assert!(
+        view.barriers
+            .iter()
+            .filter(|barrier| barrier.migration_id.as_ref() == Some(&mig))
+            .all(|barrier| barrier.voided),
+        "the proof-less live barrier is voided, not vacuously skipped"
+    );
+    assert_eq!(
+        rig.a.core.vmm.vm_state("vm-16c").expect("vm state"),
+        VmState::Running
+    );
+    assert!(!suspended(&rig.a.core.world, SEED_MINOR));
+    assert!(cut_marker_of(&rig.a.core.state_path, &volume("vol-16c")).is_none());
 }
 
 // ------------------------------------------------------------ row 17
@@ -2032,9 +2123,10 @@ async fn row_18b_half_restored_destination_destroyed_first() {
         .create("vm-18b", &[device_path.as_str()])
         .expect("create the half-restored VM");
 
-    // The restore act destroys the partial VM first; the restore
-    // itself does not run (the pre-destroy observation was `Created`,
-    // not `Absent`) — the honest answer is `absent`.
+    // The restore act re-drives: the partial VM is destroyed first
+    // and the restore then runs into the emptied VMM, landing paused
+    // (resume is false) — one call converges (plan §3's re-drive
+    // rule).
     let request = serde_json::json!({
         "migration_id": "mig-18b",
         "snapshot_dir": snapshot_dir.to_string_lossy(),
@@ -2045,12 +2137,24 @@ async fn row_18b_half_restored_destination_destroyed_first() {
     let (status, body) =
         peer_call("POST", rig.b.addr, "/v2/internal/peer/restore-vm", &request).await;
     assert_eq!(status, 200, "restore-vm: {body}");
-    assert_eq!(body_json(&body)["vm_state"], "absent", "{body}");
+    assert_eq!(body_json(&body)["vm_state"], "paused", "{body}");
     assert_eq!(
         rig.b.core.vmm.vm_state("vm-18b").expect("vm state"),
-        VmState::Absent
+        VmState::Paused
     );
     let calls = rig.b.core.vmm.calls().expect("vmm calls");
+    let destroyed_at = calls
+        .iter()
+        .position(|(method, _)| *method == "destroy")
+        .expect("the partial VM was destroyed");
+    let restored_at = calls
+        .iter()
+        .position(|(method, _)| *method == "restore")
+        .expect("the restore ran into the emptied VMM");
+    assert!(
+        destroyed_at < restored_at,
+        "the half-restored VM is destroyed before the restore: {calls:?}"
+    );
     assert_eq!(
         calls
             .iter()
@@ -2058,14 +2162,6 @@ async fn row_18b_half_restored_destination_destroyed_first() {
             .count(),
         1,
         "the partial VM was destroyed exactly once"
-    );
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|(method, _)| *method == "restore")
-            .count(),
-        0,
-        "the restore itself never ran"
     );
 
     // The journaled success replays byte-identically; nothing
@@ -2080,14 +2176,106 @@ async fn row_18b_half_restored_destination_destroyed_first() {
             .iter()
             .filter(|(method, _)| *method == "destroy")
             .count(),
-        1
+        1,
+        "nothing re-executes on the replay"
     );
     assert_eq!(
         calls
             .iter()
             .filter(|(method, _)| *method == "restore")
             .count(),
-        0
+        1,
+        "nothing re-executes on the replay"
+    );
+}
+
+/// Row 18c — the COORDINATOR's own re-drive over a half-restored
+/// destination (round-1 review, finding 2): the drive parks before
+/// the grant (the destination daemon unreachable — a transport
+/// failure, never a journaled peer-route failure), a crashed prior
+/// restore leaves a defined-not-booted VM on the destination socket,
+/// and the coordinator's resolve drives straight through it — the
+/// restore act destroys the half-restore first and the migration
+/// COMPLETES (row 18b proves the same rule at the route level).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_18c_coordinator_re_drives_a_half_restored_destination() {
+    let mut rig = rig_with(&Seeds {
+        vols: vec![vol("vol-18c", SEED_MINOR, SEED_PORT)],
+        vms: vec![vm("vm-18c", &["vol-18c"])],
+        ..Seeds::default()
+    })
+    .await;
+    let (status, body) = post_prepare(
+        rig.a.addr,
+        &serde_json::json!({
+            "migration_id": "mig-18c",
+            "vm_id": "vm-18c",
+            "target_host": PEER_NODE,
+            "volume_ids": ["vol-18c"],
+            "expected_generations": [2],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "prepare: {body}");
+
+    // The destination daemon dies after the preparation: the drive's
+    // grant cannot reach it — a transport failure parks the record at
+    // the source-revoked `IN_DOUBT` observation (nothing is journaled
+    // by the peer, so the re-drive is not blocked by a replayed
+    // failure outcome).
+    rig.b.stop().await;
+    let (status, body) = post_transfer(rig.a.addr, "mig-18c").await;
+    assert_eq!(status, 202, "transfer: {body}");
+    poll_migration(
+        rig.a.addr,
+        "mig-18c",
+        "in_doubt",
+        Some("source revoked; destination grant not yet authorized"),
+    )
+    .await;
+    drive_settled(&rig.a).await;
+
+    // While the destination is down, a crashed prior restore's
+    // half-restored (defined, not-booted) VM sits on its socket.
+    rig.b
+        .core
+        .vmm
+        .create("vm-18c", &[&format!("/dev/drbd{SEED_MINOR}")])
+        .expect("create the half-restored VM");
+
+    // The destination returns; the coordinator's re-drive grants,
+    // then restores — over the half-restore, destroying it first —
+    // and the migration completes.
+    rig.b.restart().await;
+    let record = rig
+        .a
+        .handle
+        .coordinator()
+        .resolve(&migration("mig-18c"))
+        .await
+        .expect("resolve");
+    assert_eq!(record.state, HandoffState::Complete);
+    assert_eq!(
+        rig.b.core.vmm.vm_state("vm-18c").expect("vm state"),
+        VmState::Running
+    );
+    assert_eq!(
+        rig.a.core.vmm.vm_state("vm-18c").expect("vm state"),
+        VmState::Absent,
+        "the source VM is gone"
+    );
+    let calls = rig.b.core.vmm.calls().expect("vmm calls");
+    let destroyed_at = calls
+        .iter()
+        .position(|(method, _)| *method == "destroy")
+        .expect("the half-restored VM was destroyed");
+    let restored_at = calls
+        .iter()
+        .position(|(method, _)| *method == "restore")
+        .expect("the restore ran");
+    assert!(
+        destroyed_at < restored_at,
+        "the half-restore is destroyed before the restore: {calls:?}"
     );
 }
 

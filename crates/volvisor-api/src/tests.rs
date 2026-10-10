@@ -1706,6 +1706,7 @@ fn migration_summary(state: volvisor_handoff::HandoffState) -> volvisor_handoff:
             minor: 7,
         }],
         in_doubt_detail: None,
+        cut_duration_secs: None,
     }
 }
 
@@ -2961,6 +2962,44 @@ async fn peer_prepare_rejects_an_unsafe_vm_id_and_an_unusable_snapshot_dir() {
 }
 
 #[tokio::test]
+async fn peer_prepare_refuses_a_non_empty_destination_vmm() {
+    // The restore act's destroy-first re-drive (row 18) is only sound
+    // for a socket proven empty at PREPARED: a VM squatting the
+    // destination socket is refused typed here — before the source's
+    // cut — and never destroyed.
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-p9").await;
+
+    kit.fake_vmm
+        .create("vm-p9", &["/dev/fake/vol-p9"])
+        .expect("create the squatted VM");
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/prepare",
+            &peer_prepare_body("mig-p9", "vm-p9", &[("vol-p9", 1)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], json!("INVALID_STATE"));
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("not empty"),
+        "the error names the rule: {body}"
+    );
+    // The squatted VM is untouched.
+    assert_eq!(
+        kit.fake_vmm.vm_state("vm-p9").expect("state"),
+        volvisor_provider::VmState::Created
+    );
+}
+
+#[tokio::test]
 async fn peer_grant_grants_promotes_and_answers_device_paths() {
     let kit = setup_peer();
     let app = app(&kit.state);
@@ -3337,15 +3376,19 @@ async fn peer_restore_vm_restores_and_resumes_under_verified_disk_mappings() {
 
     // A disk mapping that does not match the promoted participant set
     // is the typed refusal, before any VMM act — proven on a second
-    // migration (the first one's restore-vm operation id now carries
-    // its recorded outcome, and a different body under it is the
-    // journal's idempotency conflict, exactly as designed).
+    // migration with a FRESH destination VM id (the first one's
+    // restore-vm operation id now carries its recorded outcome, and a
+    // different body under it is the journal's idempotency conflict,
+    // exactly as designed; the fresh id also honors prepare's
+    // emptiness verification — a destination socket is empty at
+    // prepare in every production shape, since the VM can only arrive
+    // through this migration's own restore).
     let (status, _body) = send_json(
         &app,
         peer_request(
             Method::POST,
             "/v2/internal/peer/prepare",
-            &peer_prepare_body("mig-v1m", "vm-v", &[("vol-v1", 1)]),
+            &peer_prepare_body("mig-v1m", "vm-v1m", &[("vol-v1", 1)]),
         ),
     )
     .await;
@@ -3456,7 +3499,7 @@ async fn peer_restore_vm_resolves_an_in_flight_intent_by_the_observed_vm_state()
 }
 
 #[tokio::test]
-async fn peer_restore_vm_refuses_a_created_destination_vm_on_the_resume_path() {
+async fn peer_restore_vm_re_drives_a_created_destination_vm_on_the_resume_path() {
     let kit = setup_peer();
     let app = app(&kit.state);
     create_volume(&kit, "vol-v3").await;
@@ -3489,9 +3532,11 @@ async fn peer_restore_vm_refuses_a_created_destination_vm_on_the_resume_path() {
     let snapshot_dir = kit.snapshot_root.join("vm-v3");
     write_snapshot(&snapshot_dir, &["/dev/source/vol-v3"]);
 
-    // A defined, not-booted destination VM is a foreign shape the
-    // resume path refuses typed (never destroys a VM the migration
-    // did not put there).
+    // A defined, not-booted destination VM — the exact shape a crash
+    // between define and boot leaves — is this migration's own
+    // half-restore (prepare verified the socket empty before the
+    // source's cut): the resume path destroys it first and re-drives
+    // (plan §3's re-drive rule, row 18) instead of stalling on it.
     kit.fake_vmm
         .create("vm-v3", &[&device_path])
         .expect("create vm");
@@ -3509,8 +3554,17 @@ async fn peer_restore_vm_refuses_a_created_destination_vm_on_the_resume_path() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["code"], json!("INVALID_STATE"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["vm_state"], json!("running"));
+    // The re-drive order is visible in the recording wrapper's call
+    // log: the destroy of the half-restored VM precedes the restore.
+    let calls = kit.vmm.calls.lock().expect("calls");
+    let destroyed = calls.iter().position(|label| *label == "destroy");
+    let restored = calls.iter().position(|label| *label == "restore");
+    assert!(
+        destroyed.is_some_and(|at| restored.is_some_and(|after| at < after)),
+        "the half-restored VM is destroyed before the restore: {calls:?}"
+    );
 }
 
 #[tokio::test]

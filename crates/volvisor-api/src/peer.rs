@@ -1122,6 +1122,23 @@ async fn prepare_act(
             ),
         ));
     }
+    // The destination VMM must be empty for this VM. The restore act's
+    // destroy-first re-drive (plan §3, row 18) treats any VM present
+    // at restore time as this migration's own half-restore — which is
+    // only sound if the socket was verified empty when the preparation
+    // was recorded. A squatted VM id is refused here, before the
+    // source's cut; a foreign VM is never destroyed.
+    let observed = vmm_state(&ctx.vmm, &req.vm_id).await?;
+    if observed != VmState::Absent {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "destination VMM of VM {} is not empty (state {observed:?}); the coordinated \
+                 restore requires an empty destination",
+                req.vm_id
+            ),
+        ));
+    }
     let record = preparation_from_request(&ctx, &req, unix_now());
     ctx.preparations.install(&record)?;
     Ok(prepare_response(&record))
@@ -1458,30 +1475,35 @@ async fn restore_act(
     let vm_id = preparation.vm_id.clone();
     let snapshot_dir = PathBuf::from(&req.snapshot_dir);
     let disks = req.disks.clone();
-    let observed = vmm_state(&ctx.vmm, &vm_id).await?;
+    let mut observed = vmm_state(&ctx.vmm, &vm_id).await?;
     match (req.resume, observed) {
-        // Nothing to clean up (restore into the empty VMM), and the
-        // resume path's already-complete shapes: a paused VM only
-        // needs the resume below, a running one is the act's goal.
+        // The resume path's already-complete shapes: a paused VM only
+        // needs the resume below, a running one is the act's goal; an
+        // empty VMM is the clean restore path.
         (_, VmState::Absent) | (true, VmState::Paused | VmState::Running) => {}
-        // A half-restored VM is destroyed first (plan §3's re-drive
-        // rule; the adapter itself refuses a non-empty VMM).
-        (false, _) => {
+        // Everything else present on the socket is this migration's
+        // own half-restore — a crash between define and boot leaves
+        // exactly the `Created` shape, a crashed restore a `Paused`
+        // one — and is destroyed first (plan §3's re-drive rule, row
+        // 18), on both resume flavors. The foreign-VM guard is the
+        // prepare act's emptiness verification: the socket was proven
+        // empty before the source's cut, so whatever appeared since
+        // is this migration's own doing. One call converges: after
+        // the destroy the act continues into the restore below.
+        _ => {
             let vmm = Arc::clone(&ctx.vmm);
             let vm = vm_id.clone();
             run_blocking(move || vmm.destroy(&vm)).await?;
-        }
-        // A defined-but-not-booted VM is a foreign shape on the
-        // destination socket — refuse typed, never destroy a VM the
-        // migration did not put there.
-        (true, VmState::Created) => {
-            return Err(ApiError::new(
-                ApiErrorCode::InvalidState,
-                format!(
-                    "destination VMM of VM {vm_id} reports a defined, not-booted VM; \
-                     the coordinated restore refuses it (destroy it first)"
-                ),
-            ));
+            observed = vmm_state(&ctx.vmm, &vm_id).await?;
+            if observed != VmState::Absent {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "destination VMM of VM {vm_id} still reports {observed:?} after the \
+                         half-restore was destroyed; refusing to guess",
+                    ),
+                ));
+            }
         }
     }
     if observed == VmState::Absent {
