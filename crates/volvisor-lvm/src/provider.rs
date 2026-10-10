@@ -156,6 +156,40 @@ impl LvmProvider {
         })
     }
 
+    /// The attachment enumeration the daemon's grow-notification
+    /// engine drives (P6-B, ADR-0006 first slice part 1): every
+    /// volume with an attachment, derived from the provider's own
+    /// durable state under its lock — the participant-facts pattern,
+    /// never a consumer assertion. `current_size_bytes` is the
+    /// volume's current size (the notification target; sizes are
+    /// grow-only, so it never decreases). An attachment without a
+    /// recorded `vmm_disk_id` reports `Unaddressable`: the
+    /// notification is refused with a recorded reason, never a
+    /// silent `not_applicable` (a frontend exists).
+    pub fn grow_attachment_facts(
+        &self,
+    ) -> Result<BTreeMap<VolumeId, volvisor_provider::AttachmentForGrow>, ApiError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .volumes()
+            .iter()
+            .filter_map(|(volume_id, stored)| {
+                let record = stored.runtime.attachment.as_ref()?;
+                Some((
+                    volume_id.clone(),
+                    match &record.vmm_disk_id {
+                        Some(vmm_disk_id) => volvisor_provider::AttachmentForGrow::Addressable {
+                            vm_id: record.vm_id.clone(),
+                            vmm_disk_id: vmm_disk_id.clone(),
+                            current_size_bytes: stored.entry.size_bytes,
+                        },
+                        None => volvisor_provider::AttachmentForGrow::Unaddressable,
+                    },
+                ))
+            })
+            .collect())
+    }
+
     /// Run `lvs` and return its report rows.
     pub(crate) fn list_lvs(&self) -> Result<Vec<LvRow>, ApiError> {
         let output = self.runner.run("lvs", lvm_json_args())?;

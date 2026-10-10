@@ -33,7 +33,12 @@
 //! - [`vmm_version`]: the Cloud Hypervisor version gate (P6-B) — the
 //!   semver type, the tolerant `--version` output scan and the
 //!   startup probe caching the fail-closed verdict the
-//!   grow-notification consults.
+//!   grow-notification consults;
+//! - [`grow`]: the grow-notification engine (P6-B, ADR-0006 first
+//!   slice part 1) — the real `guest_notification_status` machine:
+//!   the [`grow::GrowNotifier`] seam the API layer composes inside
+//!   the grow operation, the durable notification store and the
+//!   retry pass that restores the notification invariant.
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -46,6 +51,7 @@
 pub mod admin;
 pub mod conformance;
 pub mod fake;
+pub mod grow;
 pub mod handoff;
 pub mod provider;
 pub mod runner;
@@ -55,6 +61,10 @@ pub mod vmm_version;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
+pub use grow::{
+    AttachmentForGrow, GrowAttachmentFacts, GrowNotificationEngine, GrowNotificationRecord,
+    GrowNotificationStatus, GrowNotificationStore, GrowNotifier, GrowRetryReport,
+};
 pub use handoff::{
     EligibilityParticipant, EligibilityReport, HandoffSurface, QuiesceProof, SyncProof,
 };

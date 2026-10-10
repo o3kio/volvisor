@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use volvisor_handoff::MigrationSurface;
 use volvisor_journal::Journal;
-use volvisor_provider::{AdminSurface, AdoptionSurface, HandoffSurface, VolumeProvider};
+use volvisor_provider::{
+    AdminSurface, AdoptionSurface, GrowNotifier, HandoffSurface, VolumeProvider,
+};
 
 use crate::metrics::Metrics;
 use crate::peer::PeerRouteContext;
@@ -39,6 +41,12 @@ pub struct AppState {
     /// coordinator wrapper behind the five `/v2/migrations` routes.
     /// `None` serves the typed 404 on those routes.
     pub(crate) migration: Option<Arc<dyn MigrationSurface>>,
+    /// Grow-notification seam (P6-B, ADR-0006 first slice part 1):
+    /// the engine the grow operation composes inside the journal's
+    /// execute closure. `None` — every provider without a VMM
+    /// integration — keeps the provider's own placeholder status
+    /// (see [`AppState::with_grow_notifier`]).
+    pub(crate) grow_notifier: Option<Arc<dyn GrowNotifier>>,
     /// The destination-side context of the internal peer routes (P4b
     /// stage B2): the witness connection, the VMM controller, the
     /// provider surfaces and the target-preparation store. `None`
@@ -86,6 +94,7 @@ impl AppState {
             adoption: None,
             handoff: None,
             migration: None,
+            grow_notifier: None,
             peer_ctx: None,
             peer_token: None,
             journal: std::sync::Mutex::new(journal),
@@ -133,6 +142,21 @@ impl AppState {
     #[must_use]
     pub fn with_migration(mut self, migration: Arc<dyn MigrationSurface>) -> Self {
         self.migration = Some(migration);
+        self
+    }
+
+    /// Attach the grow-notification seam (P6-B, ADR-0006 first slice
+    /// part 1): the engine the grow operation composes **inside**
+    /// the journal's execute closure, after the provider resized the
+    /// backing, to drive the VMM capacity notification and report the
+    /// honest `guest_notification_status` (the journaled outcome
+    /// carries it and replays byte-compatibly). A state built
+    /// without this builder keeps the provider's own placeholder
+    /// status — the honest answer for providers with no VMM
+    /// integration (the fake, ceph, drbd).
+    #[must_use]
+    pub fn with_grow_notifier(mut self, notifier: Arc<dyn GrowNotifier>) -> Self {
+        self.grow_notifier = Some(notifier);
         self
     }
 

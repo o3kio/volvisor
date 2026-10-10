@@ -459,6 +459,101 @@ async fn same_operation_id_with_different_payload_is_a_conflict() {
     assert_eq!(conflict["code"], json!("IDEMPOTENCY_CONFLICT"));
 }
 
+/// A stub grow notifier: records the calls, returns one scripted
+/// status (P6-B — the compose seam's focused test; the real engine's
+/// state machine lives in `volvisor-provider`'s `grow_tests`, and the
+/// daemon-level e2e composes the real engine).
+struct StubGrowNotifier {
+    calls: std::sync::Mutex<Vec<(volvisor_types::VolumeId, u64)>>,
+    status: volvisor_types::request::GrowGuestNotification,
+}
+
+impl volvisor_provider::GrowNotifier for StubGrowNotifier {
+    fn notify_grow(
+        &self,
+        volume_id: &volvisor_types::VolumeId,
+        effective_size_bytes: u64,
+    ) -> volvisor_types::request::GrowGuestNotification {
+        self.calls
+            .lock()
+            .expect("stub notifier lock")
+            .push((volume_id.clone(), effective_size_bytes));
+        self.status
+    }
+}
+
+#[tokio::test]
+async fn grow_composes_the_notifier_status_inside_the_journaled_outcome() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let stub = Arc::new(StubGrowNotifier {
+        calls: std::sync::Mutex::new(Vec::new()),
+        status: volvisor_types::request::GrowGuestNotification::Notified,
+    });
+    let state = Arc::new(
+        AppState::new(provider.clone(), None, journal, Some(TEST_TOKEN.to_owned()))
+            .with_grow_notifier(Arc::clone(&stub) as Arc<dyn volvisor_provider::GrowNotifier>),
+    );
+    let app = app(&state);
+
+    // Create and attach: an attached volume's provider placeholder is
+    // retry_required (the honest no-VMM answer), so a `notified`
+    // response can only come from the composed notifier.
+    let create = serde_json::to_value(fixture_create_request("vol-compose", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let attach = serde_json::to_value(fixture_attach_request("vol-compose", "att-compose", 1))
+        .expect("serialize attach fixture");
+    let (status, _) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-compose/attach", &attach),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let grow = serde_json::to_value(fixture_grow_request("vol-compose", 2 * GIB, 2))
+        .expect("serialize grow fixture");
+    let (status, body) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-compose/grow", &grow),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grow: {body}");
+    assert_eq!(
+        body["guest_notification_status"],
+        json!("notified"),
+        "the composed status overrides the provider's retry_required placeholder"
+    );
+    assert_eq!(body["effective_size_bytes"], json!(2 * GIB));
+    // The notifier ran inside the execute closure, after the
+    // provider resized, and saw the effective size.
+    assert_eq!(
+        stub.calls.lock().expect("stub notifier lock").as_slice(),
+        &[(
+            volvisor_types::VolumeId::new("vol-compose").expect("valid volume id"),
+            2 * GIB
+        )]
+    );
+
+    // Replay byte-identically with the same operation id: the
+    // journaled outcome already carries the composed status, so the
+    // closure (and the notifier inside it) never re-runs.
+    let (status, replay) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-compose/grow", &grow),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "replay: {replay}");
+    assert_eq!(replay, body, "the replay is byte-identical");
+    assert_eq!(
+        stub.calls.lock().expect("stub notifier lock").len(),
+        1,
+        "the replay does not re-run the notifier"
+    );
+}
+
 #[tokio::test]
 async fn attach_reused_across_volume_targets_is_a_conflict() {
     let (state, _provider, _dir) = setup();

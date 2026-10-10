@@ -22,7 +22,7 @@ use volvisor_handoff::{MobilityRequest, migration_not_enabled};
 use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AdoptVolumeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
-    DetachVolumeRequest, DrainProof, GrowVolumeRequest, ListVolumesResponse,
+    DetachVolumeRequest, DrainProof, GrowVolumeRequest, GrowVolumeResponse, ListVolumesResponse,
 };
 use volvisor_types::{
     ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, MigrationId, ProjectId,
@@ -191,13 +191,38 @@ pub(crate) async fn grow_volume(
     );
     let payload = ops::path_payload(&volume_id, &req)?;
     let provider = state.provider.clone();
+    // P6-B (ADR-0006 first slice part 1): when the daemon wired a
+    // grow-notification engine, the provider's response is composed
+    // with the real `guest_notification_status` INSIDE this closure —
+    // after the provider resized the backing, before the journal
+    // records the outcome — so the recorded outcome carries the
+    // notified/retry_required/not_applicable the client saw and
+    // replays byte-compatibly. The notification is deliberately
+    // infallible at this seam: the grow already succeeded, and the
+    // contract §4A's partial-failure rule makes every
+    // notification-side refusal a recorded `retry_required`, never
+    // the grow's failure.
+    let notifier = state.grow_notifier.clone();
     ops::execute(
         &state,
         ops::OP_GROW_VOLUME,
         req.operation_id.clone(),
         ops::grow_hash(&req, &volume_id),
         payload,
-        move || async move { provider.grow_volume(&volume_id, &req).await },
+        move || async move {
+            let response = provider.grow_volume(&volume_id, &req).await?;
+            let guest_notification_status = match &notifier {
+                Some(notifier) => notifier.notify_grow(&volume_id, response.effective_size_bytes),
+                // No engine wired (providers without a VMM
+                // integration): the provider's placeholder status is
+                // the honest answer.
+                None => response.guest_notification_status,
+            };
+            Ok(GrowVolumeResponse {
+                guest_notification_status,
+                ..response
+            })
+        },
     )
     .await
     .map_err(ApiErrorReply::from)

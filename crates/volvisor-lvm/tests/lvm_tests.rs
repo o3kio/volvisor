@@ -511,6 +511,88 @@ async fn attach_replay_survives_a_provider_restart() {
 }
 
 #[tokio::test]
+async fn attach_records_the_vmm_disk_id_and_reports_the_grow_facts() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("facts-vol", GIB))
+        .await
+        .expect("create");
+
+    // A detached volume is absent from the enumeration.
+    assert!(
+        !fixture
+            .provider
+            .grow_attachment_facts()
+            .expect("facts")
+            .contains_key(&created.volume_id)
+    );
+
+    // An attachment with a VMM disk id reports addressable, with the
+    // consumer's own id and the provider's current size.
+    let mut request = fixture_attach_request("facts-vol", "facts-att", 1);
+    request.vmm_disk_id = Some("disk-facts-vol".to_owned());
+    fixture
+        .provider
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("attach with a disk id");
+    let facts = fixture.provider.grow_attachment_facts().expect("facts");
+    assert_eq!(
+        facts.get(&created.volume_id),
+        Some(&volvisor_provider::AttachmentForGrow::Addressable {
+            vm_id: "conformance-vm".to_owned(),
+            vmm_disk_id: "disk-facts-vol".to_owned(),
+            current_size_bytes: GIB,
+        })
+    );
+
+    // A grow moves the reported current size (the notification
+    // target follows the backing).
+    fixture
+        .provider
+        .grow_volume(
+            &created.volume_id,
+            &fixture_grow_request("facts-vol", 2 * GIB, 2),
+        )
+        .await
+        .expect("grow");
+    let facts = fixture.provider.grow_attachment_facts().expect("facts");
+    assert_eq!(
+        facts.get(&created.volume_id),
+        Some(&volvisor_provider::AttachmentForGrow::Addressable {
+            vm_id: "conformance-vm".to_owned(),
+            vmm_disk_id: "disk-facts-vol".to_owned(),
+            current_size_bytes: 2 * GIB,
+        })
+    );
+
+    // An attachment WITHOUT a disk id reports unaddressable — never
+    // absent (a frontend exists), never guessed.
+    let mut bare = fixture_attach_request("facts-vol", "facts-att-2", 4);
+    bare.vmm_disk_id = None;
+    fixture
+        .provider
+        .detach_volume(
+            &created.volume_id,
+            &volvisor_types::AttachmentId::new("facts-att").expect("valid id"),
+            &fixture_detach_request("facts-att", 1),
+        )
+        .await
+        .expect("detach");
+    fixture
+        .provider
+        .attach_volume(&created.volume_id, &bare)
+        .await
+        .expect("attach without a disk id");
+    let facts = fixture.provider.grow_attachment_facts().expect("facts");
+    assert_eq!(
+        facts.get(&created.volume_id),
+        Some(&volvisor_provider::AttachmentForGrow::Unaddressable)
+    );
+}
+
+#[tokio::test]
 async fn attach_replay_conflicts_on_a_different_vmm_disk_id() {
     let fixture = fixture();
     let created = fixture
