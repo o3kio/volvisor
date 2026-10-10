@@ -30,7 +30,7 @@
 //! or tested for asynchronous acknowledgement — the peer-apply
 //! window makes the tail explicit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,12 +51,24 @@ const NOTICE_STEP: Duration = Duration::from_millis(1);
 /// block index is unique.
 const WRITE_EVERY_TICKS: u64 = 4;
 
-/// How far the writer may advance the shared frozen clock (one tick
-/// per ack): the boundary cross-check needs the coordinator's
-/// `BARRIER_DURABLE` timestamp to be comparable to ack times, and
-/// the total advance stays far under the 100 s lease TTL so no
-/// lease window is disturbed.
+/// How far ONE SCENARIO's writers may advance the shared frozen
+/// clock (one tick per ack): the boundary cross-check needs the
+/// coordinator's `BARRIER_DURABLE` timestamp to be comparable to ack
+/// times, and the total advance stays far under the 100 s lease TTL
+/// so no lease window is disturbed. The budget is shared by every
+/// writer the scenario runs ([`ClockBudget`]): the multi-volume rows
+/// (one writer per participant) must not multiply it — N writers
+/// each burning the cap would advance the synthetic clock past the
+/// earliest lease deadline and expire the lease as a RIG ARTIFACT,
+/// not as the fault under test.
 const CLOCK_ADVANCE_CAP: u64 = 40;
+
+/// The per-scenario clock-advance budget (see
+/// `CLOCK_ADVANCE_CAP`): one per scenario, shared by all its
+/// writers. [`WriterHandle::start`] mints a fresh one (the
+/// single-writer default); [`WriterHandle::start_shared`] joins an
+/// existing budget (the multi-writer rows).
+pub type ClockBudget = Arc<AtomicU64>;
 
 /// The block tag's magic (`VCW1` — volvisor campaign writer v1).
 const MAGIC: [u8; 4] = *b"VCW1";
@@ -242,8 +254,9 @@ struct GuestWriter {
     vm_id: String,
     minor: u32,
     clock: Arc<std::sync::atomic::AtomicU64>,
-    /// How many clock ticks the writer has advanced (capped).
-    clock_advances: u64,
+    /// The scenario's shared clock-advance budget (see
+    /// `CLOCK_ADVANCE_CAP`).
+    budget: ClockBudget,
     /// The acknowledged journal.
     acked: Vec<AckedWrite>,
     /// The notice-tick counter (the write cadence's divisor).
@@ -300,8 +313,11 @@ impl GuestWriter {
         match handle.write(seq, &payload) {
             Ok(ack) => {
                 self.next_seq += 1;
-                if self.clock_advances < CLOCK_ADVANCE_CAP {
-                    self.clock_advances += 1;
+                // `fetch_add` first: every writer's claim on the
+                // shared budget is unique, so exactly the first
+                // CLOCK_ADVANCE_CAP claims advance the clock — the
+                // budget is per scenario, never per writer.
+                if self.budget.fetch_add(1, Ordering::SeqCst) < CLOCK_ADVANCE_CAP {
                     self.clock.fetch_add(1, Ordering::SeqCst);
                 }
                 self.acked.push(AckedWrite {
@@ -335,7 +351,11 @@ pub struct WriterHandle {
 impl WriterHandle {
     /// Start the continuous writer for `vm` on `minor` (the source
     /// world's device), advancing the shared frozen clock by one
-    /// tick per ack (capped — see the `CLOCK_ADVANCE_CAP` constant).
+    /// tick per ack (capped — see the `CLOCK_ADVANCE_CAP`
+    /// constant). Mints a FRESH scenario budget: the single-writer
+    /// default. Scenarios running more than one writer share one
+    /// budget via [`WriterHandle::start_shared`] — the cap is per
+    /// scenario, never per writer.
     pub fn start(
         world: &Arc<Mutex<FakeDrbd>>,
         vmm: &Arc<FakeVmm>,
@@ -343,13 +363,31 @@ impl WriterHandle {
         minor: u32,
         clock: &Arc<std::sync::atomic::AtomicU64>,
     ) -> WriterHandle {
+        let budget: ClockBudget = Arc::new(AtomicU64::new(0));
+        Self::start_shared(world, vmm, vm, minor, clock, &budget)
+    }
+
+    /// Start the continuous writer JOINING an existing scenario
+    /// budget ([`ClockBudget`]): every writer of one scenario shares
+    /// the `CLOCK_ADVANCE_CAP` total, so N writers advance the
+    /// clock at most CAP ticks between them (the multi-volume rows'
+    /// shape — see the constant's doc for why a per-writer cap would
+    /// expire the lease as a rig artifact).
+    pub fn start_shared(
+        world: &Arc<Mutex<FakeDrbd>>,
+        vmm: &Arc<FakeVmm>,
+        vm: &str,
+        minor: u32,
+        clock: &Arc<std::sync::atomic::AtomicU64>,
+        budget: &ClockBudget,
+    ) -> WriterHandle {
         let inner = Arc::new(Mutex::new(GuestWriter {
             world: Arc::clone(world),
             vmm: Arc::clone(vmm),
             vm_id: vm.to_owned(),
             minor,
             clock: Arc::clone(clock),
-            clock_advances: 0,
+            budget: Arc::clone(budget),
             acked: Vec::new(),
             ticks: 0,
             next_seq: 1,
