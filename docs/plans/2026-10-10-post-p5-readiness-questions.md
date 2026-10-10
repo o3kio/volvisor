@@ -105,6 +105,15 @@ evidence status stated honestly:
   the serve and its `try_lock` defers behind the test's own fresh-prepare
   drive, so the single-shot observation became the same bounded poll the
   transfer and abort cells already use**;
+- the **row-3 oracle budget sensitivity** (disclosed in PR #20's
+  certification, not previously pinned here): the §3.2 budget bound for
+  the kill-and-recover oracle rows (5 s) sat on top of the peer-grant
+  cells' designed duration — one full migration-retry tick (5 s, the
+  production recovery path the row proves) — with zero headroom, so
+  suite-load excursions crossed it (5031 ms against the 5000 ms bound;
+  4955–4960 ms isolated). **Resolved in PR #21 (P6-A part 1): the P5
+  plan §3.2 bound for row 3 is amended to 8 s with the derivation
+  recorded there; every other row's bound is unchanged.**
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 

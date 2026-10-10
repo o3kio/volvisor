@@ -304,9 +304,22 @@ The matrix is generated, not hand-enumerated. **Bounds, stated here
 kill points are the journaled boundaries (typically 3–6 per operation,
 plus 2 store-save splits), not every journal write; the full matrix is
 budgeted per family (kill families ≤ 5s each, storm ≤ 10s, oracle
-families ≤ 5s; the whole campaign inside the existing suite budget
-~60s) — anything over budget is a recorded follow-up with its
+families ≤ 5s — except row 3, the kill-and-recover oracle rows, ≤ 8s
+per the amendment below; the whole campaign inside the existing suite
+budget ~60s) — anything over budget is a recorded follow-up with its
 uncovered points enumerated in the report, never a silent cut.
+
+*Amendment (P6-A part 1, PR #21):* row 3's bound is 8s, not 5s. The
+row's peer-grant cells (K4/K5) recover through the **production
+migration retry task**, whose tick is 5s — the recovery path the row
+exists to prove, not an accident to optimize away — so the cell's
+designed duration is one full tick plus the re-drive and the bounded
+observation poll (measured 4955–4960ms isolated; 5031ms in one
+full-suite run — the load excursion that disclosed the issue). The
+original 5s bound sat on top of that designed wait with zero headroom,
+which made the budget a tightrope instead of a budget. The amended
+bound is derived: one full retry tick (5s) plus ~3s of re-drive,
+observation and load headroom.
 
 ### 3.3 What "kill" means (the task-group model)
 
