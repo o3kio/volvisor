@@ -160,13 +160,26 @@ Every test records precise product commit, VMM and kernel versions, Ceph/DRBD/to
 
 ## 12. Implementation sequence
 
-P0: stable IDs, device claiming, single-volume API/attachments and provider conformance.
-P1: native-local LVM prototype with thin-space safeguards and direct VFIO as distinct special profile.
-P2: existing-Ceph RBD adapter with shared-backend attach/migration validation.
-P3: nearline DRBD baseline and isolated frontends + local mirror experiment.
-P4: witness/lease design, barrier state-machine, VM/storage cutover, crash/failure campaign.
-P5: compare Mayastor/io_uring/SPDK alternatives; only build a new engine when justified.
-P6: separate managed-Ceph OSD placement ADR/implementation and production gate.
+Delivered (this repo's phase labels; the numbering note below maps them to
+the previous numbering's items):
+
+| Phase | Deliverable | Evidence |
+|---|---|---|
+| P0/P1 | stable IDs, device claiming, single-volume API/attachments with provider conformance; native-local LVM prototype with thin-space safeguards and direct VFIO as a distinct special profile | PR #3 |
+| P2 | existing-Ceph RBD adapter with shared-backend attach/migration validation | PR #4 |
+| P3 | nearline DRBD baseline and isolated frontends (the local-mirror experiment residue is decided in P8) | PR #5 |
+| P4a/P4b | witness/lease design and fencing; barrier state machine, VM/storage cutover | PRs #6–#10 |
+| P5 | aggressive failure campaign: crash/failure evidence with the certified completion gates | PRs #11–#16 |
+
+Remaining sequence:
+
+P6: native online operations — [ADR-0006](../adr/0006-online-resize-and-live-local-block-relocation.md)'s first slice (grow-notification + same-VG `pvmove` relocation) plus the hardening slice (the recorded backlog triage: the `grant_set` wedge design fix, the recorded test flakes and the campaign follow-up questions — each fixed or explicitly declined with a recorded reason).
+P7: packaging and distribution ([ADR-0009](../adr/0009-distribution-and-packaging.md)): deb/rpm artifacts, service units, release gates.
+P8: Tier V real-VMM verification ([ADR-0010](../adr/0010-tier-v-real-vmm-verification.md)); the engine-comparison consideration gate (compare Mayastor/io_uring/SPDK alternatives; only build a new engine when justified by measured gaps); the local-mirror experiment decision (design and fault on the real-host/media tier, or decline with a recorded reason).
+P9: Rook-cell device-sharing POC ([ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md)'s lending surface and the three-physical-host scenarios).
+P10: separate managed-Ceph OSD placement ADR/implementation and production gate.
+
+Numbering note: the repo's historical phase labels P0–P5 (through the aggressive failure campaign) correspond to the previous numbering's P0–P4 — the repo's "P5" campaign is that numbering's P4 crash/failure item. The previous numbering's P5 (the engine-comparison consideration gate) is P8 above; its P6 (managed Ceph) is P10.
 
 The v2 documents fix semantics, **not implementation evidence**. Nothing here is a production support statement.
 

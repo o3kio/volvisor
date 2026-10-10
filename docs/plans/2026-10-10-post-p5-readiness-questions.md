@@ -26,10 +26,12 @@ bundle merges).
 ## 1. Are all implementation plans finished? What remains?
 
 **Answer: SPEC-0002 §12's items P0–P4 are delivered; three §12 residues and
-a recorded backlog remain.** (Numeral caution: the repo's own phase labels
-P0–P5 map onto §12's P0–P4 — the repo's "P5" campaign *is* §12's P4
-crash/failure item. §12's P5 is a different thing: the engine-comparison
-consideration gate below.)
+a recorded backlog remain.** (Numeral caution — resolved by the renumber
+this plan's D1 authorized, which PR #18 applied: SPEC-0002 §12 now carries
+the repo's own phase labels. Historically, the repo's phase labels P0–P5
+mapped onto §12's previous P0–P4 — the repo's "P5" campaign *is* that
+numbering's P4 crash/failure item — and §12's previous P5 was a different
+thing: the engine-comparison consideration gate, now P8.)
 
 Done and merged:
 
@@ -44,7 +46,8 @@ Done and merged:
 
 Remaining from SPEC-0002 §12 as written:
 
-1. **§12 P5, the consideration item** — "compare Mayastor/io_uring/SPDK
+1. **§12's engine-comparison consideration item (the previous numbering's
+   P5, now P8)** — "compare Mayastor/io_uring/SPDK
    alternatives; only build a new engine when justified"
    ([ADR-0007](../adr/0007-drbd9-nearline-replication-provider.md) pins DRBD
    9 as the selected prototype engine). This is a *measured-justification*
@@ -60,7 +63,8 @@ Remaining from SPEC-0002 §12 as written:
    media/devices, so the experiment is decided inside P8 (§6): design and
    fault it on the real-host/media tier, or explicitly decline it with a
    recorded reason. It is not silently deferred.
-3. **§12 P6 (managed-Ceph OSD placement ADR + production gate)** —
+3. **§12's managed-Ceph item (the previous numbering's P6, now P10;
+   managed-Ceph OSD placement ADR + production gate)** —
    unstarted, and correctly so: SPEC-0002 gates it behind the Rook-cell
    POC outcome (§3 below) and a production-support decision that no
    evidence yet carries.
@@ -332,7 +336,7 @@ shape summarized here (the ADR is normative):
 |---|---|---|
 | P6 | Native online operations: grow-notification + same-VG relocation (+ the P6 hardening slice: the grant_set wedge fix, both recorded test flakes, and the two recorded campaign follow-ups triaged — each fixed or explicitly declined with a recorded reason) | Completes an existing contract promise; no external dependencies; the wedge fix restores the honest "completes under witness faults" claim |
 | P7 | Packaging & distribution (ADR-0009) | The installability requirement; also the vehicle every later real-host phase deploys through |
-| P8 | Tier V real-VMM verification (ADR-0010), the P5 engine-comparison consideration gate, and the local-mirror experiment decision | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs; the local-mirror experiment (§12 P3 residue) is decided here — real media/device faulting is the only honest way to fault a mirror, so it is designed and faulted on the real-host/media tier (the Tier R drive, or a Tier V host where the media is real) or explicitly declined with a recorded reason |
+| P8 | Tier V real-VMM verification (ADR-0010), the engine-comparison consideration gate (the previous §12 numbering's P5), and the local-mirror experiment decision | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs; the local-mirror experiment (§12 P3 residue) is decided here — real media/device faulting is the only honest way to fault a mirror, so it is designed and faulted on the real-host/media tier (the Tier R drive, or a Tier V host where the media is real) or explicitly declined with a recorded reason |
 | P9 | Rook-cell device-sharing POC (lending surface + three-host exact-SHA scenarios) | The operator-sharing question; explicitly POC-only |
 | P10 | Managed-Ceph OSD placement ADR + production gate (was P6) | Last: gated on P9's outcome and a production-support decision the evidence must carry |
 
