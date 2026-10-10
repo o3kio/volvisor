@@ -97,6 +97,27 @@ use volvisor_witness::server::{WitnessServerState, router};
 
 mod common;
 
+/// The registered-lineage set a source would record for `resource`
+/// (the row-9 gate's expected input): the world's live identity set
+/// rendered through the show-gi grammar, in the registration's
+/// sorted, deduplicated form — the same set
+/// `DrbdProvider::lineage_uuids` observes on the device.
+fn registered_lineage(world: &Arc<Mutex<FakeDrbd>>, resource: &str) -> Vec<String> {
+    let identity = world
+        .lock()
+        .expect("world")
+        .lineage
+        .get(resource)
+        .cloned()
+        .unwrap_or_else(|| common::GiSet::for_resource(resource));
+    let mut uuids = volvisor_drbd::report::parse_drbdsetup_show_gi(&identity.show_gi_text())
+        .expect("valid show-gi text")
+        .lineage_uuids;
+    uuids.sort();
+    uuids.dedup();
+    uuids
+}
+
 /// One gibibyte (extent-aligned under the fixture's 4-MiB extents).
 const GIB: u64 = 1 << 30;
 /// The witness auth token both sides share (the legacy read-only
@@ -2067,8 +2088,9 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
             .is_none(),
         "the destination never tracked the volume"
     );
+    let lineage = registered_lineage(&f.world, &resource_of("vol-vtr"));
     surface
-        .verify_target_replica(&vol)
+        .verify_target_replica(&vol, &lineage)
         .await
         .expect("the untracked established Secondary replica passes");
 
@@ -2082,7 +2104,7 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
         .remove(&resource_of("vol-vtr"))
         .expect("resource running");
     let error = surface
-        .verify_target_replica(&vol)
+        .verify_target_replica(&vol, &lineage)
         .await
         .expect_err("down resource");
     assert_eq!(error.code, ApiErrorCode::InvalidState);
@@ -2105,7 +2127,7 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
         .expect("resource running")
         .role = Role::Primary;
     let error = surface
-        .verify_target_replica(&vol)
+        .verify_target_replica(&vol, &lineage)
         .await
         .expect_err("primary resource");
     assert_eq!(error.code, ApiErrorCode::InvalidState);
@@ -2125,7 +2147,7 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
     // a target that cannot be proven current.
     f.world.lock().expect("world").peer_online = false;
     let error = surface
-        .verify_target_replica(&vol)
+        .verify_target_replica(&vol, &lineage)
         .await
         .expect_err("disconnected replica");
     assert_eq!(error.code, ApiErrorCode::InvalidState);
@@ -2135,7 +2157,7 @@ async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_sha
     );
     f.world.lock().expect("world").peer_online = true;
     surface
-        .verify_target_replica(&vol)
+        .verify_target_replica(&vol, &lineage)
         .await
         .expect("the re-established replica passes");
 }
@@ -2161,7 +2183,10 @@ async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleare
     assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
     assert!(cut_marker_of(&state.state_path, &state.volume).is_some());
     let error = surface
-        .verify_target_replica(&state.volume)
+        .verify_target_replica(
+            &state.volume,
+            &registered_lineage(&state.world, &state.resource),
+        )
         .await
         .expect_err("cut-marked residue");
     assert_eq!(error.code, ApiErrorCode::InvalidState);
@@ -2174,7 +2199,10 @@ async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleare
         .clear_cut_marker(&state.volume, None)
         .expect("clear the Secondary residue");
     surface
-        .verify_target_replica(&state.volume)
+        .verify_target_replica(
+            &state.volume,
+            &registered_lineage(&state.world, &state.resource),
+        )
         .await
         .expect("the cleared residue reopens the gate");
 }

@@ -611,6 +611,15 @@ impl HandoffDriver for DaemonHandoffDriver {
     }
 
     async fn prepare_target(&self, record: &MigrationRecord) -> Result<(), ApiError> {
+        // The source's live data-generation lineage per participant
+        // (P5 plan §5.2): the honest expected set the destination's
+        // replica gate compares against — read from this host's own
+        // device, never from the request input.
+        let mut expected_lineages = Vec::with_capacity(record.participants.len());
+        for participant in &record.participants {
+            let lineage = self.handoff.source_lineage(&participant.volume_id).await?;
+            expected_lineages.push(lineage);
+        }
         let request = PeerPrepareRequest {
             migration_id: record.migration_id.clone(),
             vm_id: record.vm_id.clone(),
@@ -625,6 +634,7 @@ impl HandoffDriver for DaemonHandoffDriver {
                 .iter()
                 .map(|p| p.expected_generation)
                 .collect(),
+            expected_lineages,
         };
         let response = self.peer.prepare(request).await?;
         // The destination must have verified exactly the participant
@@ -1957,7 +1967,11 @@ mod tests {
             Err(not_scripted())
         }
 
-        async fn verify_target_replica(&self, _volume_id: &VolumeId) -> Result<(), ApiError> {
+        async fn verify_target_replica(
+            &self,
+            _volume_id: &VolumeId,
+            _expected_lineage: &[String],
+        ) -> Result<(), ApiError> {
             // The daemon-wiring tests reach this surface only through
             // the driver, never the peer routes (StubPeer owns the
             // route answers); every call is an honest `Ok`.
@@ -1966,6 +1980,12 @@ mod tests {
 
         async fn role_secondary(&self, _volume_id: &VolumeId) -> Result<bool, ApiError> {
             Ok(true)
+        }
+
+        async fn source_lineage(&self, _volume_id: &VolumeId) -> Result<Vec<String>, ApiError> {
+            // The daemon-wiring tests never assert the lineage's
+            // content (StubPeer owns the route answers).
+            Ok(vec!["stub-lineage".to_owned()])
         }
 
         async fn fail_closed_fence(

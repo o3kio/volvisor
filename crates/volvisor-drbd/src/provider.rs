@@ -424,8 +424,16 @@ impl HandoffSurface for DrbdProvider {
         DrbdProvider::role_secondary(self, volume_id)
     }
 
-    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
-        DrbdProvider::verify_target_replica(self, volume_id)
+    async fn verify_target_replica(
+        &self,
+        volume_id: &VolumeId,
+        expected_lineage: &[String],
+    ) -> Result<(), ApiError> {
+        DrbdProvider::verify_target_replica(self, volume_id, expected_lineage)
+    }
+
+    async fn source_lineage(&self, volume_id: &VolumeId) -> Result<Vec<String>, ApiError> {
+        DrbdProvider::source_lineage(self, volume_id)
     }
 
     async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
@@ -5059,7 +5067,11 @@ impl DrbdProvider {
     /// not name this host, or a tracked volume carries a pending
     /// self-fence / another handoff's cut marker / an unseeded
     /// replica; `INTERNAL` for an observation that cannot be trusted.
-    pub fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+    pub fn verify_target_replica(
+        &self,
+        volume_id: &VolumeId,
+        expected_lineage: &[String],
+    ) -> Result<(), ApiError> {
         let resource = resource_name_for(volume_id);
         let status = self.resource_status(&resource)?.ok_or_else(|| {
             ApiError::new(
@@ -5132,7 +5144,55 @@ impl DrbdProvider {
                 ));
             }
         }
+        // The data-lineage gate (P5 plan §5.2, row 9): the replica's
+        // live data-generation set must equal the registered lineage
+        // the source recorded at the witness — the same comparison
+        // adoption makes at promote time, pulled ahead of the cut so
+        // wrong-lineage data (a botched seed, a stale replica) is
+        // refused typed before the source is ever fenced. Sorted-set
+        // comparison, exactly as `verify_adoption` performs it.
+        let mut registered_lineage = expected_lineage.to_vec();
+        registered_lineage.sort();
+        registered_lineage.dedup();
+        let live_lineage = self.lineage_uuids(&resource)?;
+        if registered_lineage != live_lineage {
+            return Err(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                format!(
+                    "the live lineage of {resource} does not match the registered lineage \
+                     of {volume_id}: the target replica holds foreign-lineage data (a \
+                     botched seed or a stale replica is exactly this refusal)"
+                ),
+            ));
+        }
         Ok(())
+    }
+
+    /// The source-side live lineage (the [`HandoffSurface`] docs):
+    /// the registered set form of this host's own device — the honest
+    /// expected value the destination's replica gate compares against.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` for an unknown volume; `INTERNAL` when the
+    /// observation cannot be trusted (never guessed).
+    pub fn source_lineage(&self, volume_id: &VolumeId) -> Result<Vec<String>, ApiError> {
+        let resource = resource_name_for(volume_id);
+        let entry = self
+            .lock_state()?
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?
+            .entry
+            .clone();
+        if !matches!(self.check_res_file(&entry), ResFileCheck::Matches) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the resource file of {volume_id} is not verifiably this host's; its \
+                     lineage cannot be trusted"
+                ),
+            ));
+        }
+        self.lineage_uuids(&resource)
     }
 
     /// Fail-closed fencing for one participant (stage B2,
