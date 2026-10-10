@@ -227,6 +227,106 @@ impl Journal {
         self.fail_after_remaining.store(n, Ordering::SeqCst);
     }
 
+    /// Test-only journal rollback (feature `test-faults`; P5 plan
+    /// §5.4's witness-divergence injection): simulate a LOST journal
+    /// write by truncating the log to before the last intent record —
+    /// the dropped mutation's intent, its outcome and any checkpoint
+    /// after it disappear, so the next open's replay derives the
+    /// pre-mutation state while callers that already received the
+    /// dropped mutation's response hold the newer view. Enforces the
+    /// same single-writer discipline as [`Journal::open`] (the
+    /// exclusive non-blocking `flock` proves no live writer holds the
+    /// directory), reads the log with the replay decoder, truncates
+    /// and fsyncs. **Never reachable from any production path**: no
+    /// route, config or input takes a journal directory to roll back;
+    /// only a test rig that constructed (and stopped) the witness owns
+    /// the directory. Used by dependent crates' test harnesses to
+    /// exercise the fail-closed lease/epoch checks over a stale
+    /// authority view.
+    ///
+    /// # Errors
+    /// Typed `INTERNAL` when the directory cannot be locked (a live
+    /// writer holds it), the log cannot be read, or the truncation or
+    /// its fsync fails.
+    ///
+    /// # Returns
+    /// `Ok(Some(op_kind))` with the dropped intent's operation kind
+    /// when a mutation was rolled back; `Ok(None)` when the log holds
+    /// no intent record (nothing to drop — the rollback is a no-op).
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn rollback_last_mutation(dir: impl AsRef<Path>) -> Result<Option<String>, ApiError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(io_err("failed to create journal directory"))?;
+        let lock_path = dir.join(JOURNAL_LOCK_FILE);
+        let mut lock_opts = OpenOptions::new();
+        lock_opts
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        lock_opts.mode(0o600);
+        let lock_file = lock_opts.open(&lock_path).map_err(io_err(&format!(
+            "failed to open journal lock file {}",
+            lock_path.display()
+        )))?;
+        rustix::fs::flock(
+            &lock_file,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|err| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "journal directory {} is already locked by another writer \
+                     (single-writer enforcement): {err}",
+                    dir.display()
+                ),
+            )
+        })?;
+        let log_path = dir.join(JOURNAL_LOG_FILE);
+        let mut log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&log_path)
+            .map_err(io_err("failed to open journal log for rollback"))?;
+        log.seek(SeekFrom::Start(0))
+            .map_err(io_err("failed to seek journal log for rollback"))?;
+        let mut data = Vec::new();
+        log.read_to_end(&mut data)
+            .map_err(io_err("failed to read journal log for rollback"))?;
+
+        // Walk the same frame chain replay walks, remembering the byte
+        // offset of every INTENT record; the rollback point is the
+        // last one (a mutation is its intent plus everything after).
+        let mut offset = 0usize;
+        let mut sequence = 1u64;
+        let mut last_intent: Option<(usize, String)> = None;
+        while let Some(raw) = frame::decode_at(&data, offset, sequence) {
+            let envelope = serde_json::from_slice::<Envelope>(raw.payload)
+                .ok()
+                .filter(|envelope| envelope.record_version == RECORD_VERSION);
+            if let Some(envelope) = envelope {
+                if let JournalRecord::Intent(intent) = envelope.record {
+                    last_intent = Some((offset, intent.op_kind.clone()));
+                }
+            }
+            sequence = sequence.saturating_add(1);
+            offset = raw.end;
+        }
+        let Some((rollback_offset, op_kind)) = last_intent else {
+            return Ok(None);
+        };
+        log.set_len(rollback_offset as u64)
+            .map_err(io_err("failed to truncate journal log for rollback"))?;
+        log.sync_all()
+            .map_err(io_err("failed to fsync journal log after rollback"))?;
+        Ok(Some(op_kind))
+    }
+
     /// Look up an operation in the replay-derived idempotency registry.
     ///
     /// Returns `None` for unknown operations and for operations known only

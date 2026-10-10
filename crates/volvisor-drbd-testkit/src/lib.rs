@@ -2121,6 +2121,79 @@ pub fn write_raw(
     Ok(())
 }
 
+/// The foreign payload of one injected block: a deterministic
+/// non-zero fill tagged with the block index — deliberately NOT the
+/// campaign writer's crc shape (MAGIC + seq + writer id + CRC) and
+/// never the zero fill, so a byte-level reader classifies it as
+/// foreign content rather than missing data.
+fn foreign_payload(block: u64, generation: u64) -> [u8; BLOCK_SIZE] {
+    let mut payload = [0_u8; BLOCK_SIZE];
+    payload[0..8].copy_from_slice(&block.to_le_bytes());
+    payload[8..16].copy_from_slice(&generation.to_le_bytes());
+    for byte in payload.iter_mut().skip(16) {
+        *byte = 0xC3;
+    }
+    payload
+}
+
+/// Out-of-band injection of wrong-lineage data (P5 plan §5.2's
+/// injection surface): payload tagged with a FOREIGN data-generation
+/// UUID into the target replica's map — right epoch, wrong lineage,
+/// the shape a botched seed or a stale replica presents. One lie,
+/// two effects:
+///
+/// - the replica's resource-level identity set (what `drbdsetup
+///   show-gi` reports) is REPLACED with a freshly minted foreign
+///   generation — a botched `create-md` mints a new current UUID
+///   instead of inheriting the peer's, so the status-observable
+///   lineage of the replica is foreign to the registration the
+///   source recorded;
+/// - the named blocks are written into the map under that foreign
+///   lineage with a deterministic non-zero payload (the private
+///   `foreign_payload` helper's shape: block index + generation tag
+///   + a constant fill — no writer crc form, never zero).
+///
+/// **TEST-ONLY injection surface (the [`write_raw`] trust class):
+/// driving and assertion never use it** — it models a replica whose
+/// data generation volvisor never minted, and nothing else. The
+/// `generation` salt must be beyond any generation this world minted
+/// (the monotonic `lineage_salt` starts at 0), so the minted set can
+/// never collide with a real one.
+///
+/// # Errors
+/// [`ApiErrorCode::NotFound`] when no running resource holds the
+/// minor.
+pub fn inject_foreign_blocks(
+    world: &Arc<Mutex<FakeDrbd>>,
+    minor: u32,
+    blocks: &[u64],
+    generation: u64,
+) -> Result<(), ApiError> {
+    let mut world = world_lock(world)?;
+    let name = world
+        .resources
+        .iter()
+        .find(|(_, state)| state.minor == minor)
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| ApiError::not_found(format!("drbd{minor}: No such resource")))?;
+    let foreign = GiSet::for_resource_generation(&name, generation);
+    world.lineage.insert(name.clone(), foreign.clone());
+    let Some(state) = world.resources.get_mut(&name) else {
+        return Ok(());
+    };
+    for block in blocks {
+        state.blocks.insert(
+            *block,
+            Block {
+                payload: foreign_payload(*block, generation),
+                lineage: foreign.clone(),
+                applied_at_peer: false,
+            },
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------

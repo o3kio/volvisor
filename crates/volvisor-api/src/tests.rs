@@ -2207,6 +2207,7 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
     async fn verify_target_replica(
         &self,
         volume_id: &volvisor_types::VolumeId,
+        _expected_lineage: &[String],
     ) -> Result<(), ApiError> {
         self.target_checks
             .lock()
@@ -2232,6 +2233,13 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         _volume_id: &volvisor_types::VolumeId,
     ) -> Result<bool, ApiError> {
         Err(ApiError::not_found("not scripted"))
+    }
+
+    async fn source_lineage(
+        &self,
+        volume_id: &volvisor_types::VolumeId,
+    ) -> Result<Vec<String>, ApiError> {
+        Ok(vec![format!("fake-lineage-{}", volume_id.as_str())])
     }
 
     async fn fail_closed_fence(
@@ -2467,8 +2475,31 @@ struct FakeWitnessVolume {
 struct FakePeerWitness {
     host: volvisor_types::HostId,
     volumes: std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, FakeWitnessVolume>>,
+    registrations:
+        std::sync::Mutex<BTreeMap<volvisor_types::VolumeId, volvisor_types::VolumeRegistration>>,
     grant_set_calls: std::sync::Mutex<Vec<GrantSetRequest>>,
     recorded_grants: std::sync::Mutex<BTreeMap<volvisor_types::OperationId, GrantSetResponse>>,
+}
+
+/// A plausible registration for a scripted volume: one lineage UUID
+/// and one endpoint per host pair. The peer routes only read the
+/// lineage set (the prepare gate's expected input); the fake handoff
+/// surface ignores it, so a stable synthetic value suffices.
+fn synthetic_registration(
+    volume: &volvisor_types::VolumeId,
+    host: &volvisor_types::HostId,
+) -> volvisor_types::VolumeRegistration {
+    volvisor_types::VolumeRegistration {
+        volume_id: volume.clone(),
+        lineage_uuids: vec![format!("fake-lineage-{}", volume.as_str())],
+        endpoints: vec![volvisor_types::EndpointBacking {
+            host_id: host.clone(),
+            backing: format!("fake-backing-{}", volume.as_str()),
+            volvisor_created: false,
+        }],
+        barrier: None,
+        registered_at: 0,
+    }
 }
 
 impl FakePeerWitness {
@@ -2476,13 +2507,26 @@ impl FakePeerWitness {
         Self {
             host,
             volumes: std::sync::Mutex::new(BTreeMap::new()),
+            registrations: std::sync::Mutex::new(BTreeMap::new()),
             grant_set_calls: std::sync::Mutex::new(Vec::new()),
             recorded_grants: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
+    /// Script a registration without a lease (the pre-grant shape:
+    /// the prepare gate reads the registration's lineage; the grant
+    /// route's inspection later needs `set_live`).
+    fn set_registered(&self, volume: &volvisor_types::VolumeId) {
+        self.registrations
+            .lock()
+            .expect("registrations")
+            .insert(volume.clone(), synthetic_registration(volume, &self.host));
+    }
+
     /// Script a live lease held by `host` at `epoch` (the grant-act
-    /// inspection's proven-landed arrangement).
+    /// inspection's proven-landed arrangement). The volume also
+    /// becomes REGISTERED (the prepare act's lineage gate reads the
+    /// registration; the fake handoff surface ignores its content).
     fn set_live(&self, volume: &volvisor_types::VolumeId, epoch: u64, lease_id: u64) {
         self.volumes.lock().expect("volumes").insert(
             volume.clone(),
@@ -2493,6 +2537,11 @@ impl FakePeerWitness {
                 holder: Some(self.host.clone()),
             },
         );
+        self.registrations
+            .lock()
+            .expect("registrations")
+            .entry(volume.clone())
+            .or_insert_with(|| synthetic_registration(volume, &self.host));
     }
 }
 
@@ -2508,7 +2557,12 @@ impl FakePeerWitness {
             lease_id: entry.map(|v| volvisor_types::LeaseId(v.lease_id)),
             lease_remaining_secs: entry.map(|_| 30),
             commit_index: 1,
-            registration: None,
+            registration: self
+                .registrations
+                .lock()
+                .expect("registrations")
+                .get(volume)
+                .cloned(),
             barriers: Vec::new(),
             retirements: Vec::new(),
         }
@@ -2626,6 +2680,16 @@ impl BlockingWitnessConnection for FakePeerWitness {
         &self,
         volume: &volvisor_types::VolumeId,
     ) -> Result<volvisor_types::AuthorityView, WitnessError> {
+        // The real registry refuses an unknown volume typed; the fake
+        // scripts the same refusal so the routes' error mapping (and
+        // the prepare gate's registration read) behaves identically.
+        let volumes = self.volumes.lock().expect("volumes");
+        let registrations = self.registrations.lock().expect("registrations");
+        if !volumes.contains_key(volume) && !registrations.contains_key(volume) {
+            return Err(WitnessError::UnknownVolume);
+        }
+        drop(registrations);
+        drop(volumes);
         Ok(self.view(volume))
     }
 }
@@ -2764,6 +2828,14 @@ fn peer_prepare_body(migration: &str, vm: &str, volumes: &[(&str, u64)]) -> Valu
         "source_host": "src-host",
         "volume_ids": volumes.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
         "expected_generations": volumes.iter().map(|(_, g)| *g).collect::<Vec<_>>(),
+        // The source's live lineage per participant (P5 §5.2): a
+        // stable synthetic set — the fake handoff surface ignores the
+        // content; the shape (non-empty, aligned) is what the
+        // validation pins.
+        "expected_lineages": volumes
+            .iter()
+            .map(|(v, _)| vec![format!("fake-lineage-{v}")])
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -2774,8 +2846,10 @@ async fn create_volume(kit: &PeerKit, raw: &str) {
         .expect("create volume");
     // The fake provider's volumes model this host's established
     // replicas (the happy-path peer tests' destination); the surface's
-    // replica-level gate must see them as targets.
+    // replica-level gate must see them as targets, and the witness
+    // must hold their registration (the prepare gate's lineage input).
     kit.handoff.add_target(&volume_id(raw));
+    kit.witness.set_registered(&volume_id(raw));
 }
 
 #[tokio::test]

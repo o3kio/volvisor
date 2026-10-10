@@ -691,6 +691,12 @@ pub struct PeerPrepareRequest {
     pub volume_ids: Vec<VolumeId>,
     /// The expected generation per volume, positionally aligned.
     pub expected_generations: Vec<u64>,
+    /// The expected data-generation lineage per volume (the source's
+    /// live `show-gi` set, positionally aligned; P5 plan §5.2 — the
+    /// destination's replica-level gate compares it against the
+    /// target's live lineage, refusing foreign data before the cut).
+    #[serde(default)]
+    pub expected_lineages: Vec<Vec<String>>,
 }
 
 impl PeerPrepareRequest {
@@ -717,6 +723,22 @@ impl PeerPrepareRequest {
                 self.expected_generations.len(),
                 self.volume_ids.len()
             )));
+        }
+        if self.volume_ids.len() != self.expected_lineages.len() {
+            return Err(ApiError::invalid_request(format!(
+                "expected_lineages has {} entries for {} volumes \
+                 (positionally aligned lists)",
+                self.expected_lineages.len(),
+                self.volume_ids.len()
+            )));
+        }
+        for (volume_id, lineage) in self.volume_ids.iter().zip(&self.expected_lineages) {
+            if lineage.is_empty() {
+                return Err(ApiError::invalid_request(format!(
+                    "participant {volume_id} carries an empty expected lineage (the source \
+                     must attest its live data-generation set)"
+                )));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for volume_id in &self.volume_ids {
@@ -1085,11 +1107,18 @@ async fn prepare_act(
     ctx: Arc<PeerRouteContext>,
     req: PeerPrepareRequest,
 ) -> Result<PeerPrepareResponse, ApiError> {
-    for (volume_id, expected) in req.volume_ids.iter().zip(&req.expected_generations) {
+    let participants: Vec<_> = req
+        .volume_ids
+        .iter()
+        .zip(&req.expected_generations)
+        .zip(&req.expected_lineages)
+        .map(|((volume_id, expected), lineage)| (volume_id, *expected, lineage))
+        .collect();
+    for (volume_id, expected, lineage) in participants {
         match ctx.provider.inspect_volume(volume_id).await {
             Ok(inspected) => {
-                if inspected.generation != *expected {
-                    return Err(ApiError::stale_generation(*expected, inspected.generation));
+                if inspected.generation != expected {
+                    return Err(ApiError::stale_generation(expected, inspected.generation));
                 }
             }
             // The P3 peer side is operator-provisioned and untracked
@@ -1104,8 +1133,15 @@ async fn prepare_act(
         // connected, no fence marker"): refusing an unready
         // destination here, before the source's cut, is this route's
         // whole purpose (row 12 — one unprepared participant refuses
-        // the whole migration).
-        ctx.handoff.verify_target_replica(volume_id).await?;
+        // the whole migration). The expected data-generation lineage
+        // is the SOURCE's live set (P5 plan §5.2 — wrong-lineage data
+        // at the target is refused typed here), carried in the
+        // request so this act never needs the witness: the
+        // crash-window shapes park a record with the witness down,
+        // and preparation is not an authority act.
+        ctx.handoff
+            .verify_target_replica(volume_id, lineage)
+            .await?;
     }
     // The snapshot-dir boundary (plan §1/§6): prove the shared path is
     // usable by this host NOW, not at config time. The per-migration

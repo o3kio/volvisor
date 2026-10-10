@@ -323,6 +323,25 @@ pub trait HandoffSurface: Send + Sync {
         attach: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError>;
 
+    /// The source-side live data-generation lineage of one volume
+    /// (`drbdsetup show-gi`, the registration's set form): what the
+    /// source hands the destination as the EXPECTED lineage of the
+    /// target replica (P5 plan §5.2 — the peer prepare's
+    /// replica-level gate compares it against the target's live set).
+    /// Read from this host's own device: the source owns the data
+    /// being handed off, so its live lineage is the honest expected
+    /// value — and the destination must not need the witness at
+    /// prepare time (the crash-window shapes park a record with the
+    /// witness down).
+    ///
+    /// Read-only: a status observation, no mutation.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` for an unknown volume;
+    /// `INTERNAL` when the observation cannot be trusted (the lineage
+    /// is never guessed).
+    async fn source_lineage(&self, volume_id: &VolumeId) -> Result<Vec<String>, ApiError>;
+
     /// The destination's `PREPARED` gate (plan §6: "target replica
     /// verified — resource present, Secondary, connected, no fence
     /// marker"): verify this host holds the volume's target replica
@@ -332,6 +351,14 @@ pub trait HandoffSurface: Send + Sync {
     /// (its `promote_target` re-verifies everything under the granted
     /// lease; this gate refuses an obviously-unready destination
     /// **before** the source's cut, which is its whole purpose).
+    ///
+    /// The replica's live data-generation lineage (what
+    /// `drbdsetup show-gi` reports) must equal `expected_lineage` —
+    /// the registered lineage the source recorded at the witness (the
+    /// same comparison adoption makes; P5 plan §5.2: wrong-lineage
+    /// data at the target — a botched seed or a stale replica — is
+    /// refused typed here, before the cut, so a handoff never
+    /// completes over foreign data).
     ///
     /// A volume this host *does* track must additionally be free of
     /// the residues that would refuse the promote anyway (a pending
@@ -343,10 +370,16 @@ pub trait HandoffSurface: Send + Sync {
     /// # Errors
     /// Returns [`ApiError`] typed: `INVALID_STATE` when this host
     /// holds no running, Secondary, connected replica of the volume
-    /// (or its resource definition does not name this host); the
-    /// residue refusals above for a tracked volume; `INTERNAL` for an
-    /// observation that cannot be trusted.
-    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+    /// (or its resource definition does not name this host);
+    /// `FOREIGN_DEVICE_STATE` when the replica's live lineage does
+    /// not match the registered one; the residue refusals above for a
+    /// tracked volume; `INTERNAL` for an observation that cannot be
+    /// trusted.
+    async fn verify_target_replica(
+        &self,
+        volume_id: &VolumeId,
+        expected_lineage: &[String],
+    ) -> Result<(), ApiError>;
 
     /// Whether one volume's **local** role is Secondary, from observed
     /// status (stage B2: the daemon's handoff driver feeds the

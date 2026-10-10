@@ -17,7 +17,11 @@ volvisor-provider = { workspace = true }
 volvisor-drbd = { workspace = true }
 volvisor-drbd-testkit = { workspace = true }
 volvisor-handoff = { workspace = true }
-volvisor-journal = { workspace = true }
+# The journal's `test-faults` feature gates the rollback injection
+# (P5 plan §5.4): the campaign is a test-only crate (never a
+# dependency of anything), so the feature never reaches a production
+# build of the journal.
+volvisor-journal = { workspace = true, features = ["test-faults"] }
 volvisor-types = { workspace = true }
 volvisor-witness = { workspace = true }
 axum = { workspace = true }
