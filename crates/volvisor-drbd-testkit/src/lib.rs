@@ -1857,6 +1857,7 @@ pub fn open_device(world: &Arc<Mutex<FakeDrbd>>, minor: u32) -> Result<DeviceHan
 /// # Errors
 /// [`ApiErrorCode::NotFound`] when no running resource holds the
 /// minor.
+///
 /// The campaign's pre-quiesce lag shaper (P5 plan §2.3) and the
 /// transport's drain primitive: apply every queued write whose
 /// acknowledgment sequence is at most `up_to` (a `u64::MAX` bound
