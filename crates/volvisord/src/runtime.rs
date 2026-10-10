@@ -92,6 +92,14 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             // placeholder. The same engine instance serves the grow
             // operation and the retry task (one durable store).
             let grow = wire_grow_notification(config, &provider)?;
+            // The move retry reconcile (P6-C, ADR-0006 first slice
+            // part 2): the detached task owns the journaled-move
+            // lifecycle between consumer requests — completing
+            // provable relocations, re-driving verifiably-unstarted
+            // ones, parking ended-without-relocating ones IN_DOUBT.
+            // The concrete Arc is cloned before the trait-object
+            // coercion below (the pass is an inherent method).
+            let move_reconciler = provider.clone();
             let state = AppState::new(provider, Some(admin), journal, config.admin_token.clone())
                 .with_grow_notifier(grow.clone());
             // Detached by design (the renewal-task pattern): the task
@@ -99,6 +107,7 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             // lifetime and never fails the startup that spawned it —
             // every outcome is a structured event.
             let _detached = spawn_grow_retry_task(grow);
+            let _detached = spawn_move_retry_task(move_reconciler);
             state
         }
         ProviderKind::Ceph => {
@@ -302,6 +311,103 @@ fn log_grow_pass(pass: Result<Result<GrowRetryReport, ApiError>, tokio::task::Jo
             kind = "grow_retry",
             error = %error,
             "grow reconcile pass task failed; retried next pass"
+        ),
+    }
+}
+
+/// The move-records retry reconcile period (P6-C): between consumer
+/// requests, the daemon owns the journaled-move lifecycle at this
+/// cadence — completing provable relocations, re-driving
+/// verifiably-unstarted moves, parking ended-without-relocating
+/// ones `IN_DOUBT`. Matches [`GROW_RETRY_TICK`]'s cadence.
+const MOVE_RETRY_TICK: Duration = Duration::from_secs(5);
+
+/// The background move reconcile task (one per LVM daemon, the grow
+/// retry pattern): each tick runs one `move_reconcile_pass` on the
+/// blocking pool (the pass is synchronous and bounded per record by
+/// the `lvs` observation) and logs every outcome as a structured
+/// event. Detached by design — a failed pass never fails the
+/// daemon; it is retried on the next tick.
+fn spawn_move_retry_task(provider: Arc<volvisor_lvm::LvmProvider>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Non-overlap is preserved by construction — the task awaits
+        // each pass before sleeping the next tick.
+        loop {
+            let provider = Arc::clone(&provider);
+            let pass = tokio::task::spawn_blocking(move || provider.move_reconcile_pass()).await;
+            log_move_pass(pass);
+            tokio::time::sleep(MOVE_RETRY_TICK).await;
+        }
+    })
+}
+
+/// Log one move reconcile pass's outcome (see
+/// [`spawn_move_retry_task`]). Every outcome is a structured event,
+/// never a crash: a completed relocation, a re-drive, a durable
+/// COPYING roll, an `IN_DOUBT` park (warned — it wants an operator's
+/// eye), a dropped record, an unobservable world, a failed pass
+/// (typed) and a failed pass task (the join error) are all logged
+/// and retried on the next tick.
+fn log_move_pass(
+    pass: Result<
+        Result<volvisor_lvm::provider::MoveReconcileReport, ApiError>,
+        tokio::task::JoinError,
+    >,
+) {
+    match pass {
+        Ok(Ok(report)) => {
+            for volume_id in &report.completed {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "journaled move completed (verified relocation)"
+                );
+            }
+            for volume_id in &report.redriven {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "verifiably-unstarted move re-driven"
+                );
+            }
+            for volume_id in &report.marked_copying {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "live mirror observed; record rolled to COPYING"
+                );
+            }
+            for volume_id in &report.parked_in_doubt {
+                tracing::warn!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "move ended without relocating; parked IN_DOUBT with the source intact"
+                );
+            }
+            for volume_id in &report.dropped {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "move record dropped (volume gone)"
+                );
+            }
+            for volume_id in &report.unobservable {
+                tracing::warn!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "move record unobservable this pass; retried next tick"
+                );
+            }
+        }
+        Ok(Err(error)) => tracing::error!(
+            kind = "move_reconcile",
+            error = %error,
+            "move reconcile pass failed; retried next pass"
+        ),
+        Err(error) => tracing::error!(
+            kind = "move_reconcile",
+            error = %error,
+            "move reconcile pass task failed; retried next pass"
         ),
     }
 }
