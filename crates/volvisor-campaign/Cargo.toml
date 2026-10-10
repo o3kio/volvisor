@@ -1,0 +1,28 @@
+[package]
+name = "volvisor-campaign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The aggressive failure campaign harness (test-only; never production)"
+
+[lints]
+workspace = true
+
+[dependencies]
+volvisor-api = { workspace = true }
+volvisord = { workspace = true }
+volvisor-provider = { workspace = true }
+volvisor-drbd = { workspace = true }
+volvisor-drbd-testkit = { workspace = true }
+volvisor-handoff = { workspace = true }
+volvisor-journal = { workspace = true }
+volvisor-types = { workspace = true }
+volvisor-witness = { workspace = true }
+axum = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"

@@ -1,4 +1,7 @@
 /target
+# The P5 campaign's evidence bundles (§6) — under target, ignored
+# again explicitly so the artifact location is unmistakable.
+/target/campaign-evidence/
 Cargo.lock.bak
 *.swp
 .env
