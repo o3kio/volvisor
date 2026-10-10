@@ -51,41 +51,42 @@ use volvisor_types::{
     VolumeId,
 };
 
+use crate::crash::CrashPoint;
 use crate::error::{json_response, status_for_wire_code, to_json_value};
 use crate::state::SharedState;
 
 /// Operation kind: create volume.
-pub(crate) const OP_CREATE_VOLUME: &str = "create_volume";
+pub const OP_CREATE_VOLUME: &str = "create_volume";
 /// Operation kind: attach volume.
-pub(crate) const OP_ATTACH_VOLUME: &str = "attach_volume";
+pub const OP_ATTACH_VOLUME: &str = "attach_volume";
 /// Operation kind: detach volume.
-pub(crate) const OP_DETACH_VOLUME: &str = "detach_volume";
+pub const OP_DETACH_VOLUME: &str = "detach_volume";
 /// Operation kind: grow volume.
-pub(crate) const OP_GROW_VOLUME: &str = "grow_volume";
+pub const OP_GROW_VOLUME: &str = "grow_volume";
 /// Operation kind: delete volume.
-pub(crate) const OP_DELETE_VOLUME: &str = "delete_volume";
+pub const OP_DELETE_VOLUME: &str = "delete_volume";
 /// Operation kind: claim a device for a pool (admin surface).
-pub(crate) const OP_CLAIM_DEVICE: &str = "claim_device";
+pub const OP_CLAIM_DEVICE: &str = "claim_device";
 /// Operation kind: release a claimed device (admin surface).
-pub(crate) const OP_RELEASE_DEVICE: &str = "release_device";
+pub const OP_RELEASE_DEVICE: &str = "release_device";
 /// Operation kind: adopt-and-promote a nearline volume (admin surface).
-pub(crate) const OP_ADOPT_VOLUME: &str = "adopt_volume";
+pub const OP_ADOPT_VOLUME: &str = "adopt_volume";
 /// Operation kind: clear a stale migration-cut marker (admin surface).
-pub(crate) const OP_CLEAR_CUT_MARKER: &str = "clear_cut_marker";
+pub const OP_CLEAR_CUT_MARKER: &str = "clear_cut_marker";
 /// Operation kind: `PrepareNearlineHandoff` (mobility surface).
-pub(crate) const OP_MIGRATION_PREPARE: &str = "migration_prepare";
+pub const OP_MIGRATION_PREPARE: &str = "migration_prepare";
 /// Operation kind: `BarrierAndTransfer` (mobility surface).
-pub(crate) const OP_MIGRATION_TRANSFER: &str = "migration_transfer";
+pub const OP_MIGRATION_TRANSFER: &str = "migration_transfer";
 /// Operation kind: mobility abort.
-pub(crate) const OP_MIGRATION_ABORT: &str = "migration_abort";
+pub const OP_MIGRATION_ABORT: &str = "migration_abort";
 /// Operation kind: destination-side peer prepare.
-pub(crate) const OP_PEER_PREPARE: &str = "peer_prepare";
+pub const OP_PEER_PREPARE: &str = "peer_prepare";
 /// Operation kind: destination-side peer grant + promote.
-pub(crate) const OP_PEER_GRANT: &str = "peer_grant";
+pub const OP_PEER_GRANT: &str = "peer_grant";
 /// Operation kind: destination-side peer restore-vm.
-pub(crate) const OP_PEER_RESTORE_VM: &str = "peer_restore_vm";
+pub const OP_PEER_RESTORE_VM: &str = "peer_restore_vm";
 /// Operation kind: destination-side peer discard.
-pub(crate) const OP_PEER_DISCARD: &str = "peer_discard";
+pub const OP_PEER_DISCARD: &str = "peer_discard";
 
 // ---------------------------------------------------------------------------
 // Payload redaction (SPEC-0002 section 9: no secret material at rest in the
@@ -295,7 +296,11 @@ where
             journal.append_intent(operation_id.clone(), request_hash, op_kind, payload)
         }?;
         match append {
-            IntentAppend::New => {}
+            IntentAppend::New => {
+                // The intent is durable and no outcome exists: the
+                // P5 campaign's after-intent crash point (§3.1).
+                consult_crash(state, op_kind, CrashPoint::AfterIntent);
+            }
             IntentAppend::Replayed {
                 success,
                 response,
@@ -351,6 +356,9 @@ where
         Ok(value) => {
             let body = to_json_value(&value)?;
             let status = success_status.unwrap_or(StatusCode::OK);
+            // The mutation has landed and its outcome is not yet
+            // durable: the campaign's before-outcome crash point.
+            consult_crash(state, op_kind, CrashPoint::BeforeOutcome);
             let journaled = {
                 let mut journal = lock_journal(state)?;
                 journal.append_outcome_with_status(
@@ -360,6 +368,9 @@ where
                     success_status.map(|status| status.as_u16()),
                 )
             };
+            // The outcome is durable and the reply is not yet served:
+            // the campaign's after-outcome crash point.
+            consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
                 // The mutation DID succeed and the caller must learn the
                 // truth; only the replay fidelity is compromised, and any
@@ -377,10 +388,14 @@ where
         }
         Err(error) => {
             let body = to_json_value(&ApiErrorBody::from(error.clone()))?;
+            // The same two boundaries on the failure tail (a killed
+            // operation never records its refusal either).
+            consult_crash(state, op_kind, CrashPoint::BeforeOutcome);
             let journaled = {
                 let mut journal = lock_journal(state)?;
                 journal.append_outcome(operation_id.clone(), false, body)
             };
+            consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
                 tracing::error!(
                     kind = op_kind,
@@ -435,6 +450,10 @@ where
                      could not be journaled; replays will re-resolve by inspection"
                 );
             }
+            // The resolved outcome is durable (the campaign's
+            // after-outcome point also covers the recovery path's
+            // outcome writes — the re-drive of a killed operation).
+            consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             state.metrics.record_operation(op_kind, "resolved");
             tracing::info!(
                 kind = op_kind,
@@ -469,6 +488,21 @@ fn lock_journal(state: &SharedState) -> Result<MutexGuard<'_, Journal>, ApiError
             "journal mutex poisoned; refusing further mutations (fail closed)",
         )
     })
+}
+
+/// Consult the daemon's armed crash hook (P5 plan §3.1) at `point` of
+/// `op_kind`. Inert in every production shape: a state built without
+/// [`AppState::with_crash_hooks`](crate::AppState::with_crash_hooks)
+/// carries no hooks, and an unarmed table changes nothing. When the
+/// rig armed exactly this pair, the firing consumes the entry, fires
+/// the registered kill switch (the supervisor's group abort) and
+/// terminates this request mid-handler — the in-band equivalent of a
+/// process death at the durable-write boundary (see the `crash`
+/// module docs).
+fn consult_crash(state: &SharedState, op_kind: &'static str, point: CrashPoint) {
+    if let Some(hooks) = &state.crash {
+        hooks.consult(op_kind, point);
+    }
 }
 
 /// A typed `IDEMPOTENCY_CONFLICT` rejection.

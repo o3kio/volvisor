@@ -61,6 +61,36 @@
 //!   and `resize` to the minimum of the local and peer backing sizes),
 //!   never a live computation.
 //!
+//! # The fake data path (P5 plan §2)
+//!
+//! The world also models **content**, not just state: every running
+//! resource carries a block map ([`Block`], 4 KiB logical blocks,
+//! sparse — an absent block reads as zeroes under the resource's
+//! lineage), opened through the kit's [`open_device`] handle, which
+//! enforces the single-writer and suspension rules the real stack
+//! enforces at the device (writes land only on the Primary; a
+//! suspended minor refuses writes; a held handle blocks the demote
+//! exactly as the `FakeVmm` device hooks do). A write's return is the
+//! **source-side ack** (Protocol C-shaped up to the source's own map,
+//! rule 16): the bytes land in the source's map **and** in the
+//! resource's async peer-apply queue ([`QueuedApply`]), and reach the
+//! peer's map only when the queue drains — through the campaign's
+//! [`apply_peer_writes`] (pre-quiesce lag shaping only), the fake's
+//! steady-state protocol-A transport ([`spawn_peer_transport`], the
+//! lagged link a live writer needs for convergence to be observable
+//! at all) or the fake's
+//! content-copying resync (the system path: the post-barrier drain at
+//! `suspend-io` and the completing seeding resync). The
+//! data-bearing status tokens the convergence gate reads
+//! (`peer-disk:UpToDate`, no `replication:` line) are **derived from
+//! the queue's state** (P5 plan §2.3, the anti-circularity hinge): a
+//! resource reads `UpToDate` only when its apply queue is fully
+//! drained — an empty queue is trivially drained, so write-free
+//! fixtures observe the same statuses as before. `read_raw`/
+//! `write_raw` are the post-mortem/injection surfaces that bypass
+//! role, suspension and the openers set — TEST-ONLY, like the
+//! `FakeFailKnobs` precedent: assertion and driving never use them.
+//!
 //! Test-kit code: `expect`/`unwrap` are allowed here by convention (the
 //! same rule the `volvisor-drbd` integration tests follow).
 
@@ -76,9 +106,11 @@
 // code.
 #![allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use volvisor_drbd::provider::{DrbdProvider, DrbdProviderConfig, resource_name_for};
@@ -93,7 +125,9 @@ use volvisor_types::request::{
     DetachVolumeRequest, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
     ReplicationModeRequest, ReplicationPolicyRequest,
 };
-use volvisor_types::{ApiError, AttachmentId, CapabilitySet, ProjectId, VolumeId, VolumeLifecycle};
+use volvisor_types::{
+    ApiError, ApiErrorCode, AttachmentId, CapabilitySet, ProjectId, VolumeId, VolumeLifecycle,
+};
 
 /// The nearline VG every fixture configures.
 pub const VG: &str = "vgdrbd";
@@ -123,6 +157,52 @@ pub const PORT_MAX: u16 = 7910;
 pub const SEED_MINOR: u32 = 11;
 /// See [`SEED_MINOR`].
 pub const SEED_PORT: u16 = 7900;
+/// The logical block size of the fake data path (P5 plan §2.1): one
+/// [`Block`] payload, the unit the write-trace oracle writes, verifies
+/// and injects.
+pub const BLOCK_SIZE: usize = 4096;
+
+/// One 4 KiB data block of the fake data path (P5 plan §2.1): the
+/// bytes, the data-generation identity set that wrote them and the
+/// per-block state of the peer-apply window.
+///
+/// The flag is the **writing side's** bookkeeping: a block written
+/// through a [`DeviceHandle`] starts `false` and flips only when the
+/// peer-apply queue drains its content to the peer (or the fake's
+/// content-copying resync runs). Blocks arriving in a peer world's
+/// map through replication land `false` — their window is the
+/// *sender's* map's concern; presence in the receiving map is itself
+/// the ground truth the oracle verifies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// The bytes (crc-checked by the oracle).
+    pub payload: [u8; BLOCK_SIZE],
+    /// The data-generation UUID set that wrote this block (the
+    /// resource's lineage at write time).
+    pub lineage: GiSet,
+    /// Whether the peer has applied this exact content yet (the
+    /// async peer-apply window's per-block state).
+    pub applied_at_peer: bool,
+}
+
+/// One entry of a resource's async peer-apply queue (P5 plan §2.3): a
+/// source-side write that has been **acked** (it landed in the
+/// source's block map) but not yet applied at the peer. Entries carry
+/// their full payload and are applied in queue order by a drain —
+/// [`apply_peer_writes`] (the campaign's pre-quiesce lag control) or
+/// the fake's content-copying resync (the system path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedApply {
+    /// The write's acknowledgment sequence (monotonic per resource;
+    /// the value [`DeviceHandle::write`] returned).
+    pub seq: u64,
+    /// The logical block index.
+    pub block: u64,
+    /// The payload as acknowledged at the source.
+    pub payload: [u8; BLOCK_SIZE],
+    /// The lineage the write carried.
+    pub lineage: GiSet,
+}
 
 /// One simulated logical volume (keyed `vg/lv`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +245,20 @@ pub struct FakeResource {
     /// The peer node name parsed from the resource file at `up` (the
     /// status connection line is named by it).
     pub peer_node: String,
+    /// The resource's block map (P5 plan §2.1): logical block index →
+    /// content. SPARSE — a block absent from the map reads as a
+    /// zeroed payload under the resource's lineage (an unwritten
+    /// region of a real thick device), so a seeded volume costs no
+    /// per-block memory until something writes it.
+    pub blocks: BTreeMap<u64, Block>,
+    /// The async peer-apply queue (P5 plan §2.3): acked writes not
+    /// yet applied at the peer, in write order. Runtime kernel-side
+    /// state: it dies with `down` (the resource itself).
+    pub apply_queue: VecDeque<QueuedApply>,
+    /// The monotonic write-acknowledgment counter behind
+    /// [`QueuedApply::seq`] (the sequence [`DeviceHandle::write`]
+    /// returns).
+    pub write_seq: u64,
 }
 
 /// One volume's DRBD data-generation identity set — the content
@@ -357,6 +451,13 @@ pub struct FakeDrbd {
     /// Minors whose device is held open (demotion and `down` refuse
     /// with EBUSY-class stderr).
     pub open_devices: BTreeSet<u32>,
+    /// Refcount of kit-opened [`DeviceHandle`]s per minor (P5 plan
+    /// §2.1): the handle's participation in the openers/busy model,
+    /// composing with [`Self::open_devices`] (the `FakeVmm` device
+    /// hooks' set) rather than duplicating it — a minor is busy for
+    /// the demote/`down`/status-`open:` checks while EITHER holds it.
+    /// A handle increments on open and decrements on drop.
+    pub device_openers: BTreeMap<u32, u64>,
     /// Minors whose data path is frozen by the operator `drbdsetup
     /// suspend-io` (the self-fencing data-path freeze; cleared by
     /// `resume-io`). Runtime kernel state, not metadata: it dies with
@@ -386,6 +487,21 @@ pub struct FakeDrbd {
     /// generation, so a recreated same-named volume never inherits the
     /// old identity set.
     pub lineage_salt: u64,
+    /// The simulated peer HOST's world, when the rig composes two
+    /// worlds into one replication pair (P5 plan §2.1/§2.3 — the
+    /// cross-host data path: queue drains and content-copying
+    /// resyncs hand blocks to the linked world's same-named
+    /// resource). A [`Weak`] reference by design: the link is
+    /// bidirectional and must not form an owning cycle. Wired by
+    /// [`link_replication_peers`]; `None` (the default) is the
+    /// single-world shape, where the peer's map is modeled by the
+    /// source-side [`Block::applied_at_peer`] flags alone.
+    peer_world: Option<Weak<Mutex<FakeDrbd>>>,
+    /// Cross-world replication effects a scripted command queued for
+    /// the runner closure to apply after releasing this world's lock
+    /// (taking the linked world's lock while holding this one could
+    /// deadlock the pair). See [`DeferredResync`].
+    deferred_resyncs: Vec<DeferredResync>,
     // -- Fault-injection matrix (one bool per scripted failure) --
     /// `lvcreate` fails.
     pub fail_lvcreate: bool,
@@ -446,11 +562,14 @@ impl Default for FakeDrbd {
             peer_overwritten: false,
             resync_completes: true,
             open_devices: BTreeSet::new(),
+            device_openers: BTreeMap::new(),
             suspended_minors: BTreeSet::new(),
             peer_lagging: BTreeSet::new(),
             peer_node_id: 1,
             lineage: BTreeMap::new(),
             lineage_salt: 0,
+            peer_world: None,
+            deferred_resyncs: Vec::new(),
             fail_lvcreate: false,
             fail_lvextend: false,
             fail_primary: false,
@@ -472,14 +591,33 @@ impl Default for FakeDrbd {
 }
 
 impl FakeDrbd {
-    /// A scripted runner wired to this world (closure mode).
+    /// A scripted runner wired to this world (closure mode). The
+    /// closure releases the world lock before applying any
+    /// cross-world replication effects a command queued (the world's
+    /// deferred-resync list) — a scripted command never holds this
+    /// world's lock while taking the linked peer world's.
     #[must_use]
     pub fn runner(world: &Arc<Mutex<Self>>) -> Arc<FakeRunner> {
         let world = Arc::clone(world);
         Arc::new(FakeRunner::with_closure(move |program, args| {
-            let mut world = world.lock().ok()?;
-            script(&mut world, program, args)
+            let mut guard = world.lock().ok()?;
+            let output = script(&mut guard, program, args);
+            let deferred = std::mem::take(&mut guard.deferred_resyncs);
+            drop(guard);
+            for (resource, blocks) in deferred {
+                replicate_blocks_to_peer(&world, &resource, &blocks);
+            }
+            output
         }))
+    }
+
+    /// Whether a minor's device is busy (blocks demotion/`down`): the
+    /// `FakeVmm` device hooks' [`Self::open_devices`] set OR a live
+    /// kit [`DeviceHandle`] ([`Self::device_openers`]) — one busy
+    /// model, both opener kinds composing into it (P5 plan §2.1's
+    /// openers rule).
+    fn device_busy(&self, minor: u32) -> bool {
+        self.open_devices.contains(&minor) || self.device_openers.contains_key(&minor)
     }
 
     /// The effective peer backing size for a resource whose local LV is
@@ -549,7 +687,9 @@ fn arg_after<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
 fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String {
     // drbdsetup.c: `open:` is printed unconditionally on kernel
     // >= 9.2.9, naming whether the device is currently held open.
-    let open = if world.open_devices.contains(&resource.minor) {
+    // Either opener kind holds it: a VM's device (the openers set)
+    // or a kit DeviceHandle (the openers refcount).
+    let open = if world.device_busy(resource.minor) {
         "yes"
     } else {
         "no"
@@ -578,13 +718,18 @@ fn status_text(world: &FakeDrbd, name: &str, resource: &FakeResource) -> String 
         ""
     };
     if world.peer_online {
-        // Peer-apply lag (P4b plan §8 item 3): a lagging minor reports
-        // a resync in progress over a not-`UpToDate` peer disk — the
+        // Peer-apply lag (P4b plan §8 item 3, generalized by the P5
+        // plan §2.3 gate-coupling rule): a lagging minor reports a
+        // resync in progress over a not-`UpToDate` peer disk — the
         // exact token shape a convergence proof must observe and
-        // refuse. The pinned peer-disk state models the asynchronous
-        // apply tail; the `replication:` line is what a resyncing
-        // peer-device really prints.
-        let lagging = world.peer_lagging.contains(&resource.minor);
+        // refuse. Lag is DERIVED, never independently set: the manual
+        // `peer_lagging` pin OR a non-drained async apply queue both
+        // hold the peer back (the data-bearing tokens the convergence
+        // gate reads cannot lie while the queue is open — an empty
+        // queue is trivially drained, so a write-free fixture reads
+        // the same statuses as before).
+        let lagging =
+            world.peer_lagging.contains(&resource.minor) || !resource.apply_queue.is_empty();
         let resyncing = resource.resyncing || lagging;
         let peer_disk = if lagging {
             DiskState::Inconsistent
@@ -730,7 +875,7 @@ fn script_drbdadm(world: &mut FakeDrbd, args: &[&str]) -> Option<CommandOutput> 
                 return Some(CommandOutput::failure("drbdadm down: simulated failure"));
             }
             if let Some(resource_state) = world.resources.get(resource) {
-                if world.open_devices.contains(&resource_state.minor) {
+                if world.device_busy(resource_state.minor) {
                     return Some(CommandOutput::failure(format!(
                         "drbdadm down {resource}: State change failed: (-16) Device or resource \
                          busy: /dev/drbd{} is open by another process",
@@ -821,6 +966,11 @@ fn script_drbdadm_up(
             resyncing: false,
             device_size,
             peer_node,
+            // A fresh resource's data path starts empty (the sparse
+            // zero fill; P5 plan §2.1) with an empty apply queue.
+            blocks: BTreeMap::new(),
+            apply_queue: VecDeque::new(),
+            write_seq: 0,
         },
     );
     Some(CommandOutput::success(String::new()))
@@ -836,6 +986,7 @@ fn script_drbdadm_primary(
         return Some(CommandOutput::failure("drbdadm primary: simulated failure"));
     }
     let state = world.resources.get_mut(resource)?;
+    let mut resync_copies_content = false;
     if force {
         // The seeding promotion: the forced source becomes UpToDate and
         // the peer is overwritten (resync follows). Seeding makes the
@@ -851,6 +1002,15 @@ fn script_drbdadm_primary(
         if world.peer_online {
             world.peer_overwritten = true;
             if world.resync_completes {
+                // The completing resync is content-copying (P5 plan
+                // §2.4): payload AND lineage reach the peer, and the
+                // apply queue drains with it. The copy runs only when
+                // the peer actually needed the resync (a
+                // not-`UpToDate` peer disk, the seeding shape) — an
+                // already-`UpToDate` peer (the promoted destination's
+                // view of its source) keeps its content, exactly as a
+                // real promotion over an in-sync pair resyncs nothing.
+                resync_copies_content = state.peer_disk != DiskState::UpToDate;
                 state.peer_disk = DiskState::UpToDate;
                 state.resyncing = false;
             } else {
@@ -874,6 +1034,9 @@ fn script_drbdadm_primary(
         }
     }
     state.role = Role::Primary;
+    if resync_copies_content {
+        resync_to_peer(world, resource);
+    }
     Some(CommandOutput::success(String::new()))
 }
 
@@ -887,12 +1050,12 @@ fn script_drbdadm_secondary(world: &mut FakeDrbd, resource: &str) -> Option<Comm
                 .unwrap_or_else(|| "drbdadm secondary: simulated failure".to_owned()),
         ));
     }
-    let state = world.resources.get_mut(resource)?;
     // The real kernel refusal while the device is open
     // (SS_DEVICE_IN_USE): drbdsetup prints the state-change failure and
-    // the kernel's opener info verbatim.
-    if world.open_devices.contains(&state.minor) {
-        let minor = state.minor;
+    // the kernel's opener info verbatim. Either opener kind triggers
+    // it — a VM's device or a kit DeviceHandle (the one busy model).
+    let minor = world.resources.get(resource)?.minor;
+    if world.device_busy(minor) {
         return Some(CommandOutput::failure(format!(
             "drbd{minor}: State change failed: (-12) Device is held open by someone\n\
              additional info from kernel:\n\
@@ -900,7 +1063,7 @@ fn script_drbdadm_secondary(world: &mut FakeDrbd, resource: &str) -> Option<Comm
              drbd{minor} opened by qemu (pid 1234) at 2026-10-09 12:34:56\n"
         )));
     }
-    state.role = Role::Secondary;
+    world.resources.get_mut(resource)?.role = Role::Secondary;
     Some(CommandOutput::success(String::new()))
 }
 
@@ -1011,13 +1174,38 @@ fn script_drbdsetup_suspend_io(
             "Cannot determine minor device number of device '{spec}'"
         ));
     };
-    if !world.resources.values().any(|state| state.minor == minor) {
+    if !world
+        .resources
+        .iter()
+        .any(|(_, state)| state.minor == minor)
+    {
         return CommandOutput::failure(format!(
             "{spec}: Failure: (127) Device minor not allocated"
         ));
     }
     if suspend {
         world.suspended_minors.insert(minor);
+        // The post-barrier drain (P5 plan §2.3/§2.4): suspending the
+        // data path is the barrier's boundary, and the fake's
+        // content-copying resync — the SYSTEM path, never the campaign
+        // — is what closes the peer-apply window behind it: the peer
+        // applies the outstanding queue, exactly as a real peer keeps
+        // applying in-flight replication after the source freezes.
+        // Gated on the link state: over a partition nothing drains,
+        // and the convergence gate must (and does) keep refusing on
+        // the not-established connection. The campaign's
+        // `apply_peer_writes` remains the ONLY way to shape how much
+        // applied BEFORE this boundary (the pre-quiesce lag).
+        if world.peer_online {
+            if let Some((resource, _)) = world
+                .resources
+                .iter()
+                .find(|(_, state)| state.minor == minor)
+            {
+                let resource = resource.clone();
+                resync_to_peer(world, &resource);
+            }
+        }
     } else {
         world.suspended_minors.remove(&minor);
     }
@@ -1234,6 +1422,703 @@ fn script_uname(world: &FakeDrbd) -> CommandOutput {
         return CommandOutput::failure("uname: simulated failure");
     }
     CommandOutput::success(format!("{}\n", world.node_name))
+}
+
+// ---------------------------------------------------------------------------
+// The fake data path (P5 plan §2)
+// ---------------------------------------------------------------------------
+
+/// One deferred cross-world resync effect: the resource and the full
+/// block map a scripted command copied toward the linked peer world.
+/// Queued by [`resync_to_peer`] while the runner closure holds this
+/// world's lock; the closure applies it (through
+/// [`replicate_blocks_to_peer`]) only after releasing the lock, so no
+/// scripted command ever holds both worlds' locks at once — the
+/// replication link is bidirectional, and nested locks across the
+/// pair could deadlock.
+type DeferredResync = (String, Vec<(u64, Block)>);
+
+/// Lock the world, mapping poisoning to a typed `INTERNAL` error (the
+/// fake VMM's lock discipline — never a panic).
+fn world_lock(world: &Arc<Mutex<FakeDrbd>>) -> Result<MutexGuard<'_, FakeDrbd>, ApiError> {
+    world.lock().map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            "fake DRBD world lock poisoned by a previous failure",
+        )
+    })
+}
+
+/// The fake's content-copying resync (P5 plan §2.4): every local block
+/// — payload AND lineage — is copied to the peer and the apply queue
+/// is drained with it. This is the SYSTEM path that closes the
+/// peer-apply window (the post-barrier drain at `suspend-io`, the
+/// completing seeding resync); the campaign never calls it — its only
+/// queue control is [`apply_peer_writes`], the pre-quiesce lag shaper.
+///
+/// The copy carries EVERY source block, including [`write_raw`]'s
+/// out-of-band writes (which never enter the queue): real DRBD's
+/// bitmap marks a rogue writer's blocks dirty and the resync copies
+/// them faithfully — divergence propagates, and the witness's
+/// classifier is what must catch it, not the transport (the §5.1
+/// stale-write injection depends on exactly this). Deliberate, not
+/// an oversight.
+///
+/// The copy to a LINKED peer world cannot run here (the caller may
+/// hold this world's lock — see [`DeferredResync`]), so it is queued
+/// for the runner closure; the single-world effects (flags flipped,
+/// queue drained) are immediate, keeping the resource consistent with
+/// its own status.
+fn resync_to_peer(world: &mut FakeDrbd, resource: &str) {
+    let Some(state) = world.resources.get_mut(resource) else {
+        return;
+    };
+    for block in state.blocks.values_mut() {
+        block.applied_at_peer = true;
+    }
+    state.apply_queue.clear();
+    let blocks: Vec<(u64, Block)> = state
+        .blocks
+        .iter()
+        .map(|(index, block)| (*index, block.clone()))
+        .collect();
+    if blocks.is_empty() {
+        return;
+    }
+    world.deferred_resyncs.push((resource.to_owned(), blocks));
+}
+
+/// Hand a resync's copied blocks to the linked peer world's
+/// same-named resource. The caller must hold NO lock on `world` (see
+/// [`DeferredResync`]); a missing link (the single-world shape) or a
+/// peer world without the resource is a silent no-op — the copy is a
+/// replication effect, and there is nothing to replicate to.
+fn replicate_blocks_to_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, blocks: &[(u64, Block)]) {
+    let Some(peer) = world_lock(world)
+        .ok()
+        .and_then(|world| world.peer_world.as_ref().and_then(Weak::upgrade))
+    else {
+        return;
+    };
+    let Ok(mut peer_world) = peer.lock() else {
+        return;
+    };
+    let Some(peer_resource) = peer_world.resources.get_mut(resource) else {
+        return;
+    };
+    for (index, block) in blocks {
+        peer_resource.blocks.insert(
+            *index,
+            Block {
+                payload: block.payload,
+                lineage: block.lineage.clone(),
+                // The flag is the WRITING side's bookkeeping (see
+                // [`Block`]); a block replicated in lands false — its
+                // window is the sender's map's concern, and presence
+                // in this map is itself the ground truth.
+                applied_at_peer: false,
+            },
+        );
+    }
+}
+
+/// Hand drained queue entries to the peer (P5 plan §2.3): first the
+/// linked peer world's map — with NO lock on this world held, the
+/// same no-nested-locks discipline as [`replicate_blocks_to_peer`] —
+/// then the source-side flags, only for entries whose content is
+/// still current (a newer write to the same block superseded the
+/// entry; the newer queue entry carries that content).
+///
+/// Returns whether the entries were **delivered**. The gate-coupling
+/// hinge (§2.3) makes this load-bearing: a drain that silently
+/// dropped entries — the linked peer alive but its same-named
+/// resource absent — would flip the source-side flags and empty the
+/// queue while the blocks never landed, and the gate would read
+/// `UpToDate` over un-applied blocks, exactly the lie §2.3 forbids.
+/// A `false` return tells the caller to put the entries back: the
+/// queue stays open and the gate stays closed. A world with **no
+/// peer link at all** (the single-world shape) delivers by
+/// definition — there is no peer to lie to, and the queue is
+/// source-side bookkeeping only.
+fn apply_at_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, entries: &[QueuedApply]) -> bool {
+    if entries.is_empty() {
+        return true;
+    }
+    // The linked peer, if one exists. The single-world shape (no
+    // link at all) delivers by definition — there is no peer to lie
+    // to, and the queue is source-side bookkeeping only — so it
+    // falls through to the bookkeeping below rather than returning
+    // early (the flags still flip: the drain is real bookkeeping).
+    // A POISONED source-world lock also has no link to read, but it
+    // is NOT the single-world shape — it is an unreadable world, and
+    // an unreadable world fails closed: the drain reports failure so
+    // the entries requeue rather than the gate reading `UpToDate`
+    // over blocks whose delivery state is unknown (round-2 N2).
+    let peer = match world_lock(world) {
+        Ok(world) => world.peer_world.as_ref().and_then(Weak::upgrade),
+        Err(_) => return false,
+    };
+    if let Some(peer) = peer {
+        let Ok(mut peer_world) = peer.lock() else {
+            return false;
+        };
+        let Some(peer_resource) = peer_world.resources.get_mut(resource) else {
+            return false;
+        };
+        for entry in entries {
+            peer_resource.blocks.insert(
+                entry.block,
+                Block {
+                    payload: entry.payload,
+                    lineage: entry.lineage.clone(),
+                    applied_at_peer: false,
+                },
+            );
+        }
+    }
+    if let Ok(mut world) = world.lock() {
+        if let Some(state) = world.resources.get_mut(resource) {
+            for entry in entries {
+                if let Some(block) = state.blocks.get_mut(&entry.block) {
+                    if block.payload == entry.payload && block.lineage == entry.lineage {
+                        block.applied_at_peer = true;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Compose two worlds into one replication pair (P5 plan §2.1/§2.3):
+/// each world's linked peer becomes the other, so queue drains and
+/// content-copying resyncs on either side hand blocks to the other's
+/// same-named resource. The links are [`Weak`] — bidirectional strong
+/// references would form an owning cycle — so the rig must keep both
+/// worlds alive for the scenario's lifetime (every harness does: the
+/// worlds live in the rig structs).
+pub fn link_replication_peers(a: &Arc<Mutex<FakeDrbd>>, b: &Arc<Mutex<FakeDrbd>>) {
+    a.lock().expect("world").peer_world = Some(Arc::downgrade(b));
+    b.lock().expect("world").peer_world = Some(Arc::downgrade(a));
+}
+
+/// An open handle on one running resource's device (P5 plan §2.1) —
+/// the fake's ENFORCED data path, the surface both the write-trace
+/// oracle and a guest's I/O model run on:
+///
+/// - opening requires the Primary role (a Secondary's device fails
+///   typed, E_ROFS-shaped — the single-writer invariant the real
+///   stack enforces at the device);
+/// - writes refuse while the minor is suspended (the quiesce is real
+///   at the data path, not just a flag; the real kernel BLOCKS a
+///   suspended write — the kit refuses typed instead, so a frozen
+///   writer fails loudly and deterministically rather than hanging
+///   the scenario);
+/// - the handle participates in the openers/busy model exactly as the
+///   `FakeVmm` device hooks do: while it lives, the demote (and
+///   `down`) refuse with the held-open error and the status `open:`
+///   line reads `yes` (rule 17 — a held device blocks the demote);
+/// - a write's return is the SOURCE-SIDE ack (Protocol C-shaped up to
+///   the source's own map, rule 16): the bytes land in the source's
+///   block map AND in the async peer-apply queue, and the returned
+///   sequence number is the write's identity in that queue.
+///
+/// Reads work on any role (a Secondary's device is readable) and
+/// through a suspension — abort-path verification reads the source
+/// device after the barrier, and post-mortem reads below enforcement
+/// use [`read_raw`] instead.
+pub struct DeviceHandle {
+    /// The world the device lives in.
+    world: Arc<Mutex<FakeDrbd>>,
+    /// The device's minor (`/dev/drbd<minor>`).
+    minor: u32,
+}
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        // Release the opener: decrement the refcount and forget the
+        // minor at zero. A poisoned lock leaves the count alone — the
+        // world is unusable anyway.
+        if let Ok(mut world) = self.world.lock() {
+            if let Some(count) = world.device_openers.get_mut(&self.minor) {
+                *count -= 1;
+                if *count == 0 {
+                    world.device_openers.remove(&self.minor);
+                }
+            }
+        }
+    }
+}
+
+impl DeviceHandle {
+    /// The device's minor.
+    #[must_use]
+    pub fn minor(&self) -> u32 {
+        self.minor
+    }
+
+    /// Write one logical block (exactly [`BLOCK_SIZE`] bytes) and
+    /// return the write's acknowledgment sequence — the source-side
+    /// ack, the identity [`apply_peer_writes`] drains by. The write
+    /// lands in the source's block map and in the async peer-apply
+    /// queue; it reaches the peer's map only when the queue drains
+    /// (P5 plan §2.3's window: the acknowledged set may exceed the
+    /// peer-applied set, and the status tokens say so).
+    ///
+    /// # Errors
+    /// [`ApiErrorCode::NotFound`] when the resource is gone; `INVALID_STATE`
+    /// when the resource is no longer Primary (E_ROFS-shaped — the
+    /// role flipped under the handle) or the minor is suspended;
+    /// `INVALID_REQUEST` for a wrong-size payload or a block beyond
+    /// the device.
+    pub fn write(&self, block: u64, payload: &[u8]) -> Result<u64, ApiError> {
+        let mut world = world_lock(&self.world)?;
+        // The name is cloned out so the mutable map access below is
+        // not borrow-tied to the lookups above (the guard's Deref
+        // borrows the whole world, not per-field).
+        let name = world
+            .resources
+            .iter()
+            .find(|(_, state)| state.minor == self.minor)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| ApiError::not_found(format!("drbd{}: No such resource", self.minor)))?;
+        let state = &world.resources[&name];
+        if state.role != Role::Primary {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "write(/dev/drbd{}): (-30) Read-only file system — the resource is no \
+                     longer Primary; the fake enforces the single-writer invariant at the \
+                     device",
+                    self.minor
+                ),
+            ));
+        }
+        if world.suspended_minors.contains(&self.minor) {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "write(/dev/drbd{}): the data path is suspended (suspended:user) — the \
+                     quiesce is real at the data path, not just a flag",
+                    self.minor
+                ),
+            ));
+        }
+        if payload.len() != BLOCK_SIZE {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                format!(
+                    "write(/dev/drbd{}): payload is {} bytes; exactly {BLOCK_SIZE} (one \
+                     logical block) is required",
+                    self.minor,
+                    payload.len()
+                ),
+            ));
+        }
+        let block_count = state.device_size / BLOCK_SIZE as u64;
+        if block >= block_count {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                format!(
+                    "write(/dev/drbd{}): block {block} is beyond the device ({block_count} \
+                     logical blocks)",
+                    self.minor
+                ),
+            ));
+        }
+        let lineage = world
+            .lineage
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| GiSet::for_resource(&name));
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        bytes.copy_from_slice(payload);
+        let state = world
+            .resources
+            .get_mut(&name)
+            .expect("the resource was found above");
+        state.write_seq += 1;
+        let seq = state.write_seq;
+        state.blocks.insert(
+            block,
+            Block {
+                payload: bytes,
+                lineage: lineage.clone(),
+                applied_at_peer: false,
+            },
+        );
+        state.apply_queue.push_back(QueuedApply {
+            seq,
+            block,
+            payload: bytes,
+            lineage,
+        });
+        Ok(seq)
+    }
+
+    /// Read one logical block from the resource's local map. An
+    /// absent block is the sparse zero fill: a zeroed payload under
+    /// the resource's current lineage, trivially in sync
+    /// (`applied_at_peer: true` — an unwritten region has no
+    /// peer-apply window).
+    ///
+    /// # Errors
+    /// [`ApiErrorCode::NotFound`] when the resource is gone;
+    /// `INVALID_REQUEST` for a block beyond the device.
+    pub fn read(&self, block: u64) -> Result<Block, ApiError> {
+        let world = world_lock(&self.world)?;
+        let name = world
+            .resources
+            .iter()
+            .find(|(_, state)| state.minor == self.minor)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| ApiError::not_found(format!("drbd{}: No such resource", self.minor)))?;
+        let state = &world.resources[&name];
+        let block_count = state.device_size / BLOCK_SIZE as u64;
+        if block >= block_count {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                format!(
+                    "read(/dev/drbd{}): block {block} is beyond the device ({block_count} \
+                     logical blocks)",
+                    self.minor
+                ),
+            ));
+        }
+        if let Some(block_content) = state.blocks.get(&block) {
+            return Ok(block_content.clone());
+        }
+        let lineage = world
+            .lineage
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| GiSet::for_resource(&name));
+        Ok(Block {
+            payload: [0_u8; BLOCK_SIZE],
+            lineage,
+            applied_at_peer: true,
+        })
+    }
+}
+
+/// Open one running resource's device (P5 plan §2.1): the enforced
+/// path — role-checked at open, suspension-checked at write,
+/// openers-tracked for the demote/busy model (see [`DeviceHandle`]).
+///
+/// # Errors
+/// [`ApiErrorCode::NotFound`] when no running resource holds the
+/// minor; `INVALID_STATE` (E_ROFS-shaped) when the resource is not
+/// Primary — a Secondary's device is read-only, and the fake enforces
+/// the single-writer invariant the real stack enforces.
+pub fn open_device(world: &Arc<Mutex<FakeDrbd>>, minor: u32) -> Result<DeviceHandle, ApiError> {
+    let mut guard = world_lock(world)?;
+    let role = guard
+        .resources
+        .values()
+        .find(|state| state.minor == minor)
+        .map(|state| state.role);
+    let Some(role) = role else {
+        return Err(ApiError::not_found(format!(
+            "drbd{minor}: No such resource"
+        )));
+    };
+    if role != Role::Primary {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "open(/dev/drbd{minor}): (-30) Read-only file system — the resource is \
+                 Secondary; writes land only on the Primary (the single-writer invariant, \
+                 enforced at the device)"
+            ),
+        ));
+    }
+    *guard.device_openers.entry(minor).or_insert(0) += 1;
+    Ok(DeviceHandle {
+        world: Arc::clone(world),
+        minor,
+    })
+}
+
+/// Apply the queued peer writes of `minor` up to (including)
+/// acknowledgment sequence `up_to` (P5 plan §2.3) — the CAMPAIGN's
+/// pre-quiesce lag control, and deliberately its only queue control:
+/// shaping how much of the acknowledged tail the peer has applied
+/// before the boundary. The post-barrier drain is the fake's
+/// content-copying resync (the system path, the resync the
+/// `suspend-io` barrier and a completing seeding promotion run),
+/// never this function.
+///
+/// Entries apply in queue order; a linked peer world's same-named
+/// resource receives their content, and the source-side blocks are
+/// marked applied. Draining the queue fully is what lets the
+/// resource read `peer-disk:UpToDate` again — the status tokens are
+/// derived from this state (the gate-coupling rule).
+///
+/// # Errors
+/// [`ApiErrorCode::NotFound`] when no running resource holds the
+/// minor.
+///
+/// The campaign's pre-quiesce lag shaper (P5 plan §2.3) and the
+/// transport's drain primitive: apply every queued write whose
+/// acknowledgment sequence is at most `up_to` (a `u64::MAX` bound
+/// drains everything). A refused delivery requeues — the delivery
+/// rules and the single-world shapes are documented on the private
+/// `apply_at_peer` helper.
+///
+/// # Concurrency shape (round-2 N1, the single-drainer invariant)
+///
+/// The ordering guarantees — front-first requeue, same-block entries
+/// applied oldest-first — hold under **one drainer per world at a
+/// time** (the spawned transport thread, or a single-threaded test
+/// body). Two concurrent drainers could interleave a failed drain's
+/// requeue with a successful drain of a newer same-block entry. That
+/// is the invariant's limit, stated here deliberately: stage C adds
+/// a second drainer only together with a serialized drain (one world
+/// lock critical section around pop-and-apply, or a drain mutex).
+pub fn apply_peer_writes(
+    world: &Arc<Mutex<FakeDrbd>>,
+    minor: u32,
+    up_to: u64,
+) -> Result<(), ApiError> {
+    let (resource, entries) = {
+        let mut guard = world_lock(world)?;
+        let name = guard
+            .resources
+            .iter()
+            .find(|(_, state)| state.minor == minor)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| ApiError::not_found(format!("drbd{minor}: No such resource")))?;
+        let state = guard
+            .resources
+            .get_mut(&name)
+            .expect("the resource was found above");
+        let mut entries = Vec::new();
+        while state
+            .apply_queue
+            .front()
+            .is_some_and(|entry| entry.seq <= up_to)
+        {
+            if let Some(entry) = state.apply_queue.pop_front() {
+                entries.push(entry);
+            }
+        }
+        (name, entries)
+    };
+    if !apply_at_peer(world, &resource, &entries) {
+        // The delivery failed (the linked peer's resource is absent —
+        // §2.3's hinge): put the entries back, front-first in the
+        // original order, so the queue stays open and the gate stays
+        // closed. The drain is retried when the peer can receive.
+        let mut guard = world_lock(world)?;
+        let state = guard
+            .resources
+            .get_mut(&resource)
+            .expect("the resource was found above");
+        for entry in entries.into_iter().rev() {
+            state.apply_queue.push_front(entry);
+        }
+    }
+    Ok(())
+}
+
+/// The fake's steady-state protocol-A transport (P5 plan §2.1): a
+/// background thread that drains `minor`'s peer-apply queue with a
+/// real-time `lag`, modeling the asynchronous peer apply the real
+/// stack performs continuously — "asynchronous peer apply is real
+/// time" ([`volvisor_drbd`]'s convergence gate retries the typed
+/// `REPLICA_NOT_DURABLE` refusal while the peer lags). Without it a
+/// live writer would hold the queue non-empty forever and even a
+/// happy-path migration could never observe convergence; with it the
+/// peer-apply window is genuinely open for at most `lag` after every
+/// write (a real, nonzero tail mid-flight) and closes on its own.
+///
+/// This is a DATA-PATH component of the fake (the replication link
+/// itself — it lives below the daemons and survives their kills,
+/// exactly as a real link would), not a campaign injection: the
+/// post-barrier drain at `suspend-io` remains the fake's only
+/// SYSTEM-path window closer (`resync_to_peer`), and stopping the
+/// transport is how a rig models the link's steady state ending
+/// (a frozen tail for lag shaping). It races nothing: queue drains
+/// are idempotent and the world lock is never held across a drain.
+///
+/// The thread is detached on drop (it exits within one `lag`); call
+/// [`PeerTransport::join`] to observe the exit deterministically.
+pub fn spawn_peer_transport(
+    world: &Arc<Mutex<FakeDrbd>>,
+    minor: u32,
+    lag: Duration,
+) -> PeerTransport {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let world = Arc::clone(world);
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name(format!("peer-transport-drbd{minor}"))
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(lag);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // A partition (the world's `peer_online` flag, P5
+                    // plan §5.5) stops the drain — the transport does
+                    // not deliver over a down link; the queue stays
+                    // open and the gate stays closed until the
+                    // partition heals. Stopping the transport entirely
+                    // is the OTHER way to end the steady state (a
+                    // removed link); the flag is the in-place
+                    // partition. The check and the drain are
+                    // deliberately NOT atomic: a flip between them
+                    // lets one in-flight drain deliver over a link
+                    // that just dropped — real DRBD semantics (in-
+                    // flight writes complete when the link drops),
+                    // recorded in round-2 N3.
+                    let online = world_lock(&world).is_ok_and(|world| world.peer_online);
+                    if !online {
+                        continue;
+                    }
+                    // A `u64::MAX` bound drains everything queued —
+                    // the transport's lag IS the bound.
+                    let _ = apply_peer_writes(&world, minor, u64::MAX);
+                }
+            })
+            .expect("spawn peer transport")
+    };
+    PeerTransport {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// One running [`spawn_peer_transport`] link (see its docs): stop it
+/// to freeze the peer-apply window (the queue stops draining), join
+/// it to observe the exit.
+pub struct PeerTransport {
+    /// The stop flag the thread polls between lags.
+    stop: Arc<AtomicBool>,
+    /// The transport thread; `None` once joined.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeerTransport {
+    /// Ask the link to stop (it exits within one lag); idempotent.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop and wait for the thread's exit — after this the queue is
+    /// definitively frozen (no in-flight drain can land afterwards).
+    pub fn join(mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PeerTransport {
+    fn drop(&mut self) {
+        // Detach: the thread exits within one lag on its own.
+        self.stop();
+    }
+}
+
+/// Post-mortem read of one logical block (P5 plan §2.1's escape
+/// hatch): the resource's local map, with NONE of the enforced path's
+/// rules — no role check, no suspension check, and the openers set is
+/// never touched. **TEST-ONLY injection surface (the `FakeFailKnobs`
+/// doc-gate precedent): assertion and driving never use it** — it
+/// exists so an oracle can read the bytes of a fenced, demoted or
+/// suspended resource (bytes are the ground truth) and nothing else.
+///
+/// # Errors
+/// [`ApiErrorCode::NotFound`] when no running resource holds the
+/// minor (a `down`ed resource's block map died with the device — the
+/// fake models no on-LV block persistence, the same boundary as
+/// `down` removing the resource).
+pub fn read_raw(world: &Arc<Mutex<FakeDrbd>>, minor: u32, block: u64) -> Result<Block, ApiError> {
+    let world = world_lock(world)?;
+    let name = world
+        .resources
+        .iter()
+        .find(|(_, state)| state.minor == minor)
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| ApiError::not_found(format!("drbd{minor}: No such resource")))?;
+    let state = &world.resources[&name];
+    if let Some(block_content) = state.blocks.get(&block) {
+        return Ok(block_content.clone());
+    }
+    let lineage = world
+        .lineage
+        .get(&name)
+        .cloned()
+        .unwrap_or_else(|| GiSet::for_resource(&name));
+    Ok(Block {
+        payload: [0_u8; BLOCK_SIZE],
+        lineage,
+        applied_at_peer: true,
+    })
+}
+
+/// Out-of-band write of one logical block (P5 plan §2.4's injection
+/// surface): the resource's local map, with NONE of the enforced
+/// path's rules — no role check, no suspension check, no bounds
+/// check, the openers set never touched, and (the point) NO apply
+/// queue entry: a rogue writer below volvisor's enforcement is below
+/// the replication path too, so the peer never receives these bytes.
+/// **TEST-ONLY injection surface (the `FakeFailKnobs` doc-gate
+/// precedent): driving and assertion never use it** — it models an
+/// actor volvisor cannot see (the stale-write-after-fence injection)
+/// and nothing else.
+///
+/// # Errors
+/// [`ApiErrorCode::NotFound`] when no running resource holds the
+/// minor; `INVALID_REQUEST` for a payload that is not exactly
+/// [`BLOCK_SIZE`] bytes.
+pub fn write_raw(
+    world: &Arc<Mutex<FakeDrbd>>,
+    minor: u32,
+    block: u64,
+    payload: &[u8],
+) -> Result<(), ApiError> {
+    if payload.len() != BLOCK_SIZE {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "write_raw(drbd{minor}): payload is {} bytes; exactly {BLOCK_SIZE} (one \
+                 logical block) is required",
+                payload.len()
+            ),
+        ));
+    }
+    let mut world = world_lock(world)?;
+    let name = world
+        .resources
+        .iter()
+        .find(|(_, state)| state.minor == minor)
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| ApiError::not_found(format!("drbd{minor}: No such resource")))?;
+    let mut bytes = [0_u8; BLOCK_SIZE];
+    bytes.copy_from_slice(payload);
+    let lineage = world
+        .lineage
+        .get(&name)
+        .cloned()
+        .unwrap_or_else(|| GiSet::for_resource(&name));
+    world
+        .resources
+        .get_mut(&name)
+        .expect("the resource was found above")
+        .blocks
+        .insert(
+            block,
+            Block {
+                payload: bytes,
+                lineage,
+                applied_at_peer: false,
+            },
+        );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +2370,11 @@ pub fn seed_foreign_volume(
             resyncing: false,
             device_size: device,
             peer_node: NODE.to_owned(),
+            // Seeding lands an empty block map under the seeded
+            // lineage (the sparse zero fill; P5 plan §2.1).
+            blocks: BTreeMap::new(),
+            apply_queue: VecDeque::new(),
+            write_seq: 0,
         },
     );
     resource
@@ -1648,6 +2538,11 @@ pub fn seed_volume_with_identity(
             resyncing: false,
             device_size: device,
             peer_node: PEER_NODE.to_owned(),
+            // Seeding lands an empty block map under the seeded
+            // lineage (the sparse zero fill; P5 plan §2.1).
+            blocks: BTreeMap::new(),
+            apply_queue: VecDeque::new(),
+            write_seq: 0,
         },
     );
 }
@@ -1754,6 +2649,12 @@ pub fn seed_peer_volume(
             resyncing: false,
             device_size: device,
             peer_node: NODE.to_owned(),
+            // The replica's data path starts empty (the sparse zero
+            // fill; the source's writes reach it through the apply
+            // queue's drains — P5 plan §2.3).
+            blocks: BTreeMap::new(),
+            apply_queue: VecDeque::new(),
+            write_seq: 0,
         },
     );
     // Deliberately NO state-file entry: the destination host has never

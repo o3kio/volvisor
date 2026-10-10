@@ -16,6 +16,8 @@
 
 mod common;
 
+use std::collections::{BTreeMap, VecDeque};
+
 use common::{Fixture, PEER_NODE, SEED_MINOR, VG, fixture, provider_from, seed_lv, seed_volume};
 use volvisor_drbd::provider::resource_name_for;
 use volvisor_drbd::report::{DiskState, Role};
@@ -490,6 +492,9 @@ fn seed_crashed_create(
                 resyncing: false,
                 device_size: size_bytes,
                 peer_node: PEER_NODE.to_owned(),
+                blocks: BTreeMap::new(),
+                apply_queue: VecDeque::new(),
+                write_seq: 0,
             },
         );
     }

@@ -1094,6 +1094,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "volvisor-campaign"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "volvisor-api",
+ "volvisor-drbd",
+ "volvisor-drbd-testkit",
+ "volvisor-handoff",
+ "volvisor-journal",
+ "volvisor-provider",
+ "volvisor-types",
+ "volvisor-witness",
+ "volvisord",
+]
+
+[[package]]
 name = "volvisor-ceph"
 version = "0.1.0"
 dependencies = [

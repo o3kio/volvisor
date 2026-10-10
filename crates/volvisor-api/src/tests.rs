@@ -3667,3 +3667,88 @@ async fn peer_health_reports_the_honest_snapshot_dir_answer() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["snapshot_dir_readable"], json!(false));
 }
+
+// --------------------------------------------------------- crash hook
+
+/// The crash hook's doc gate (P5 plan §3.1): the armed table defaults
+/// to inert — no consult fires anything until the constructing rig
+/// arms an exact `(operation kind, point)` pair, an unarmed point is
+/// a no-op even with a kill switch registered, a firing is one-shot,
+/// and a state built without `with_crash_hooks` carries no hooks at
+/// all (no route, config or input path can reach the table).
+#[test]
+fn crash_hooks_default_to_inert_and_fire_only_when_armed() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::crash::{CRASH_PANIC_PREFIX, CrashHooks, CrashPoint};
+    use crate::op_kinds::OP_CREATE_VOLUME;
+
+    let hooks = CrashHooks::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&fired);
+    hooks.set_kill_switch(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Inert by default: every point of every operation kind is a
+    // no-op, and the kill switch never fires.
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::AfterIntent);
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::BeforeOutcome);
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::AfterOutcome);
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        0,
+        "unarmed consults fire nothing"
+    );
+
+    // A built state carries no hooks unless the constructing rig
+    // attaches them.
+    let (state, _provider, _dir) = setup_with_token(Some(TEST_TOKEN));
+    assert!(
+        state.crash.is_none(),
+        "AppState::new leaves the crash hook unset (inert)"
+    );
+
+    // Arming one point of one operation fires exactly there: the
+    // kill switch runs once and the firing consult panics with the
+    // campaign payload (the in-band process death).
+    hooks.arm(OP_CREATE_VOLUME, CrashPoint::AfterOutcome);
+    let silence = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let fired_panic = catch_unwind(AssertUnwindSafe(|| {
+        hooks.consult(OP_CREATE_VOLUME, CrashPoint::AfterOutcome);
+    }));
+    std::panic::set_hook(silence);
+    let payload = fired_panic
+        .expect_err("the armed point terminates the request")
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        payload.starts_with(CRASH_PANIC_PREFIX),
+        "the panic payload is the campaign crash marker: {payload}"
+    );
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the kill switch fired once"
+    );
+
+    // One shot: the consumed entry cannot fire again, and a
+    // differently-pointed entry stays armed for its own point.
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::AfterOutcome);
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "a fired entry is consumed");
+    hooks.arm(OP_CREATE_VOLUME, CrashPoint::BeforeOutcome);
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::AfterIntent);
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "only the exact point fires"
+    );
+
+    // `clear` disarms without firing.
+    hooks.clear();
+    hooks.consult(OP_CREATE_VOLUME, CrashPoint::BeforeOutcome);
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "cleared entries are inert");
+}

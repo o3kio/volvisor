@@ -9,6 +9,7 @@ members = [
     "crates/volvisor-drbd",
     "crates/volvisor-drbd-testkit",
     "crates/volvisor-witness",
+    "crates/volvisor-campaign",
     "crates/volvisor-handoff",
     "crates/volvisor-api",
     "crates/volvisord",
@@ -30,8 +31,10 @@ volvisor-ceph = { path = "crates/volvisor-ceph" }
 volvisor-drbd = { path = "crates/volvisor-drbd" }
 volvisor-drbd-testkit = { path = "crates/volvisor-drbd-testkit" }
 volvisor-witness = { path = "crates/volvisor-witness" }
+volvisor-campaign = { path = "crates/volvisor-campaign" }
 volvisor-handoff = { path = "crates/volvisor-handoff" }
 volvisor-api = { path = "crates/volvisor-api" }
+volvisord = { path = "crates/volvisord" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

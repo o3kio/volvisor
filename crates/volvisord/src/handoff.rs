@@ -104,9 +104,10 @@
 //! two-host R4 evidence campaign remains the production gate (plan
 //! §8/§9). No production-support claim is made by this module.
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1113,6 +1114,135 @@ impl HandoffDriver for DaemonHandoffDriver {
 pub type ParticipantFacts =
     Arc<dyn Fn(&VolumeId, &str, u64) -> Result<(String, u32), ApiError> + Send + Sync>;
 
+/// One slot of the drive-task registry: `transfer` records the
+/// spawned task's `JoinHandle` only after `tokio::spawn` returns, so
+/// a fail-fast task may run its final act first — the slot records
+/// which side of that spawn/finish race it is in.
+enum DriveTaskSlot {
+    /// The id is allocated; the spawner is between `spawn` and the
+    /// record step.
+    Starting,
+    /// The recorded handle, live until the task's own final act
+    /// removes the slot.
+    Tracked(tokio::task::JoinHandle<()>),
+    /// The task finished before its handle was recorded — the record
+    /// step drops the handle instead of tracking a dead task.
+    FinishedEarly,
+    /// The kill group fired while the slot was still [`Starting`]
+    /// (P5 plan §3.3: the group must be COMPLETE — a drive between
+    /// spawn and record is a mutation engine the kill missed). The
+    /// handle is not abortable yet, so the record step aborts it the
+    /// moment it arrives.
+    AbortPending,
+}
+
+/// The transfer drive tasks this surface spawned (P5 plan §3.3's
+/// tracked registry): the failure-campaign supervisor's kill group
+/// must enumerate the detached drive, so its `JoinHandle` is recorded
+/// here. The task's own final act removes its slot, so the registry
+/// never grows on graceful paths — behavior-neutral by construction
+/// (the drive's future is unchanged).
+#[derive(Default)]
+struct DriveTaskRegistry {
+    /// The next task id (monotonic, never reused within the process).
+    next_id: u64,
+    /// The slots by task id.
+    slots: BTreeMap<u64, DriveTaskSlot>,
+}
+
+impl DriveTaskRegistry {
+    /// Allocate the next task id (the slot starts [`Starting`]: the
+    /// spawner records the handle right after `tokio::spawn`).
+    fn alloc(&mut self) -> u64 {
+        self.next_id += 1;
+        self.slots.insert(self.next_id, DriveTaskSlot::Starting);
+        self.next_id
+    }
+
+    /// Record the spawned task's handle (the spawner's half of the
+    /// spawn/finish race): a task that already finished marked its
+    /// slot, so the handle is dropped — a dead task is never tracked.
+    /// A slot the kill group marked [`DriveTaskSlot::AbortPending`]
+    /// aborts the handle here — the drive dies at the record step
+    /// instead of escaping the kill. Returns whether the handle was
+    /// aborted (the kill-window test's deterministic assertion).
+    fn record(&mut self, id: u64, handle: tokio::task::JoinHandle<()>) -> bool {
+        match self.slots.get(&id) {
+            Some(DriveTaskSlot::FinishedEarly) => {
+                self.slots.remove(&id);
+                false
+            }
+            Some(DriveTaskSlot::AbortPending) => {
+                handle.abort();
+                self.slots.remove(&id);
+                true
+            }
+            _ => {
+                self.slots.insert(id, DriveTaskSlot::Tracked(handle));
+                false
+            }
+        }
+    }
+
+    /// The task's final act (the task's half of the race): remove the
+    /// slot, or mark it when the handle is not recorded yet.
+    fn finish(&mut self, id: u64) {
+        match self.slots.get(&id) {
+            Some(DriveTaskSlot::Starting | DriveTaskSlot::AbortPending) => {
+                self.slots.insert(id, DriveTaskSlot::FinishedEarly);
+            }
+            _ => {
+                self.slots.remove(&id);
+            }
+        }
+    }
+
+    /// The number of live drive tasks (the kill group's enumeration
+    /// input).
+    fn live(&self) -> usize {
+        self.slots
+            .values()
+            .filter(|slot| matches!(slot, DriveTaskSlot::Tracked(_)))
+            .count()
+    }
+
+    /// Take every recorded handle out (the abort path's first half —
+    /// an aborted task cannot run its final act, so the registry must
+    /// reap it wholesale). A slot still [`Starting`] (the spawner
+    /// between spawn and record) is marked [`AbortPending`] — the
+    /// group is complete only if this window is covered too.
+    fn take_live(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let ids: Vec<u64> = self.slots.keys().copied().collect();
+        let mut handles = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.slots.get(&id) {
+                Some(DriveTaskSlot::Tracked(_)) => {
+                    if let Some(DriveTaskSlot::Tracked(handle)) = self.slots.remove(&id) {
+                        handles.push(handle);
+                    }
+                }
+                Some(DriveTaskSlot::Starting) => {
+                    self.slots.insert(id, DriveTaskSlot::AbortPending);
+                }
+                _ => {}
+            }
+        }
+        handles
+    }
+}
+
+/// Lock the registry without panicking on poison: every critical
+/// section is a pure map operation, so a poisoned lock can only mean
+/// another thread panicked in unrelated code while holding it — the
+/// map is still structurally valid, and task bookkeeping must not
+/// crash the daemon (the coordinator's own store maps poison to a
+/// typed error; this registry has no caller to refuse).
+fn lock_registry(registry: &Arc<Mutex<DriveTaskRegistry>>) -> MutexGuard<'_, DriveTaskRegistry> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The daemon's [`MigrationSurface`]: the coordinator wrapped with the
 /// prepare enrichment and the one-drive-at-a-time lock (plan §3: the
 /// coordinator is not internally serialized; the daemon serializes
@@ -1125,6 +1255,11 @@ pub struct MigrationHandle {
     /// retry pass; a shared `Arc` so the spawned drive task and the
     /// surface take the same lock.
     drive: Arc<tokio::sync::Mutex<()>>,
+    /// The transfer drive tasks `transfer` spawned (plan §3.3's
+    /// tracked registry): the supervisor's kill group aborts them as
+    /// a group; each task's own final act removes its slot, so the
+    /// registry never grows on graceful paths.
+    drive_tasks: Arc<Mutex<DriveTaskRegistry>>,
 }
 
 impl MigrationHandle {
@@ -1139,6 +1274,34 @@ impl MigrationHandle {
     #[must_use]
     pub fn drive_lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
         &self.drive
+    }
+
+    /// The number of live transfer drive tasks (plan §3.3: the
+    /// supervisor's kill-group enumeration input — the detached drive
+    /// is part of the task group the rig aborts as one unit).
+    #[must_use]
+    pub fn live_drive_tasks(&self) -> usize {
+        lock_registry(&self.drive_tasks).live()
+    }
+
+    /// Abort and drain every tracked transfer drive task (plan §3.3:
+    /// the supervisor's kill act). An aborted task cannot run its own
+    /// final act, so the registry reaps the handle here; a task that
+    /// already finished resolves immediately. The handles are taken
+    /// out under the lock first — the lock is never held across an
+    /// await. Aborting the drive *task* is not aborting the
+    /// *migration*: the record keeps its durable state.
+    pub async fn abort_drive_tasks(&self) {
+        // The handles are taken out under the lock first — the lock
+        // is never held across an await.
+        let handles = lock_registry(&self.drive_tasks).take_live();
+        for handle in handles {
+            handle.abort();
+            // Drain: the abort resolves the task (a kill that leaves
+            // the drive mutating witness and migration state is not a
+            // kill).
+            let _ = handle.await;
+        }
     }
 }
 
@@ -1189,8 +1352,10 @@ impl MigrationSurface for MigrationHandle {
         let at_start = record.observe();
         let coordinator = Arc::clone(&self.coordinator);
         let drive = Arc::clone(&self.drive);
+        let drive_tasks = Arc::clone(&self.drive_tasks);
         let migration_id = migration_id.clone();
-        tokio::spawn(async move {
+        let task_id = lock_registry(&self.drive_tasks).alloc();
+        let task = tokio::spawn(async move {
             // One drive at a time: a retry pass in flight is awaited,
             // never raced.
             let _guard = drive.lock().await;
@@ -1209,7 +1374,15 @@ impl MigrationSurface for MigrationHandle {
                      retry task re-drives it"
                 ),
             }
+            // The final act (plan §3.3): the task removes its own
+            // registry slot, so the registry never grows on graceful
+            // paths.
+            lock_registry(&drive_tasks).finish(task_id);
         });
+        // Record-after-spawn (plan §3.3): the supervisor's kill group
+        // includes this drive. A fail-fast task may already have
+        // finished — `record` drops the handle in that case.
+        lock_registry(&self.drive_tasks).record(task_id, task);
         Ok(at_start)
     }
 
@@ -1343,6 +1516,7 @@ where
         facts,
         host_id: host_id.clone(),
         drive: Arc::new(tokio::sync::Mutex::new(())),
+        drive_tasks: Arc::new(Mutex::new(DriveTaskRegistry::default())),
     });
     // The destination-side half: the same witness connection behind
     // the blocking adapter, the same VMM seam and handoff surface the
@@ -2516,6 +2690,197 @@ mod tests {
             matches!(reconciled.state, HandoffState::Aborted { .. }),
             "the reconcile rolls an un-transferred preparation back: {}",
             reconciled.state
+        );
+    }
+
+    /// Plan §3.3's tracked registry, the spawn/finish race included:
+    /// `record` runs after `tokio::spawn` returns, so every ordering
+    /// of alloc/record/finish must leave the registry empty once the
+    /// task is done — a dead handle is never tracked, and the abort
+    /// path takes the live handles out wholesale.
+    #[tokio::test]
+    async fn the_drive_task_registry_survives_the_spawn_finish_race() {
+        let mut registry = DriveTaskRegistry::default();
+
+        // The graceful ordering: record first, the task's final act
+        // second — the slot drops with the handle.
+        let graceful = registry.alloc();
+        registry.record(graceful, tokio::spawn(async {}));
+        assert_eq!(registry.live(), 1, "the recorded task is live");
+        registry.finish(graceful);
+        assert_eq!(registry.live(), 0, "the final act removes the slot");
+
+        // The fail-fast ordering: the task finishes before the spawner
+        // records the handle — the record step drops the dead handle
+        // instead of tracking it (the registry never grows).
+        let fail_fast = registry.alloc();
+        registry.finish(fail_fast);
+        assert_eq!(registry.live(), 0);
+        registry.record(fail_fast, tokio::spawn(async {}));
+        assert_eq!(
+            registry.live(),
+            0,
+            "a handle recorded after the task finished is never tracked"
+        );
+
+        // The abort ordering: a recorded handle is taken out wholesale
+        // (an aborted task cannot run its final act).
+        let aborted = registry.alloc();
+        registry.record(aborted, tokio::spawn(async {}));
+        let taken = registry.take_live();
+        assert_eq!(taken.len(), 1, "the abort path drains the registry");
+        assert_eq!(registry.live(), 0);
+        for handle in taken {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        // The kill-inside-the-spawn-window ordering (P5 plan §3.3's
+        // complete-group rule): the kill fires while the slot is
+        // still Starting — the handle does not exist to take, so the
+        // slot is marked AbortPending and the record step aborts the
+        // drive the moment the handle arrives. The window cannot
+        // leak a mutation engine past the kill.
+        let window = registry.alloc();
+        let taken = registry.take_live();
+        assert!(taken.is_empty(), "a Starting slot has no handle to take");
+        assert_eq!(registry.live(), 0, "nothing is live through the window");
+        let aborted_at_record = registry.record(
+            window,
+            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(3600)).await }),
+        );
+        assert!(
+            aborted_at_record,
+            "the record step aborts the handle of an AbortPending slot"
+        );
+        assert_eq!(
+            registry.live(),
+            0,
+            "the AbortPending slot never becomes a tracked live task"
+        );
+    }
+
+    /// Plan §3.3's registry over the real spawn path: a `transfer`
+    /// drive is tracked (the supervisor's kill-group enumeration
+    /// input), removes itself when it finishes, and is aborted and
+    /// drained by [`MigrationHandle::abort_drive_tasks`] — and
+    /// aborting the drive *task* is not aborting the *migration*.
+    #[tokio::test]
+    async fn transfer_drive_tasks_are_tracked_reaped_and_abortable() {
+        // The full composition (the runtime's wiring over fakes): both
+        // roles from one `wire_migration` call.
+        let witness = witness_kit().await;
+        let snapshot_dir = tempfile::tempdir().expect("snapshot dir");
+        let dirs = tempfile::tempdir().expect("store dir");
+        let vmm: Arc<dyn VmmController> = Arc::new(FakeVmm::new(snapshot_dir.path()));
+        let surface: Arc<dyn HandoffSurface> = Arc::new(FakeSurface::new());
+        let stub = Arc::new(StubPeer::new(Vec::new()));
+        // The destination verifies exactly the participant set the
+        // preparation names (same order, same generations).
+        *stub.prepare_participants.lock().expect("participants") =
+            vec![participant("vol-drive", 1, 100)];
+        let peer: Arc<dyn PeerClient> = stub;
+        let facts: ParticipantFacts =
+            Arc::new(|_volume, _vm, _generation| Ok(("drbd-res".to_owned(), 100_u32)));
+        // The volume is registered at the witness: the drive's
+        // external-facts fold inspects every participant before it
+        // cuts.
+        register_volume(&witness, &volume("vol-drive")).await;
+        let (handle, _peer_ctx) = wire_migration(
+            host(NODE),
+            Arc::new(client_for(&witness.server, Some(NODE_TOKEN))),
+            witness.server.addr,
+            vmm,
+            surface,
+            Arc::new(FakeProvider::new()),
+            peer,
+            facts,
+            snapshot_dir.path().to_owned(),
+            dirs.path().join("migrations"),
+            dirs.path().join("peer-preparations"),
+            Arc::new(|| 0_u64),
+        )
+        .expect("wiring");
+
+        // Two PREPARED records: one whose drive runs to its outcome,
+        // one whose drive is aborted while parked.
+        let driven = migration("mig-drive-live");
+        let parked = migration("mig-drive-abort");
+        for mig in [&driven, &parked] {
+            handle
+                .coordinator()
+                .prepare(PrepareHandoffRequest {
+                    migration_id: mig.clone(),
+                    vm_id: "vm-1".to_owned(),
+                    source_host: host(NODE),
+                    target_host: host(PEER),
+                    participants: vec![participant("vol-drive", 1, 100)],
+                })
+                .await
+                .expect("prepare");
+        }
+
+        // A parked drive is deterministically tracked: the test holds
+        // the surface, so the spawned task cannot pass its first await
+        // and cannot finish — after `transfer` returns, the recorded
+        // handle is live.
+        let guard = handle.drive_lock().lock().await;
+        handle
+            .transfer(&driven, serde_json::json!({"kind": "unit"}))
+            .await
+            .expect("transfer");
+        assert_eq!(
+            handle.live_drive_tasks(),
+            1,
+            "the parked drive task is tracked"
+        );
+
+        // Released, the drive runs to its outcome — over this kit the
+        // stub peer grants nothing, so the drive fails fast and keeps
+        // the record's durable state — and its final act removes it.
+        drop(guard);
+        let mut removed = false;
+        for _ in 0..1_000 {
+            if handle.live_drive_tasks() == 0 {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            removed,
+            "the drive task's final act must remove its own slot"
+        );
+
+        // The kill act: a second parked drive is aborted and drained
+        // by the registry (an aborted task cannot run its final act),
+        // and the record keeps its PREPARED state — the task abort is
+        // not a migration abort.
+        let _guard = handle.drive_lock().lock().await;
+        handle
+            .transfer(&parked, serde_json::json!({"kind": "unit"}))
+            .await
+            .expect("transfer 2");
+        assert_eq!(
+            handle.live_drive_tasks(),
+            1,
+            "the second parked drive task is tracked"
+        );
+        handle.abort_drive_tasks().await;
+        assert_eq!(
+            handle.live_drive_tasks(),
+            0,
+            "the registry reaped the aborted task"
+        );
+        assert_eq!(
+            handle
+                .coordinator()
+                .observe(&parked)
+                .expect("observe")
+                .expect("record")
+                .state,
+            HandoffState::Prepared,
+            "aborting the drive task must not abort the migration"
         );
     }
 }

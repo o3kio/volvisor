@@ -60,6 +60,13 @@ pub struct AppState {
     /// with `401` (the tokenless mode is loopback-only dev/test; the daemon
     /// refuses non-loopback binds without a token).
     pub(crate) admin_token: Option<String>,
+    /// The journal-append crash hook (P5 plan §3.1), when the
+    /// constructing test rig attached one. `None` — every production
+    /// path — is fully inert: the pipeline consults nothing. Doc-gated
+    /// trust class: no route, config or input can set it, only
+    /// [`AppState::with_crash_hooks`], which only the campaign rig
+    /// calls (see the `crash` module docs).
+    pub(crate) crash: Option<Arc<crate::crash::CrashHooks>>,
 }
 
 impl AppState {
@@ -84,7 +91,20 @@ impl AppState {
             journal: std::sync::Mutex::new(journal),
             metrics: Arc::new(Metrics::new()),
             admin_token,
+            crash: None,
         }
+    }
+
+    /// Attach the journal-append crash hook (P5 plan §3.1). **Test
+    /// rig only** — the doc-gated trust class (see the `crash` module
+    /// docs): the hook is inert until its armed table is set, and
+    /// only the constructing rig can arm it; no route, request or
+    /// config path reaches it. A state built without this builder
+    /// never consults the crash hook at all.
+    #[must_use]
+    pub fn with_crash_hooks(mut self, crash: Arc<crate::crash::CrashHooks>) -> Self {
+        self.crash = Some(crash);
+        self
     }
 
     /// Attach the nearline adopt-and-promote surface (P4a plan §6): the
