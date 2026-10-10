@@ -207,9 +207,22 @@ pub fn barrier_timestamp(summary: &serde_json::Value) -> Option<u64> {
 /// The boundary cross-check (§2.3 rule 1): the coordinator recorded
 /// the barrier durable at `barrier_at` — no acknowledged write may
 /// carry a LATER clock value than the barrier it should be covered
-/// by (a coordinator that records the barrier before the writes it
-/// should have covered is a boundary-skew violation; a negative
-/// result fails the check).
+/// by. What each direction means:
+///
+/// - **Negative skew** (`barrier_at` before the last acknowledged
+///   write) is the violation this check exists for: the coordinator
+///   recorded the barrier *before* the writes it should have covered
+///   — writes slipped past the barrier's protection. The rows treat
+///   any negative skew as a failure.
+/// - **Zero or positive skew** is the honest shape (the barrier at,
+///   or after, the last acknowledged write).
+///
+/// The check's complement is the byte verdict: a *late* barrier
+/// (recorded after a tail the coordinator should have covered) does
+/// not show up as skew — it shows up as missing blocks at the
+/// destination, which [`verify_against`] reports. The two checks
+/// together cover both failure directions; neither is sufficient
+/// alone (the negative tests in `tests/oracle_negative.rs` pin both).
 #[must_use]
 pub fn boundary_skew(acked: &[AckedWrite], barrier_at: u64) -> Option<i64> {
     let last = acked.last().map(|write| write.clock)?;

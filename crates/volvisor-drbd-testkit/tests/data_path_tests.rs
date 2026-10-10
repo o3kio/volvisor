@@ -610,3 +610,165 @@ fn the_peer_transport_drains_with_a_lag_and_freezes_when_stopped() {
         "after the link stops the queue no longer drains"
     );
 }
+
+/// A FAILED delivery requeues (§2.3's hinge): a linked peer world
+/// alive but without the same-named resource is a drain that cannot
+/// land — without the requeue, the source-side flags would flip and
+/// the gate would read `UpToDate` over blocks that never arrived,
+/// exactly the lie the coupling rule forbids. With it, the entries go
+/// back to the queue (front-first, order preserved), the flags stay
+/// unflipped, and the gate stays closed until the peer can receive.
+#[test]
+fn a_failed_delivery_requeues_and_keeps_the_gate_closed() {
+    let (base, world, runner, resource) = seeded_world("vol-faildel");
+    // The linked peer world exists but carries NO resource of this
+    // name (an absent replica, not a down link — the down-link shape
+    // is the transport test above).
+    let world_b = Arc::new(Mutex::new(FakeDrbd::default()));
+    link_replication_peers(&world, &world_b);
+
+    promote(&runner, &base, &resource);
+    let device = open_device(&world, SEED_MINOR).expect("open");
+    let ack = device.write(0, &payload(0x3c)).expect("write");
+
+    // The drain cannot deliver: the entries requeue, the flags stay
+    // unflipped, the window stays open.
+    apply_peer_writes(&world, SEED_MINOR, ack).expect("the drain attempted");
+    let state = resource_of(&world, &resource);
+    assert_eq!(
+        state.apply_queue.len(),
+        1,
+        "the refused entries requeue instead of dropping"
+    );
+    assert!(
+        !state.blocks[&0].applied_at_peer,
+        "no source-side flag flips on a refused drain"
+    );
+    let tokens = status(&runner, &resource);
+    assert!(
+        tokens.contains("peer-disk:Inconsistent"),
+        "the gate stays closed: {tokens}"
+    );
+    assert!(tokens.contains("replication:SyncSource"), "{tokens}");
+
+    // The peer gains its resource (the replica is seeded): the SAME
+    // drain command now delivers — the queue was never lost, only
+    // refused; order and content are intact.
+    let base_b = host_dir();
+    seed_peer_volume(
+        &base_b,
+        &world_b,
+        "vol-faildel",
+        MIB,
+        ReplicationMode::A,
+        SEED_MINOR,
+        volvisor_drbd_testkit::SEED_PORT,
+    );
+    apply_peer_writes(&world, SEED_MINOR, ack).expect("the retried drain");
+    let state = resource_of(&world, &resource);
+    assert!(
+        state.apply_queue.is_empty(),
+        "the retried drain delivers the requeued entries"
+    );
+    assert!(state.blocks[&0].applied_at_peer);
+    assert_eq!(
+        read_raw(&world_b, SEED_MINOR, 0)
+            .expect("read the peer's bytes")
+            .payload,
+        payload(0x3c),
+        "the delivered content is the write's, not a zero fill"
+    );
+    let tokens = status(&runner, &resource);
+    assert!(
+        tokens.contains("peer-disk:UpToDate"),
+        "the gate opens only on real delivery: {tokens}"
+    );
+}
+
+/// The transport honors the world's `peer_online` flag (the §5.5
+/// partition injection): while the link is flagged down the
+/// transport delivers nothing — the queue stays open and the gate
+/// stays closed — and healing the flag lets the same lagged transport
+/// drain. A partition must never read as caught-up.
+#[test]
+fn the_transport_honors_a_partitioned_link() {
+    use std::time::{Duration, Instant};
+
+    use volvisor_drbd_testkit::spawn_peer_transport;
+
+    let (base, world, runner, resource) = seeded_world("vol-part");
+    let base_b = host_dir();
+    let world_b = Arc::new(Mutex::new(FakeDrbd::default()));
+    seed_peer_volume(
+        &base_b,
+        &world_b,
+        "vol-part",
+        MIB,
+        ReplicationMode::A,
+        SEED_MINOR,
+        volvisor_drbd_testkit::SEED_PORT,
+    );
+    link_replication_peers(&world, &world_b);
+
+    promote(&runner, &base, &resource);
+    let device = open_device(&world, SEED_MINOR).expect("open");
+
+    // The partition is flagged BEFORE the transport can deliver
+    // anything; the transport keeps running (the link is up, the
+    // FLAG is down — the in-place partition).
+    world.lock().expect("world").peer_online = false;
+    let transport = spawn_peer_transport(&world, SEED_MINOR, Duration::from_millis(1));
+    device.write(0, &payload(0x77)).expect("write");
+
+    // A generous negative window — 100× the transport's lag — over
+    // which nothing may arrive. (A bare wait is the only way to
+    // prove absence; it is bounded, and the heal below proves the
+    // same transport CAN deliver when the flag allows.)
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        read_raw(&world_b, SEED_MINOR, 0)
+            .expect("read peer")
+            .payload
+            .iter()
+            .all(|byte| *byte == 0),
+        "the partitioned transport delivered nothing"
+    );
+    let state = resource_of(&world, &resource);
+    assert_eq!(
+        state.apply_queue.len(),
+        1,
+        "the queue stays open over the partition"
+    );
+    // The partition's own honest shape: the real `WFConnection`
+    // token (the link is down), and no caught-up token anywhere —
+    // `peer-disk:UpToDate` must not appear over undelivered blocks.
+    let tokens = status(&runner, &resource);
+    assert!(
+        tokens.contains("connection:WFConnection"),
+        "the partition renders the real disconnect token: {tokens}"
+    );
+    assert!(
+        !tokens.contains("peer-disk:UpToDate"),
+        "a partition never reads as caught-up: {tokens}"
+    );
+
+    // The heal: the flag up, the same transport drains within the
+    // bounded lag.
+    world.lock().expect("world").peer_online = true;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let drained = read_raw(&world_b, SEED_MINOR, 0)
+            .expect("read peer")
+            .payload[0]
+            == 0x77;
+        if drained {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the healed transport drained within the bound"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    transport.join();
+}

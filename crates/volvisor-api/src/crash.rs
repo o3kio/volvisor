@@ -67,9 +67,11 @@ pub enum CrashPoint {
 
 /// The kill switch the constructing rig registers: fired inside the
 /// armed point, before the request dies. The switch must be safe to
-/// call from within a request task (it runs under the journal lock)
-/// and must not await — aborts are requests, and the supervisor owns
-/// the awaiting.
+/// call from within a request task — it runs from the ops pipeline
+/// between journal writes, OUTSIDE every journal critical section
+/// (the append has returned; no lock is held across the fire) — and
+/// must not await: aborts are requests, and the supervisor owns the
+/// awaiting.
 pub type KillSwitch = Arc<dyn Fn() + Send + Sync>;
 
 /// The prefix every crash-injection panic payload starts with — a

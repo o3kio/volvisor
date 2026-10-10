@@ -1128,6 +1128,12 @@ enum DriveTaskSlot {
     /// The task finished before its handle was recorded — the record
     /// step drops the handle instead of tracking a dead task.
     FinishedEarly,
+    /// The kill group fired while the slot was still [`Starting`]
+    /// (P5 plan §3.3: the group must be COMPLETE — a drive between
+    /// spawn and record is a mutation engine the kill missed). The
+    /// handle is not abortable yet, so the record step aborts it the
+    /// moment it arrives.
+    AbortPending,
 }
 
 /// The transfer drive tasks this surface spawned (P5 plan §3.3's
@@ -1156,21 +1162,38 @@ impl DriveTaskRegistry {
     /// Record the spawned task's handle (the spawner's half of the
     /// spawn/finish race): a task that already finished marked its
     /// slot, so the handle is dropped — a dead task is never tracked.
-    fn record(&mut self, id: u64, handle: tokio::task::JoinHandle<()>) {
-        if matches!(self.slots.get(&id), Some(DriveTaskSlot::FinishedEarly)) {
-            self.slots.remove(&id);
-        } else {
-            self.slots.insert(id, DriveTaskSlot::Tracked(handle));
+    /// A slot the kill group marked [`DriveTaskSlot::AbortPending`]
+    /// aborts the handle here — the drive dies at the record step
+    /// instead of escaping the kill. Returns whether the handle was
+    /// aborted (the kill-window test's deterministic assertion).
+    fn record(&mut self, id: u64, handle: tokio::task::JoinHandle<()>) -> bool {
+        match self.slots.get(&id) {
+            Some(DriveTaskSlot::FinishedEarly) => {
+                self.slots.remove(&id);
+                false
+            }
+            Some(DriveTaskSlot::AbortPending) => {
+                handle.abort();
+                self.slots.remove(&id);
+                true
+            }
+            _ => {
+                self.slots.insert(id, DriveTaskSlot::Tracked(handle));
+                false
+            }
         }
     }
 
     /// The task's final act (the task's half of the race): remove the
     /// slot, or mark it when the handle is not recorded yet.
     fn finish(&mut self, id: u64) {
-        if let Some(DriveTaskSlot::Starting) = self.slots.get(&id) {
-            self.slots.insert(id, DriveTaskSlot::FinishedEarly);
-        } else {
-            self.slots.remove(&id);
+        match self.slots.get(&id) {
+            Some(DriveTaskSlot::Starting | DriveTaskSlot::AbortPending) => {
+                self.slots.insert(id, DriveTaskSlot::FinishedEarly);
+            }
+            _ => {
+                self.slots.remove(&id);
+            }
         }
     }
 
@@ -1185,18 +1208,23 @@ impl DriveTaskRegistry {
 
     /// Take every recorded handle out (the abort path's first half —
     /// an aborted task cannot run its final act, so the registry must
-    /// reap it wholesale).
+    /// reap it wholesale). A slot still [`Starting`] (the spawner
+    /// between spawn and record) is marked [`AbortPending`] — the
+    /// group is complete only if this window is covered too.
     fn take_live(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
-        let ids: Vec<u64> = self
-            .slots
-            .iter()
-            .filter(|(_, slot)| matches!(slot, DriveTaskSlot::Tracked(_)))
-            .map(|(id, _)| *id)
-            .collect();
+        let ids: Vec<u64> = self.slots.keys().copied().collect();
         let mut handles = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(DriveTaskSlot::Tracked(handle)) = self.slots.remove(&id) {
-                handles.push(handle);
+            match self.slots.get(&id) {
+                Some(DriveTaskSlot::Tracked(_)) => {
+                    if let Some(DriveTaskSlot::Tracked(handle)) = self.slots.remove(&id) {
+                        handles.push(handle);
+                    }
+                }
+                Some(DriveTaskSlot::Starting) => {
+                    self.slots.insert(id, DriveTaskSlot::AbortPending);
+                }
+                _ => {}
             }
         }
         handles
@@ -2706,6 +2734,30 @@ mod tests {
             handle.abort();
             let _ = handle.await;
         }
+
+        // The kill-inside-the-spawn-window ordering (P5 plan §3.3's
+        // complete-group rule): the kill fires while the slot is
+        // still Starting — the handle does not exist to take, so the
+        // slot is marked AbortPending and the record step aborts the
+        // drive the moment the handle arrives. The window cannot
+        // leak a mutation engine past the kill.
+        let window = registry.alloc();
+        let taken = registry.take_live();
+        assert!(taken.is_empty(), "a Starting slot has no handle to take");
+        assert_eq!(registry.live(), 0, "nothing is live through the window");
+        let aborted_at_record = registry.record(
+            window,
+            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(3600)).await }),
+        );
+        assert!(
+            aborted_at_record,
+            "the record step aborts the handle of an AbortPending slot"
+        );
+        assert_eq!(
+            registry.live(),
+            0,
+            "the AbortPending slot never becomes a tracked live task"
+        );
     }
 
     /// Plan §3.3's registry over the real spawn path: a `transfer`

@@ -86,8 +86,12 @@ pub const INTERVAL: u64 = 20;
 /// The rig-side renewal loop's tick (production's shape:
 /// `renew_leases` itself throttles actual renewals to `INTERVAL`).
 const RENEWAL_TICK: Duration = Duration::from_secs(1);
-/// Bounded polling: real timeouts, small steps (house style).
-pub const POLL_BOUND: Duration = Duration::from_secs(10);
+/// Bounded polling: real timeouts, small steps (house style). The
+/// bound is the failure-detector ceiling, not a sleep — the happy
+/// path returns at the first observation. 15s gives a 3× margin over
+/// the retry task's ~5s tick on a loaded CI box (a kill-and-recover
+/// row must cross one tick to see the re-drive).
+pub const POLL_BOUND: Duration = Duration::from_secs(15);
 /// See [`POLL_BOUND`].
 pub const POLL_STEP: Duration = Duration::from_millis(50);
 
@@ -428,18 +432,27 @@ impl DaemonCore {
     /// supervisor to await. Firing order inside the crash hook
     /// guarantees the tasks stop before the rig can drive the daemon
     /// again. Called once at construction (the switch is permanent;
-    /// each launch refreshes the group slot it aborts).
+    /// each launch refreshes the group slot it aborts). The closure
+    /// holds `Weak` handles, not `Arc`s: a strong closure would cycle
+    /// (`DaemonCore` → its crash state → the closure → `DaemonCore`)
+    /// and leak the pair together when the rig drops the daemon; the
+    /// `killed` flag is a plain `Arc<AtomicBool>` (it must survive to
+    /// the supervisor's post-mortem reads even if the core went
+    /// away). An upgrade failure means the rig already dropped the
+    /// daemon — there is nothing left to kill and nothing driving it.
     fn install_kill_switch(self: &Arc<Self>) {
-        let group_slot = Arc::clone(self);
-        let dead_slot = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         let killed = Arc::clone(&self.killed);
         self.crash.set_kill_switch(Arc::new(move || {
             killed.store(true, Ordering::SeqCst);
-            let Some(group) = take_slot(&group_slot.group) else {
+            let Some(core) = weak.upgrade() else {
+                return;
+            };
+            let Some(group) = take_slot(&core.group) else {
                 return;
             };
             abort_group(&group);
-            *lock_slot(&dead_slot.dead_group) = Some(group);
+            *lock_slot(&core.dead_group) = Some(group);
         }));
     }
 }

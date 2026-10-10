@@ -1456,6 +1456,14 @@ fn world_lock(world: &Arc<Mutex<FakeDrbd>>) -> Result<MutexGuard<'_, FakeDrbd>, 
 /// completing seeding resync); the campaign never calls it — its only
 /// queue control is [`apply_peer_writes`], the pre-quiesce lag shaper.
 ///
+/// The copy carries EVERY source block, including [`write_raw`]'s
+/// out-of-band writes (which never enter the queue): real DRBD's
+/// bitmap marks a rogue writer's blocks dirty and the resync copies
+/// them faithfully — divergence propagates, and the witness's
+/// classifier is what must catch it, not the transport (the §5.1
+/// stale-write injection depends on exactly this). Deliberate, not
+/// an oversight.
+///
 /// The copy to a LINKED peer world cannot run here (the caller may
 /// hold this world's lock — see [`DeferredResync`]), so it is queued
 /// for the runner closure; the single-world effects (flags flipped,
@@ -1520,27 +1528,46 @@ fn replicate_blocks_to_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, blocks
 /// then the source-side flags, only for entries whose content is
 /// still current (a newer write to the same block superseded the
 /// entry; the newer queue entry carries that content).
-fn apply_at_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, entries: &[QueuedApply]) {
+///
+/// Returns whether the entries were **delivered**. The gate-coupling
+/// hinge (§2.3) makes this load-bearing: a drain that silently
+/// dropped entries — the linked peer alive but its same-named
+/// resource absent — would flip the source-side flags and empty the
+/// queue while the blocks never landed, and the gate would read
+/// `UpToDate` over un-applied blocks, exactly the lie §2.3 forbids.
+/// A `false` return tells the caller to put the entries back: the
+/// queue stays open and the gate stays closed. A world with **no
+/// peer link at all** (the single-world shape) delivers by
+/// definition — there is no peer to lie to, and the queue is
+/// source-side bookkeeping only.
+fn apply_at_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, entries: &[QueuedApply]) -> bool {
     if entries.is_empty() {
-        return;
+        return true;
     }
+    // The linked peer, if one exists. The single-world shape (no
+    // link at all) delivers by definition — there is no peer to lie
+    // to, and the queue is source-side bookkeeping only — so it
+    // falls through to the bookkeeping below rather than returning
+    // early (the flags still flip: the drain is real bookkeeping).
     let peer = world_lock(world)
         .ok()
         .and_then(|world| world.peer_world.as_ref().and_then(Weak::upgrade));
     if let Some(peer) = peer {
-        if let Ok(mut peer_world) = peer.lock() {
-            if let Some(peer_resource) = peer_world.resources.get_mut(resource) {
-                for entry in entries {
-                    peer_resource.blocks.insert(
-                        entry.block,
-                        Block {
-                            payload: entry.payload,
-                            lineage: entry.lineage.clone(),
-                            applied_at_peer: false,
-                        },
-                    );
-                }
-            }
+        let Ok(mut peer_world) = peer.lock() else {
+            return false;
+        };
+        let Some(peer_resource) = peer_world.resources.get_mut(resource) else {
+            return false;
+        };
+        for entry in entries {
+            peer_resource.blocks.insert(
+                entry.block,
+                Block {
+                    payload: entry.payload,
+                    lineage: entry.lineage.clone(),
+                    applied_at_peer: false,
+                },
+            );
         }
     }
     if let Ok(mut world) = world.lock() {
@@ -1554,6 +1581,7 @@ fn apply_at_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, entries: &[Queued
             }
         }
     }
+    true
 }
 
 /// Compose two worlds into one replication pair (P5 plan §2.1/§2.3):
@@ -1852,7 +1880,20 @@ pub fn apply_peer_writes(
         }
         (name, entries)
     };
-    apply_at_peer(world, &resource, &entries);
+    if !apply_at_peer(world, &resource, &entries) {
+        // The delivery failed (the linked peer's resource is absent —
+        // §2.3's hinge): put the entries back, front-first in the
+        // original order, so the queue stays open and the gate stays
+        // closed. The drain is retried when the peer can receive.
+        let mut guard = world_lock(world)?;
+        let state = guard
+            .resources
+            .get_mut(&resource)
+            .expect("the resource was found above");
+        for entry in entries.into_iter().rev() {
+            state.apply_queue.push_front(entry);
+        }
+    }
     Ok(())
 }
 
@@ -1894,6 +1935,18 @@ pub fn spawn_peer_transport(
                     std::thread::sleep(lag);
                     if stop.load(Ordering::SeqCst) {
                         break;
+                    }
+                    // A partition (the world's `peer_online` flag, P5
+                    // plan §5.5) stops the drain — the transport does
+                    // not deliver over a down link; the queue stays
+                    // open and the gate stays closed until the
+                    // partition heals. Stopping the transport entirely
+                    // is the OTHER way to end the steady state (a
+                    // removed link); the flag is the in-place
+                    // partition.
+                    let online = world_lock(&world).is_ok_and(|world| world.peer_online);
+                    if !online {
+                        continue;
                     }
                     // A `u64::MAX` bound drains everything queued —
                     // the transport's lag IS the bound.
