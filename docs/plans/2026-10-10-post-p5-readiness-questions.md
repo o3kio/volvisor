@@ -58,11 +58,11 @@ Remaining from SPEC-0002 §12 as written:
    not-delivered in the nearline §10 note ("no mirror implementation
    exists to fault"). A mirror can only be honestly faulted on real
    media/devices, so the experiment is decided inside P8 (§6): design and
-   fault it on the real-host tier, or explicitly decline it with a
+   fault it on the real-host/media tier, or explicitly decline it with a
    recorded reason. It is not silently deferred.
 3. **§12 P6 (managed-Ceph OSD placement ADR + production gate)** —
    unstarted, and correctly so: SPEC-0002 gates it behind the Rook-cell
-   POC outcome (§4 below) and a production-support decision that no
+   POC outcome (§3 below) and a production-support decision that no
    evidence yet carries.
 
 Recorded backlog. Items with existing artifacts are pinned there (the
@@ -122,12 +122,12 @@ What exists (all in the default test suite, 855 tests):
   axum over TCP, a real loopback `volvisor_witness::server`, the real
   HTTP peer path between daemons, the real coordinator/handoff
   composition, and two `FakeVmm` instances sharing one snapshot root.
-  `FakeVmm` instances sharing one snapshot root. The file's own scope note
+  The file's own scope note
   marks rows 13–17, 22 and 23 as end-to-end (both daemons, real peer
-  HTTP); the remaining rows drive the same two-daemon rig with narrower
+  HTTP); the remaining rows (18–21) drive the same two-daemon rig with
+  narrower
   focuses (restore faults and coordinator re-drive, snapshot-dir refusal,
-  eligibility fencing, idempotency, partial-target promotion, disk-path
-  rewrite). Fault cells inject at the `FakeVmm`
+  eligibility fencing, idempotency). Fault cells inject at the `FakeVmm`
   knobs. This proves the migration *protocol* (prepare →
   transfer → pause → snapshot → barrier → peer grant → promote → restore
   → resume → complete) including its failure and recovery paths.
@@ -330,9 +330,9 @@ shape summarized here (the ADR is normative):
 
 | Phase | Name | Why here |
 |---|---|---|
-| P6 | Native online operations: grow-notification + same-VG relocation (+ the grant_set wedge fix, the flake fix) | Completes an existing contract promise; no external dependencies; the wedge fix restores the honest "completes under witness faults" claim |
+| P6 | Native online operations: grow-notification + same-VG relocation (+ the P6 hardening slice: the grant_set wedge fix, both recorded test flakes, and the two recorded campaign follow-ups triaged — each fixed or explicitly declined with a recorded reason) | Completes an existing contract promise; no external dependencies; the wedge fix restores the honest "completes under witness faults" claim |
 | P7 | Packaging & distribution (ADR-0009) | The installability requirement; also the vehicle every later real-host phase deploys through |
-| P8 | Tier V real-VMM verification (ADR-0010), the P5 engine-comparison consideration gate, and the local-mirror experiment decision | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs; the local-mirror experiment (§12 P3 residue) is decided here — real media/device faulting is the only honest way to fault a mirror, so it is designed and faulted on the real-host tier or explicitly declined with a recorded reason |
+| P8 | Tier V real-VMM verification (ADR-0010), the P5 engine-comparison consideration gate, and the local-mirror experiment decision | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs; the local-mirror experiment (§12 P3 residue) is decided here — real media/device faulting is the only honest way to fault a mirror, so it is designed and faulted on the real-host/media tier (the Tier R drive, or a Tier V host where the media is real) or explicitly declined with a recorded reason |
 | P9 | Rook-cell device-sharing POC (lending surface + three-host exact-SHA scenarios) | The operator-sharing question; explicitly POC-only |
 | P10 | Managed-Ceph OSD placement ADR + production gate (was P6) | Last: gated on P9's outcome and a production-support decision the evidence must carry |
 
