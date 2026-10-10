@@ -1549,9 +1549,15 @@ fn apply_at_peer(world: &Arc<Mutex<FakeDrbd>>, resource: &str, entries: &[Queued
     // to, and the queue is source-side bookkeeping only — so it
     // falls through to the bookkeeping below rather than returning
     // early (the flags still flip: the drain is real bookkeeping).
-    let peer = world_lock(world)
-        .ok()
-        .and_then(|world| world.peer_world.as_ref().and_then(Weak::upgrade));
+    // A POISONED source-world lock also has no link to read, but it
+    // is NOT the single-world shape — it is an unreadable world, and
+    // an unreadable world fails closed: the drain reports failure so
+    // the entries requeue rather than the gate reading `UpToDate`
+    // over blocks whose delivery state is unknown (round-2 N2).
+    let peer = match world_lock(world) {
+        Ok(world) => world.peer_world.as_ref().and_then(Weak::upgrade),
+        Err(_) => return false,
+    };
     if let Some(peer) = peer {
         let Ok(mut peer_world) = peer.lock() else {
             return false;
@@ -1851,6 +1857,23 @@ pub fn open_device(world: &Arc<Mutex<FakeDrbd>>, minor: u32) -> Result<DeviceHan
 /// # Errors
 /// [`ApiErrorCode::NotFound`] when no running resource holds the
 /// minor.
+/// The campaign's pre-quiesce lag shaper (P5 plan §2.3) and the
+/// transport's drain primitive: apply every queued write whose
+/// acknowledgment sequence is at most `up_to` (a `u64::MAX` bound
+/// drains everything). A refused delivery requeues — the delivery
+/// rules and the single-world shapes are documented on the private
+/// `apply_at_peer` helper.
+///
+/// # Concurrency shape (round-2 N1, the single-drainer invariant)
+///
+/// The ordering guarantees — front-first requeue, same-block entries
+/// applied oldest-first — hold under **one drainer per world at a
+/// time** (the spawned transport thread, or a single-threaded test
+/// body). Two concurrent drainers could interleave a failed drain's
+/// requeue with a successful drain of a newer same-block entry. That
+/// is the invariant's limit, stated here deliberately: stage C adds
+/// a second drainer only together with a serialized drain (one world
+/// lock critical section around pop-and-apply, or a drain mutex).
 pub fn apply_peer_writes(
     world: &Arc<Mutex<FakeDrbd>>,
     minor: u32,
@@ -1943,7 +1966,12 @@ pub fn spawn_peer_transport(
                     // partition heals. Stopping the transport entirely
                     // is the OTHER way to end the steady state (a
                     // removed link); the flag is the in-place
-                    // partition.
+                    // partition. The check and the drain are
+                    // deliberately NOT atomic: a flip between them
+                    // lets one in-flight drain deliver over a link
+                    // that just dropped — real DRBD semantics (in-
+                    // flight writes complete when the link drops),
+                    // recorded in round-2 N3.
                     let online = world_lock(&world).is_ok_and(|world| world.peer_online);
                     if !online {
                         continue;
