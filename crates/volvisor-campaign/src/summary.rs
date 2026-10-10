@@ -895,28 +895,66 @@ const CLAIM_PHRASES: [&str; 5] = [
 /// literally carry them).
 const TIER_R_CLAIM_PHRASES: [&str; 1] = ["production support"];
 
-/// The negations that turn a phrase occurrence into a DISCLAIMER
-/// (the comprehensive surface round-2 N3): a Tier S record stating
-/// the discipline ("no real-host claim is made") upholds the very
-/// rule this gate enforces — the scan must not fail it. An
-/// occurrence immediately preceded by one of these reads as the
-/// disclaimer shape, not a claim.
+/// The negations that can open a DISCLAIMER (the comprehensive
+/// surface round-2 N3): a Tier S record stating the discipline ("no
+/// real-host claim is made") upholds the very rule this gate
+/// enforces — the scan must not fail it.
 const DISCLAIMING_PREFIXES: [&str; 5] = ["no ", "not ", "never ", "n't ", "nor "];
+
+/// The claim-ACT words that complete a disclaimer (round-3 R3-1):
+/// a negation before a NOUN-phrase claim ("production support",
+/// "real-host", …) disclaims only when the phrase is the object
+/// being disclaimed — "no real-host CLAIM is made". The negation +
+/// "no <phrase> GAP remains" shape is a claim wearing a negation
+/// (it asserts the property was verified), so the words that may
+/// follow a disclaimed noun phrase name the claim act itself.
+/// ("proven on hardware" — a verb phrase — is its own claim act:
+/// see [`carries_claim`].)
+const DISCLAIMING_ACTS: [&str; 6] = [
+    "claim", "claimed", "is made", "implied", "asserted", "inferred",
+];
+
+/// How far after a noun-phrase occurrence the completing claim act
+/// may sit ("no real-host OR PRODUCTION-SUPPORT claim is made" —
+/// the act lands past the second phrase).
+const DISCLAIMING_WINDOW: usize = 48;
 
 /// Does `text` carry `phrase` as a CLAIM? Every occurrence is
 /// examined: the first may be a disclaimer ("no real-host claim…")
 /// while a later one is the claim itself, so the scan walks all
-/// matches and reports the phrase only when at least one occurrence
-/// is not preceded by a disclaiming prefix.
+/// matches. An occurrence is the DISCLAIMER shape only when a
+/// negation immediately precedes the phrase AND the phrase is
+/// disclaimed as an act — either the phrase is itself the claim act
+/// (the "proven on hardware" verb phrase: negating it disclaims),
+/// or a claim-act word follows a noun phrase within the window.
+/// The boundary is deliberately fail-safe: any other negated shape
+/// (including honest wordings like "no real drbd involved") reads
+/// as a claim and fails the gate — a human then rewords the record;
+/// the discipline sentence lives in the report header by design,
+/// never inside a record.
 fn carries_claim(text: &str, phrase: &str) -> bool {
+    // The verb-phrase claim: its own act, so a negation before it
+    // disclaims unconditionally ("never proven on hardware").
+    let self_acting = phrase == "proven on hardware";
     let mut from = 0;
     while let Some(found) = text[from..].find(phrase) {
         let at = from + found;
         let head = &text[..at];
-        let disclaimed = DISCLAIMING_PREFIXES
+        let tail = &text[at + phrase.len()..];
+        let negated = DISCLAIMING_PREFIXES
             .iter()
             .any(|negation| head.ends_with(negation));
-        if !disclaimed {
+        if !negated {
+            return true;
+        }
+        // A negated occurrence disclaims only as an act: the verb
+        // phrase is its own; a noun phrase needs the act named
+        // after it ("no real-host claim is made"). A negated noun
+        // phrase without an act — "no production support gap
+        // remains" — is the claim frame wearing a negation.
+        let window: String = tail.chars().take(DISCLAIMING_WINDOW).collect();
+        let act_completes = self_acting || DISCLAIMING_ACTS.iter().any(|act| window.contains(act));
+        if !act_completes {
             return true;
         }
         from = at + phrase.len();
@@ -1608,11 +1646,17 @@ mod tests {
 
     /// `carries_claim` walks every occurrence (the unit behind the
     /// disclaimer test above): a first disclaimed match does not
-    /// hide a later real one, and the negation must be IMMEDIATELY
-    /// before the phrase (a distant "no" does not disclaim).
+    /// hide a later real one, the negation must be IMMEDIATELY
+    /// before the phrase, and — round-3 R3-1 — a negation only
+    /// disclaims an ACT: "no <phrase> gap remains" is the claim
+    /// frame wearing a negation, not a disclaimer.
     #[test]
     fn carries_claim_walks_every_occurrence() {
         assert!(!carries_claim("no real-host claim is made", "real-host"));
+        assert!(!carries_claim(
+            "no real-host or production-support claim is made",
+            "real-host"
+        ));
         assert!(carries_claim(
             "no real-host claim is made, but real-host durability was proven",
             "real-host"
@@ -1623,6 +1667,20 @@ mod tests {
             "proven on hardware"
         ));
         assert!(carries_claim("proven on hardware", "proven on hardware"));
+        // R3-1's demonstrated shape: the negation asserts the
+        // property HOLDS — a claim, never a disclaimer.
+        assert!(carries_claim(
+            "no production support gap remains",
+            "production support"
+        ));
+        assert!(carries_claim(
+            "pass: no production support gap remains, no real-host gap remains",
+            "real-host"
+        ));
+        // The fail-safe boundary, documented on carries_claim: an
+        // honest wording without the claim act still reads as a
+        // claim — the record is reworded, the gate is never quiet.
+        assert!(carries_claim("no real drbd involved", "real drbd"));
     }
 
     /// A record-free view is honestly incomplete, never a pass by
