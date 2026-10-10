@@ -215,6 +215,28 @@ pub struct StateHistoryEntry {
     pub detail: Option<String>,
 }
 
+/// One journaled typed refusal: the marker a parked record carries
+/// so the observation, the restart reconcile and the retry pass all
+/// see the same typed outcome (never a silently different one).
+///
+/// The v1 carrier is the barrier-time lineage re-check (P6-A F1,
+/// [`MigrationRecord::barrier_lineage_refusal`]): the refusal is
+/// durable state, not a log line — the drive that refused may be
+/// gone (a crash, a restart), and the marker is what makes the
+/// refusal re-observable without re-executing the gate first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedRefusal {
+    /// The contract-spelled error code (e.g. `FOREIGN_DEVICE_STATE`)
+    /// — the same wire vocabulary [`volvisor_types::ApiErrorCode`]
+    /// spells.
+    pub code: String,
+    /// The refusal's human-readable detail (diagnostic only).
+    pub detail: String,
+    /// Unix epoch seconds at which the refusal was journaled.
+    pub at: u64,
+}
+
 /// The v1 abort policy: a pre-cut migration is automatically rolled
 /// back by the reconcile (the source's authority is intact, so
 /// rollback is safe and the consumer re-issues). There is no abort
@@ -303,6 +325,23 @@ pub struct MigrationRecord {
     /// B1-era records decode with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cut_completed_at: Option<u64>,
+    /// The barrier-time lineage re-check's typed refusal (P6-A F1,
+    /// defense in depth): set when the barrier's replica-lineage
+    /// re-verification refused `FOREIGN_DEVICE_STATE` — a
+    /// wrong-lineage injection that landed on the target after the
+    /// prepare. While the marker stands the record **parks for the
+    /// operator**: the reconcile re-drives it (the re-check
+    /// re-refuses — the same typed outcome every pass) instead of
+    /// consuming it with the auto-before-cut rollback, which would
+    /// silently convert a typed safety refusal into a plain abort.
+    /// Cleared when the re-check passes again (the operator re-seeded
+    /// the target; the drive then converges); retained through
+    /// `Aborted` (the operator's abort is the marker's other exit).
+    ///
+    /// Additive field: records written before the re-check decode
+    /// with `None` (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier_lineage_refusal: Option<TypedRefusal>,
 }
 
 impl MigrationRecord {
@@ -398,6 +437,7 @@ impl MigrationRecord {
                 (Some(started), Some(completed)) => Some(completed.saturating_sub(started)),
                 _ => None,
             },
+            barrier_lineage_refusal: self.barrier_lineage_refusal.clone(),
         }
     }
 }
@@ -425,6 +465,12 @@ pub struct MigrationSummary {
     /// observation. `None` before the cut begins and until the
     /// migration completes.
     pub cut_duration_secs: Option<u64>,
+    /// The barrier-time lineage re-check's journaled typed refusal
+    /// (P6-A F1), when one stands: the record parks for the operator
+    /// — the canonical state stays `QUIESCED` (pre-cut, no barrier
+    /// recorded) and this marker is the typed reason. Carried through
+    /// `Aborted` (the operator's abort is the marker's other exit).
+    pub barrier_lineage_refusal: Option<TypedRefusal>,
 }
 
 #[cfg(test)]
@@ -453,6 +499,7 @@ mod tests {
             updated_at: 2,
             cut_started_at: None,
             cut_completed_at: None,
+            barrier_lineage_refusal: None,
         }
     }
 
@@ -472,6 +519,42 @@ mod tests {
         complete.cut_started_at = Some(100);
         complete.cut_completed_at = Some(145);
         assert_eq!(complete.observe().cut_duration_secs, Some(45));
+    }
+
+    #[test]
+    fn observe_carries_a_standing_barrier_lineage_refusal() {
+        // The park shape (P6-A F1): pre-cut, no barrier recorded, the
+        // typed refusal journaled on the record.
+        let mut parked = record(HandoffState::Quiesced, None);
+        parked.barrier_lineage_refusal = Some(TypedRefusal {
+            code: "FOREIGN_DEVICE_STATE".to_owned(),
+            detail: "the live lineage of the target replica diverged from the \
+                     source-supplied expected set"
+                .to_owned(),
+            at: 7,
+        });
+        let summary = parked.observe();
+        assert_eq!(
+            summary.state,
+            HandoffState::Quiesced,
+            "the parked record observes its canonical pre-cut state"
+        );
+        assert_eq!(
+            summary.barrier_lineage_refusal,
+            parked.barrier_lineage_refusal.clone(),
+            "the observation carries the journaled typed refusal verbatim"
+        );
+
+        // The marker survives the operator's abort (the other exit).
+        let mut aborted = parked;
+        aborted.state = HandoffState::Aborted {
+            reason: "operator abort".to_owned(),
+            at: 9,
+        };
+        assert!(
+            aborted.observe().barrier_lineage_refusal.is_some(),
+            "the aborted record keeps the typed refusal of record"
+        );
     }
 
     #[test]

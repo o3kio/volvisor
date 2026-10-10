@@ -2268,22 +2268,21 @@ async fn row_18c_coordinator_re_drives_a_half_restored_destination() {
     .await;
     assert_eq!(status, 201, "prepare: {body}");
 
-    // The destination daemon dies after the preparation: the drive's
-    // grant cannot reach it — a transport failure parks the record at
-    // the source-revoked `IN_DOUBT` observation (nothing is journaled
-    // by the peer, so the re-drive is not blocked by a replayed
-    // failure outcome).
+    // The destination daemon dies after the preparation: the
+    // barrier's lineage re-check (P6-A F1) cannot reach the peer, so
+    // the drive waits it out inside the driver-owned bounded retry
+    // (the `track_sync` discipline — a transient destination bounce
+    // at the barrier must not abort the migration) with the record
+    // parked pre-cut at `QUIESCED`, observable while the drive is
+    // still riding. (Before the re-check, this outage surfaced one
+    // step later, at the grant: a transport failure parking the
+    // record at the source-revoked `IN_DOUBT`. That post-cut parking
+    // shape stays covered by the kill matrix's peer-grant cells,
+    // which kill the destination after the barrier.)
     rig.b.stop().await;
     let (status, body) = post_transfer(rig.a.addr, "mig-18c").await;
     assert_eq!(status, 202, "transfer: {body}");
-    poll_migration(
-        rig.a.addr,
-        "mig-18c",
-        "in_doubt",
-        Some("source revoked; destination grant not yet authorized"),
-    )
-    .await;
-    drive_settled(&rig.a).await;
+    poll_migration(rig.a.addr, "mig-18c", "quiesced", None).await;
 
     // While the destination is down, a crashed prior restore's
     // half-restored (defined, not-booted) VM sits on its socket.
@@ -2293,10 +2292,12 @@ async fn row_18c_coordinator_re_drives_a_half_restored_destination() {
         .create("vm-18c", &[&format!("/dev/drbd{SEED_MINOR}")])
         .expect("create the half-restored VM");
 
-    // The destination returns; the coordinator's re-drive grants,
-    // then restores — over the half-restore, destroying it first —
-    // and the migration completes.
+    // The destination returns; the drive's bounded re-check retry
+    // reaches it, the cut proceeds, the grant lands, and the restore
+    // runs — over the half-restore, destroying it first — so the
+    // migration completes through the production drive path.
     rig.b.restart().await;
+    drive_settled(&rig.a).await;
     let record = rig
         .a
         .handle

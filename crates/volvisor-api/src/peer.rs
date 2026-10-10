@@ -1,6 +1,6 @@
 //! # The internal peer routes (destination host; P4b plan §6, stage B2)
 //!
-//! The destination daemon's half of a coordinated migration: the five
+//! The destination daemon's half of a coordinated migration: the six
 //! `/v2/internal/peer/*` routes the source daemon's handoff driver
 //! calls over the daemon-to-daemon credential. Every mutation routes
 //! through the same journal pipeline as every other privileged act
@@ -56,6 +56,16 @@
 //! pre-cut abort tail that drops the target preparation — and the
 //! source driver must reach it over the same authenticated surface.
 //! It is idempotent (`Ok` when the preparation is already absent).
+//!
+//! ## The sixth route
+//!
+//! `POST /v2/internal/peer/verify-lineage` is the barrier-time
+//! lineage re-verification (P6-A F1, defense in depth): an
+//! **observation**, never journaled — the source re-reads its live
+//! lineage set and this route re-runs exactly the replica-level gate
+//! prepare ran, so a wrong-lineage injection landing on the target
+//! after the prepare is refused at the barrier, before the cut
+//! crosses foreign data (see [`verify_lineage`]).
 
 // axum handlers consume their extractors by value; clippy's
 // pass-by-value heuristics do not apply to the handler boundary.
@@ -774,6 +784,78 @@ pub struct PeerPreparedVolume {
     pub expected_generation: u64,
 }
 
+/// `POST /v2/internal/peer/verify-lineage` request: the barrier-time
+/// lineage re-verification (P6-A F1, defense in depth). The same
+/// lineage input prepare carries — the source's live
+/// data-generation set per participant, positionally aligned — read
+/// fresh by the source at call time, never cached in a record. The
+/// route re-runs exactly the replica-level gate prepare ran
+/// ([`HandoffSurface::verify_target_replica`]) and mutates nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerVerifyLineageRequest {
+    /// The migration identity.
+    pub migration_id: MigrationId,
+    /// The participating volumes (non-empty, unique, ordered).
+    pub volume_ids: Vec<VolumeId>,
+    /// The source's live expected lineage per volume, positionally
+    /// aligned with `volume_ids`.
+    pub expected_lineages: Vec<Vec<String>>,
+}
+
+impl PeerVerifyLineageRequest {
+    /// Validate the request shape (aligned, non-empty, unique).
+    ///
+    /// # Errors
+    /// `INVALID_REQUEST` for an empty participant set, misaligned
+    /// lists, an empty lineage or a duplicate participant.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.volume_ids.is_empty() {
+            return Err(ApiError::invalid_request(
+                "a lineage verification needs at least one participating volume",
+            ));
+        }
+        if self.volume_ids.len() != self.expected_lineages.len() {
+            return Err(ApiError::invalid_request(format!(
+                "expected_lineages has {} entries for {} volumes \
+                 (positionally aligned lists)",
+                self.expected_lineages.len(),
+                self.volume_ids.len()
+            )));
+        }
+        for (volume_id, lineage) in self.volume_ids.iter().zip(&self.expected_lineages) {
+            if lineage.is_empty() {
+                return Err(ApiError::invalid_request(format!(
+                    "participant {volume_id} carries an empty expected lineage (the source \
+                     must attest its live data-generation set)"
+                )));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for volume_id in &self.volume_ids {
+            if !seen.insert(volume_id.clone()) {
+                return Err(ApiError::invalid_request(format!(
+                    "duplicate participant volume {volume_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `POST /v2/internal/peer/verify-lineage` response: the verified
+/// participant set, echoed in preparation order so the source driver
+/// can assert the destination re-verified exactly the volumes the
+/// record carries (same order, never a subset).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerVerifyLineageResponse {
+    /// The migration identity.
+    pub migration_id: MigrationId,
+    /// The re-verified volumes, in preparation order.
+    pub volume_ids: Vec<VolumeId>,
+}
+
 /// `POST /v2/internal/peer/grant` request: the migration identity
 /// alone — the participant set, the witness operation id and the
 /// attach identities are all derived from the durable preparation, so
@@ -951,6 +1033,55 @@ fn id_only_participants(preparation: &TargetPreparation) -> Vec<Participant> {
             minor: 0,
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// verify-lineage
+// ---------------------------------------------------------------------------
+
+/// `POST /v2/internal/peer/verify-lineage` — the barrier-time lineage
+/// re-verification (P6-A F1, defense in depth): re-run exactly the
+/// replica-level gate prepare ran ([`HandoffSurface::
+/// verify_target_replica`]) over the source's freshly-read live
+/// lineage set, so a wrong-lineage injection that landed on the
+/// target after the prepare is refused at the barrier — before the
+/// cut crosses foreign data.
+///
+/// Read-only with respect to authority and journal state (an
+/// observation, like `health`): never journaled, no preparation
+/// record, no witness mutation, no idempotency machinery — the gate
+/// is deterministic over observed replica state and repeats verbatim
+/// on every call. The cost is the I/O class prepare already paid (the
+/// destination's own replica-status and lineage reads); the source's
+/// re-read of its live lineage is the source driver's side of the
+/// same contract.
+pub(crate) async fn verify_lineage(
+    State(state): State<SharedState>,
+    _peer: RequirePeer,
+    ValidJson(req): ValidJson<PeerVerifyLineageRequest>,
+) -> Result<Response, ApiErrorReply> {
+    req.validate()?;
+    let ctx = peer_context(&state)?;
+    tracing::info!(
+        migration_id = %req.migration_id,
+        volumes = req.volume_ids.len(),
+        "accepting peer lineage verification"
+    );
+    for (volume_id, lineage) in req.volume_ids.iter().zip(&req.expected_lineages) {
+        // The same gate prepare runs, per participant, first-failure
+        // refuses: resource present, Secondary, connected, the
+        // definition naming this host, no tracked residues — and the
+        // live data-generation set equal to the source-supplied
+        // expected set (FOREIGN_DEVICE_STATE on mismatch).
+        ctx.handoff
+            .verify_target_replica(volume_id, lineage)
+            .await?;
+    }
+    let body = to_json_value(&PeerVerifyLineageResponse {
+        migration_id: req.migration_id,
+        volume_ids: req.volume_ids,
+    })?;
+    Ok(json_response(StatusCode::OK, &body))
 }
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ use volvisor_types::{ApiError, ApiErrorCode};
 use crate::store::MigrationStore;
 use crate::types::{
     AbortPolicy, BarrierProof, CutProgress, HandoffState, MigrationRecord, MigrationSummary,
-    Participant, PrepareHandoffRequest, StateHistoryEntry,
+    Participant, PrepareHandoffRequest, StateHistoryEntry, TypedRefusal,
 };
 
 /// Deterministic wall clock for timestamps (unix epoch seconds).
@@ -104,6 +104,36 @@ pub trait HandoffDriver: Send + Sync {
         volume_id: &VolumeId,
         migration_id: &MigrationId,
     ) -> Result<(), ApiError>;
+
+    /// Re-verify the destination's replica lineage at the barrier
+    /// (P6-A F1, defense in depth): the same lineage predicate
+    /// [`Self::prepare_target`] verified at prepare — the target's
+    /// live data-generation set against the source's live set, read
+    /// fresh at call time from the source's own device, never from
+    /// the record — re-checked immediately before the barrier acts
+    /// run. The prepare-time gate is one-shot by construction; this
+    /// closes the post-prepare window for lineage-shaped divergence
+    /// (a wrong-lineage injection landing on the target mid-drive)
+    /// **while the pre-cut rollback is still available**: the cut
+    /// never crosses foreign data, the source stays suspended and
+    /// intact. Epoch/fencing remains the primary protection for
+    /// everything past the barrier; this re-check adds no authority
+    /// claim of its own.
+    ///
+    /// Cost discipline: the re-read is the I/O class the drive
+    /// already touches — the source's local lineage observation (the
+    /// same read prepare made) and the destination's replica-status
+    /// reads (the same reads its prepare made) over one peer round
+    /// trip (the same transport prepare/grant use). No new I/O class,
+    /// no witness mutation, no journal record: it is an observation,
+    /// repeated verbatim on every barrier re-entry.
+    ///
+    /// A `FOREIGN_DEVICE_STATE` refusal here parks the record for
+    /// the operator (the coordinator journals the typed refusal;
+    /// see [`MigrationRecord::barrier_lineage_refusal`]). Every
+    /// other error is an ordinary drive failure with the established
+    /// retry semantics.
+    async fn verify_target_lineage(&self, record: &MigrationRecord) -> Result<(), ApiError>;
 
     /// Prove replication catch-up (peer `UpToDate`, no resync) —
     /// taken **after** the suspension fixed the boundary (plan D2).
@@ -439,6 +469,7 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             updated_at: now,
             cut_started_at: None,
             cut_completed_at: None,
+            barrier_lineage_refusal: None,
         };
         // Side effects first, then persist, then report (plan §3).
         self.driver.prepare_target(&record).await?;
@@ -550,7 +581,11 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
     ///
     /// - pre-cut, no cut → the abort path (the `AutoBeforeCut` policy;
     ///   G5-ordered, fail-closed into terminal `InDoubt` on a failed
-    ///   void);
+    ///   void) — **unless a barrier-lineage refusal stands** (P6-A
+    ///   F1): a record the barrier's lineage re-check refused is
+    ///   re-driven, not rolled back (the re-check re-refuses — the
+    ///   same typed outcome every pass; see
+    ///   [`MigrationRecord::barrier_lineage_refusal`]);
     /// - cut present or state ≥ `SourceRevoked` → the forward-only
     ///   re-drive, skipping acts the external facts prove already
     ///   done;
@@ -576,7 +611,17 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
             _ => {}
         }
         self.fold_external_facts(&mut record).await?;
+        // A standing barrier-lineage refusal parks the record for the
+        // operator (P6-A F1): the reconcile re-drives it — the
+        // re-check re-refuses, the same typed outcome every pass —
+        // instead of consuming it with the auto-before-cut rollback,
+        // which would silently convert the typed safety refusal into
+        // a plain abort. The marker's exits are exactly two: the
+        // re-check passing again (the operator re-seeded the target;
+        // `drive_barriers` clears it and the drive converges) and the
+        // operator's abort (the rollback tail, which retains it).
         if record.cut.is_some()
+            || record.barrier_lineage_refusal.is_some()
             || record
                 .state
                 .forward_rank()
@@ -718,13 +763,44 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         self.transition(record, HandoffState::Quiesced, None, None)
     }
 
-    /// `Quiesced → BarrierDurable`: post-suspension `TrackSync` proof
-    /// per participant, then `RecordBarrier` per participant with the
-    /// deterministic per-volume operation id; the proofs are persisted
-    /// with the state.
+    /// `Quiesced → BarrierDurable`: the barrier-time lineage
+    /// re-check (P6-A F1, defense in depth — first, before any
+    /// barrier act or bounded convergence wait), then the
+    /// post-suspension `TrackSync` proof per participant, then
+    /// `RecordBarrier` per participant with the deterministic
+    /// per-volume operation id; the proofs are persisted with the
+    /// state.
     async fn drive_barriers(&self, record: &mut MigrationRecord) -> Result<(), ApiError> {
         if record.state != HandoffState::Quiesced {
             return Ok(());
+        }
+        // The F1 re-check (the trait docs carry the full contract):
+        // re-verify the target's replica lineage before the barrier
+        // executes. A `FOREIGN_DEVICE_STATE` refusal parks the record
+        // for the operator — the typed refusal is journaled so the
+        // observation, the restart reconcile and the retry pass all
+        // see the same typed outcome, mirroring the prepare-time
+        // refusal's determinism (same-id re-drives re-refuse). Every
+        // other error is an ordinary drive failure (the established
+        // retry semantics own the record).
+        if let Err(refusal) = self.driver.verify_target_lineage(record).await {
+            if refusal.code == ApiErrorCode::ForeignDeviceState {
+                let now = (self.clock)();
+                record.barrier_lineage_refusal = Some(TypedRefusal {
+                    code: refusal.code.as_str().to_owned(),
+                    detail: refusal.detail.clone(),
+                    at: now,
+                });
+                self.with_store(|store| store.upsert(record))?;
+            }
+            return Err(refusal);
+        }
+        // The re-check passed: a standing marker is discharged (the
+        // operator re-seeded the target — the parked record now
+        // converges). Persisted before the barrier acts so the clear
+        // survives a crash between here and `BarrierDurable`.
+        if record.barrier_lineage_refusal.take().is_some() {
+            self.with_store(|store| store.upsert(record))?;
         }
         for participant in &record.participants {
             self.driver.track_sync(&participant.volume_id).await?;
