@@ -10,6 +10,39 @@ Verification: [POC](../docs/poc/rook-cells/README.md)
 
 `HostId -> CellId -> Kubernetes NodeUID -> PhysicalDeviceId -> Ceph OSD ID` is an audited binding. Physical HostId and placement failure domain must not be derived solely from potentially replaced Kubernetes node name; NodeUID may change after legitimate re-join but must reconcile against CellId/HostId. Cell guest Node name must be stable. Rook controls Ceph daemon lifecycle but **not** PCI device ownership, cell CPU, VM memory, destructive authorization or guest image lifecycle.
 
+## Device lending and sharing
+
+Sharing a volvisor-claimed device with a cell (Rook) is an **explicit lending operation**, never an implicit handover or a released claim — decided by [ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md) (its "Device lending and reclaim" section) and scoped to the POC. The operator surface's shape:
+
+```text
+LendDevice(device_id, borrower_cell_id, expected_claim_generation, operation_id)
+ReclaimDevice(device_id, expected_lend_generation, operation_id,
+              force?{ operator_authorization, residue_check })
+DeviceOwnership(device_id)
+  -> { claimed_by: volvisor, claim_generation,
+       lent?: { borrower_cell_id, lend_generation, recorded_at, evidence_ref? } }
+```
+
+Invariants (each one is POC evidence, below):
+
+- **Lend is journal-before-mutate** and idempotent by `operation_id` + exact request hash; replays return the recorded response, a differing body under the same id is a typed conflict. A failed or unknown-outcome lend leaves the device **unlent** (fail-closed), resolved by reconciling the journaled intent — never by inference from observed state.
+- **The claim is not surrendered.** Lending adds a lend generation to the existing ownership record; it does not release the claim. There is **no double-ownership window**: claim, lend and reclaim are generations of one record, and at no point do two principals both hold authority over the device.
+- **The lent state is operator-visible**: `DeviceOwnership` answers, typed, who holds the device and whether (and to whom) any of it is lent.
+- **A lent device is frozen for volvisor mutations**: destructive role changes, reformat, re-claim and a second lend are typed refusals while a lend is live (`WRITER_ALREADY_ACTIVE`-class semantics at the device layer; the refusal names the live lend).
+- **Reclaim needs a release or a recorded force**: the borrower must have released the device (cell teardown observed), or the operator-authorized force path runs — whose record carries a **residue check** (the device's observed state inspected and recorded; foreign residue quarantines the device, never silently reuses it). Force reclaim is an explicit recorded operation, not a cleanup shortcut.
+- **Unknown state fails closed** everywhere in the surface: a device whose lending state cannot be determined is not lent, reclaimed or mutated; it is quarantined pending reconciliation.
+
+These invariants are what keep AGENTS rules 7 and 19 true while a cell guest holds the device. Nothing here authorizes production Rook support (ADR-0008's gate wording); the surface exists so the POC can *prove* sharing rather than assume it.
+
+### POC evidence requirements (device lending)
+
+The lending surface is proven by scenarios, each recorded with the POC's evidence discipline (exact SHA pinning, run records, "not run" distinct from "not implemented"):
+
+1. **Lend → visible ownership → use → teardown → reclaim**: a claimed device is lent to a cell, `DeviceOwnership` shows the lend to an operator, a Rook OSD is deployed on the lent device inside the cell, the cell is torn down, and the reclaim completes with its residue check recorded.
+2. **Refusals**: a double-lend of a lent device, and a volvisor mutation of a lent device, are both refused typed — never silent.
+3. **Force reclaim with residue**: an operator-authorized force reclaim after an unclean borrower exit records the residue check and quarantines on foreign residue.
+4. **Fail-closed on unknown state**: a crash between the lend journal and its effect (or an unreadable ownership record) leaves the device unlent-but-quarantined, never inferred lent or reclaimed.
+
 ## Cell requirements
 
 A cell VM is infrastructure, not a tenant VM. Host admission atomically reserves the chosen vCPUs, pinned physical CPU capacity (if exclusive reservation claimed), fixed RAM + host overhead, separate Ceph-independent root/system state, and a complete IOMMU-isolated NVMe PCI function. The agent refuses duplicate/ambiguous device claims and refuses accidental host access while the cell owns the device.

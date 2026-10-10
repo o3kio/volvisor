@@ -1,7 +1,7 @@
 # ADR-0006 — Online block-volume growth and live backing-store relocation
 
-Status: Proposed (R&D-gated)
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (first slice: grow-notification + same-VG pvmove evacuation); the QSD mirror/pivot path (Option B) remains R&D-gated
+Decision-accepted: 2026-10-10 (PR #18, per the readiness plan D4)
 Date: 2026-10-09
 Related: [ADR-0003](0003-tiered-volume-virtualization.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [Volume API v2](../../contracts/volume-api-v2.md)
 
@@ -98,6 +98,48 @@ Do not write a generic block copier/mirror or manipulate dm tables during live g
 A storage move is a *persisted ownership transition*, never just background `dd`. Source is not disposable until verified target authority is durable and the old backend cannot accept new foreground writes. Failures **before** pivot retain source as authoritative; failures **after** pivot must reconcile target state and avoid automatic source rollback. Unknown outcome: `IN_DOUBT`, no destructive cleanup.
 
 Online operation acceptance suite: growing attached thick and thin LVs, host block-device CHV notification, guest re-read of partition geometry, same-VG extents move under I/O, QSD vhost-user-blk connection and export, 4K random writes during mirror, flush/FUA/discard, target out-of-space, source SSD failure, QSD SIGKILL at every phase, stale attachment fencing, restart and idempotency, load at p99/p999 and throughput against native device.
+
+## First implementation slice (P6)
+
+Per the [readiness plan](../plans/2026-10-10-post-p5-readiness-questions.md)
+decision D4, exactly one slice of this ADR is accepted for
+implementation; everything else keeps its existing gate. The scope of
+the acceptance (points 1–2 are the accepted work; points 3–4 record
+what remains closed):
+
+1. **Grow-notification (Option "online grow", step 4 above).**
+   `GrowVolume` on an attached `native-local` volume completes the VMM
+   capacity-notification step through the existing
+   `ChRemoteVmm` adapter (`PUT /api/v1/vm.resize-disk`) on a **pinned,
+   startup-verified Cloud Hypervisor version** — upstream PR #7948 is
+   required for externally grown host block devices, so a version that
+   is not proven at startup refuses the grow typed instead of growing
+   without notification. Resize of **vhost-user-blk** frontends remains
+   unproven and out of scope. Partial-failure semantics are the ADR's
+   existing rule: the backend may grow before the VMM/guest is
+   notified; the provider **retries the notification, never shrinks
+   the LV to undo** a successful expansion
+   (`guest_notification_status: retry_required`).
+2. **Same-VG extent evacuation (Option A).** Implemented over the
+   **already-contracted** surface — [Volume API
+   v2](../../contracts/volume-api-v2.md) §4A
+   `MoveVolumeBackingOnline` with the `same_vg_extent_move`
+   capability — not a new operation name. Journal-before-mutate;
+   source extents are freed only after verified relocation and
+   ownership reconciliation; the contract's never-generic-`FAILED` /
+   `IN_DOUBT` rule applies verbatim.
+3. **`same_host_live_backing_move` (Option B, QSD mirror/pivot) is
+   advertised nowhere** until its acceptance suite passes (the
+   uninterrupted-fio/power-loss/restart suite above). This is the
+   ADR's existing gate, unchanged by this acceptance.
+4. **Option C (custom mover) stays rejected.** Accepting the first
+   slice does not reopen it.
+
+Out of the slice's scope by construction: cross-VG, cross-pool and
+cross-class moves (typed refusals, see the volume contract's
+`MOVE_UNSUPPORTED_SCOPE`), thin-pool-wide relocations presented as
+single-thin-LV moves, and any claim that same-VG evacuation confers
+cross-pool mobility.
 
 ## Conclusion
 
