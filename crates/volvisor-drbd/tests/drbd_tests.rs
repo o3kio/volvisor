@@ -97,6 +97,7 @@ fn attach_req(volume_id: &str, expected_generation: u64) -> AttachVolumeRequest 
         expected_volume_generation: expected_generation,
         access_mode: AccessModeRequest::SingleWriter,
         requested_frontend: None,
+        vmm_disk_id: None,
     }
 }
 

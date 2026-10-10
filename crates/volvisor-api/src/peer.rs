@@ -1345,6 +1345,11 @@ async fn grant_act(
             expected_volume_generation: participant.expected_generation,
             access_mode: AccessModeRequest::SingleWriter,
             requested_frontend: None,
+            // No VMM disk id crosses the promote seam: the
+            // grow-notification mapping is the consumer's own attach
+            // request on the destination host, not the migration's
+            // business (P6-B).
+            vmm_disk_id: None,
         };
         let promoted = ctx
             .handoff

@@ -778,6 +778,7 @@ fn attach_req(
         expected_volume_generation: expected_generation,
         access_mode: AccessModeRequest::SingleWriter,
         requested_frontend: None,
+        vmm_disk_id: None,
     }
 }
 

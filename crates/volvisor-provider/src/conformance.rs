@@ -92,6 +92,7 @@ pub fn fixture_attach_request(
         expected_volume_generation,
         access_mode: AccessModeRequest::SingleWriter,
         requested_frontend: None,
+        vmm_disk_id: None,
     }
 }
 

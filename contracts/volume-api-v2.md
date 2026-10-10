@@ -79,7 +79,7 @@ authority: { epoch, lease_state, holder, lease_remaining_secs }
 
 ```text
 Attach(volume_id, vm_id, host_id, attachment_id, expected_volume_generation,
-       access_mode=single_writer, requested_frontend, idempotency_key)
+       access_mode=single_writer, requested_frontend, vmm_disk_id, idempotency_key)
 Detach(attachment_id, expected_attachment_generation, vm_stopped_or_io_drained_proof)
 ```
 
@@ -88,6 +88,12 @@ Conditions:
 - other readers only if backend and consumer have an explicit safe multi-reader contract;
 - no guessed path or tenant-accessible backend credential;
 - attach returns a **host-scoped, ephemeral backend handle**, not raw secrets;
+- `vmm_disk_id`, when the consumer sets it, is the consumer's own VMM device
+  identity for the frontend (e.g. Cloud Hypervisor's `--disk path=...,id=...`),
+  recorded with the attachment as the durable mapping a grow's capacity
+  notification addresses (section 4A); the provider never invents one — an
+  attached volume without a recorded id cannot be notified, and the grow
+  reports the recorded refusal, never a silent un-notified success;
 - VMM attach evidence must distinguish `prepared`, `advertised` and `active`;
 - detach cannot release authority until in-flight writes are drained and stale device handles rejected;
 - stale generations return a typed conflict, not success;

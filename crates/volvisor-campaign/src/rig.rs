@@ -972,6 +972,7 @@ fn attach_req(volume_id: &str, vm: &str, host: &str) -> AttachVolumeRequest {
         expected_volume_generation: 1,
         access_mode: AccessModeRequest::SingleWriter,
         requested_frontend: None,
+        vmm_disk_id: None,
     }
 }
 

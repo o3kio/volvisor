@@ -463,6 +463,7 @@ impl LvmProvider {
                         && record.vm_id == req.vm_id
                         && record.host_id == req.host_id
                         && record.access_mode == mode
+                        && record.vmm_disk_id == req.vmm_disk_id
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
@@ -502,6 +503,7 @@ impl LvmProvider {
             host_id: req.host_id.clone(),
             generation: 1,
             access_mode: mode,
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         stored.runtime.attachment = Some(record.clone());
         stored.runtime.state = VolumeLifecycle::Attached;
@@ -653,9 +655,18 @@ impl LvmProvider {
         state.save(&self.state_path)?;
         Ok(GrowVolumeResponse {
             backing_resized: true,
-            // No VMM integration exists: an attached frontend still needs a
-            // (retried) notification; a detached volume has nobody to
-            // notify. Never `Notified`.
+            // The provider-layer placeholder, honestly labeled: this
+            // layer has no VMM to notify. When the daemon wires the
+            // P6-B grow-notification engine (volvisor-provider's
+            // `grow` module — the LVM daemon path always does), the
+            // API layer composes the real status over this response,
+            // inside the journal's execute closure, so the recorded
+            // outcome carries it and replays byte-compatibly. This
+            // placeholder remains the honest standalone answer (the
+            // conformance kit, provider-direct callers): an attached
+            // frontend still needs a (retried) notification; a
+            // detached volume has nobody to notify. Never `Notified`
+            // from here.
             guest_notification_status: if has_attachment {
                 GrowGuestNotification::RetryRequired
             } else {

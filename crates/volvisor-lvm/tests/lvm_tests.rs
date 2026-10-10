@@ -510,6 +510,52 @@ async fn attach_replay_survives_a_provider_restart() {
         .expect("detach after restart");
 }
 
+#[tokio::test]
+async fn attach_replay_conflicts_on_a_different_vmm_disk_id() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("id-vol", GIB))
+        .await
+        .expect("create");
+    let mut request = fixture_attach_request("id-vol", "id-att", 1);
+    request.vmm_disk_id = Some("disk-one".to_owned());
+    fixture
+        .provider
+        .attach_volume(&created.volume_id, &request)
+        .await
+        .expect("attach");
+
+    // The same attachment id with a different VMM disk id is a
+    // conflict — the recorded mapping is the durable truth.
+    let mut conflicting = fixture_attach_request("id-vol", "id-att", 1);
+    conflicting.vmm_disk_id = Some("disk-two".to_owned());
+    let err = fixture
+        .provider
+        .attach_volume(&created.volume_id, &conflicting)
+        .await
+        .expect_err("disk id mismatch");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+}
+
+#[test]
+fn a_pre_p6b_attachment_record_loads_without_the_disk_id() {
+    // Backward compatibility: state files written before P6-B carry
+    // no `vmm_disk_id`; they load with the field absent (never
+    // guessed), which the grow facts then report as unaddressable.
+    let record: volvisor_lvm::state::AttachmentRecord = serde_json::from_str(
+        r#"{
+            "id": "att-old",
+            "vm_id": "vm-old",
+            "host_id": "host-old",
+            "generation": 1,
+            "access_mode": "single_writer"
+        }"#,
+    )
+    .expect("a pre-P6-B record loads unchanged");
+    assert_eq!(record.vmm_disk_id, None);
+}
+
 // ---------------------------------------------------------------------------
 // Reconciliation
 // ---------------------------------------------------------------------------
