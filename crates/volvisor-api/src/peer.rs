@@ -22,7 +22,7 @@
 //! ## The failure re-issue rule (the `grant_set` wedge fix)
 //!
 //! A recorded **failure** outcome of a peer mutation is re-issued, not
-//! re-served ([`crate::ops::FailureReplay::Reissue`]): the failure is a
+//! re-served (`crate::ops::FailureReplay::Reissue`): the failure is a
 //! fact about a past attempt, and the world may have converged past it
 //! — the recorded wedge (P6-A part 3) was exactly that shape, a
 //! witness kill inside the grant commit whose witness-side replay
