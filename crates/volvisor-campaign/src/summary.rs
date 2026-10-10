@@ -176,7 +176,13 @@ const ROWS: &[RowSpec] = &[
         row: 9,
         family: "wrong-lineage injection at the target",
         class: "wrong-epoch data injection (lineage-shaped)",
-        coverage: Coverage::Names(&["row-9/wrong-lineage-data-at-target"]),
+        coverage: Coverage::Names(&[
+            "row-9/wrong-lineage-data-at-target",
+            // The P6-A F1 delivery: the same injection landing after
+            // the prepare (mid-drive), refused by the barrier-time
+            // lineage re-check — the post-prepare window's cell.
+            "row-9b/post-prepare-lineage-refused-at-barrier",
+        ]),
         budget_ms: None,
     },
     RowSpec {
@@ -1125,12 +1131,19 @@ const FINDINGS: &[(&str, &str)] = &[
          data.",
     ),
     (
-        "The F1 defense-in-depth note",
-        "The lineage gate is one-shot at prepare: the target's replica lineage is \
-         verified before the cut and is not re-checked at the barrier. A foreign \
-         injection landing after prepare (mid-drive) is caught only by the \
-         epoch/fencing disciplines, not by lineage re-verification. A barrier-time \
-         re-check is a recorded follow-up (defense in depth), not a shipped guarantee.",
+        "The F1 defense-in-depth note (now shipped, P6-A part 2)",
+        "The lineage gate was one-shot at prepare: a foreign injection landing after \
+         prepare (mid-drive) was caught only past the point of no return (the adopt \
+         gate at promote, with the source VM already destroyed) or by the \
+         epoch/fencing disciplines. The barrier-time lineage re-check closes that \
+         window (row 9b): the same predicate prepare established is re-verified \
+         immediately before the barrier executes, a mismatch refuses \
+         FOREIGN_DEVICE_STATE with the record parked pre-cut for the operator \
+         (journaled on the record — the retry pass and the restart reconcile see \
+         the same typed outcome), and the cut never crosses foreign data while the \
+         pre-cut rollback is still available. Epoch/fencing remains the primary \
+         protection for everything past the barrier; the re-check is defense in \
+         depth, priced at the I/O class the drive already touches.",
     ),
     (
         "Design property: the live-lease fence is the protection (row 8)",

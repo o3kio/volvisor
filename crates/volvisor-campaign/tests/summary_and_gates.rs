@@ -198,6 +198,11 @@ fn fixture_injections(dir: &Path) {
           refuse typed",
         ),
         (
+            "row-9b/post-prepare-lineage-refused-at-barrier",
+            "refused: FOREIGN_DEVICE_STATE — the barrier-time re-check refused the post-prepare \
+          injection; the cut never crossed foreign data",
+        ),
+        (
             "row-10/forged-barrier-proofs",
             "refused: StaleEpoch and IdentityRequired; the holder's foreign barrier parked the \
           abort OPERATION_IN_DOUBT until its void recovered it",

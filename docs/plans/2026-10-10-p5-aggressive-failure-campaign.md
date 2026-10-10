@@ -566,6 +566,7 @@ the report):
 | 7 | kill matrix: witness journal (stop/restart + mid-save) | SIGKILL during meta commit, quorum loss window | authority fail-closed on divergence |
 | 8 | stale source write after fence | source-after-fence stale writes | destination untouched; source promotion is `UNSAFE` |
 | 9 | wrong-lineage injection at the target | wrong-epoch data injection (lineage-shaped, §1) | typed refusal; never `COMPLETE` over foreign data |
+| 9b | the same injection landing after prepare, mid-drive (P6-A F1 delivery: the barrier-time lineage re-check) | the post-prepare window of the same lineage-shaped injection | typed refusal at the barrier, pre-cut: the record parks carrying the typed marker, the source stays fenced/intact, the cut never crosses foreign data |
 | 10 | forged barrier proofs | wrong-epoch barrier injection | void keys by migration; mismatch refuses typed |
 | 11 | witness divergence | control-plane disconnect / stale authority | next mutation fails closed |
 | 12 | concurrent multi-volume cut + resync-under-foreground + source-VMM death mid-cut + kills during an in-flight resync (the dirty-bitmap window) | multi-disk final cut; resync while foreground continues; VMM crash; SIGKILL during dirty bitmap (logical window — §1 records the durable boundary as Tier R) | convergence or exact `IN_DOUBT` participant report; the convergence gate never lies over a partition, an in-flight resync, or an un-drained apply queue |
