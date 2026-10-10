@@ -32,6 +32,10 @@
 //!   fail-closed on an unreachable witness;
 //! - eligibility is VM-wide: one unprepared participant refuses the
 //!   whole migration (row 12);
+//! - `verify_target_replica` (§6, the destination's `PREPARED` gate):
+//!   the untracked P3 peer replica passes from observed state, and a
+//!   down / Primary / disconnected replica or a tracked cut-marked
+//!   residue refuses typed before the source's cut;
 //! - the clear-cut-marker admin operation: refuses a Primary/writer,
 //!   clears + reconciles when Secondary, and accepts only a
 //!   witness-corroborated fencing proof of the volume's own retired
@@ -68,7 +72,7 @@ use std::time::Duration;
 
 use common::{
     FakeDrbd, NODE, PEER_NODE, SEED_MINOR, SEED_PORT, config_for_peer, fixture, flip_world_to_peer,
-    provider_from_with_authority, seed_volume_with_identity, set_peer_lag,
+    provider_from_with_authority, seed_peer_volume, seed_volume_with_identity, set_peer_lag,
 };
 use volvisor_drbd::AuthorityContext;
 use volvisor_drbd::provider::{DrbdProvider, resource_name_for};
@@ -1981,6 +1985,153 @@ async fn role_secondary_reports_the_observed_local_role() {
         .await
         .expect_err("unreadable status");
     assert_eq!(error.code, ApiErrorCode::Internal);
+}
+
+/// `verify_target_replica` — the destination's `PREPARED` gate (plan
+/// §6: "target replica verified — resource present, Secondary,
+/// connected, no fence marker"): the P3 destination's established
+/// replica passes from OBSERVED state while the volume stays
+/// UNTRACKED on that host (the composition the peer `prepare` route
+/// rests on — its provider answers `NOT_FOUND`, the replica does
+/// not), and every unready shape refuses typed before the source's
+/// cut: a down resource, someone's live Primary writer, and a
+/// disconnected replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_target_replica_passes_the_untracked_peer_and_refuses_unready_shapes() {
+    let kit = witness_kit().await;
+
+    // The P3 destination: an established replica in a second world
+    // this host never tracked (no state entry at all).
+    let f = fixture();
+    seed_peer_volume(
+        &f.base,
+        &f.world,
+        "vol-vtr",
+        GIB,
+        ReplicationMode::C,
+        SEED_MINOR,
+        SEED_PORT,
+    );
+    let peer = peer_provider(&kit, &f.base, &f.world);
+    let surface: Arc<dyn HandoffSurface> = peer.clone();
+    let vol = volume("vol-vtr");
+    assert!(
+        DrbdState::load(&f.base.join("state-peer.json"))
+            .expect("peer state")
+            .volume(&vol)
+            .is_none(),
+        "the destination never tracked the volume"
+    );
+    surface
+        .verify_target_replica(&vol)
+        .await
+        .expect("the untracked established Secondary replica passes");
+
+    // Down: the resource is gone from the simulated DRBD — no target
+    // replica is present on this host.
+    let running = f
+        .world
+        .lock()
+        .expect("world")
+        .resources
+        .remove(&resource_of("vol-vtr"))
+        .expect("resource running");
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("down resource");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("is down"),
+        "the down refusal: {error}"
+    );
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .insert(resource_of("vol-vtr"), running);
+
+    // Primary: someone's live writer — never a migration target.
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .get_mut(&resource_of("vol-vtr"))
+        .expect("resource running")
+        .role = Role::Primary;
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("primary resource");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("must be Secondary"),
+        "the primary refusal: {error}"
+    );
+    f.world
+        .lock()
+        .expect("world")
+        .resources
+        .get_mut(&resource_of("vol-vtr"))
+        .expect("resource running")
+        .role = Role::Secondary;
+
+    // Disconnected: the replica is not established — the gate refuses
+    // a target that cannot be proven current.
+    f.world.lock().expect("world").peer_online = false;
+    let error = surface
+        .verify_target_replica(&vol)
+        .await
+        .expect_err("disconnected replica");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("not connected"),
+        "the connection refusal: {error}"
+    );
+    f.world.lock().expect("world").peer_online = true;
+    surface
+        .verify_target_replica(&vol)
+        .await
+        .expect("the re-established replica passes");
+}
+
+/// The tracked-residue half of `verify_target_replica`: a cut that
+/// outlived its lease fences the writer but KEEPS the marker on a
+/// Secondary (the row-11 shape) — a mid-handoff residue is never
+/// someone else's target, and the operator's clear (row 16a) is
+/// what reopens the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_target_replica_refuses_a_tracked_cut_marked_residue_until_cleared() {
+    let kit = witness_kit().await;
+    let state = attached(&kit, "vol-vtr-residue").await;
+    let surface: Arc<dyn HandoffSurface> = state.provider.clone();
+    let mig = migration("mig-vtr");
+    state
+        .provider
+        .quiesce_for_barrier(&state.volume, &mig)
+        .expect("quiesce");
+    kit.server.handle.abort();
+    kit.writer_clock.store(START + TTL + 1, Ordering::SeqCst);
+    state.provider.renew_leases().expect("renewal pass");
+    assert_eq!(role_of(&state.world, &state.resource), Role::Secondary);
+    assert!(cut_marker_of(&state.state_path, &state.volume).is_some());
+    let error = surface
+        .verify_target_replica(&state.volume)
+        .await
+        .expect_err("cut-marked residue");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert!(
+        error.detail.contains("cut marker"),
+        "the residue refusal: {error}"
+    );
+    state
+        .provider
+        .clear_cut_marker(&state.volume, None)
+        .expect("clear the Secondary residue");
+    surface
+        .verify_target_replica(&state.volume)
+        .await
+        .expect("the cleared residue reopens the gate");
 }
 
 /// `fail_closed_fence` (the daemon driver's `fence_source`): the P4a

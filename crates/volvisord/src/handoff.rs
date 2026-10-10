@@ -1704,6 +1704,13 @@ mod tests {
             Err(not_scripted())
         }
 
+        async fn verify_target_replica(&self, _volume_id: &VolumeId) -> Result<(), ApiError> {
+            // The daemon-wiring tests reach this surface only through
+            // the driver, never the peer routes (StubPeer owns the
+            // route answers); every call is an honest `Ok`.
+            Ok(())
+        }
+
         async fn role_secondary(&self, _volume_id: &VolumeId) -> Result<bool, ApiError> {
             Ok(true)
         }

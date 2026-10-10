@@ -2056,6 +2056,13 @@ struct FakeHandoffSurface {
     >,
     eligibility: std::sync::Mutex<Vec<String>>,
     cleared: std::sync::Mutex<Vec<(volvisor_types::VolumeId, bool)>>,
+    /// The volumes whose target replica this surface verifies `Ok`
+    /// (a volume this host tracks models an established replica);
+    /// everything else is the typed no-replica refusal — the
+    /// unprepared participant of row 12.
+    targets: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
+    /// Every replica verification the surface saw (assertion input).
+    target_checks: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
 }
 
 impl FakeHandoffSurface {
@@ -2064,7 +2071,17 @@ impl FakeHandoffSurface {
             promotes: std::sync::Mutex::new(Vec::new()),
             eligibility: std::sync::Mutex::new(Vec::new()),
             cleared: std::sync::Mutex::new(Vec::new()),
+            targets: std::sync::Mutex::new(Vec::new()),
+            target_checks: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a volume as holding an established target replica.
+    fn add_target(&self, volume_id: &volvisor_types::VolumeId) {
+        self.targets
+            .lock()
+            .expect("targets")
+            .push(volume_id.clone());
     }
 }
 
@@ -2177,6 +2194,29 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
             },
             state: volvisor_types::AttachmentState::Prepared,
         })
+    }
+
+    async fn verify_target_replica(
+        &self,
+        volume_id: &volvisor_types::VolumeId,
+    ) -> Result<(), ApiError> {
+        self.target_checks
+            .lock()
+            .expect("target checks")
+            .push(volume_id.clone());
+        if self
+            .targets
+            .lock()
+            .expect("targets")
+            .iter()
+            .any(|target| target == volume_id)
+        {
+            Ok(())
+        } else {
+            Err(ApiError::not_found(format!(
+                "no target replica of {volume_id} on this host"
+            )))
+        }
     }
 
     async fn role_secondary(
@@ -2724,6 +2764,10 @@ async fn create_volume(kit: &PeerKit, raw: &str) {
         .create_volume(&fixture_create_request(raw, GIB))
         .await
         .expect("create volume");
+    // The fake provider's volumes model this host's established
+    // replicas (the happy-path peer tests' destination); the surface's
+    // replica-level gate must see them as targets.
+    kit.handoff.add_target(&volume_id(raw));
 }
 
 #[tokio::test]

@@ -292,6 +292,31 @@ pub trait HandoffSurface: Send + Sync {
         attach: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError>;
 
+    /// The destination's `PREPARED` gate (plan §6: "target replica
+    /// verified — resource present, Secondary, connected, no fence
+    /// marker"): verify this host holds the volume's target replica
+    /// from **observed** state, without requiring the volume to be
+    /// tracked in this host's provider state — the P3 peer side is
+    /// operator-provisioned and untracked until the promote adopts it
+    /// (its `promote_target` re-verifies everything under the granted
+    /// lease; this gate refuses an obviously-unready destination
+    /// **before** the source's cut, which is its whole purpose).
+    ///
+    /// A volume this host *does* track must additionally be free of
+    /// the residues that would refuse the promote anyway (a pending
+    /// self-fence, another handoff's cut marker, an unseeded replica)
+    /// — refused here, before any source-side act.
+    ///
+    /// Read-only: a status observation, no mutation.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `INVALID_STATE` when this host
+    /// holds no running, Secondary, connected replica of the volume
+    /// (or its resource definition does not name this host); the
+    /// residue refusals above for a tracked volume; `INTERNAL` for an
+    /// observation that cannot be trusted.
+    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError>;
+
     /// Whether one volume's **local** role is Secondary, from observed
     /// status (stage B2: the daemon's handoff driver feeds the
     /// coordinator's `source_secondary` observation, and the

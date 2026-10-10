@@ -1076,18 +1076,36 @@ fn prepare_response(record: &TargetPreparation) -> PeerPrepareResponse {
 }
 
 /// The prepare act: verify every participant against this host's
-/// provider (typed refusals for an unknown volume or a stale
-/// generation), probe the migration's snapshot directory, persist the
-/// preparation.
+/// provider (typed refusals for a stale generation on a volume this
+/// host tracks, and — for the untracked P3 peer side, operator-
+/// provisioned until the promote adopts it — the handoff surface's
+/// replica-level gate), probe the migration's snapshot directory,
+/// persist the preparation.
 async fn prepare_act(
     ctx: Arc<PeerRouteContext>,
     req: PeerPrepareRequest,
 ) -> Result<PeerPrepareResponse, ApiError> {
     for (volume_id, expected) in req.volume_ids.iter().zip(&req.expected_generations) {
-        let inspected = ctx.provider.inspect_volume(volume_id).await?;
-        if inspected.generation != *expected {
-            return Err(ApiError::stale_generation(*expected, inspected.generation));
+        match ctx.provider.inspect_volume(volume_id).await {
+            Ok(inspected) => {
+                if inspected.generation != *expected {
+                    return Err(ApiError::stale_generation(*expected, inspected.generation));
+                }
+            }
+            // The P3 peer side is operator-provisioned and untracked
+            // in this host's provider state (its volume records begin
+            // at the promote): `NOT_FOUND` here is not a refusal —
+            // the replica-level gate below owns the verification.
+            Err(error) if error.code == ApiErrorCode::NotFound => {}
+            Err(error) => return Err(error),
         }
+        // The replica-level gate for EVERY participant (plan §6:
+        // "target replica verified — resource present, Secondary,
+        // connected, no fence marker"): refusing an unready
+        // destination here, before the source's cut, is this route's
+        // whole purpose (row 12 — one unprepared participant refuses
+        // the whole migration).
+        ctx.handoff.verify_target_replica(volume_id).await?;
     }
     // The snapshot-dir boundary (plan §1/§6): prove the shared path is
     // usable by this host NOW, not at config time. The per-migration

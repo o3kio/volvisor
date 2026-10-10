@@ -416,6 +416,10 @@ impl HandoffSurface for DrbdProvider {
         DrbdProvider::role_secondary(self, volume_id)
     }
 
+    async fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        DrbdProvider::verify_target_replica(self, volume_id)
+    }
+
     async fn fail_closed_fence(&self, volume_id: &VolumeId, reason: &str) -> Result<(), ApiError> {
         DrbdProvider::fail_closed_fence(self, volume_id, reason)
     }
@@ -5007,6 +5011,101 @@ impl DrbdProvider {
         Ok(self
             .resource_status(&resource)?
             .is_some_and(|status| status.role == Role::Secondary))
+    }
+
+    /// The destination's `PREPARED` gate (stage B2,
+    /// [`HandoffSurface::verify_target_replica`]): verify this host
+    /// holds the volume's target replica from **observed** state —
+    /// the resource is present and running, Secondary, connected to
+    /// its peer, and its definition names this host — without
+    /// requiring the volume to be tracked in this host's state. The
+    /// resource is derived from the volume id the way
+    /// [`Self::promote_target`] derives it (the P3 peer side is
+    /// operator-provisioned and untracked until the promote adopts
+    /// it); a volume this host *does* track must be free of the
+    /// residues that would refuse the promote anyway — refused here,
+    /// before the source's cut.
+    ///
+    /// # Errors
+    /// `INVALID_STATE` when this host holds no running, Secondary,
+    /// connected replica of the volume, its resource definition does
+    /// not name this host, or a tracked volume carries a pending
+    /// self-fence / another handoff's cut marker / an unseeded
+    /// replica; `INTERNAL` for an observation that cannot be trusted.
+    pub fn verify_target_replica(&self, volume_id: &VolumeId) -> Result<(), ApiError> {
+        let resource = resource_name_for(volume_id);
+        let status = self.resource_status(&resource)?.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is down on this host; the target \
+                     replica is not present"
+                ),
+            )
+        })?;
+        if status.role != Role::Secondary {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is {:?}; the target replica must be \
+                     Secondary (a Primary one is someone's live writer)",
+                    status.role
+                ),
+            ));
+        }
+        if !status.connected {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "resource {resource} of {volume_id} is not connected to its peer; the \
+                     target replica is not established"
+                ),
+            ));
+        }
+        let definition = self.parsed_definition(&resource)?;
+        if !definition
+            .nodes
+            .iter()
+            .any(|node| node.name == self.config.node_name)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the resource definition for {resource} does not name this host ({}); \
+                     this host is not a replication end of {volume_id}",
+                    self.config.node_name
+                ),
+            ));
+        }
+        // The tracked-residue gates (an untracked peer side has none of
+        // these by construction — there is no entry to carry them).
+        if let Some(stored) = self.lock_state()?.volume(volume_id) {
+            if stored.runtime.fence.is_some() {
+                return Err(ApiError::new(
+                    ApiErrorCode::FencePending,
+                    format!(
+                        "volume {volume_id} carries a pending self-fence (its writer \
+                         authority was provably lost); it cannot take a handoff"
+                    ),
+                ));
+            }
+            if stored.runtime.migration.is_some() {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "volume {volume_id} already carries a migration-cut marker (another \
+                         handoff owns its cut)"
+                    ),
+                ));
+            }
+            if !stored.runtime.seeded {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!("volume {volume_id} is not seeded (its replica is not established)"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Fail-closed fencing for one participant (stage B2,
