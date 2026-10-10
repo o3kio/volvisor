@@ -1244,7 +1244,7 @@ async fn barrier_lineage_recheck_refuses_typed_and_parks_for_the_operator() {
         );
         assert_eq!(world.suspended.len(), VOLS.len());
         for state in world.volumes.values() {
-            assert!(state.barriers.is_empty());
+            assert_eq!(state.barriers, [], "no barrier was recorded at the witness");
             assert_eq!(state.lease, LeaseStateKind::Live);
             assert_eq!(state.holder.as_ref().map(HostId::as_str), Some(SOURCE));
         }
