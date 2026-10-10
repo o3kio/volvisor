@@ -27,19 +27,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 use volvisor_provider::VolumeProvider;
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning,
     VolumeClass,
 };
+
+use volvisor_types::crash::StoreCrashHooks;
 use volvisor_types::request::{
     AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, ErasurePolicy, GrowGuestNotification, GrowVolumeRequest,
     GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
+    MoveVolumeBackingRequest, MoveVolumeBackingResponse,
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, DeviceId,
-    ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
+    MoveVolumeBackingState, ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
 };
 
 use crate::report::{LvRow, VgRow};
@@ -91,6 +95,85 @@ fn extent_rounded(size: u64, extent: u64) -> u64 {
 /// Host identity of the single-host P0 daemon.
 const LOCAL_HOST_ID: &str = "local";
 
+/// The move drive's observation poll interval while a `pvmove` runs
+/// (the brief's 250–500 ms band, centered).
+const MOVE_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How long one `move_volume_backing` call supervises an in-flight
+/// move before returning `COPYING` honestly. The move itself keeps
+/// running (the kernel mirror is outside the daemon): a fresh
+/// operation re-attaches, and the daemon's retry reconcile completes
+/// the record without any consumer call.
+const MOVE_SUPERVISION_WINDOW: Duration = Duration::from_secs(30);
+
+/// The move retry-reconcile tick (the background task spawned by the
+/// daemon's LVM path).
+pub const MOVE_RETRY_TICK: Duration = Duration::from_secs(5);
+
+/// The move drive's timing knobs (the production defaults above,
+/// overridable for the deterministic fake world and the fault rows —
+/// never for a production daemon).
+#[derive(Clone, Copy, Debug)]
+pub struct MoveTiming {
+    /// The `lvs` observation interval while supervising.
+    pub poll_interval: Duration,
+    /// One call's supervision window.
+    pub supervision_window: Duration,
+}
+
+impl Default for MoveTiming {
+    fn default() -> Self {
+        Self {
+            poll_interval: MOVE_POLL_INTERVAL,
+            supervision_window: MOVE_SUPERVISION_WINDOW,
+        }
+    }
+}
+
+/// What the world was observed to say about one LV being moved: the
+/// honest `lvs`-observable truth the whole move discipline rests on
+/// (the record plus this observation are the crash model's two
+/// survivors; the kernel dm mirror and the backgrounded `pvmove`
+/// process are outside the daemon).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MoveObservation {
+    /// A `pvmove` mirror segment is active (the LV's device list
+    /// references a `pvmove*` segment).
+    pub moving: bool,
+    /// The LV's backing device names (extent suffixes stripped; the
+    /// `pvmove*` segment name included while moving).
+    pub devices: Vec<String>,
+}
+
+impl MoveObservation {
+    /// The relocation proof: no move is active and the source PV no
+    /// longer backs the LV.
+    #[must_use]
+    pub(crate) fn source_freed(&self, source_pv: &str) -> bool {
+        !self.moving && !self.devices.iter().any(|pv| pv == source_pv)
+    }
+}
+
+/// One `move_reconcile_pass` outcome report (the retry task logs it;
+/// the fault rows assert on it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveReconcileReport {
+    /// Moves whose completion was observed and verified this pass.
+    pub completed: Vec<VolumeId>,
+    /// Records rolled to `COPYING` (a live mirror observed, or a
+    /// re-driven start).
+    pub marked_copying: Vec<VolumeId>,
+    /// Records parked `IN_DOUBT` (the move ended without relocating).
+    pub parked_in_doubt: Vec<VolumeId>,
+    /// PREPARING records whose `pvmove` was (re-)started this pass.
+    pub redriven: Vec<VolumeId>,
+    /// Records dropped (their volume no longer exists).
+    pub dropped: Vec<VolumeId>,
+    /// Records skipped: the world could not be observed this pass
+    /// (retried on the next tick; never resolved destructively).
+    pub unobservable: Vec<VolumeId>,
+}
+
 /// The native-local LVM provider.
 ///
 /// All state lives in the durable JSON state file (see [`LvmState`]); the
@@ -110,7 +193,27 @@ pub struct LvmProvider {
     pub(crate) vg_prefix: String,
     /// Scoped destructive-authorization token (compared, never logged).
     pub(crate) expected_auth_token: String,
+    /// The state file's store-save crash seam (inert unless a rig
+    /// arms it — the move fault rows' kill surface).
+    store_crash: Arc<StoreCrashHooks>,
+    /// The move drive's timing (production defaults; overridable for
+    /// the deterministic fake world only).
+    move_timing: MoveTiming,
     state: Mutex<LvmState>,
+}
+
+/// The phase-1 admission outcome for a move request.
+enum MoveAdmission {
+    /// Answer now: the idempotent re-observation of a completed
+    /// move — nothing is touched, nothing re-runs.
+    Answered(MoveVolumeBackingResponse),
+    /// Qualified for the drive: the LV's names plus the active
+    /// move's target PV when the request re-attaches to one.
+    Drive {
+        vg_name: String,
+        lv_name: String,
+        existing_target: Option<String>,
+    },
 }
 
 impl LvmProvider {
@@ -140,10 +243,36 @@ impl LvmProvider {
             sysfs_root,
             vg_prefix,
             expected_auth_token,
+            store_crash: Arc::new(StoreCrashHooks::new()),
+            move_timing: MoveTiming::default(),
             state: Mutex::new(state),
         };
         provider.reconcile()?;
         Ok(provider)
+    }
+
+    /// Override the move drive's timing (the deterministic fake
+    /// world and the fault rows poll in milliseconds and bound the
+    /// supervision window tightly; a production daemon keeps the
+    /// defaults). Must be called before the first move.
+    #[must_use]
+    pub fn with_move_timing(mut self, timing: MoveTiming) -> Self {
+        self.move_timing = timing;
+        self
+    }
+
+    /// The state file's crash seam (the rig arms it to kill at a
+    /// move record's commit boundaries).
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> &Arc<StoreCrashHooks> {
+        &self.store_crash
+    }
+
+    /// Persist the in-memory state through the crash-hooked atomic
+    /// save (every internal mutation routes through here, so the
+    /// armed seam sees every commit boundary of the state file).
+    fn persist(&self, state: &mut LvmState) -> Result<(), ApiError> {
+        state.save_with_hooks(&self.state_path, Some(&self.store_crash))
     }
 
     /// Lock the in-memory state, mapping poisoning to `INTERNAL`.
@@ -389,8 +518,17 @@ impl LvmProvider {
             }
         }
         if changed {
-            state.save(&self.state_path)?;
+            self.persist(&mut state)?;
         }
+        drop(state);
+        // Move records (P6-C): classify every record against the
+        // observed world at startup — a live mirror rolls the record
+        // to COPYING, a provable relocation completes it, an ended
+        // unrelocated move parks IN_DOUBT. Classification and durable
+        // rolls only: the constructor never starts a pvmove (the
+        // daemon's retry task owns the re-drive of a verifiably
+        // unstarted PREPARING record).
+        self.reconcile_moves(false)?;
         Ok(())
     }
 
@@ -466,7 +604,7 @@ impl LvmProvider {
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
         Ok(inspect_response(&req.volume_id, &stored))
     }
 
@@ -543,7 +681,7 @@ impl LvmProvider {
         stored.runtime.state = VolumeLifecycle::Attached;
         stored.entry.generation += 1;
         let response = attach_response(&record, &stored.entry);
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
         Ok(response)
     }
 
@@ -586,7 +724,7 @@ impl LvmProvider {
         stored.entry.generation += 1;
         stored.entry.data_epoch += 1;
         let response = inspect_response(volume_id, stored);
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
         Ok(response)
     }
 
@@ -686,7 +824,7 @@ impl LvmProvider {
             .ok_or_else(|| not_found(volume_id))?;
         stored.entry.size_bytes = actual;
         stored.entry.generation += 1;
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
         Ok(GrowVolumeResponse {
             backing_resized: true,
             // The provider-layer placeholder, honestly labeled: this
@@ -800,8 +938,756 @@ impl LvmProvider {
             }
         }
         state.remove_volume(volume_id);
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Online same-VG extent moves (P6-C, ADR-0006 first slice part 2)
+    // ------------------------------------------------------------------
+    //
+    // The crash model, stated once and binding for everything below:
+    // the kernel-side pvmove mirror and the backgrounded pvmove
+    // process live OUTSIDE the daemon — they survive daemon death and
+    // advance past any journal write. The two survivors a restart
+    // reasons from are (1) the durable move record in the state file
+    // and (2) the lvs-observable world (the LV's device list: a
+    // `pvmove*` segment reference while moving, the real PVs when
+    // settled). Recovery is always classification of those two
+    // against each other — never a guess, never a destructive
+    // resolution of an honest unknown.
+
+    /// Observe one LV's move-relevant truth: whether a pvmove mirror
+    /// segment is active and which devices back the LV.
+    ///
+    /// `INTERNAL` when `lvs` fails or the LV is absent — the caller
+    /// decides what an unobservable world means (the drive parks
+    /// `IN_DOUBT`; the reconcile pass skips and retries).
+    fn observe_lv(&self, vg_name: &str, lv_name: &str) -> Result<MoveObservation, ApiError> {
+        let output = self.runner.run("lvs", move_lvs_args())?;
+        if !output.success {
+            return Err(command_failed("lvs", &output));
+        }
+        let rows: Vec<LvRow> = crate::report::parse_report(&output.stdout, "lv")?;
+        let wanted = format!("{vg_name}/{lv_name}");
+        rows.into_iter()
+            .find(|row| row.vg_slash_lv().as_deref() == Some(wanted.as_str()))
+            .map(|row| MoveObservation {
+                moving: row.move_segment_active(),
+                devices: row.device_pvs().into_iter().map(str::to_owned).collect(),
+            })
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!("LV {wanted} is not reported by lvs"),
+                )
+            })
+    }
+
+    /// Start (or resume) the scoped pvmove. Verified LVM 2.03.x
+    /// behavior this builds on: a re-run while the source PV carries
+    /// an active move attaches to it (exit 0, remaining arguments
+    /// ignored — which is why the provider refuses a second move
+    /// from the same source PV instead of silently no-oping), and a
+    /// re-run after completion fails with "No data to move" (exit 5 —
+    /// which is why the drive always observes completion before ever
+    /// invoking this).
+    fn start_pvmove(
+        &self,
+        vg_name: &str,
+        lv_name: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<(), ApiError> {
+        let output = self.runner.run(
+            "pvmove",
+            &[
+                "--background",
+                "--noudevsync",
+                "-n",
+                &format!("{vg_name}/{lv_name}"),
+                source,
+                target,
+            ],
+        )?;
+        if output.success {
+            return Ok(());
+        }
+        Err(command_failed("pvmove", &output))
+    }
+
+    /// The response for the volume's current recorded move shape.
+    fn move_response(
+        state: &LvmState,
+        volume_id: &VolumeId,
+        record: &crate::state::MoveRecord,
+    ) -> MoveVolumeBackingResponse {
+        let generation = state
+            .volume(volume_id)
+            .map_or(0, |stored| stored.entry.generation);
+        MoveVolumeBackingResponse {
+            state: record.state,
+            generation,
+            source_pv: record.source_pv.clone(),
+            target_pv: record.target_pv.clone(),
+            detail: record.detail.clone(),
+        }
+    }
+
+    /// Park the volume's move record `IN_DOUBT` with the honest
+    /// reason and answer the response from the parked record. The
+    /// source is intact by construction of every caller (an
+    /// unverified outcome never freed anything); the record stays
+    /// queryable by the reconcile pass, which rolls it forward if
+    /// the world later proves completion.
+    fn park_in_doubt(
+        &self,
+        volume_id: &VolumeId,
+        detail: String,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        let mut state = self.lock_state()?;
+        // The parked record is the response (the guard's state is
+        // exactly what gets persisted — no re-lock after the save).
+        let response = {
+            if let Some(record) = state.move_record_mut(volume_id) {
+                record.state = MoveVolumeBackingState::InDoubt;
+                record.detail = Some(detail);
+            }
+            state
+                .move_record(volume_id)
+                .map(|record| Self::move_response(&state, volume_id, record))
+        };
+        self.persist(&mut state)?;
+        response.ok_or_else(|| not_found(volume_id))
+    }
+
+    /// Verify the relocation with a **fresh** observation and durably
+    /// complete the move: one atomic state save carries both the
+    /// `COMPLETE` record and the volume's generation bump (the
+    /// relocation is a fenced placement mutation; the LV's identity,
+    /// path and data are unchanged).
+    ///
+    /// A verification that cannot prove the source freed parks
+    /// `IN_DOUBT` — the source extents are never declared freed on
+    /// pvmove's word alone.
+    fn finish_complete(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        record: &crate::state::MoveRecord,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        let verification = match self.observe_lv(vg_name, lv_name) {
+            Ok(verification) => verification,
+            // The completion was observed but cannot be verified:
+            // unknown, never a silent success.
+            Err(e) => {
+                return self.park_in_doubt(
+                    volume_id,
+                    format!("verification could not observe the LV after the move ended: {e}"),
+                );
+            }
+        };
+        if !verification.source_freed(&record.source_pv) {
+            return self.park_in_doubt(
+                volume_id,
+                format!(
+                    "verification refused: the LV's devices still reference the source \
+                     PV {} after the move ended; the extents were not freed",
+                    record.source_pv
+                ),
+            );
+        }
+        let mut state = self.lock_state()?;
+        let Some(stored) = state.volume_mut(volume_id) else {
+            // The volume was deleted while the move ran (the delete
+            // path's own lvremove would have refused a moving LV, so
+            // this is the settled tail): nothing to complete.
+            state.remove_move(volume_id);
+            self.persist(&mut state)?;
+            return Err(not_found(volume_id));
+        };
+        stored.entry.generation += 1;
+        state.insert_move(
+            volume_id.clone(),
+            crate::state::MoveRecord {
+                operation_id: record.operation_id.clone(),
+                source_pv: record.source_pv.clone(),
+                target_pv: record.target_pv.clone(),
+                state: MoveVolumeBackingState::Complete,
+                detail: None,
+            },
+        );
+        let response = state
+            .move_record(volume_id)
+            .map(|completed| Self::move_response(&state, volume_id, completed));
+        self.persist(&mut state)?;
+        response.ok_or_else(|| not_found(volume_id))
+    }
+
+    /// The MoveVolumeBackingOnline drive (contract section 4A,
+    /// `same_vg_extent_move` scope).
+    ///
+    /// Phases: qualify under the state lock → observe the world
+    /// (source derivation, target validation, capacity) → journal
+    /// `PREPARING` → start pvmove → journal `COPYING` → supervise
+    /// within the window → on completion verify and journal
+    /// `COMPLETE` (one save with the generation bump). An unknown
+    /// mid-move outcome parks `IN_DOUBT`; the window expiring with
+    /// the move progressing answers `COPYING` (a truthful
+    /// observation of this call, not a completion claim).
+    /// Phase 1 — qualify a move request under the state lock: the
+    /// generation fence, the lifecycle admission, and the existing
+    /// record's shape (an idempotent re-observation answers; an
+    /// active move to the same target re-attaches; a different
+    /// target or an `IN_DOUBT` park refuses). Nothing is journaled
+    /// and nothing in the world is touched here.
+    fn admit_move(
+        &self,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<MoveAdmission, ApiError> {
+        let state = self.lock_state()?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        if stored.entry.generation != req.expected_generation {
+            return Err(ApiError::stale_generation(
+                req.expected_generation,
+                stored.entry.generation,
+            ));
+        }
+        match stored.runtime.state {
+            VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded => {}
+            other => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "a same-VG move admits Ready/Attached/Degraded volumes; \
+                         volume is {other:?}"
+                    ),
+                ));
+            }
+        }
+        let names = (stored.entry.vg_name.clone(), stored.entry.lv_name.clone());
+        match state.move_record(volume_id) {
+            None => Ok(MoveAdmission::Drive {
+                vg_name: names.0,
+                lv_name: names.1,
+                existing_target: None,
+            }),
+            Some(record) => match record.state {
+                MoveVolumeBackingState::Complete => {
+                    if record.target_pv == req.target_pool_id {
+                        // Idempotent re-observation: this exact move
+                        // already completed.
+                        return Ok(MoveAdmission::Answered(Self::move_response(
+                            &state, volume_id, record,
+                        )));
+                    }
+                    // A different target after a completed move is a
+                    // fresh move.
+                    Ok(MoveAdmission::Drive {
+                        vg_name: names.0,
+                        lv_name: names.1,
+                        existing_target: None,
+                    })
+                }
+                MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying => {
+                    if record.target_pv != req.target_pool_id {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidState,
+                            format!(
+                                "a move to {} is already active for this volume; \
+                                 wait for it to complete or re-issue against its target",
+                                record.target_pv
+                            ),
+                        ));
+                    }
+                    // Re-attach to the active move.
+                    Ok(MoveAdmission::Drive {
+                        vg_name: names.0,
+                        lv_name: names.1,
+                        existing_target: Some(record.target_pv.clone()),
+                    })
+                }
+                MoveVolumeBackingState::InDoubt => Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the volume's previous move (to {}) is IN_DOUBT{}; it parks \
+                         until reconciliation proves completion or an operator \
+                         resolves it",
+                        record.target_pv,
+                        record
+                            .detail
+                            .as_deref()
+                            .map_or_else(String::new, |detail| format!(": {detail}"))
+                    ),
+                )),
+                _ => Ok(MoveAdmission::Drive {
+                    vg_name: names.0,
+                    lv_name: names.1,
+                    existing_target: None,
+                }),
+            },
+        }
+    }
+
+    /// Phase 2a — qualify the request's named target against the
+    /// observed world: it must exist and belong to the volume's own
+    /// VG (the capability is same-VG only). The target is observed,
+    /// never assumed.
+    fn qualify_move_target(
+        &self,
+        req: &MoveVolumeBackingRequest,
+        vg_name: &str,
+    ) -> Result<crate::report::PvRow, ApiError> {
+        let pvs = self.list_pvs()?;
+        let target_row = pvs
+            .iter()
+            .find(|row| row.pv_name.as_deref() == Some(req.target_pool_id.as_str()))
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    format!("target PV {} is not reported by pvs", req.target_pool_id),
+                )
+            })?
+            .clone();
+        let target_vg = target_row.vg_name.clone().unwrap_or_default();
+        if target_vg != vg_name {
+            return Err(ApiError::new(
+                ApiErrorCode::MoveUnsupportedScope,
+                format!(
+                    "cross-VG move refused: target PV {} belongs to VG {target_vg:?}, the \
+                     volume's VG is {vg_name:?} (the same_vg_extent_move capability is \
+                     same-VG only)",
+                    req.target_pool_id
+                ),
+            ));
+        }
+        Ok(target_row)
+    }
+
+    /// Phase 2b — derive the evacuation source and validate it: a
+    /// fresh move requires the LV's extents to sit on exactly one
+    /// source PV (the single-source scope), a target distinct from
+    /// the source, room for the extents in the target's free space,
+    /// and no other volume already evacuating the same source PV
+    /// (LVM would attach the second scoped pvmove to the first and
+    /// silently ignore its arguments). A re-attach skips all of it:
+    /// the record's source is the durable source and the extents
+    /// are mid-transfer.
+    fn derive_move_source(
+        &self,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+        vg_name: &str,
+        lv_name: &str,
+        existing_target: Option<&str>,
+        observation: &MoveObservation,
+        target_row: &crate::report::PvRow,
+    ) -> Result<Option<String>, ApiError> {
+        if existing_target.is_some() {
+            // Re-attach: the record's source is the durable source
+            // (the devices column shows the pvmove segment while
+            // moving, not the real PVs).
+            return Ok(None);
+        }
+        let sources = observation.devices.clone();
+        if sources.len() != 1 {
+            return Err(ApiError::new(
+                ApiErrorCode::MoveUnsupportedScope,
+                format!(
+                    "the same-VG move scope requires the LV's extents to sit on \
+                     exactly one source PV; {vg_name}/{lv_name} is spread across \
+                     {sources:?}"
+                ),
+            ));
+        }
+        let source = sources[0].clone();
+        if source == req.target_pool_id {
+            return Err(ApiError::invalid_request(format!(
+                "target PV {} already holds the volume's extents; the request \
+                 describes no move",
+                req.target_pool_id
+            )));
+        }
+        // Capacity: the LV's extent-rounded size must fit in the
+        // target's free space (LVM allocates whole extents; the
+        // stored effective size is already extent-aligned).
+        let lv_size = {
+            let state = self.lock_state()?;
+            state
+                .volume(volume_id)
+                .map(|stored| stored.entry.size_bytes)
+                .ok_or_else(|| not_found(volume_id))?
+        };
+        let target_free = target_row.free_bytes().ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "target PV {} does not report free space; refusing the move \
+                     rather than assuming capacity",
+                    req.target_pool_id
+                ),
+            )
+        })?;
+        if target_free < lv_size {
+            return Err(ApiError::new(
+                ApiErrorCode::NoSafeCapacity,
+                format!(
+                    "target PV {} has {target_free} bytes free; the volume's \
+                     extents need {lv_size}",
+                    req.target_pool_id
+                ),
+            ));
+        }
+        // One pvmove per source PV: LVM attaches a second scoped
+        // pvmove to the first and IGNORES its arguments — a second
+        // move from the same source would be a silent no-op, so it
+        // is refused typed instead.
+        let same_source = {
+            let state = self.lock_state()?;
+            state.moves().iter().any(|(other, record)| {
+                other != volume_id
+                    && record.source_pv == source
+                    && matches!(
+                        record.state,
+                        MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
+                    )
+            })
+        };
+        if same_source {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "another volume is already evacuating source PV {source}; LVM \
+                     attaches a second scoped pvmove to the first and ignores its \
+                     arguments, so one move per source PV at a time"
+                ),
+            ));
+        }
+        Ok(Some(source))
+    }
+
+    async fn move_volume_backing_inner(
+        &self,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        validate_api_version(&req.api_version)?;
+        // Honored or refused, never silently ignored: no same-VG
+        // pvmove implementation can rate-limit the copy.
+        if let Some(rate) = req.max_copy_bytes_per_sec {
+            return Err(unsupported(format!(
+                "max_copy_bytes_per_sec ({rate}) cannot be honored by a same-VG pvmove \
+                 (LVM exposes no copy rate limit); refusing the request rather than \
+                 ignoring the parameter"
+            )));
+        }
+
+        // Phase 1 — qualify under the state lock. Nothing is
+        // journaled and nothing in the world is touched until every
+        // check passes.
+        let (vg_name, lv_name, existing_target) = match self.admit_move(volume_id, req)? {
+            MoveAdmission::Answered(response) => return Ok(response),
+            MoveAdmission::Drive {
+                vg_name,
+                lv_name,
+                existing_target,
+            } => (vg_name, lv_name, existing_target),
+        };
+
+        // Phase 2 — observe the world (no lock held): the target
+        // qualification first (the request's own named reference is
+        // validated against the observed world), then the source
+        // derivation.
+        let observation = self.observe_lv(&vg_name, &lv_name)?;
+        if existing_target.is_none() && observation.moving {
+            // A moving LV with no journaled record: someone else's
+            // pvmove. Never touched, never adopted.
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "a pvmove mirror segment is active on {vg_name}/{lv_name} outside \
+                     volvisor's journal; refusing to supervise a foreign move"
+                ),
+            ));
+        }
+        let target_row = self.qualify_move_target(req, &vg_name)?;
+        let source_pv = self.derive_move_source(
+            volume_id,
+            req,
+            &vg_name,
+            &lv_name,
+            existing_target.as_deref(),
+            &observation,
+            &target_row,
+        )?;
+
+        // Phase 3 — journal the intent. The record is the
+        // reconciliation anchor: after this save, a daemon death
+        // anywhere below leaves a durable fact to classify against.
+        let (source_pv, record_for_drive) = {
+            let mut state = self.lock_state()?;
+            let (source, record) = match state.move_record(volume_id) {
+                Some(record)
+                    if matches!(
+                        record.state,
+                        MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
+                    ) =>
+                {
+                    (record.source_pv.clone(), record.clone())
+                }
+                _ => {
+                    let source = source_pv.clone().unwrap_or_default();
+                    let record = crate::state::MoveRecord {
+                        operation_id: req.operation_id.clone(),
+                        source_pv: source.clone(),
+                        target_pv: req.target_pool_id.clone(),
+                        state: MoveVolumeBackingState::Preparing,
+                        detail: None,
+                    };
+                    state.insert_move(volume_id.clone(), record.clone());
+                    (source, record)
+                }
+            };
+            self.persist(&mut state)?;
+            (source, record)
+        };
+
+        // Phase 4 — start (or resume) the pvmove, then journal
+        // COPYING. Between the start and this save the record says
+        // PREPARING: a crash there classifies from the world (the
+        // mirror observed → COPYING; settled and unrelocated →
+        // re-drive).
+        if let Err(e) =
+            self.start_pvmove(&vg_name, &lv_name, &source_pv, &record_for_drive.target_pv)
+        {
+            // Honest tail: did it start anyway? A non-zero exit with
+            // a live mirror means the move is running despite the
+            // error — supervise it. Otherwise nothing happened in
+            // the world: drop the record and fail typed.
+            let observation = self.observe_lv(&vg_name, &lv_name)?;
+            if !observation.moving {
+                let mut state = self.lock_state()?;
+                if let Some(record) = state.move_record(volume_id) {
+                    if record.state == MoveVolumeBackingState::Preparing {
+                        state.remove_move(volume_id);
+                        self.persist(&mut state)?;
+                    }
+                }
+                return Err(e);
+            }
+        }
+        {
+            let mut state = self.lock_state()?;
+            if let Some(record) = state.move_record_mut(volume_id) {
+                record.state = MoveVolumeBackingState::Copying;
+                record.operation_id = req.operation_id.clone();
+                record.detail = None;
+            }
+            self.persist(&mut state)?;
+        }
+
+        // Phase 5 — supervise within the window: poll the world,
+        // complete on a verified relocation, park `IN_DOUBT` on
+        // anything unknown.
+        self.supervise_move(volume_id, &vg_name, &lv_name, &source_pv, &record_for_drive)
+            .await
+    }
+
+    /// Phase 5 — supervise the started move within the request's
+    /// supervision window. The state lock is never held across
+    /// awaits; the world is re-observed every poll:
+    ///
+    /// - still moving past the window → an honest `COPYING` answer
+    ///   (the record stays `COPYING`; the retry reconcile completes
+    ///   it, a fresh operation re-attaches);
+    /// - the observation fails → `IN_DOUBT` (an unobservable world,
+    ///   never a guess);
+    /// - the source is freed → [`Self::finish_complete`] (a fresh
+    ///   verification observation before anything is freed);
+    /// - the move ended without relocating → `IN_DOUBT` with the
+    ///   source intact and serving.
+    async fn supervise_move(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        source_pv: &str,
+        record: &crate::state::MoveRecord,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        let deadline = Instant::now() + self.move_timing.supervision_window;
+        loop {
+            let observation = match self.observe_lv(vg_name, lv_name) {
+                Ok(observation) => observation,
+                Err(e) => {
+                    return self.park_in_doubt(
+                        volume_id,
+                        format!("the lvs observation failed while supervising the move: {e}"),
+                    );
+                }
+            };
+            if observation.moving {
+                if Instant::now() >= deadline {
+                    // The window expired with the move progressing:
+                    // answer the honest state. The record stays
+                    // COPYING; the daemon's retry reconcile completes
+                    // it, and a fresh operation re-attaches.
+                    let mut state = self.lock_state()?;
+                    let response = {
+                        if let Some(record) = state.move_record_mut(volume_id) {
+                            record.detail = Some(
+                                "the supervision window expired with the move in progress; \
+                                 re-issue with a fresh operation_id to re-attach"
+                                    .to_owned(),
+                            );
+                        }
+                        state
+                            .move_record(volume_id)
+                            .map(|record| Self::move_response(&state, volume_id, record))
+                    };
+                    self.persist(&mut state)?;
+                    return response.ok_or_else(|| not_found(volume_id));
+                }
+                tokio::time::sleep(self.move_timing.poll_interval).await;
+                continue;
+            }
+            if observation.source_freed(source_pv) {
+                return self.finish_complete(volume_id, vg_name, lv_name, record);
+            }
+            // The move ended without relocating the extents —
+            // aborted out-of-band or failed. Unknown outcome: park,
+            // source intact.
+            return self.park_in_doubt(
+                volume_id,
+                format!(
+                    "the pvmove ended without relocating the extents to {} (aborted \
+                     out-of-band or failed); the source PV {} is intact and serving",
+                    record.target_pv, source_pv
+                ),
+            );
+        }
+    }
+
+    /// The move-records reconciliation: classify every record
+    /// against the observed world and roll the durable state. This
+    /// is the restart-and-retry heart of the crash model — the
+    /// constructor runs it with `redrive: false` (classification and
+    /// durable rolls only; the constructor never starts world
+    /// mutations), and the daemon's retry task runs it with
+    /// `redrive: true` (a PREPARING record whose pvmove verifiably
+    /// never started is re-driven — the consumer's journaled intent
+    /// resolved by the world, the migration-drive discipline).
+    ///
+    /// Never destructive: an unobservable record is skipped (retried
+    /// next tick), an unrelocated `COPYING` record parks `IN_DOUBT`,
+    /// and nothing but a verified relocation ever completes.
+    fn reconcile_moves(&self, redrive: bool) -> Result<MoveReconcileReport, ApiError> {
+        let mut report = MoveReconcileReport::default();
+        let snapshot: Vec<(VolumeId, crate::state::MoveRecord)> = {
+            let state = self.lock_state()?;
+            state
+                .moves()
+                .iter()
+                .map(|(id, record)| (id.clone(), record.clone()))
+                .collect()
+        };
+        for (volume_id, record) in snapshot {
+            let names = {
+                let state = self.lock_state()?;
+                state
+                    .volume(&volume_id)
+                    .map(|stored| (stored.entry.vg_name.clone(), stored.entry.lv_name.clone()))
+            };
+            let Some((vg_name, lv_name)) = names else {
+                // The volume is gone (deleted under the move):
+                // nothing to move, drop the record.
+                let mut state = self.lock_state()?;
+                state.remove_move(&volume_id);
+                self.persist(&mut state)?;
+                report.dropped.push(volume_id);
+                continue;
+            };
+            if record.state == MoveVolumeBackingState::Complete {
+                // A completed record is a historical fact: the world
+                // moving on afterwards is a new move for a new
+                // consumer request, never a re-completion (and never
+                // a second generation bump).
+                continue;
+            }
+            let Ok(observation) = self.observe_lv(&vg_name, &lv_name) else {
+                // Honest unknown: leave the record untouched,
+                // retry on the next pass.
+                report.unobservable.push(volume_id);
+                continue;
+            };
+            if observation.moving {
+                // The move is alive (whether this daemon started it
+                // or a previous incarnation did): the record must say
+                // so durably.
+                if record.state != MoveVolumeBackingState::Copying {
+                    let mut state = self.lock_state()?;
+                    if let Some(record) = state.move_record_mut(&volume_id) {
+                        record.state = MoveVolumeBackingState::Copying;
+                        record.detail = None;
+                    }
+                    self.persist(&mut state)?;
+                }
+                report.marked_copying.push(volume_id);
+                continue;
+            }
+            if observation.source_freed(&record.source_pv) {
+                // Completion is provable from the world — including
+                // for an IN_DOUBT record ("rolls forward under
+                // reconciled authority").
+                self.finish_complete(&volume_id, &vg_name, &lv_name, &record)?;
+                report.completed.push(volume_id);
+                continue;
+            }
+            match record.state {
+                MoveVolumeBackingState::Preparing if redrive => {
+                    // The pvmove never verifiably started: re-drive
+                    // the journaled intent. A start failure leaves
+                    // the record PREPARING for the next tick.
+                    if self
+                        .start_pvmove(&vg_name, &lv_name, &record.source_pv, &record.target_pv)
+                        .is_ok()
+                    {
+                        let mut state = self.lock_state()?;
+                        if let Some(record) = state.move_record_mut(&volume_id) {
+                            record.state = MoveVolumeBackingState::Copying;
+                            record.detail = None;
+                        }
+                        self.persist(&mut state)?;
+                        report.redriven.push(volume_id);
+                    }
+                }
+                MoveVolumeBackingState::Copying => {
+                    // The move ended without relocating: park.
+                    self.park_in_doubt(
+                        &volume_id,
+                        format!(
+                            "the pvmove ended without relocating the extents to {} \
+                             (aborted out-of-band or failed); the source PV {} is intact \
+                             and serving",
+                            record.target_pv, record.source_pv
+                        ),
+                    )?;
+                    report.parked_in_doubt.push(volume_id);
+                }
+                _ => {}
+            }
+        }
+        Ok(report)
+    }
+
+    /// One retry reconcile pass (the daemon's background task and
+    /// the fault rows' recovery entry point): classify, roll, and
+    /// re-drive verifiably-unstarted moves.
+    pub fn move_reconcile_pass(&self) -> Result<MoveReconcileReport, ApiError> {
+        self.reconcile_moves(true)
     }
 }
 
@@ -812,7 +1698,13 @@ impl VolumeProvider for LvmProvider {
     }
 
     fn capabilities(&self) -> CapabilitySet {
-        CapabilitySet::native_local_p0()
+        // P6-C (ADR-0006 first slice part 2): the same-VG extent
+        // move is qualified — `same_host_live_backing_move` (the QSD
+        // mirror/pivot path) remains advertised NOWHERE until its
+        // acceptance suite passes (the ADR's own gate).
+        let mut capabilities = CapabilitySet::native_local_p0();
+        capabilities.insert(Capability::SameVgExtentMove);
+        capabilities
     }
 
     fn supported_classes(&self) -> &[VolumeClass] {
@@ -872,6 +1764,19 @@ impl VolumeProvider for LvmProvider {
         self.grow_volume_inner(volume_id, req)
     }
 
+    async fn move_volume_backing(
+        &self,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        // Unlike every other op (single CLI invocations), the drive
+        // supervises an in-flight pvmove for up to the window — the
+        // poll loop sleeps asynchronously so no executor worker is
+        // pinned; the CLI calls themselves stay inline like every
+        // other op.
+        self.move_volume_backing_inner(volume_id, req).await
+    }
+
     async fn delete_volume(
         &self,
         volume_id: &VolumeId,
@@ -903,6 +1808,24 @@ fn vgs_json_args() -> &'static [&'static str] {
         "--nosuffix",
         "-o",
         "vg_name,vg_free,vg_size,vg_extent_size",
+    ]
+}
+
+/// The move observation's `lvs` arguments: the shared JSON arguments
+/// plus the explicit move-relevant columns — `devices` is not among
+/// `lvs`' default columns, and it is the honest moving/relocated
+/// observation (a `pvmove*` segment reference while moving, the real
+/// PVs when settled). Shaped and verified against LVM 2.03.16's JSON
+/// report.
+fn move_lvs_args() -> &'static [&'static str] {
+    &[
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "vg_name,lv_name,lv_attr,copy_percent,devices",
     ]
 }
 

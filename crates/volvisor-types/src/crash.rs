@@ -87,6 +87,11 @@ pub const STORE_WITNESS_COMMIT: &str = "witness_commit";
 /// See [`STORE_MIGRATION_RECORDS`]: the one grow-notification
 /// state file a daemon's engine owns (P6-B).
 pub const STORE_GROW_NOTIFICATIONS: &str = "grow_notifications";
+/// See [`STORE_MIGRATION_RECORDS`]: the LVM provider's durable
+/// state file — the move records' commit boundaries (P6-C: the
+/// online same-VG move's PREPARING/COPYING/COMPLETE/IN_DOUBT
+/// record saves are armed through this seam).
+pub const STORE_LVM_STATE: &str = "lvm_state";
 
 /// One deterministic kill point inside a durable save (P5 plan
 /// §3.1).

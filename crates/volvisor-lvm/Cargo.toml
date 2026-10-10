@@ -22,6 +22,10 @@ async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+# The move drive's supervision poll sleeps asynchronously (tokio's
+# time): a same-VG move supervises for up to its window, and no
+# executor worker may be pinned for it. Time feature only.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"
