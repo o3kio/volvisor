@@ -149,6 +149,14 @@ pub struct ApiError {
     pub detail: String,
 }
 
+/// The single source of the peer-daemon transport class's detail
+/// prefix: [`ApiError::peer_unreachable`] builds it and
+/// [`ApiError::is_peer_unreachable`] matches it — one definition, so
+/// the constructor and the discriminator cannot drift apart (a drift
+/// would stop the class riding out a peer outage and surface the
+/// error immediately — the fail-safe direction, never a false pass).
+const PEER_UNREACHABLE_PREFIX: &str = "peer daemon unreachable";
+
 impl ApiError {
     /// Build an error with the given code and detail.
     #[must_use]
@@ -187,6 +195,36 @@ impl ApiError {
             ApiErrorCode::IdempotencyConflict,
             format!("operation_id {operation_id} reused with a different request payload"),
         )
+    }
+
+    /// Convenience constructor for the peer-daemon transport class:
+    /// the source daemon's handoff driver cannot reach the
+    /// destination daemon (connect, timeout, torn body). `INTERNAL`
+    /// by design — no state claim is made about the peer — and the
+    /// detail carries the `PEER_UNREACHABLE_PREFIX` stamp so
+    /// [`ApiError::is_peer_unreachable`] (the same source) can tell
+    /// this class apart from every other internal failure: the two
+    /// are one definition, never two string copies that can drift.
+    #[must_use]
+    pub fn peer_unreachable(detail: impl fmt::Display) -> Self {
+        Self::new(
+            ApiErrorCode::Internal,
+            format!("{PEER_UNREACHABLE_PREFIX}: {detail}"),
+        )
+    }
+
+    /// Whether this error is the peer-daemon transport class built by
+    /// [`ApiError::peer_unreachable`] (connect/timeout/torn-body —
+    /// the destination was never asked, so nothing it owns was
+    /// journaled and the act is freely re-drivable). Every other
+    /// `INTERNAL` failure — including the same client's local
+    /// serialization failures — is deliberately **not** this class:
+    /// callers use the discriminator to retry riding out a peer
+    /// outage, and a wrong positive would retry a bug; a wrong
+    /// negative (the fail-safe direction) surfaces immediately.
+    #[must_use]
+    pub fn is_peer_unreachable(&self) -> bool {
+        self.code == ApiErrorCode::Internal && self.detail.starts_with(PEER_UNREACHABLE_PREFIX)
     }
 
     /// HTTP status for this error.
@@ -304,6 +342,38 @@ mod tests {
         assert_eq!(err.code, ApiErrorCode::StaleGeneration);
         assert_eq!(err.http_status(), 409);
         assert!(err.detail.contains("expected generation 3"));
+    }
+
+    #[test]
+    fn the_peer_unreachable_class_round_trips_and_excludes_every_other_internal() {
+        // The transport class: built by the constructor, recognized by
+        // the discriminator — the same source, so the round trip is
+        // total by construction (this pins it).
+        let err = ApiError::peer_unreachable("connect refused (test)");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert_eq!(err.http_status(), 500);
+        assert!(err.is_peer_unreachable(), "the constructor's own class");
+
+        // The exclusions (the fail-safe direction — each of these
+        // must surface immediately, never ride out a retry bound):
+        // any other internal detail, and the same words in a
+        // different code (a typed refusal is never the transport
+        // class, whatever its detail says).
+        let local_bug = ApiError::new(ApiErrorCode::Internal, "peer request serialization failure");
+        assert!(!local_bug.is_peer_unreachable());
+        let elsewhere = ApiError::new(
+            ApiErrorCode::Internal,
+            "the witness reported: peer daemon unreachable downstream",
+        );
+        assert!(
+            !elsewhere.is_peer_unreachable(),
+            "an internal detail merely containing the words is not the class: {elsewhere}"
+        );
+        let typed = ApiError::new(ApiErrorCode::ForeignDeviceState, "peer daemon unreachable");
+        assert!(
+            !typed.is_peer_unreachable(),
+            "a typed refusal is never the transport class: {typed}"
+        );
     }
 
     #[test]

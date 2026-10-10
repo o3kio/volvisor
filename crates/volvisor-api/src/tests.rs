@@ -1802,6 +1802,7 @@ fn migration_summary(state: volvisor_handoff::HandoffState) -> volvisor_handoff:
         }],
         in_doubt_detail: None,
         cut_duration_secs: None,
+        barrier_lineage_refusal: None,
     }
 }
 
@@ -2178,6 +2179,17 @@ impl FakeHandoffSurface {
             .lock()
             .expect("targets")
             .push(volume_id.clone());
+    }
+
+    /// Every replica verification the surface saw, in order (the
+    /// assertion input for the lineage re-verification route).
+    fn target_check_list(&self) -> Vec<String> {
+        self.target_checks
+            .lock()
+            .expect("target checks")
+            .iter()
+            .map(|volume| volume.as_str().to_owned())
+            .collect()
     }
 }
 
@@ -3170,6 +3182,99 @@ async fn peer_prepare_refuses_a_non_empty_destination_vmm() {
     assert_eq!(
         kit.fake_vmm.vm_state("vm-p9").expect("state"),
         volvisor_provider::VmState::Created
+    );
+}
+
+#[tokio::test]
+async fn peer_verify_lineage_re_runs_the_replica_gate_read_only() {
+    // P6-A F1 (the barrier-time lineage re-check): the route re-runs
+    // exactly the replica-level gate prepare ran, over the source's
+    // freshly-read expected set — an observation, never journaled,
+    // mutating nothing (no preparation record, no idempotency
+    // machinery).
+    let kit = setup_peer();
+    let app = app(&kit.state);
+    create_volume(&kit, "vol-vl1").await;
+    create_volume(&kit, "vol-vl2").await;
+    let before = journal_record_count(&kit.state);
+
+    // Misaligned lists are the typed validation refusal.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/verify-lineage",
+            &json!({
+                "migration_id": "mig-vl",
+                "volume_ids": ["vol-vl1", "vol-vl2"],
+                "expected_lineages": [["fake-lineage-vol-vl1"]],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
+
+    // A volume this host holds no replica of is the gate's typed
+    // refusal (first failure refuses the whole set).
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/verify-lineage",
+            &json!({
+                "migration_id": "mig-vl",
+                "volume_ids": ["vol-vl1", "vol-nope"],
+                "expected_lineages": [
+                    ["fake-lineage-vol-vl1"],
+                    ["fake-lineage-vol-nope"],
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+
+    // The honest re-verification passes and echoes the verified set
+    // in preparation order.
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/verify-lineage",
+            &json!({
+                "migration_id": "mig-vl",
+                "volume_ids": ["vol-vl1", "vol-vl2"],
+                "expected_lineages": [
+                    ["fake-lineage-vol-vl1"],
+                    ["fake-lineage-vol-vl2"],
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["migration_id"], json!("mig-vl"));
+    assert_eq!(
+        body["volume_ids"],
+        json!(["vol-vl1", "vol-vl2"]),
+        "the verified set is echoed in preparation order"
+    );
+
+    // The gate really re-ran over the participants (the surface saw
+    // every check, refused ones included) — and the route journaled
+    // nothing (an observation, never a mutation).
+    let checks = kit.handoff.target_check_list();
+    assert_eq!(
+        checks,
+        ["vol-vl1", "vol-nope", "vol-vl1", "vol-vl2"],
+        "each attempt re-runs the gate per participant, first failure refuses"
+    );
+    assert_eq!(
+        journal_record_count(&kit.state),
+        before,
+        "the observation journals nothing"
     );
 }
 

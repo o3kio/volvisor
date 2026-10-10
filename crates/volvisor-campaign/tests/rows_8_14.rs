@@ -836,6 +836,178 @@ async fn row_9_wrong_lineage_data_at_target() {
     assert!(record.is_file(), "the evidence record landed: {record:?}");
 }
 
+// ------------------------------------------------------------- row 9b
+
+/// Row 9b (§9, the P6-A F1 delivery): the same wrong-lineage
+/// injection as row 9, landing AFTER the prepare succeeds —
+/// mid-drive, in the window row 9's one-shot prepare gate cannot
+/// see. Before the barrier-time re-check, that injection was caught
+/// only past the point of no return (the adopt gate at promote, with
+/// the source VM already destroyed) or by the epoch/fencing
+/// disciplines. The re-check (this PR) pulls the refusal back to the
+/// barrier: the cut never crosses foreign data, the record parks
+/// pre-cut carrying the typed marker, and the source stays fenced
+/// and intact — the family's invariants.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_9b_post_prepare_injection_refused_at_the_barrier() {
+    let seq = next_id();
+    let (rig, writer, _transport) = live_scenario(&format!("r9b-{seq}")).await;
+    let mut evidence = Evidence::new("row-9b/post-prepare-lineage-refused-at-barrier");
+    evidence.fault(
+        "wrong_lineage_injection_post_prepare",
+        "inject_foreign_blocks lands on the target AFTER the prepare succeeds (mid-drive): the \
+         same right-epoch, wrong-lineage shape as row 9, one step later in the sequence",
+    );
+
+    // The prepare passes over the clean target — row 9's gate holds
+    // at prepare (the injection has not landed yet).
+    prepare(&rig, "mig-r9b").await;
+
+    // The injection lands mid-drive: after the prepare, before the
+    // barrier. Foreign payload at indexes the writer already
+    // acknowledged, under a freshly minted foreign generation — the
+    // divergence shape row 9 established.
+    let foreign_blocks: &[u64] = &[0, 1, 2, 3];
+    let foreign_generation = u64::MAX;
+    inject_foreign_blocks(&rig.world_b, SEED_MINOR, foreign_blocks, foreign_generation)
+        .expect("the foreign-lineage injection");
+
+    // The transfer spawns the drive; the barrier's lineage re-check
+    // refuses the foreign target before any barrier act.
+    let (status, body) = transfer(&rig, "mig-r9b").await;
+    assert_eq!(status, 202, "the transfer spawns the drive: {body}");
+
+    // The park: the record is QUIESCED (pre-cut, the quiesce ran)
+    // and carries the journaled typed refusal — the drive fails
+    // asynchronously, so the marker is awaited, not assumed.
+    let summary = await_lineage_park(rig.a.addr, "mig-r9b").await;
+    assert_eq!(
+        state_name(&summary),
+        "quiesced",
+        "the record parks pre-cut at the barrier: {summary}"
+    );
+    assert_eq!(
+        summary["barrier_lineage_refusal"]["code"],
+        json!("FOREIGN_DEVICE_STATE"),
+        "the observation carries the typed-refusal marker: {summary}"
+    );
+    assert_eq!(
+        summary["barrier_lineage_refusal"]["historical"],
+        json!(false),
+        "the park renders the refusal as the active condition: {summary}"
+    );
+
+    // The cut never crossed foreign data: no barrier exists at the
+    // witness, the source resource was never demoted, the epoch-1
+    // lease is live at the source (the destination was never granted
+    // — no dual writer), and the destination never promoted.
+    let view = witness_view(&rig.witness, &rig.volume_id()).await;
+    assert!(
+        view.barriers.is_empty(),
+        "no cut ever ran over the foreign target: {:?}",
+        view.barriers
+    );
+    assert_eq!(
+        rig.vmm_a.vm_state(&rig.vm).expect("source VM state"),
+        VmState::Paused,
+        "the source VM is paused at the park (fenced, never destroyed)"
+    );
+    assert_eq!(
+        role_of(&rig.world_a, &rig.resource()),
+        Role::Primary,
+        "the source resource was never demoted"
+    );
+    assert_eq!(
+        role_of(&rig.world_b, &rig.resource()),
+        Role::Secondary,
+        "the destination never promoted over foreign data"
+    );
+    assert_eq!(
+        view.current_epoch.0, 1,
+        "the writer epoch was never retired"
+    );
+    assert_eq!(
+        view.holder.as_ref().map(HostId::as_str),
+        Some(NODE),
+        "the source still holds the lease: {view:?}"
+    );
+    assert_eq!(view.lease_state, LeaseState::Live);
+
+    // The byte-level positive control: the foreign bytes really sit
+    // at the destination (block idx LE + generation LE + 0xC3 fill —
+    // never the writer's tag shape).
+    let mut expect_foreign = [0_u8; BLOCK_SIZE];
+    expect_foreign[0..8].copy_from_slice(&0_u64.to_le_bytes());
+    expect_foreign[8..16].copy_from_slice(&foreign_generation.to_le_bytes());
+    expect_foreign[16..].fill(0xC3);
+    assert_eq!(
+        read_raw(&rig.world_b, SEED_MINOR, 0)
+            .expect("read the destination")
+            .payload,
+        expect_foreign,
+        "the foreign data is present and detectable at the byte level"
+    );
+
+    // The source holds every acknowledged write (the pause fixed the
+    // boundary; nothing was lost).
+    let (acked, boundary) = writer.join().await;
+    let verdict = verify_against(&rig.world_a, SEED_MINOR, &acked, WRITER_ID);
+    assert!(
+        verdict.prefix_intact(),
+        "the source holds every acknowledged write: {verdict:?}"
+    );
+
+    evidence.invariant(
+        "barrier_recheck_refusal",
+        "pass: the barrier-time lineage re-check refused the post-prepare injection typed — \
+         FOREIGN_DEVICE_STATE journaled on the record, the cut never crossed foreign data (no \
+         barrier exists)",
+    );
+    evidence.invariant(
+        "park_for_the_operator",
+        "pass: the record parks pre-cut at QUIESCED carrying the typed marker — the reconcile \
+         re-drives and re-refuses (the same typed outcome every pass), never a silent \
+         auto-rollback into a plain abort",
+    );
+    evidence.invariant(
+        "source_fenced_intact",
+        "pass: the source VM is paused (never destroyed), the resource stays Primary, the \
+         epoch-1 lease is live at the source, the destination never promoted — no dual writer",
+    );
+    evidence.outcome(
+        "refused: FOREIGN_DEVICE_STATE — the barrier-time re-check (P6-A F1) refused the \
+         post-prepare injection; the cut never crossed foreign data and the record parks for \
+         the operator",
+    );
+    let record = emit_oracle(&rig, evidence, &acked, boundary, "source", None);
+    assert!(record.is_file(), "the evidence record landed: {record:?}");
+}
+
+/// Bounded wait for the lineage park: the observation shows QUIESCED
+/// carrying the journaled FOREIGN_DEVICE_STATE marker (the drive
+/// fails asynchronously — the marker is awaited, never assumed).
+async fn await_lineage_park(addr: std::net::SocketAddr, mig: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + POLL_BOUND;
+    loop {
+        let (status, body) = get_migration(addr, mig).await.served("observe migration");
+        assert_eq!(status, 200, "the observation answers: {body}");
+        let summary = body_json(&body);
+        let parked = state_name(&summary) == "quiesced"
+            && summary["barrier_lineage_refusal"]["code"] == json!("FOREIGN_DEVICE_STATE")
+            && summary["barrier_lineage_refusal"]["historical"] == json!(false);
+        if parked {
+            return summary;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "migration {mig} did not park at the lineage refusal within {POLL_BOUND:?}; \
+             last: {body}"
+        );
+        tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
 // ------------------------------------------------------------- row 10
 
 /// Row 10 (§5.3, §9): the forged barrier proofs.

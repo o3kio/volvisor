@@ -84,6 +84,11 @@ struct World {
     dst_vm_paused: bool,
     suspended: BTreeSet<VolumeId>,
     secondary: BTreeSet<VolumeId>,
+    /// The barrier-time lineage re-check's answer: `true` models a
+    /// wrong-lineage injection that landed on the target after the
+    /// prepare (P6-A F1 — the re-check refuses FOREIGN_DEVICE_STATE
+    /// while this stands; clearing it models the operator's re-seed).
+    foreign_target_lineage: bool,
     witness_reachable: bool,
     commit_index: u64,
     volumes: BTreeMap<VolumeId, VolumeState>,
@@ -290,6 +295,23 @@ impl HandoffDriver for FakeDriver {
             .expect("world lock")
             .suspended
             .insert(volume_id.clone());
+        Ok(())
+    }
+
+    async fn verify_target_lineage(&self, record: &MigrationRecord) -> Result<(), ApiError> {
+        self.call(&format!("verify_target_lineage:{}", record.migration_id))?;
+        if self
+            .world
+            .lock()
+            .expect("world lock")
+            .foreign_target_lineage
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                "the live lineage of the target replica does not match the source-supplied \
+                 expected set (injected foreign data)",
+            ));
+        }
         Ok(())
     }
 
@@ -1157,6 +1179,242 @@ async fn resolve_rolls_back_pre_cut_states() {
         assert!(world.suspended.is_empty(), "{act}");
         assert!(!world.vm_paused, "{act}");
     }
+}
+
+#[tokio::test]
+async fn barrier_lineage_recheck_refuses_typed_and_parks_for_the_operator() {
+    // P6-A F1 (the barrier-time lineage re-check, defense in depth):
+    // the prepare passes, a wrong-lineage injection lands on the
+    // target mid-drive, and the barrier refuses typed BEFORE any
+    // barrier act runs — no D2 proof, no witness barrier, no cut.
+    // The refusal is journaled on the record (the same typed outcome
+    // for the observation, the retry pass and a restarted
+    // coordinator); the record parks for the operator instead of
+    // being consumed by the auto-before-cut rollback.
+    let fixture = Fixture::new();
+    let coordinator = fixture.coordinator();
+    let record = coordinator
+        .prepare(prepare_request())
+        .await
+        .expect("the prepare passes over the clean target");
+    // The injection lands AFTER the prepare, mid-drive: the transfer
+    // meets it at the barrier.
+    fixture.world.lock().unwrap().foreign_target_lineage = true;
+    let error = coordinator
+        .transfer(&record.migration_id)
+        .await
+        .expect_err("the barrier re-check refuses the foreign target");
+    assert_eq!(error.code, ApiErrorCode::ForeignDeviceState);
+
+    // The park: pre-cut, no cut, no barrier proof, the typed refusal
+    // journaled (durable — a fresh store load sees it).
+    let parked = coordinator
+        .observe(&migration_id())
+        .expect("observe")
+        .expect("the record exists");
+    assert_eq!(parked.state, HandoffState::Quiesced);
+    assert_eq!(
+        parked.state_history.last().map(|entry| entry.cut),
+        Some(None),
+        "no cut write-ahead exists (the barrier never executed)"
+    );
+    let observed = parked
+        .barrier_lineage_refusal
+        .as_ref()
+        .expect("the typed refusal is journaled on the observation");
+    assert_eq!(observed.refusal.code, "FOREIGN_DEVICE_STATE");
+    assert!(
+        !observed.historical,
+        "the parked record renders the refusal as the active condition"
+    );
+    assert_eq!(stored_refusal(&fixture).code, "FOREIGN_DEVICE_STATE");
+
+    // The gate refused before any barrier act: no D2 proof, no
+    // witness barrier, and the world keeps the fail-closed park —
+    // the VM paused, every source suspended, the source still the
+    // lease holder (no dual writer).
+    {
+        let world = fixture.world.lock().unwrap();
+        assert_eq!(world.count("verify_target_lineage:mig-1"), 1);
+        assert_eq!(world.count("track_sync:vol-a"), 0, "no D2 proof ran");
+        assert_eq!(
+            world.count("record_barrier:vol-a"),
+            0,
+            "no barrier was recorded"
+        );
+        assert!(
+            world.vm_paused,
+            "the VM stays paused (fenced, never resumed)"
+        );
+        assert_eq!(world.suspended.len(), VOLS.len());
+        for state in world.volumes.values() {
+            assert_eq!(state.barriers, [], "no barrier was recorded at the witness");
+            assert_eq!(state.lease, LeaseStateKind::Live);
+            assert_eq!(state.holder.as_ref().map(HostId::as_str), Some(SOURCE));
+        }
+    }
+
+    // The retry pass sees the SAME typed outcome: the reconcile
+    // re-drives the parked record (never rolls it back) and the
+    // re-check re-refuses.
+    let retried = coordinator
+        .resolve(&migration_id())
+        .await
+        .expect_err("the retry pass re-refuses the foreign target");
+    assert_eq!(retried.code, ApiErrorCode::ForeignDeviceState);
+    let still_parked = coordinator
+        .observe(&migration_id())
+        .expect("observe")
+        .expect("the record exists");
+    assert_eq!(still_parked.state, HandoffState::Quiesced);
+    assert!(still_parked.barrier_lineage_refusal.is_some());
+    {
+        let world = fixture.world.lock().unwrap();
+        assert!(world.vm_paused, "the park is stable across the retry pass");
+        assert_eq!(world.suspended.len(), VOLS.len());
+        assert_eq!(world.count("discard_target:mig-1"), 0, "no rollback ran");
+    }
+
+    // The restart reconcile keeps the refusal: a fresh coordinator
+    // over the same durable store and world re-refuses identically.
+    drop(coordinator);
+    let restarted = fixture.coordinator();
+    let error = restarted
+        .resolve(&migration_id())
+        .await
+        .expect_err("the restarted reconcile re-refuses");
+    assert_eq!(error.code, ApiErrorCode::ForeignDeviceState);
+    assert_eq!(
+        restarted
+            .observe(&migration_id())
+            .expect("observe")
+            .expect("the record exists")
+            .state,
+        HandoffState::Quiesced
+    );
+
+    // The recovery: the operator re-seeds the target (the injection
+    // is cleared) — the next pass converges and the marker is
+    // discharged.
+    fixture.world.lock().unwrap().foreign_target_lineage = false;
+    let converged = restarted
+        .resolve(&migration_id())
+        .await
+        .expect("the re-seeded target converges");
+    assert_eq!(converged.state, HandoffState::Complete);
+    assert_eq!(converged.barrier_lineage_refusal, None);
+    assert_eq!(history_pairs(&converged), expected_happy_history());
+}
+
+#[tokio::test]
+async fn a_transient_recheck_failure_keeps_the_established_rollback_semantics() {
+    // The journaling rule is narrow: only the typed lineage refusal
+    // (FOREIGN_DEVICE_STATE) parks the record. A transient failure at
+    // the re-check (here: an injected INTERNAL) is an ordinary drive
+    // failure — the record parks without a marker and the reconcile
+    // applies the AutoBeforeCut rollback exactly as before.
+    let fixture = Fixture::new();
+    let error = fixture
+        .drive_until_failure("verify_target_lineage:mig-1")
+        .await;
+    assert_eq!(error.code, ApiErrorCode::Internal);
+    let parked = fixture.stored_record();
+    assert_eq!(parked.state, HandoffState::Quiesced);
+    assert_eq!(
+        parked.barrier_lineage_refusal, None,
+        "a transient failure journals no lineage marker"
+    );
+
+    let coordinator = fixture.coordinator();
+    let resolved = coordinator.resolve(&migration_id()).await.expect("resolve");
+    assert!(
+        matches!(resolved.state, HandoffState::Aborted { .. }),
+        "the pre-cut record rolls back (the established semantics)"
+    );
+    let world = fixture.world.lock().unwrap();
+    assert!(world.suspended.is_empty());
+    assert!(!world.vm_paused);
+}
+
+#[tokio::test]
+async fn abort_from_the_lineage_park_retains_the_refusal() {
+    // The marker's other exit: the operator's abort. The G5 rollback
+    // runs from the parked state (void confirms, sources unsuspend,
+    // the VM resumes, the target is discarded) and the Aborted record
+    // keeps the journaled typed refusal of record.
+    let fixture = Fixture::new();
+    let coordinator = fixture.coordinator();
+    let record = coordinator
+        .prepare(prepare_request())
+        .await
+        .expect("prepare");
+    fixture.world.lock().unwrap().foreign_target_lineage = true;
+    let error = coordinator
+        .transfer(&record.migration_id)
+        .await
+        .expect_err("the barrier re-check refuses");
+    assert_eq!(error.code, ApiErrorCode::ForeignDeviceState);
+
+    let aborted = coordinator
+        .abort(&migration_id())
+        .await
+        .expect("the operator aborts the parked record");
+    assert!(matches!(aborted.state, HandoffState::Aborted { .. }));
+    assert_eq!(
+        aborted
+            .barrier_lineage_refusal
+            .as_ref()
+            .map(|r| r.code.as_str()),
+        Some("FOREIGN_DEVICE_STATE")
+    );
+    // F4: the observation layer says what the retained marker now is
+    // — history. The journal byte is unchanged (the record's marker
+    // above is verbatim); only the rendering moved, so the terminal
+    // record never reads as if it were still parked on the refusal.
+    assert_eq!(
+        coordinator
+            .observe(&migration_id())
+            .expect("observe")
+            .expect("the aborted record exists")
+            .barrier_lineage_refusal
+            .as_ref()
+            .map(|r| (r.refusal.code.as_str(), r.historical)),
+        Some(("FOREIGN_DEVICE_STATE", true)),
+        "the aborted observation renders the refusal historical — refused \
+         at the barrier before the operator abort"
+    );
+    {
+        let world = fixture.world.lock().unwrap();
+        assert!(
+            world.suspended.is_empty(),
+            "the abort tail unsuspended the source"
+        );
+        assert!(!world.vm_paused, "the abort tail resumed the VM");
+        assert!(world.vm_present);
+        assert_eq!(world.count("discard_target:mig-1"), 1);
+    }
+
+    // Terminal: a re-transfer of the aborted record refuses typed
+    // (the refusal is the abort's, never a silent re-drive).
+    let error = coordinator
+        .transfer(&migration_id())
+        .await
+        .expect_err("an aborted migration never re-drives");
+    assert_eq!(error.code, ApiErrorCode::InvalidState);
+    assert_eq!(
+        stored_refusal(&fixture).code,
+        "FOREIGN_DEVICE_STATE",
+        "the durable record keeps the refusal"
+    );
+}
+
+/// The durable record's journaled lineage refusal, loaded fresh from
+/// the store (the restart's view, not the live coordinator's).
+fn stored_refusal(fixture: &Fixture) -> volvisor_handoff::TypedRefusal {
+    fixture
+        .stored_record()
+        .barrier_lineage_refusal
+        .expect("the refusal is durable")
 }
 
 #[tokio::test]

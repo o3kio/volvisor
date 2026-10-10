@@ -99,6 +99,10 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
         // `peer::RequirePeer`). A daemon without the peer context
         // serves the typed 404 on every route.
         .route("/v2/internal/peer/prepare", post(peer::prepare))
+        .route(
+            "/v2/internal/peer/verify-lineage",
+            post(peer::verify_lineage),
+        )
         .route("/v2/internal/peer/grant", post(peer::grant))
         .route("/v2/internal/peer/restore-vm", post(peer::restore_vm))
         .route("/v2/internal/peer/discard", post(peer::discard))

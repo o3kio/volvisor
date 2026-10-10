@@ -33,6 +33,7 @@
 //! | `replica_caught_up` | `HandoffSurface::replica_caught_up`, the same bounded retry — the pre-quiesce `PRECOPY` convergence observation (no proof minted; the D2 proof stays `track_sync`'s) |
 //! | `pause_vm` / `snapshot_vm` / `destroy_vm` | local `VmmController` (verified adapter) |
 //! | `quiesce_source` | `HandoffSurface::quiesce_for_barrier` |
+//! | `verify_target_lineage` | peer `verify-lineage` over this host's freshly-read `HandoffSurface::source_lineage` set — the barrier-time lineage re-check (P6-A F1, defense in depth; read-only, never journaled on either side) |
 //! | `track_sync` | `HandoffSurface::track_sync`, bounded retry over the retryable `REPLICA_NOT_DURABLE` refusal |
 //! | `record_barrier` | witness `RecordBarrier` (the coordinator's deterministic op id, the inspected current epoch, the all-true attestation of the already-proven pause/suspension/sync chain) |
 //! | `void_barriers` | per **participant**: witness log → void every unvoided barrier of this migration under the deterministic `void-barrier` op id → **re-inspect confirm** (a recorded proof the witness cannot present refuses typed; a proof-less participant with no barrier is the crash window's nothing-to-void) |
@@ -54,6 +55,29 @@
 //! peer calls; the only witness mutations the source issues are
 //! `RecordBarrier`, `VoidBarrier` and `RevokeSet` — each
 //! holder-asserting **this** host.
+//!
+//! ### The barrier-time lineage re-check (P6-A F1)
+//!
+//! The lineage gate is defense in depth, and the module is explicit
+//! about what it is NOT: the **primary** protection for a foreign
+//! replica that diverges after the prepare remains the
+//! epoch/fencing discipline (the witness's lease epochs, the cut
+//! marker, the demote/revoke chain) plus the adopt-time lineage
+//! comparison that refuses `FOREIGN_DEVICE_STATE` at promote. Those
+//! disciplines own everything past the barrier. What they cannot do
+//! is keep the refusal **cheap**: a lineage-shaped divergence caught
+//! only at promote is caught past the point of no return (the source
+//! VM destroyed, the record forward-only), where recovery is an
+//! operator exercise. The barrier re-check closes exactly the
+//! post-prepare window for lineage-shaped divergence: it re-runs the
+//! prepare-time predicate (`verify_target_replica` over the source's
+//! freshly-read live set) immediately before the barrier acts, so a
+//! wrong-lineage injection landing mid-drive refuses typed while the
+//! pre-cut rollback is still available — no cut over foreign data,
+//! no dual writer, the source suspended and intact. The cost is the
+//! I/O class the drive already touches (the source's local lineage
+//! observation, the destination's replica-status reads, one peer
+//! round trip); the re-check adds no authority claim of its own.
 //!
 //! ### `witness_reachable`
 //!
@@ -124,7 +148,7 @@ use serde::de::DeserializeOwned;
 use volvisor_api::peer::{
     PeerDiscardRequest, PeerDiscardResponse, PeerGrantOutcome, PeerGrantRequest, PeerGrantResponse,
     PeerPrepareRequest, PeerPrepareResponse, PeerRestoreVmRequest, PeerRestoreVmResponse,
-    PeerRouteContext, TargetPreparationStore,
+    PeerRouteContext, PeerVerifyLineageRequest, PeerVerifyLineageResponse, TargetPreparationStore,
 };
 use volvisor_handoff::{
     BarrierProof, Clock, HandoffDriver, MigrationCoordinator, MigrationRecord, MigrationStore,
@@ -162,6 +186,21 @@ const WITNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// waits, never assumes).
 const TRACK_SYNC_BOUND: Duration = Duration::from_secs(60);
 
+/// The barrier-time lineage re-check's bounded wait over an
+/// unreachable peer daemon: a transient destination bounce at the
+/// barrier must not abort the migration (the pre-re-check behavior —
+/// the cut proceeded and only the grant needed the peer), so the
+/// re-check rides the outage out inside this bound exactly as
+/// `track_sync` rides out a lagging replica. A sustained outage
+/// (beyond the bound) surfaces the transport refusal typed and the
+/// record parks pre-cut — the established AutoBeforeCut semantics
+/// own it from there.
+const PEER_RECHECK_BOUND: Duration = Duration::from_secs(30);
+
+/// The delay between two re-check attempts while the peer is
+/// unreachable.
+const PEER_RECHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// The delay between two `track_sync` observations inside the bound.
 const TRACK_SYNC_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -192,6 +231,20 @@ pub trait PeerClient: Send + Sync {
     /// an unusable snapshot dir, a conflicting preparation), or
     /// `INTERNAL` when the peer daemon cannot be reached.
     async fn prepare(&self, request: PeerPrepareRequest) -> Result<PeerPrepareResponse, ApiError>;
+
+    /// The destination's barrier-time lineage re-verification (P6-A
+    /// F1, defense in depth): re-run the replica-level gate over the
+    /// source's freshly-read live lineage set. Read-only on the
+    /// destination (never journaled there — an observation).
+    ///
+    /// # Errors
+    /// The peer's typed refusal (a target whose live lineage no
+    /// longer matches the expected set refuses `FOREIGN_DEVICE_STATE`),
+    /// or `INTERNAL` when the peer daemon cannot be reached.
+    async fn verify_lineage(
+        &self,
+        request: PeerVerifyLineageRequest,
+    ) -> Result<PeerVerifyLineageResponse, ApiError>;
 
     /// The destination's `GrantSet` + promote-under-granted-lease act
     /// (W8: the witness mutation is the peer's own, never the
@@ -262,12 +315,7 @@ impl HttpPeerClient {
         path: &str,
         body: &(impl Serialize + Sync),
     ) -> Result<T, ApiError> {
-        let unreachable = |detail: String| {
-            ApiError::new(
-                ApiErrorCode::Internal,
-                format!("peer daemon unreachable: {detail}"),
-            )
-        };
+        let unreachable = |detail: String| ApiError::peer_unreachable(detail);
         let uri = format!("{}{path}", self.base_url)
             .parse::<Uri>()
             .map_err(|err| unreachable(format!("invalid peer base URL: {err}")))?;
@@ -328,6 +376,14 @@ impl HttpPeerClient {
 impl PeerClient for HttpPeerClient {
     async fn prepare(&self, request: PeerPrepareRequest) -> Result<PeerPrepareResponse, ApiError> {
         self.request(Method::POST, "/v2/internal/peer/prepare", &request)
+            .await
+    }
+
+    async fn verify_lineage(
+        &self,
+        request: PeerVerifyLineageRequest,
+    ) -> Result<PeerVerifyLineageResponse, ApiError> {
+        self.request(Method::POST, "/v2/internal/peer/verify-lineage", &request)
             .await
     }
 
@@ -492,6 +548,15 @@ pub struct DaemonHandoffDriver {
     /// The delay between two `track_sync` observations (tests tighten
     /// it).
     track_sync_retry_delay: Duration,
+    /// The barrier-time lineage re-check's bounded wait over an
+    /// unreachable peer daemon (tests tighten it): a transient
+    /// destination bounce at the barrier must not abort the
+    /// migration — the drive rides it out inside this bound, exactly
+    /// as `track_sync` rides out a lagging replica.
+    peer_recheck_bound: Duration,
+    /// The delay between two re-check attempts while the peer is
+    /// unreachable (tests tighten it).
+    peer_recheck_retry_delay: Duration,
 }
 
 impl DaemonHandoffDriver {
@@ -516,6 +581,8 @@ impl DaemonHandoffDriver {
             snapshot_root: snapshot_root.into(),
             track_sync_bound: TRACK_SYNC_BOUND,
             track_sync_retry_delay: TRACK_SYNC_RETRY_DELAY,
+            peer_recheck_bound: PEER_RECHECK_BOUND,
+            peer_recheck_retry_delay: PEER_RECHECK_RETRY_DELAY,
         }
     }
 
@@ -525,6 +592,16 @@ impl DaemonHandoffDriver {
     pub fn with_track_sync_bounds(mut self, bound: Duration, retry_delay: Duration) -> Self {
         self.track_sync_bound = bound;
         self.track_sync_retry_delay = retry_delay;
+        self
+    }
+
+    /// Tighten the lineage re-check's bounded wait over an
+    /// unreachable peer (tests only: the production bound would make
+    /// an expiry test slow, not more honest).
+    #[must_use]
+    pub fn with_peer_recheck_bound(mut self, bound: Duration, retry_delay: Duration) -> Self {
+        self.peer_recheck_bound = bound;
+        self.peer_recheck_retry_delay = retry_delay;
         self
     }
 
@@ -662,6 +739,85 @@ impl HandoffDriver for DaemonHandoffDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn verify_target_lineage(&self, record: &MigrationRecord) -> Result<(), ApiError> {
+        // The barrier-time re-check (P6-A F1, defense in depth): the
+        // same reads prepare_target made, taken fresh — the source's
+        // live lineage per participant from this host's own device
+        // (never the record's memory of it), then one peer round
+        // trip that re-runs the destination's replica-level gate.
+        // No new I/O class; the refusal is the peer's typed
+        // FOREIGN_DEVICE_STATE exactly as at prepare.
+        let mut expected_lineages = Vec::with_capacity(record.participants.len());
+        for participant in &record.participants {
+            let lineage = self.handoff.source_lineage(&participant.volume_id).await?;
+            expected_lineages.push(lineage);
+        }
+        let volume_ids: Vec<_> = record
+            .participants
+            .iter()
+            .map(|p| p.volume_id.clone())
+            .collect();
+        // A transient peer outage at the barrier rides out inside the
+        // driver-owned bound (the `track_sync` discipline): the
+        // re-check must not abort a migration whose destination is
+        // bouncing — the cut proceeds once the peer answers. Only
+        // the transport class ([`ApiError::is_peer_unreachable`],
+        // the same centralized source that builds the error) is
+        // retryable: a typed peer refusal — the
+        // FOREIGN_DEVICE_STATE gate above all — surfaces
+        // immediately, never retried into a pass.
+        let deadline = std::time::Instant::now() + self.peer_recheck_bound;
+        loop {
+            match self
+                .peer
+                .verify_lineage(PeerVerifyLineageRequest {
+                    migration_id: record.migration_id.clone(),
+                    volume_ids: volume_ids.clone(),
+                    expected_lineages: expected_lineages.clone(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    // The destination must have re-verified exactly
+                    // the participant set this record carries — same
+                    // order, never a subset or a reordering (the
+                    // barrier gate covers the whole migration or
+                    // refuses).
+                    let verified: Vec<&VolumeId> = response.volume_ids.iter().collect();
+                    let expected: Vec<&VolumeId> =
+                        record.participants.iter().map(|p| &p.volume_id).collect();
+                    if verified != expected {
+                        return Err(ApiError::new(
+                            ApiErrorCode::Internal,
+                            format!(
+                                "the peer re-verified a different participant set for \
+                                 migration {} (response {:?}, record {:?})",
+                                record.migration_id, verified, expected
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.is_peer_unreachable() => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ApiError::new(
+                            ApiErrorCode::Internal,
+                            format!(
+                                "the peer daemon did not answer the barrier lineage \
+                                 re-check of migration {} within {} s (last refusal: \
+                                 {error}); the record parks pre-cut",
+                                record.migration_id,
+                                self.peer_recheck_bound.as_secs()
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(self.peer_recheck_retry_delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn discard_target(&self, record: &MigrationRecord) -> Result<(), ApiError> {
@@ -1707,6 +1863,7 @@ mod tests {
             updated_at: 0,
             cut_started_at: None,
             cut_completed_at: None,
+            barrier_lineage_refusal: None,
         }
     }
 
@@ -1911,7 +2068,16 @@ mod tests {
         }
 
         async fn track_sync(&self, volume_id: &VolumeId) -> Result<SyncProof, ApiError> {
-            let lag = self.track_sync_lag.fetch_sub(1, Ordering::SeqCst);
+            // The lag knob counts down to convergence and then stays
+            // there: a wrapping `fetch_sub` used to turn the first
+            // converged call into a `u64::MAX` lag for the next one
+            // (surfaced by the first full-drive wiring test over
+            // this fake — `replica_caught_up` consumes the zero, the
+            // barrier's D2 proof then always refused).
+            let lag = self.track_sync_lag.load(Ordering::SeqCst);
+            if lag > 0 {
+                self.track_sync_lag.store(lag - 1, Ordering::SeqCst);
+            }
             if self.track_sync_stuck.load(Ordering::SeqCst) || lag > 0 {
                 return Err(ApiError::new(
                     ApiErrorCode::ReplicaNotDurable,
@@ -2012,6 +2178,12 @@ mod tests {
         /// The observed `restore-vm` requests (disks, resume flag,
         /// snapshot dir), in order.
         restores: Mutex<Vec<(Vec<DiskMapping>, bool, String)>>,
+        /// Queued `verify-lineage` refusals, served first-failure
+        /// first (the transport-retry tests' outage script).
+        verify_refusals: Mutex<Vec<ApiError>>,
+        /// Queued grant refusals, served first-failure first (the
+        /// transport-outage-at-the-grant test's script).
+        grant_refusals: Mutex<Vec<ApiError>>,
     }
 
     impl StubPeer {
@@ -2022,6 +2194,8 @@ mod tests {
                 restore_state: Mutex::new(VmState::Running),
                 calls: Mutex::new(Vec::new()),
                 restores: Mutex::new(Vec::new()),
+                verify_refusals: Mutex::new(Vec::new()),
+                grant_refusals: Mutex::new(Vec::new()),
             }
         }
 
@@ -2068,11 +2242,32 @@ mod tests {
             })
         }
 
+        async fn verify_lineage(
+            &self,
+            request: volvisor_api::peer::PeerVerifyLineageRequest,
+        ) -> Result<volvisor_api::peer::PeerVerifyLineageResponse, ApiError> {
+            self.record("verify_lineage");
+            if let Some(error) = self.verify_refusals.lock().expect("verify refusals").pop() {
+                return Err(error);
+            }
+            // The happy answer: the destination re-verified exactly
+            // the requested set (the driver's set assertion is the
+            // behavior under test elsewhere; the wiring tests pin the
+            // call and the mapping).
+            Ok(volvisor_api::peer::PeerVerifyLineageResponse {
+                migration_id: request.migration_id,
+                volume_ids: request.volume_ids,
+            })
+        }
+
         async fn grant(
             &self,
             request: volvisor_api::peer::PeerGrantRequest,
         ) -> Result<volvisor_api::peer::PeerGrantResponse, ApiError> {
             self.record("grant");
+            if let Some(error) = self.grant_refusals.lock().expect("grant refusals").pop() {
+                return Err(error);
+            }
             Ok(volvisor_api::peer::PeerGrantResponse {
                 migration_id: request.migration_id,
                 grants: self.grants.clone(),
@@ -2138,7 +2333,8 @@ mod tests {
                 peer.clone(),
                 snapshot_dir.path().to_owned(),
             )
-            .with_track_sync_bounds(Duration::from_secs(1), Duration::from_millis(10)),
+            .with_track_sync_bounds(Duration::from_secs(1), Duration::from_millis(10))
+            .with_peer_recheck_bound(Duration::from_secs(1), Duration::from_millis(5)),
         );
         DriverKit {
             witness,
@@ -2257,6 +2453,295 @@ mod tests {
             "no live lease: {view:?}"
         );
         assert_eq!(view.holder, None, "no holder was granted: {view:?}");
+    }
+
+    #[tokio::test]
+    async fn the_lineage_recheck_rides_out_a_transient_peer_outage() {
+        // P6-A F1: the barrier's lineage re-check retries the
+        // transport class inside the driver-owned bound — a
+        // transient destination bounce at the barrier must not abort
+        // the migration (the pre-re-check behavior: the cut proceeded
+        // and only the grant needed the peer).
+        let kit = driver_kit().await;
+        let record = record_for("mig-recheck", vec![participant("vol-recheck", 1, 100)]);
+        // Two transport refusals, then the peer answers.
+        for _ in 0..2 {
+            kit.peer
+                .verify_refusals
+                .lock()
+                .expect("verify refusals")
+                .push(ApiError::peer_unreachable("transport failure (scripted)"));
+        }
+        kit.driver
+            .verify_target_lineage(&record)
+            .await
+            .expect("the ride-out completes once the peer answers");
+        assert_eq!(
+            kit.peer
+                .calls()
+                .iter()
+                .filter(|call| **call == "verify_lineage")
+                .count(),
+            3,
+            "the driver retried the transport refusal inside the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lineage_recheck_surfaces_a_sustained_outage_typed() {
+        // The bound's expiry is the drive's typed error (the record
+        // parks pre-cut; the established AutoBeforeCut semantics own
+        // it from there) — never an unbounded spin, never a silent
+        // skip of the gate.
+        let kit = driver_kit().await;
+        let tight = Arc::new(
+            DaemonHandoffDriver::new(
+                host(NODE),
+                Arc::new(client_for(&kit.witness.server, Some(NODE_TOKEN))),
+                kit.witness.server.addr,
+                Arc::clone(&kit.vmm) as Arc<dyn VmmController>,
+                Arc::clone(&kit.surface) as Arc<dyn HandoffSurface>,
+                Arc::clone(&kit.peer) as Arc<dyn PeerClient>,
+                kit.snapshot_dir.path().to_owned(),
+            )
+            .with_peer_recheck_bound(Duration::from_millis(80), Duration::from_millis(10)),
+        );
+        let record = record_for("mig-recheck2", vec![participant("vol-recheck2", 1, 100)]);
+        // The outage outlasts the bound.
+        for _ in 0..32 {
+            kit.peer
+                .verify_refusals
+                .lock()
+                .expect("verify refusals")
+                .push(ApiError::peer_unreachable("transport failure (scripted)"));
+        }
+        let error = tight
+            .verify_target_lineage(&record)
+            .await
+            .expect_err("the sustained outage surfaces typed");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error
+                .detail
+                .contains("did not answer the barrier lineage re-check"),
+            "the error names the gate and the park: {error}"
+        );
+        assert!(
+            error.detail.contains("the record parks pre-cut"),
+            "the error states the fail-closed direction: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lineage_recheck_never_retries_a_typed_peer_refusal() {
+        // Only the transport class is retryable: the gate's own typed
+        // refusal (FOREIGN_DEVICE_STATE) surfaces immediately — a
+        // safety refusal is never retried into a pass.
+        let kit = driver_kit().await;
+        let record = record_for("mig-recheck3", vec![participant("vol-recheck3", 1, 100)]);
+        kit.peer
+            .verify_refusals
+            .lock()
+            .expect("verify refusals")
+            .push(ApiError::new(
+                ApiErrorCode::ForeignDeviceState,
+                "the live lineage of the target replica does not match (scripted)",
+            ));
+        let error = kit
+            .driver
+            .verify_target_lineage(&record)
+            .await
+            .expect_err("the typed refusal surfaces");
+        assert_eq!(error.code, ApiErrorCode::ForeignDeviceState);
+        assert_eq!(
+            kit.peer
+                .calls()
+                .iter()
+                .filter(|call| **call == "verify_lineage")
+                .count(),
+            1,
+            "a typed refusal is asked exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lineage_recheck_does_not_ride_out_a_non_transport_internal_error() {
+        // The ride-out's discriminator is the typed transport class
+        // alone (`ApiError::is_peer_unreachable`): every other
+        // INTERNAL failure — here an unrelated scripted one — is
+        // asked exactly once and surfaces immediately. This is the
+        // fail-safe direction of the discriminator: a class that
+        // drifted narrow (or a failure misfiled into it) stops
+        // riding and errors the drive pre-cut, where the established
+        // rollback semantics own the record — never a false pass,
+        // never an unbounded spin over a bug.
+        let kit = driver_kit().await;
+        let record = record_for("mig-recheck4", vec![participant("vol-recheck4", 1, 100)]);
+        kit.peer
+            .verify_refusals
+            .lock()
+            .expect("verify refusals")
+            .push(ApiError::new(
+                ApiErrorCode::Internal,
+                "an unrelated internal failure (scripted)",
+            ));
+        let error = kit
+            .driver
+            .verify_target_lineage(&record)
+            .await
+            .expect_err("the non-transport internal surfaces");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            !error.is_peer_unreachable(),
+            "the surfaced error is not the transport class: {error}"
+        );
+        assert_eq!(
+            kit.peer
+                .calls()
+                .iter()
+                .filter(|call| **call == "verify_lineage")
+                .count(),
+            1,
+            "a non-transport internal is asked exactly once — no ride-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_outage_at_the_grant_parks_in_doubt_and_the_re_drive_is_clean() {
+        // PR #22 review F1 — the property row 18c's relocation lost,
+        // pinned at the coordinator/driver seam: the destination is
+        // FULLY DEAD when the cut reaches the grant. A pure transport
+        // failure — the request never lands, so nothing is journaled
+        // by the peer — parks the record at SOURCE_REVOKED, observed
+        // IN_DOUBT ("source revoked; destination grant not yet
+        // authorized"), and the re-drive, once the peer answers,
+        // completes: the destination journaled no failure outcome, so
+        // nothing is replayed at the re-drive — its grant is a fresh
+        // ask. (The `grant_set` wedge — a peer dead mid-journal-op —
+        // is the other class, the kill matrix's peer-grant cells.)
+        //
+        // The real `DaemonHandoffDriver` over the loopback witness,
+        // the fake VMM and surface, and a scripted peer: the full
+        // production drive path, not a full e2e.
+        let witness = witness_kit().await;
+        let snapshot_dir = tempfile::tempdir().expect("snapshot dir");
+        let dirs = tempfile::tempdir().expect("store dir");
+        let vol = volume("vol-tg");
+        let vmm = Arc::new(FakeVmm::new(snapshot_dir.path()));
+        vmm.create("vm-tg", &["/dev/drbd100"])
+            .expect("the source VM exists");
+        // The consumer's act (volvisor never launches VMMs, plan §1):
+        // a running source, as the cut's pause expects to find.
+        vmm.start("vm-tg").expect("the source VM runs");
+        let surface: Arc<dyn HandoffSurface> = Arc::new(FakeSurface::new());
+        let stub = Arc::new(StubPeer::new(vec![grant_outcome(
+            "vol-tg",
+            "/dev/drbd-by-target",
+        )]));
+        *stub.prepare_participants.lock().expect("participants") =
+            vec![participant("vol-tg", 1, 100)];
+        // The destination dies for exactly the grant: one
+        // transport-class failure, served once. The stub owns no
+        // journal — a pure transport outage never reaches one, which
+        // is precisely the property under test.
+        stub.grant_refusals
+            .lock()
+            .expect("grant refusals")
+            .push(ApiError::peer_unreachable("transport failure (scripted)"));
+        let peer: Arc<dyn PeerClient> = stub.clone();
+        let facts: ParticipantFacts =
+            Arc::new(|_volume, _vm, _generation| Ok(("drbd-res".to_owned(), 100_u32)));
+        // The volume is registered and the source holds the epoch-1
+        // lease: the cut's barrier and revoke are real witness acts.
+        register_volume(&witness, &vol).await;
+        grant_to_node(&witness, &vol).await;
+        let (handle, _peer_ctx) = wire_migration(
+            host(NODE),
+            Arc::new(client_for(&witness.server, Some(NODE_TOKEN))),
+            witness.server.addr,
+            vmm.clone(),
+            surface,
+            Arc::new(FakeProvider::new()),
+            peer,
+            facts,
+            snapshot_dir.path().to_owned(),
+            dirs.path().join("migrations"),
+            dirs.path().join("peer-preparations"),
+            Arc::new(|| 0_u64),
+        )
+        .expect("wiring");
+
+        let mig = migration("mig-tg");
+        handle
+            .coordinator()
+            .prepare(PrepareHandoffRequest {
+                migration_id: mig.clone(),
+                vm_id: "vm-tg".to_owned(),
+                source_host: host(NODE),
+                target_host: host(PEER),
+                participants: vec![participant("vol-tg", 1, 100)],
+            })
+            .await
+            .expect("prepare");
+
+        // The cut runs through the barrier, the snapshot, the destroy
+        // and the revoke — then the dead destination surfaces the
+        // transport class and the drive parks.
+        let error = handle
+            .coordinator()
+            .transfer(&mig)
+            .await
+            .expect_err("the grant outage parks the drive");
+        assert!(
+            error.is_peer_unreachable(),
+            "the surfaced error is the transport class: {error}"
+        );
+
+        // The D3 window, observed: the revoke landed, the grant has
+        // not — IN_DOUBT, never a progress-like clean state (G1).
+        let parked = handle
+            .coordinator()
+            .observe(&mig)
+            .expect("observe")
+            .expect("the parked record exists");
+        assert!(matches!(parked.state, HandoffState::InDoubt { .. }));
+        assert_eq!(
+            parked.in_doubt_detail.as_deref(),
+            Some("source revoked; destination grant not yet authorized"),
+            "the park is the source-revoked window: {parked:?}"
+        );
+        assert_eq!(
+            stub.calls().iter().filter(|call| **call == "grant").count(),
+            1,
+            "the dead destination was asked exactly once"
+        );
+
+        // The destination returns (the scripted outage is spent) and
+        // the re-drive completes through the production drive path:
+        // the grant is re-asked fresh — no journaled failure outcome
+        // is replayed at it, because none was ever journaled — the
+        // VM is restored at the destination, and the source's copy is
+        // gone (the destroy held).
+        let resolved = handle
+            .coordinator()
+            .resolve(&mig)
+            .await
+            .expect("the re-drive completes");
+        assert_eq!(resolved.state, HandoffState::Complete);
+        assert!(
+            stub.calls().iter().filter(|call| **call == "grant").count() >= 2,
+            "the re-drive re-asked the grant — a fresh ask, nothing replayed"
+        );
+        assert_eq!(
+            stub.restores.lock().expect("restores").len(),
+            1,
+            "the destination restored the VM"
+        );
+        assert_eq!(
+            vmm.vm_state("vm-tg").expect("the source VMM answers"),
+            VmState::Absent,
+            "the source's VM copy was destroyed by the cut"
+        );
     }
 
     #[tokio::test]
