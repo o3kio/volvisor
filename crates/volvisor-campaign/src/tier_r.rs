@@ -22,7 +22,7 @@
 //! Production support is claimed NOWHERE (§0); the Tier R records
 //! are the open hardware gate any future claim must close.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::evidence::Evidence;
@@ -236,11 +236,18 @@ pub fn detect_real_host() -> Result<RealHost, String> {
 /// [`drive_with`] — both panics are the loud gate, never a silent
 /// pass).
 pub fn drive(scenario: &Scenario) -> PathBuf {
-    drive_with(scenario, env_gate(), detect_real_host())
+    let out_dir = crate::evidence::run_dir();
+    let path = drive_with(scenario, env_gate(), detect_real_host(), &out_dir);
+    // The live path refreshes the run's `REPORT.md` like any
+    // finish (§6) — the staging path does not (a staging directory
+    // is not a run directory). In the claimed arms this line is
+    // unreachable: the loud refusal above IS the gate.
+    crate::evidence::render_report(&out_dir);
+    path
 }
 
-/// The scaffold's drive over an explicit gate and detection result
-/// (the testable core of [`drive`]):
+/// The scaffold's drive over an explicit gate, detection result and
+/// output directory (the testable core of [`drive`]):
 ///
 /// - `Skipped` → the skip record (§6's canonical shape, plus the
 ///   documented body — the record is the gate statement).
@@ -251,14 +258,26 @@ pub fn drive(scenario: &Scenario) -> PathBuf {
 ///   recorded follow-up), then panic: passing would fabricate a
 ///   real-host capability (§0).
 ///
+/// `out_dir` is the write target: [`drive`] passes the LIVE run
+/// directory (§6's shippable tree); the unit tests pass a STAGING
+/// directory — a constructed-host record must never reach the live
+/// tree (round-1 review, MAJOR-1; the live seam guards against it
+/// in [`Evidence::finish_tier_r`], and the staging seam
+/// [`Evidence::finish_tier_r_at`] skips the report refresh).
+///
 /// # Panics
 ///
 /// In both `Claimed` arms, with the exact reason — the loud gate.
-pub fn drive_with(scenario: &Scenario, gate: Gate, host: Result<RealHost, String>) -> PathBuf {
+pub fn drive_with(
+    scenario: &Scenario,
+    gate: Gate,
+    host: Result<RealHost, String>,
+    out_dir: &Path,
+) -> PathBuf {
     match gate {
         Gate::Skipped => {
             let evidence = Evidence::new_tier_r(&format!("tier-r/{}", scenario.name));
-            evidence.finish_tier_r("skipped", scenario.skip_reason, scenario.body)
+            evidence.finish_tier_r_at(out_dir, "skipped", scenario.skip_reason, scenario.body)
         }
         Gate::Claimed => match host {
             Err(detail) => panic!(
@@ -271,7 +290,8 @@ pub fn drive_with(scenario: &Scenario, gate: Gate, host: Result<RealHost, String
                 // the attempt — then the loud refusal (the record
                 // alone would read as a pass in the matrix).
                 let evidence = Evidence::new_tier_r(&format!("tier-r/{}", scenario.name));
-                evidence.finish_tier_r(
+                evidence.finish_tier_r_at(
+                    out_dir,
                     "blocked",
                     &format!(
                         "real-host drive not implemented: the scaffold detected the \
@@ -298,6 +318,15 @@ pub fn drive_with(scenario: &Scenario, gate: Gate, host: Result<RealHost, String
 mod tests {
     use super::*;
 
+    /// A staging directory for the scaffold's unit-test records —
+    /// NEVER the live run directory (round-1 review, MAJOR-1): the
+    /// claimed-gate arms construct a host, and a constructed-host
+    /// record in the evidence tree would be a fabricated
+    /// environmental claim no gate catches.
+    fn staging_dir() -> PathBuf {
+        volvisor_drbd_testkit::leak_tempdir()
+    }
+
     /// A claimed gate without hardware fails loudly with the
     /// detection's own detail (never a silent pass).
     #[test]
@@ -308,40 +337,67 @@ mod tests {
             scenario,
             Gate::Claimed,
             Err("drbdadm is not executable".to_owned()),
+            &staging_dir(),
         );
     }
 
     /// A claimed gate WITH hardware still refuses to pass: the
     /// real-host drive is not implemented, and the scaffold says so
-    /// (fabricating a capability is the one thing §0 forbids).
+    /// (fabricating a capability is the one thing §0 forbids). The
+    /// constructed-host `blocked` record persists to a STAGING
+    /// directory — the real refusal path (record shape + panic) is
+    /// exercised without ever writing a synthetic-host claim into
+    /// the live evidence tree (round-1 review, MAJOR-1).
     #[test]
     #[should_panic(expected = "refusing to pass silently")]
     fn a_claimed_gate_with_hardware_refuses_to_fabricate() {
         let scenario = &SCENARIOS[0];
-        drive_with(
-            scenario,
-            Gate::Claimed,
-            Ok(RealHost {
-                drbd_version: "DRBDADM_BUILTIN".to_owned(),
-                ch_remote: "ch-remote".to_owned(),
-            }),
+        let staging = staging_dir();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_with(
+                scenario,
+                Gate::Claimed,
+                Ok(RealHost {
+                    drbd_version: "DRBDADM_BUILTIN".to_owned(),
+                    ch_remote: "ch-remote".to_owned(),
+                }),
+                &staging,
+            );
+        }));
+        // The refusal panicked (the loud gate) AND the blocked
+        // record landed in the staging directory with the §6 shape
+        // — the record exists, carries the constructed toolchain,
+        // and never touched run_dir().
+        assert!(result.is_err(), "the claimed-with-hardware arm panics");
+        let path = staging.join(format!("tier-r/{}.json", scenario.name));
+        let body = std::fs::read_to_string(&path).expect("the blocked record landed in staging");
+        let record: serde_json::Value =
+            serde_json::from_str(&body).expect("the blocked record is JSON");
+        assert_eq!(record["outcome"], "blocked");
+        assert_eq!(record["tier"], "R");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("DRBDADM_BUILTIN")),
+            "the staged record carries the constructed toolchain"
         );
+        // Resume the refusal so #[should_panic] sees it.
+        std::panic::resume_unwind(result.expect_err("the panic payload"));
     }
 
     /// The default gate emits the §6 skip-record shape: tier R,
     /// outcome skipped, the canonical reason and the documented
-    /// body. Uses a DIFFERENT scenario than the claimed-gate tests:
-    /// the records land in the live run directory under the
-    /// scenario's name, and parallel unit tests writing the same
-    /// file would race (the blocked-record test below writes
-    /// `same-families-on-real-hosts`; this one takes `power-cut`).
+    /// body — persisted to a staging directory like every unit
+    /// test of the scaffold.
     #[test]
     fn the_default_gate_emits_the_skip_record() {
         let scenario = &SCENARIOS[1];
+        let staging = staging_dir();
         let path = drive_with(
             scenario,
             Gate::Skipped,
             Err("unused in this arm".to_owned()),
+            &staging,
         );
         let body = std::fs::read_to_string(&path).expect("the skip record landed");
         let record: serde_json::Value =
@@ -350,5 +406,34 @@ mod tests {
         assert_eq!(record["outcome"], "skipped");
         assert_eq!(record["reason"], scenario.skip_reason);
         assert_eq!(record["would_run"], scenario.body);
+    }
+
+    /// The live seam's defense-in-depth guard (round-1 review,
+    /// MAJOR-1): a Tier R record carrying a synthetic-host marker
+    /// must NEVER be writable into the live run directory — the
+    /// guard fires before any write.
+    #[test]
+    #[should_panic(expected = "must never reach the live evidence tree")]
+    fn the_live_seam_refuses_synthetic_host_records() {
+        Evidence::new_tier_r("tier-r/guard-probe").finish_tier_r(
+            "blocked",
+            "the scaffold detected the real toolchain (drbdadm DRBDADM_BUILTIN, ch-remote)",
+            "the documented body",
+        );
+    }
+
+    /// The staging seam accepts the same record the live seam
+    /// refuses — the unit tests' constructed-host records have
+    /// somewhere to land without touching the evidence tree.
+    #[test]
+    fn the_staging_seam_accepts_what_the_live_seam_refuses() {
+        let staging = staging_dir();
+        let path = Evidence::new_tier_r("tier-r/staging-probe").finish_tier_r_at(
+            &staging,
+            "blocked",
+            "the scaffold detected the real toolchain (drbdadm DRBDADM_BUILTIN, ch-remote)",
+            "the documented body",
+        );
+        assert!(path.exists(), "the staged record landed");
     }
 }

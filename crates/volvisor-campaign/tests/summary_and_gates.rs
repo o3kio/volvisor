@@ -381,6 +381,51 @@ fn row_15_coverage_matrix_budgets_and_gates() {
     });
 }
 
+/// The round-1 review pins over the same complete fixture
+/// (evidence.rs/summary.rs render semantics):
+///
+/// - the family budgets measure the FAMILY wall — the `_family`
+///   aggregate's duration — never the max single cell (MINOR-2:
+///   row 4's fixture wall is 240 ms while every cell records
+///   20 ms; a max-cell render would show 20 ms and understate
+///   the family ~12x);
+/// - CG2's detail counts the flattened oracle SECTIONS
+///   (MINOR-4: the fixture's nine oracle-bearing records carry
+///   eleven sections — the row-12 array alone contributes three,
+///   so a regression that ignores `Value::Array` undercounts and
+///   this test fails with it).
+#[test]
+fn family_walls_and_flattened_sections_render_honestly() {
+    let dir = complete_fixture();
+    let report = build_campaign_report(std::slice::from_ref(&dir));
+    assert!(
+        report.contains(
+            "| row 4 kill matrix: volume mutations (30 cells) | 5000 ms | 240 ms | adhere |"
+        ),
+        "the family budget line shows the family wall, not the max cell:\n{}",
+        report
+            .lines()
+            .filter(|line| line.starts_with("| row 4 "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let gates = completion_gates_over(std::slice::from_ref(&dir));
+    let cg2 = gates
+        .iter()
+        .find(|gate| gate.gate == "CG2")
+        .expect("CG2 is in the gate set");
+    assert!(
+        cg2.complete,
+        "CG2 passes over the complete fixture: {}",
+        cg2.detail
+    );
+    assert!(
+        cg2.detail.contains("11 oracle sections across 9 records"),
+        "CG2's detail counts the flattened sections: {}",
+        cg2.detail
+    );
+}
+
 /// Row 15's log sources: the row drives no daemon and no witness —
 /// its evidence is the run's records and `REPORT.md` — so the
 /// captured "journals" are notes saying exactly that (the record's

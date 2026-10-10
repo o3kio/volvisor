@@ -19,6 +19,16 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+/// The synthetic-host markers the LIVE Tier R seam refuses (round-1
+/// review, MAJOR-1 — defense in depth): strings a constructed
+/// [`crate::tier_r::RealHost`] carries in the unit tests. A record
+/// mentioning one is a fabricated environmental claim, and the
+/// evidence tree (the shippable artifact) must never hold one —
+/// the scaffold's unit tests persist their claimed-gate records to
+/// a staging directory ([`Evidence::finish_tier_r_at`]), never to
+/// `run_dir()`.
+const SYNTHETIC_HOST_MARKERS: &[&str] = &["DRBDADM_BUILTIN"];
+
 /// The scenario record's log-source directories (copied, never
 /// moved — the rig keeps serving from the originals).
 pub struct LogSources<'a> {
@@ -238,9 +248,63 @@ impl Evidence {
     ///   toolchain answered, but the real-host drive is not
     ///   implemented (the recorded follow-up).
     ///
-    /// Refreshes the run's `REPORT.md` like any finish.
+    /// Writes into the LIVE run directory (§6's shippable tree) and
+    /// refreshes the run's `REPORT.md` like any finish. The live
+    /// seam carries the defense-in-depth guard: a record whose text
+    /// carries a synthetic-host marker (`SYNTHETIC_HOST_MARKERS`)
+    /// must never reach the evidence tree — a unit test exercising
+    /// the claimed-gate arms persists to a staging directory via
+    /// [`Self::finish_tier_r_at`] instead, never here.
+    ///
+    /// # Panics
+    ///
+    /// When the record's text carries a synthetic-host marker —
+    /// the live tree must never hold a fabricated environmental
+    /// claim (round-1 review, MAJOR-1).
     pub fn finish_tier_r(self, outcome: &str, reason: &str, would_run: &str) -> PathBuf {
+        for marker in SYNTHETIC_HOST_MARKERS {
+            for text in [outcome, reason, would_run] {
+                assert!(
+                    !text.contains(marker),
+                    "a Tier R record carrying the synthetic-host marker {marker:?} must never \
+                     reach the live evidence tree (the unit tests persist to a staging \
+                     directory via finish_tier_r_at — the live seam is for real environments \
+                     only)"
+                );
+            }
+        }
         let dir = run_dir();
+        let path = self.write_tier_r_record(&dir, outcome, reason, would_run);
+        render_report(&dir);
+        path
+    }
+
+    /// Finish a Tier R record into an EXPLICIT directory — the
+    /// staging path for the scaffold's unit tests (the
+    /// claimed-with-hardware arm must exercise the real record
+    /// shape without ever writing a constructed-host claim into
+    /// the live tree, [`Self::finish_tier_r`]'s guard). No report
+    /// refresh: a staging directory is not a run directory.
+    pub fn finish_tier_r_at(
+        self,
+        dir: &Path,
+        outcome: &str,
+        reason: &str,
+        would_run: &str,
+    ) -> PathBuf {
+        self.write_tier_r_record(dir, outcome, reason, would_run)
+    }
+
+    /// The §6 Tier R record writer (shared by the live and staging
+    /// seams): the canonical schema with `components` null (a gate
+    /// statement, not an observation).
+    fn write_tier_r_record(
+        &self,
+        dir: &Path,
+        outcome: &str,
+        reason: &str,
+        would_run: &str,
+    ) -> PathBuf {
         let record = json!({
             "scenario": self.scenario,
             "tier": self.tier,
@@ -266,7 +330,6 @@ impl Evidence {
             serde_json::to_string_pretty(&record).expect("record JSON"),
         )
         .expect("write record");
-        render_report(&dir);
         path
     }
 }

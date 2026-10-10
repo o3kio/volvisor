@@ -419,7 +419,15 @@ impl BudgetLine {
 /// The budget lines computable from `records` (§3.2's stated bounds
 /// only — the plan bounds the kill families, the oracle families,
 /// the storm and the suite; the injection rows carry no stated
-/// bound and show durations in the matrix alone).
+/// bound and show durations in the matrix alone). For the
+/// kill-matrix families the measured value is the FAMILY wall —
+/// the `matrix/<family>/_family` record's duration, which
+/// `run_family` records over the whole concurrent cell batch —
+/// never the max single-cell duration (a cell that ran alone
+/// understates the family ~the batch's width; round-1 review,
+/// MINOR-2). When the aggregate record is absent the max-cell
+/// duration is the fallback (a partial run keeps its table row;
+/// CG3 flags the missing aggregate separately).
 fn budget_lines(records: &[Value]) -> Vec<BudgetLine> {
     let mut lines = Vec::new();
     for spec in ROWS {
@@ -427,12 +435,22 @@ fn budget_lines(records: &[Value]) -> Vec<BudgetLine> {
             continue;
         };
         let expected = expected_names(spec);
-        let measured_ms = expected
-            .iter()
-            .filter_map(|scenario| record_for(records, scenario))
-            .filter_map(|record| record["duration_ms"].as_u64())
-            .max()
-            .unwrap_or(0);
+        let max_cell_ms = || {
+            expected
+                .iter()
+                .filter_map(|scenario| record_for(records, scenario))
+                .filter_map(|record| record["duration_ms"].as_u64())
+                .max()
+                .unwrap_or(0)
+        };
+        let measured_ms = match spec.coverage {
+            Coverage::MatrixFamily(family) => {
+                record_for(records, &format!("matrix/{}/_family", family.name()))
+                    .and_then(|record| record["duration_ms"].as_u64())
+                    .unwrap_or_else(max_cell_ms)
+            }
+            Coverage::Names(_) => max_cell_ms(),
+        };
         let cells = match spec.coverage {
             Coverage::MatrixFamily(family) => {
                 format!(" ({} cells)", matrix::family_cells(family).len())
@@ -690,15 +708,19 @@ fn cg3_kill_matrix_and_budgets(records: &[Value]) -> GateStatus {
 }
 
 /// The §9 rows whose scenarios are the §5 adversarial injections
-/// (CG4's scope).
-const INJECTION_ROWS: [u8; 6] = [8, 9, 10, 11, 12, 13];
+/// (CG4's scope) — including row 14, the abort storm (§5.7's
+/// rotating pre-cut faults; round-1 review, MINOR-3).
+const INJECTION_ROWS: [u8; 7] = [8, 9, 10, 11, 12, 13, 14];
 
 /// CG4: every adversarial injection ends in a typed refusal, an
 /// honest UNSAFE/IN_DOUBT classification, or a pass — checked at
-/// the report level by the outcome's presence and the typed-marker
-/// vocabulary in the record (the scenarios themselves assert the
-/// exact wire-level refusals; the gate makes the vocabulary
-/// checkable from the artifacts).
+/// the report level by the OUTCOME text alone: the marker
+/// vocabulary is matched against `record["outcome"]`, never the
+/// whole serialized record (every record's invariants contain
+/// "pass", so the wider match was vacuous; round-1 review,
+/// MINOR-3). The scenarios themselves assert the exact wire-level
+/// refusals; the gate makes the vocabulary checkable from the
+/// artifacts.
 fn cg4_injection_outcomes(records: &[Value]) -> GateStatus {
     let mut problems: Vec<String> = Vec::new();
     for row in INJECTION_ROWS {
@@ -708,23 +730,21 @@ fn cg4_injection_outcomes(records: &[Value]) -> GateStatus {
         for scenario in expected_names(spec) {
             match record_for(records, &scenario) {
                 None => problems.push(format!("{scenario} has no record")),
-                Some(record) => {
-                    if record["outcome"].is_null() {
-                        problems.push(format!("{scenario} records no outcome"));
-                    } else {
-                        let text = serde_json::to_string(record).unwrap_or_default();
-                        let lowercase = text.to_lowercase();
+                Some(record) => match record["outcome"].as_str() {
+                    None => problems.push(format!("{scenario} records no outcome")),
+                    Some(outcome) => {
+                        let lowercase = outcome.to_lowercase();
                         if !TYPED_MARKERS
                             .iter()
                             .any(|marker| lowercase.contains(&marker.to_lowercase()))
                         {
                             problems.push(format!(
-                                "{scenario} carries none of the typed markers \
-                                 (refusal/UNSAFE/IN_DOUBT/pass)"
+                                "{scenario}'s outcome carries none of the typed markers \
+                                 (refusal/UNSAFE/IN_DOUBT/pass): {outcome:?}"
                             ));
                         }
                     }
-                }
+                },
             }
         }
     }
@@ -732,8 +752,9 @@ fn cg4_injection_outcomes(records: &[Value]) -> GateStatus {
         gate: "CG4",
         complete: problems.is_empty(),
         detail: if problems.is_empty() {
-            "every §5 injection record (§9 rows 8-13) ends in a typed refusal, an \
-             UNSAFE/IN_DOUBT classification or a pass"
+            "every §5 injection record (§9 rows 8-14) ends in a typed refusal, an \
+             UNSAFE/IN_DOUBT classification or a pass — the outcome text alone carries \
+             the marker"
                 .to_owned()
         } else {
             problems.join("; ")
@@ -881,8 +902,11 @@ pub fn build_campaign_report(dirs: &[PathBuf]) -> String {
     report
 }
 
-/// The provenance: the constituent runs and their commits — flagged
-/// when mixed, never averaged away.
+/// The provenance: the constituent runs, their commits and their
+/// kernels — flagged when mixed, never averaged away (round-1
+/// review, NOTE-2: divergent kernels get the same MIXED flag as
+/// divergent commits; a report over a stale multi-host tree says
+/// so instead of silently showing one kernel).
 fn render_provenance(report: &mut String, campaign: &Campaign) {
     let records = &campaign.records;
     let mut commits: Vec<&str> = campaign
@@ -908,6 +932,24 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
                 .join(", ")
         )
     };
+    let mut kernels: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["kernel"].as_str())
+        .collect();
+    kernels.sort_unstable();
+    kernels.dedup();
+    let kernel_cell = match kernels.len() {
+        0 => "unknown".to_owned(),
+        1 => kernels[0].to_owned(),
+        _ => format!(
+            "MIXED ({})",
+            kernels
+                .iter()
+                .map(|kernel| format!("`{kernel}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
     line!(
         report,
         "- Runs: {}\n- Commit: {}\n- Kernel: {}\n- Records: {} (Tier S: {}, Tier R: {})",
@@ -918,10 +960,7 @@ fn render_provenance(report: &mut String, campaign: &Campaign) {
             .collect::<Vec<_>>()
             .join(", "),
         commit_cell,
-        records
-            .first()
-            .and_then(|record| record["kernel"].as_str())
-            .unwrap_or("unknown"),
+        kernel_cell,
         records.len(),
         records.len() - tier_r_count,
         tier_r_count,
@@ -1147,6 +1186,139 @@ mod tests {
         assert!(
             !gates[4].complete,
             "CG5 fails on no records (the gate is silent)"
+        );
+    }
+
+    /// CG2 must read THROUGH the array shape (round-1 review,
+    /// MINOR-4): a multi-volume record whose oracle is an ARRAY of
+    /// per-volume sections is here the SOLE oracle-bearing record,
+    /// so every CG2 predicate (the complete prefix, the honest
+    /// tail, the data-path boundary, the cross-check) is satisfied
+    /// only through the flattening — a regression that ignores
+    /// `Value::Array` fails every clause and this test with it.
+    #[test]
+    fn cg2_reads_every_section_of_an_array_oracle() {
+        let record = json!({
+            "scenario": "row-12/multi-volume-cut/converges",
+            "tier": "S",
+            "oracle": [
+                {
+                    "acknowledged": 10, "verified": 10, "corrupted": 0, "tail": 0,
+                    "boundary_source": "data-path", "boundary_skew_ticks": 0
+                },
+                {
+                    "acknowledged": 8, "verified": 8, "corrupted": 0, "tail": 3,
+                    "boundary_source": "data-path", "boundary_skew_ticks": 1
+                }
+            ],
+        });
+        let gates = completion_gates(&[record]);
+        assert!(
+            gates[1].complete,
+            "CG2 passes over the array alone (every predicate reads a section): {}",
+            gates[1].detail
+        );
+        assert!(
+            gates[1]
+                .detail
+                .contains("2 oracle sections across 1 records"),
+            "the flattened section count appears in the detail: {}",
+            gates[1].detail
+        );
+    }
+
+    /// CG4's marker vocabulary is matched against the OUTCOME text
+    /// alone (round-1 review, MINOR-3): a record whose invariants
+    /// say "pass" (as every record's do) but whose outcome carries
+    /// no typed marker must FAIL the gate — the whole-record match
+    /// was vacuous.
+    #[test]
+    fn cg4_reads_the_outcome_text_alone() {
+        let vacuous = json!({
+            "scenario": "row-9/wrong-lineage-data-at-target",
+            "tier": "S",
+            "outcome": "delivered: the foreign data crossed",
+            "invariants": [{"replay_idempotency": "pass"}],
+        });
+        let gates = completion_gates(&[vacuous]);
+        assert!(!gates[3].complete, "the marker-less outcome fails CG4");
+        assert!(
+            gates[3]
+                .detail
+                .contains("carries none of the typed markers"),
+            "the failure is the marker check, not just the absent rows: {}",
+            gates[3].detail
+        );
+
+        // The positive control: the same record with a typed
+        // outcome passes the marker check (CG4 may still be
+        // incomplete over the other rows' absence — never over this
+        // record's vocabulary).
+        let typed = json!({
+            "scenario": "row-9/wrong-lineage-data-at-target",
+            "tier": "S",
+            "outcome": "refused: FOREIGN_DEVICE_STATE",
+            "invariants": [{"replay_idempotency": "pass"}],
+        });
+        let gates = completion_gates(&[typed]);
+        assert!(
+            !gates[3]
+                .detail
+                .contains("carries none of the typed markers"),
+            "the typed outcome satisfies the marker check: {}",
+            gates[3].detail
+        );
+    }
+
+    /// The family budget is measured on the FAMILY wall (round-1
+    /// review, MINOR-2): the `matrix/<family>/_family` record's
+    /// duration, never the max single-cell duration — a 30-cell
+    /// family whose aggregate says 240 ms must measure 240 ms even
+    /// when every cell's own record says 20 ms.
+    #[test]
+    fn the_family_budget_measures_the_family_wall() {
+        let family = json!({
+            "scenario": "matrix/volume-mutations/_family",
+            "tier": "S",
+            "outcome": null,
+            "duration_ms": 240,
+        });
+        let mut records = vec![family.clone()];
+        for cell in matrix::family_cells(Family::VolumeMutations) {
+            let mut cell_record = json!({
+                "scenario": cell.scenario(),
+                "tier": "S",
+                "outcome": "recovered: typed",
+                "duration_ms": 20,
+                "invariants": [{"fixture": "pass"}],
+            });
+            cell_record["fault"] = json!({
+                "kind": cell.hook.fault_kind(),
+                "at": cell.hook.location(),
+            });
+            records.push(cell_record);
+        }
+        let lines = budget_lines(&records);
+        let volume_mutations = lines
+            .iter()
+            .find(|line| line.label.starts_with("row 4 "))
+            .expect("the volume-mutations budget line");
+        assert_eq!(
+            volume_mutations.measured_ms, 240,
+            "the family wall (240 ms) is the measurement, not the max cell (20 ms)"
+        );
+        // The fallback: without the aggregate record the max-cell
+        // duration keeps the table row (CG3 flags the missing
+        // aggregate separately).
+        records.retain(|record| record["scenario"] != "matrix/volume-mutations/_family");
+        let lines = budget_lines(&records);
+        let volume_mutations = lines
+            .iter()
+            .find(|line| line.label.starts_with("row 4 "))
+            .expect("the fallback budget line");
+        assert_eq!(
+            volume_mutations.measured_ms, 20,
+            "the max-cell fallback renders when the aggregate is absent"
         );
     }
 }
