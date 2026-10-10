@@ -2749,6 +2749,11 @@ impl volvisor_provider::VmmController for RecordingVmm {
     fn state(&self, vm_id: &str) -> Result<volvisor_provider::VmState, ApiError> {
         self.inner.state(vm_id)
     }
+
+    fn resize_disk(&self, vm_id: &str, disk_id: &str, new_size_bytes: u64) -> Result<(), ApiError> {
+        self.record("resize_disk");
+        self.inner.resize_disk(vm_id, disk_id, new_size_bytes)
+    }
 }
 
 /// The peer-route test kit: the wired state plus every double it

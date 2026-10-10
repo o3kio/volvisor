@@ -25,7 +25,11 @@
 //!   the Cloud Hypervisor `ch-remote` adapter
 //!   ([`vmm::ChRemoteVmm`]) over [`CommandRunner`], and the TEST-ONLY
 //!   [`vmm::FakeVmm`] harness that makes the device-open discipline
-//!   provable in tests.
+//!   provable in tests;
+//! - [`vmm_http`]: the hand-rolled HTTP/1.1 `PUT` over a unix domain
+//!   socket behind [`vmm::VmmController::resize_disk`] (P6-B — the
+//!   REST-only resize-disk call; `ch-remote` has no such
+//!   subcommand).
 //!
 //! Dependency direction (implementation plan section 4): `volvisor-api` and
 //! `volvisor-lvm` depend on this crate; this crate depends only on
@@ -42,6 +46,7 @@ pub mod handoff;
 pub mod provider;
 pub mod runner;
 pub mod vmm;
+pub mod vmm_http;
 
 pub use admin::{AdminSurface, AdoptionSurface};
 pub use fake::FakeProvider;
@@ -51,6 +56,7 @@ pub use handoff::{
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
 pub use vmm::{
-    ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeVmm, PauseProof,
-    VmState, VmmController,
+    ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeResizeCall, FakeVmm,
+    PauseProof, VmState, VmmController,
 };
+pub use vmm_http::{MAX_RESPONSE_BYTES, VmmHttpResponse};

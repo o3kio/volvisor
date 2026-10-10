@@ -27,6 +27,20 @@
 //! `FakeRunner`/custom runners in tests) — the established
 //! argv-verified, timeout-guarded, shell-free execution path.
 //!
+//! # The resize-disk exception (P6-B)
+//!
+//! One operation is **not** a `ch-remote` command:
+//! [`VmmController::resize_disk`]. Verified against
+//! cloud-hypervisor v37.0's published command list, `ch-remote` has
+//! no `resize-disk` subcommand — disk resize is REST-API-only
+//! (`PUT /api/v1/vm.resize-disk` over the same `--api-socket`, JSON
+//! body per the `VmResizeDisk` schema). The adapter issues that call
+//! through [`crate::vmm_http`] — a hand-rolled HTTP/1.1 `PUT` over
+//! the unix domain socket, byte-pinned the same way the argv table
+//! above pins the commands (ADR-0006 first slice part 1; the
+//! argv-exact discipline translates to byte-exact HTTP assertions
+//! for this call).
+//!
 //! Not used, with reasons (recorded so a future change must confront
 //! them, not rediscover them):
 //!
@@ -107,13 +121,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use volvisor_types::{ApiError, ApiErrorCode};
 
-use crate::runner::{CommandOutput, CommandRunner};
+use crate::runner::{CommandOutput, CommandRunner, STDERR_EXCERPT_MAX_CHARS};
 
 /// The characteristic stderr tokens (lowercased substring match on
 /// the flattened excerpt) of a `ch-remote info` failure that means
@@ -126,6 +140,12 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// surface; pinned against real `ch-remote` output by the
 /// `VOLVISOR_TEST_CH` campaign (a later slice).
 const NOT_FOUND_TOKENS: [&str; 4] = ["not found", "no vm", "not initialized", "vm not created"];
+
+/// The per-call budget of the resize-disk HTTP exchange (the module
+/// docs' resize-disk exception): the same order as the control-path
+/// HTTP bounds (the peer and witness request timeouts) — generous
+/// against a healthy VMM, bounded against a wedged one.
+const RESIZE_DISK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The VMM-side state of one VM, as the migration coordinator needs
 /// it (plan §5): the engine-neutral vocabulary behind
@@ -295,6 +315,28 @@ pub trait VmmController: Send + Sync {
     /// **result** (the not-found shape), never an error, and never a
     /// fallback for an unrecognized failure.
     fn state(&self, vm_id: &str) -> Result<VmState, ApiError>;
+
+    /// Resize one disk of one VM through the VMM's resize-disk API
+    /// (P6-B, ADR-0006 first slice part 1): `PUT
+    /// /api/v1/vm.resize-disk` over the VM's api-socket with the
+    /// `VmResizeDisk` body — `{"id": <disk_id>, "new_size":
+    /// <new_size_bytes>}` (`slot` is optional in the schema and
+    /// omitted). The capacity-notification step of an online grow on
+    /// an attached volume.
+    ///
+    /// Re-drive-safe for the notification engine's retry: re-issuing
+    /// the same (disk, size) is a no-op on the VMM side. The
+    /// never-shrink rule (contract §4A: a failed notification is
+    /// retried, the backing is never shrunk to undo) is the
+    /// **caller's** contract — this seam executes the resize it is
+    /// handed and cannot know the disk's current size.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] typed: `NOT_FOUND` when the VMM holds no
+    /// VM, `INVALID_STATE` when the VMM answers a non-2xx status
+    /// (the status is carried), `INTERNAL` for transport failures
+    /// (an unreachable or wedged socket, an unparseable response).
+    fn resize_disk(&self, vm_id: &str, disk_id: &str, new_size_bytes: u64) -> Result<(), ApiError>;
 }
 
 /// Configuration of the Cloud Hypervisor `ch-remote` adapter.
@@ -317,7 +359,10 @@ pub struct ChRemoteConfig {
 /// Every command runs through the injected [`CommandRunner`] with the
 /// argv the verified table pins (module docs); the adapter adds
 /// nothing to the surface — no `send-migration`, no `shutdown`, no
-/// capability probing. Verified command surface, not exercised
+/// capability probing. The one exception is
+/// [`VmmController::resize_disk`]: the REST-only resize-disk call
+/// (module docs' resize-disk exception), issued as HTTP/1.1 over the
+/// same api-socket. Verified command surface, not exercised
 /// against a real cloud-hypervisor in CI (module docs' honesty
 /// boundary).
 pub struct ChRemoteVmm {
@@ -538,6 +583,50 @@ impl VmmController for ChRemoteVmm {
             None => Ok(VmState::Absent),
         }
     }
+
+    fn resize_disk(&self, vm_id: &str, disk_id: &str, new_size_bytes: u64) -> Result<(), ApiError> {
+        // The module docs' resize-disk exception: REST-only, over the
+        // same api-socket, with the VmResizeDisk body byte-pinned
+        // (the argv-exact discipline translated to HTTP bytes). The
+        // disk id is the attachment-recorded VMM device id (P6-B) —
+        // the body addresses the VMM's own device identity, never a
+        // host path.
+        let body = json!({ "id": disk_id, "new_size": new_size_bytes }).to_string();
+        let response = crate::vmm_http::put_json(
+            &self.socket_path(vm_id),
+            "/api/v1/vm.resize-disk",
+            &body,
+            RESIZE_DISK_TIMEOUT,
+        )?;
+        if (200..300).contains(&response.status) {
+            // 204 No Content is the verified success shape; every 2xx
+            // is a success (the transport module is deliberately not
+            // privy to which).
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "vm.resize-disk for VM {vm_id} (disk {disk_id}, {new_size_bytes} bytes) refused: \
+                 HTTP {} {}: {}",
+                response.status,
+                response.reason,
+                response_excerpt(&response.rest)
+            ),
+        ))
+    }
+}
+
+/// A short, flattened excerpt of a resize-disk response's remainder
+/// (headers and any body) for error details — the
+/// [`CommandOutput::stderr_excerpt`] discipline applied to HTTP.
+fn response_excerpt(rest: &str) -> String {
+    rest.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(STDERR_EXCERPT_MAX_CHARS)
+        .collect()
 }
 
 /// Whether a failed command output carries the not-found shape (the
@@ -810,6 +899,26 @@ pub struct FakeFailKnobs {
     pub resume: bool,
     /// `state` fails.
     pub state: bool,
+    /// `resize_disk` fails.
+    pub resize_disk: bool,
+}
+
+/// One recorded successful `resize_disk` call against [`FakeVmm`]
+/// (harness introspection): what the VMM was told, exactly. The
+/// engine's tests assert the recorded `(vm_id, disk_id, size)`
+/// triples against the attachment-recorded disk id and the grow's
+/// effective size — the disk id is opaque to the fake (the fake's
+/// VMs model device *paths*, the migration world's key), so the
+/// assertion lives on the caller's side, where the expected id is
+/// known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeResizeCall {
+    /// The VM whose VMM was told.
+    pub vm_id: String,
+    /// The VMM device id the resize addressed.
+    pub disk_id: String,
+    /// The size the VMM was told.
+    pub new_size_bytes: u64,
 }
 
 /// The present (non-`Absent`) states of the fake's model.
@@ -848,6 +957,9 @@ struct FakeVmmWorld {
     fail: BTreeMap<String, FakeFailKnobs>,
     /// The ordered controller-call log (see [`FakeVmm::calls`]).
     calls: Vec<(&'static str, String)>,
+    /// The successful `resize_disk` calls, in order (see
+    /// [`FakeVmm::resize_calls`]).
+    resizes: Vec<FakeResizeCall>,
 }
 
 /// TEST-ONLY fake VMM (plan §5): an in-memory state machine over real
@@ -874,7 +986,13 @@ struct FakeVmmWorld {
 ///   bug that demotes before `destroy` fails against the fake's busy
 ///   device, exactly as it would on a real host;
 /// - per-VM, per-operation failure injection ([`FakeFailKnobs`]) for
-///   crash-window tests.
+///   crash-window tests;
+/// - `resize_disk` as a recorded, fault-injectable tell (see
+///   [`FakeResizeCall`]): the fake does not model the disk's size —
+///   it records exactly what it was told, and the engine's tests
+///   assert the recorded triples against the provider's truth (the
+///   never-shrink rule is asserted against the backing, not the
+///   VMM).
 ///
 /// The re-drive-safety rules match the adapter exactly: destroying an
 /// `Absent` VM is a no-op that succeeds without a device event, and
@@ -935,13 +1053,22 @@ impl FakeVmm {
 
     /// The ordered log of [`VmmController`] calls against this fake:
     /// `(method, vm_id)` pairs in call order (e.g. `pause`, `snapshot`,
-    /// `destroy`, `restore`, `resume`, `state`), including calls that
-    /// failed. The harness-side `create`/`start` seeding acts are NOT
-    /// logged — the log records what the VMM controller did, not what
-    /// the consumer set up.
+    /// `destroy`, `restore`, `resume`, `state`, `resize_disk`),
+    /// including calls that failed. The harness-side `create`/`start`
+    /// seeding acts are NOT logged — the log records what the VMM
+    /// controller did, not what the consumer set up.
     pub fn calls(&self) -> Result<Vec<(&'static str, String)>, ApiError> {
         let world = lock(&self.world)?;
         Ok(world.calls.clone())
+    }
+
+    /// The successful `resize_disk` calls against this fake, in
+    /// order (the what-the-VMM-was-told record; see
+    /// [`FakeResizeCall`]). Failed attempts appear only in
+    /// [`Self::calls`] — a faulted resize told the VMM nothing.
+    pub fn resize_calls(&self) -> Result<Vec<FakeResizeCall>, ApiError> {
+        let world = lock(&self.world)?;
+        Ok(world.resizes.clone())
     }
 
     /// Edit one VM's failure-injection knobs (created on first use;
@@ -1265,6 +1392,26 @@ impl VmmController for FakeVmm {
             .vms
             .get(vm_id)
             .map_or(VmState::Absent, |vm| vm.state.into()))
+    }
+
+    fn resize_disk(&self, vm_id: &str, disk_id: &str, new_size_bytes: u64) -> Result<(), ApiError> {
+        self.note("resize_disk", vm_id)?;
+        let mut world = lock(&self.world)?;
+        if world.fail.get(vm_id).is_some_and(|knobs| knobs.resize_disk) {
+            return Err(Self::injected("resize_disk", vm_id));
+        }
+        if !world.vms.contains_key(vm_id) {
+            return Err(ApiError::not_found(format!("fake VMM: no VM {vm_id}")));
+        }
+        // The fake does not model the disk's size: the tell is the
+        // record. Never-shrink is the caller's rule, asserted by the
+        // engine's tests against the backing.
+        world.resizes.push(FakeResizeCall {
+            vm_id: vm_id.to_owned(),
+            disk_id: disk_id.to_owned(),
+            new_size_bytes,
+        });
+        Ok(())
     }
 }
 
@@ -1713,5 +1860,85 @@ mod tests {
         assert_eq!(err.code, ApiErrorCode::Internal);
         // The other VM is unaffected.
         assert_eq!(fake.state("vm-2").expect("state"), VmState::Absent);
+    }
+
+    // -- FakeVmm: resize_disk ---------------------------------------
+
+    #[test]
+    fn fake_vmm_resize_disk_records_the_tell_and_needs_a_present_vm() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fake = FakeVmm::new(root.path());
+        fake.create("vm-1", &["/dev/drbd1"]).expect("create");
+
+        // An absent VM is a typed NOT_FOUND, and nothing is recorded.
+        let err = fake
+            .resize_disk("vm-x", "vol-1", 2048)
+            .expect_err("resize of an absent VM must fail");
+        assert_eq!(err.code, ApiErrorCode::NotFound, "{err}");
+        assert_eq!(
+            fake.resize_calls().expect("resizes"),
+            Vec::<FakeResizeCall>::new()
+        );
+
+        fake.resize_disk("vm-1", "vol-1", 2_147_483_648)
+            .expect("resize");
+        fake.resize_disk("vm-1", "vol-2", 3_221_225_472)
+            .expect("resize");
+        assert_eq!(
+            fake.resize_calls().expect("resizes"),
+            vec![
+                FakeResizeCall {
+                    vm_id: "vm-1".to_owned(),
+                    disk_id: "vol-1".to_owned(),
+                    new_size_bytes: 2_147_483_648,
+                },
+                FakeResizeCall {
+                    vm_id: "vm-1".to_owned(),
+                    disk_id: "vol-2".to_owned(),
+                    new_size_bytes: 3_221_225_472,
+                },
+            ]
+        );
+        // The attempt is in the call log whether or not it succeeded.
+        let calls = fake.calls().expect("calls");
+        let methods: Vec<&str> = calls.iter().map(|(method, _)| *method).collect();
+        assert_eq!(
+            methods,
+            vec!["resize_disk", "resize_disk", "resize_disk"],
+            "the faulted absent-VM attempt is logged too"
+        );
+    }
+
+    #[test]
+    fn fake_vmm_resize_disk_fault_is_injected_and_records_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fake = FakeVmm::new(root.path());
+        fake.create("vm-1", &["/dev/drbd1"]).expect("create");
+
+        fake.set_fail("vm-1", |knobs| knobs.resize_disk = true)
+            .expect("knobs");
+        let err = fake
+            .resize_disk("vm-1", "vol-1", 2048)
+            .expect_err("injected resize failure");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("injected"), "{err}");
+        // A faulted resize told the VMM nothing.
+        assert_eq!(
+            fake.resize_calls().expect("resizes"),
+            Vec::<FakeResizeCall>::new()
+        );
+        // Recovery through the same surface production would.
+        fake.set_fail("vm-1", |knobs| knobs.resize_disk = false)
+            .expect("knobs");
+        fake.resize_disk("vm-1", "vol-1", 2048)
+            .expect("resize after recovery");
+        assert_eq!(
+            fake.resize_calls().expect("resizes"),
+            vec![FakeResizeCall {
+                vm_id: "vm-1".to_owned(),
+                disk_id: "vol-1".to_owned(),
+                new_size_bytes: 2048,
+            }]
+        );
     }
 }
