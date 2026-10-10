@@ -1241,6 +1241,7 @@ dependencies = [
  "volvisor-api",
  "volvisor-ceph",
  "volvisor-drbd",
+ "volvisor-drbd-testkit",
  "volvisor-handoff",
  "volvisor-journal",
  "volvisor-lvm",

@@ -49,3 +49,4 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 
 [dev-dependencies]
 tempfile = { workspace = true }
+volvisor-drbd-testkit = { workspace = true }
