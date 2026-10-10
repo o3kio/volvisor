@@ -130,7 +130,8 @@ pub trait VolumeProvider: Send + Sync {
     /// **Binding semantics for every implementation:**
     ///
     /// 1. **Capability-gated scope.** Only a provider advertising
-    ///    [`Capability::SameVgExtentMove`] may serve the move; the
+    ///    [`SameVgExtentMove`](volvisor_types::Capability::SameVgExtentMove)
+    ///    may serve the move; the
     ///    default implementation refuses every request with
     ///    `MOVE_UNSUPPORTED_SCOPE`. Cross-VG, cross-pool and
     ///    cross-class targets are typed refusals of the same code —
@@ -146,7 +147,7 @@ pub trait VolumeProvider: Send + Sync {
     ///    freed only after the move's completion is *verified* by
     ///    observation (the LV's device list no longer references the
     ///    source PV). A failed verification never frees and reports
-    ///    [`MoveVolumeBackingState::InDoubt`].
+    ///    [`InDoubt`](volvisor_types::MoveVolumeBackingState::InDoubt).
     /// 4. **Never a generic `FAILED`.** An unknown mid-move outcome
     ///    (observation failure, or the move ending without relocating
     ///    the extents) reads `IN_DOUBT` with the source intact and

@@ -411,8 +411,8 @@ pub struct GrowVolumeResponse {
 /// typed `MOVE_UNSUPPORTED_SCOPE` refusal, never a silent
 /// degradation.
 ///
-/// The response's [`MoveVolumeBackingState`](crate::state::MoveVolumeBackingState)
-/// carries the contract's full vocabulary; a same-VG extent move
+/// The response's [`MoveVolumeBackingState`] carries the contract's
+/// full vocabulary; a same-VG extent move
 /// passes through the honest subset `PREPARING | COPYING | COMPLETE |
 /// IN_DOUBT` — `MIRROR_READY`/`PIVOTED` belong to the mirror-and-pivot
 /// path (the LV's dm identity is stable across a `pvmove`, so there
