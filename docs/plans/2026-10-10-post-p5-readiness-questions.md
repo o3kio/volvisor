@@ -19,12 +19,17 @@ the five questions below is answered with file-level evidence, each answer
 ends in a decision, and §7 maps every decision to the normative documents
 that must change before implementation begins. The implementation plan
 itself (staged, gated, PR-mapped) follows in
-[the post-P5 implementation plan](2026-10-10-post-p5-implementation-plan.md).
+[the post-P5 implementation plan](2026-10-10-post-p5-implementation-plan.md)
+(created by the follow-up bundle in §7 — the link goes live when that
+bundle merges).
 
 ## 1. Are all implementation plans finished? What remains?
 
-**Answer: the SPEC-0002 §12 sequence is finished through P5; two sequence
-items and four recorded backlog items remain.**
+**Answer: SPEC-0002 §12's items P0–P4 are delivered; three §12 residues and
+a recorded backlog remain.** (Numeral caution: the repo's own phase labels
+P0–P5 map onto §12's P0–P4 — the repo's "P5" campaign *is* §12's P4
+crash/failure item. §12's P5 is a different thing: the engine-comparison
+consideration gate below.)
 
 Done and merged:
 
@@ -39,7 +44,7 @@ Done and merged:
 
 Remaining from SPEC-0002 §12 as written:
 
-1. **P5's consideration item** — "compare Mayastor/io_uring/SPDK
+1. **§12 P5, the consideration item** — "compare Mayastor/io_uring/SPDK
    alternatives; only build a new engine when justified"
    ([ADR-0007](../adr/0007-drbd9-nearline-replication-provider.md) pins DRBD
    9 as the selected prototype engine). This is a *measured-justification*
@@ -47,13 +52,27 @@ Remaining from SPEC-0002 §12 as written:
    benchmark exists to measure against (see §2 and §6 of this document —
    the packaging and real-VMM phases come first precisely so the
    comparison can be run on installable, real-VMM software).
-2. **P6 (managed-Ceph OSD placement ADR + production gate)** — unstarted,
-   and correctly so: SPEC-0002 gates it behind the Rook-cell POC outcome
-   (§4 below) and a production-support decision that no evidence yet
-   carries.
+2. **§12 P3's local-mirror experiment residue** — "nearline DRBD baseline
+   and isolated frontends + local mirror experiment": the baseline and
+   isolated frontends shipped (PR #5); the local mirror is recorded
+   not-delivered in the nearline §10 note ("no mirror implementation
+   exists to fault"). A mirror can only be honestly faulted on real
+   media/devices, so the experiment is decided inside P8 (§6): design and
+   fault it on the real-host tier, or explicitly decline it with a
+   recorded reason. It is not silently deferred.
+3. **§12 P6 (managed-Ceph OSD placement ADR + production gate)** —
+   unstarted, and correctly so: SPEC-0002 gates it behind the Rook-cell
+   POC outcome (§4 below) and a production-support decision that no
+   evidence yet carries.
 
-Recorded backlog (each pinned in its evidence record / commit message,
-never silently dropped):
+Recorded backlog. Items with existing artifacts are pinned there (the
+grant_set wedge in its evidence record and the campaign report's findings;
+the local mirror and Tier R in the nearline §10 note; the `IN_DOUBT`
+stall-nuance question and the F1 barrier-time lineage re-check in the
+campaign report's findings section, per the nearline note's "own plan/PR,
+never silently" rule). Two intermittently observed test flakes have no
+other recording artifact, so this plan is their pin — both with their
+evidence status stated honestly:
 
 - the **`grant_set` wedge** — a witness kill inside the grant commit parks
   a migration safely at `destination_authorized` forever while the retry
@@ -61,11 +80,18 @@ never silently dropped):
   re-resolvable peer acts, or a promote path that does not route through
   the failed grant op);
 - the **renewal-deadline flake** in `volvisor-drbd`
-  (`an_unreachable_witness_defers_renewal_until_the_deadline`, ~1/20 full
-  suites; the kit's `server.handle.abort()` does not drain in-flight
-  renewals);
-- the **local mirror** — named not-delivered in the nearline §10 note (no
-  mirror implementation exists to fault);
+  (`an_unreachable_witness_defers_renewal_until_the_deadline`): observed
+  intermittently in earlier full-suite runs (roughly 1-in-20; 0/15 in
+  isolation), *not* reproduced in this plan's review round; the suspected
+  root cause (the kit's `server.handle.abort()` aborts the axum serve
+  without draining in-flight renewals) is unproven, so the fix must start
+  from either a reproduction or a drain fix that is provably correct
+  regardless;
+- the **kill-matrix startup race** in the campaign suite
+  (`row_5_consumer_mobility_kill_matrix`, the post-restart "rolled back to
+  aborted" assertion in `rows_4_7.rs`): reproduced roughly 2–3 of 6
+  full-suite runs during this plan's review round — the assertion races
+  the daemon's async startup reconciliation;
 - the **Tier R real-host drive** — the 8 gates are scaffolded, skipped
   honestly, and fail loudly under `VOLVISOR_CAMPAIGN_TIER=R`.
 
@@ -73,11 +99,15 @@ never silently dropped):
 online operations, packaging/distribution, the real-VMM verification tier,
 the Rook-cell device-sharing POC), with the old P6 (managed Ceph) renumbered
 to P10 and kept last before any production gate. SPEC-0002 §12 is renumbered
-accordingly. The P5 consideration item (new-engine comparison) stays gated
-on P8's real-VMM benchmarks. The grant_set wedge fix is folded into the
-nearline hardening slice of P6 (it blocks honest "migration completes under
-witness faults" claims); the flake is fixed opportunistically in the first
-phase that touches the kit.
+accordingly, and §12 P3's local-mirror residue is scheduled explicitly
+into P8 (decided there, not silently deferred). The P5 consideration item
+(new-engine comparison) stays gated on P8's real-VMM benchmarks. The
+grant_set wedge fix, both recorded test flakes, and the two recorded
+campaign follow-ups (the `IN_DOUBT` stall-nuance question, the F1
+barrier-time lineage re-check) are all triaged in P6's hardening slice —
+each either fixed or explicitly declined with a recorded reason, never
+silently dropped; the wedge fix specifically restores the honest
+"migration completes under witness faults" claim.
 
 ## 2. Do we have test scenarios proving live migration with a VMM works on nearline-replicated?
 
@@ -92,11 +122,12 @@ What exists (all in the default test suite, 855 tests):
   axum over TCP, a real loopback `volvisor_witness::server`, the real
   HTTP peer path between daemons, the real coordinator/handoff
   composition, and two `FakeVmm` instances sharing one snapshot root.
-  `FakeVmm` instances sharing one snapshot root. The matrix rows 13–23
-  (19 tests: happy path, snapshot faults, the crash-between-X cells,
-  dead-source adoption, restore faults and coordinator re-drive,
+  `FakeVmm` instances sharing one snapshot root. The file's own scope note
+  marks rows 13–17, 22 and 23 as end-to-end (both daemons, real peer
+  HTTP); the remaining rows drive the same two-daemon rig with narrower
+  focuses (restore faults and coordinator re-drive, snapshot-dir refusal,
   eligibility fencing, idempotency, partial-target promotion, disk-path
-  rewrite) are fully end-to-end; fault cells inject at the `FakeVmm`
+  rewrite). Fault cells inject at the `FakeVmm`
   knobs. This proves the migration *protocol* (prepare →
   transfer → pause → snapshot → barrier → peer grant → promote → restore
   → resume → complete) including its failure and recovery paths.
@@ -129,7 +160,7 @@ emits an explicit `skipped` gate record (the matrix shows the gate, never a
 hole); with it set but the VMM absent, the tier fails loudly. The scenario
 set is small and bounded: the migration happy path end-to-end, the
 pause/snapshot kill windows against a real VMM, snapshot/restore divergence
-detection, and the resize notification from P6 (§5). Normative home:
+detection, and the resize notification from P6 (§4, D4). Normative home:
 ADR-0010 (new) + a Tier V note in the nearline §10 implementation-status
 ledger. Tier V does not claim production support — it claims "verified
 against a real VMM process at recorded versions".
@@ -151,11 +182,13 @@ Evidence:
   requirements, capacity semantics, fail-closed invariants, Rook
   interface, evidence, non-goals) are all requirements *on a future POC*,
   not descriptions of tested behavior.
-- [ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md) — "The Rook
-  Cell mode remains POC-only until exact-SHA three-physical-host tests
-  prove all lifecycle, quorum/CRUSH topology, disk/VFIO isolation,
-  cleanup, CPU/memory budget, node scheduling/admission, fail/restart and
-  benchmark gates."
+- [ADR-0008](../adr/0008-rook-only-hyperconverged-cells.md) — its decision
+  gate: a small three-physical-host POC "must prove bare-metal VFIO claim,
+  Kubernetes node registration/placement/admission, Rook OSD/MON/MGR
+  deployment, RBD I/O and storage client reachability, failure recovery,
+  CRUSH physical placement, resource ceilings and performance vs Rook
+  directly on the same hardware," and passing nested functional tests
+  alone "can only authorize physical POC, **not production acceptance**."
 
 The specific question — *can the devices volvisor owns on the host be
 shared with the operator (Rook)?* — is not just untested, it is
@@ -192,9 +225,11 @@ POC**, in three ordered parts:
 
 ## 4. Can native-local migrate its underlying device to another device without interruption?
 
-**Answer: not today — by contract in v0, and ADR-0006 (which designs it)
-is Proposed / R&D-gated. Two of its three designed options are
-implementable now; the third stays gated behind its own proof.**
+**Answer: not today — by contract in v0, and ADR-0006 (which designs it) is
+Proposed / R&D-gated. Of its three designed relocation options, exactly one
+is implementable now (Option A, same-VG `pvmove`); Option B stays gated
+behind its own proof and Option C is rejected. The online-grow VMM
+notification step is separately implementable, version-gated.**
 
 Evidence:
 
@@ -235,12 +270,18 @@ cross-VG/pool whole-volume moves** (QSD path needs its POC first).
    version verified at startup, typed refusal when the version is not
    proven), with the ADR's partial-failure semantics (backend grew,
    notification failed → retry the notification, never shrink to undo).
-2. **Same-VG evacuation**: a typed `RelocateVolume` surface on the
-   provider/API with exactly one implemented scope — same-VG extent
-   relocation via `pvmove` — journal-before-mutate, source freed only
-   after verified relocation, `RELOCATION_UNSUPPORTED_SCOPE` for
-   everything else (cross-VG, cross-pool, other classes — fail-closed,
-   never silent). Volume API v2 gains the operation + the refusal code;
+2. **Same-VG evacuation**: implement the *already-contracted* operation —
+   volume-api-v2 §4A defines `MoveVolumeBackingOnline` with the
+   `same_vg_extent_move` / `same_host_live_backing_move` capability split
+   and the pvmove-same-VG restriction — with exactly one qualified
+   capability scope in this phase: `same_vg_extent_move` via `pvmove`,
+   journal-before-mutate, source extents freed only after verified
+   relocation and ownership reconciliation (the contract's
+   never-generic-FAILED / `IN_DOUBT` rule applies).
+   `same_host_live_backing_move` is advertised nowhere until the QSD path
+   passes its acceptance suite; out-of-scope moves are refused typed
+   (fail-closed, never silent — the refusal code is settled in the §7
+   contract update). No new operation name is introduced.
    ADR-0006's status moves from Proposed to "first slice accepted;
    QSD path remains R&D-gated".
 3. **The QSD mirror/pivot POC stays out of P6** — it is the explicit
@@ -291,7 +332,7 @@ shape summarized here (the ADR is normative):
 |---|---|---|
 | P6 | Native online operations: grow-notification + same-VG relocation (+ the grant_set wedge fix, the flake fix) | Completes an existing contract promise; no external dependencies; the wedge fix restores the honest "completes under witness faults" claim |
 | P7 | Packaging & distribution (ADR-0009) | The installability requirement; also the vehicle every later real-host phase deploys through |
-| P8 | Tier V real-VMM verification (ADR-0010) + the P5 engine-comparison consideration gate | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs |
+| P8 | Tier V real-VMM verification (ADR-0010), the P5 engine-comparison consideration gate, and the local-mirror experiment decision | Validates the migration story end-to-end against a real VMM; produces the benchmarks the new-engine comparison needs; the local-mirror experiment (§12 P3 residue) is decided here — real media/device faulting is the only honest way to fault a mirror, so it is designed and faulted on the real-host tier or explicitly declined with a recorded reason |
 | P9 | Rook-cell device-sharing POC (lending surface + three-host exact-SHA scenarios) | The operator-sharing question; explicitly POC-only |
 | P10 | Managed-Ceph OSD placement ADR + production gate (was P6) | Last: gated on P9's outcome and a production-support decision the evidence must carry |
 
@@ -302,25 +343,32 @@ review-until-clean loop.
 ## 7. Document changes this plan authorizes (the follow-up bundle)
 
 1. **ADR-0006** — status update: first slice accepted (grow-notification +
-   same-VG `pvmove` evacuation, with the safety contract and the
-   `RelocateVolume` surface), QSD path remains R&D-gated behind its
-   acceptance suite.
-2. **ADR-0009 (new)** — distribution & packaging (§5 above).
-3. **ADR-0010 (new)** — Tier V: the real-VMM verification tier, extending
+   same-VG `pvmove` evacuation over the contracted
+   `MoveVolumeBackingOnline` surface), QSD path remains R&D-gated behind
+   its acceptance suite.
+2. **ADR-0008** — update: the device-lending surface decision
+   (lend/reclaim on claimed devices, visible ownership, no
+   double-ownership window) and its POC gate wording, matching the
+   contract change in item 7.
+3. **ADR-0009 (new)** — distribution & packaging (§5 above).
+4. **ADR-0010 (new)** — Tier V: the real-VMM verification tier, extending
    the P5 tier/claim discipline.
-4. **SPEC-0002 §12** — renumbered/extended implementation sequence (§6).
-5. **volume-api-v2** — the `RelocateVolume` operation (native-local,
-   same-VG scope only in this phase) with typed refusals
-   (`RELOCATION_UNSUPPORTED_SCOPE`), and the grow-notification semantics
-   for attached volumes.
-6. **rook-cell-experimental-v0** — the device-lending/sharing semantics
+5. **SPEC-0002 §12** — renumbered/extended implementation sequence (§6),
+   with the local-mirror residue explicitly scheduled into P8.
+6. **volume-api-v2** — no new operation: pin the P6 scope of
+   `MoveVolumeBackingOnline` (§4A) to the `same_vg_extent_move`
+   capability, settle the typed-refusal code for out-of-scope moves, and
+   record the grow-notification semantics for attached volumes (the
+   `guest_notification_status` retry rule).
+7. **rook-cell-experimental-v0** — the device-lending/sharing semantics
    section + the POC evidence requirements for it.
-7. **nearline-replication-v2 §10** — the Tier V line in the
+8. **nearline-replication-v2 §10** — the Tier V line in the
    implementation-status ledger (verified-against-real-VMM is a distinct
    claim from Tier S and from production support).
-8. **The post-P5 implementation plan**
+9. **The post-P5 implementation plan**
    ([2026-10-10-post-p5-implementation-plan.md](2026-10-10-post-p5-implementation-plan.md))
-   — the staged plan for P6–P9.
+   — the staged plan for P6–P9. The file does not exist yet; this bundle
+   creates it, so the link goes live when the bundle merges.
 
 ## 8. Honesty rules carried forward
 
