@@ -1159,7 +1159,9 @@ async fn mobility_transfer_cell(cell: Cell) {
 /// the interrupted rollback (the record is pre-cut, so the resolve
 /// re-drives it); the same-op re-POST refuses typed except after the
 /// outcome (the recorded 200 replays); a transfer on the aborted
-/// record is the terminal refusal.
+/// record answers 202 with the record — the drive's refusal is
+/// logged, never surfaced as a route error (the 202-always
+/// contract).
 async fn mobility_abort_cell(cell: Cell) {
     let seq = next_id();
     let Hook::Journal(point) = cell.hook else {
@@ -1502,11 +1504,15 @@ async fn witness_barrier_cell(cell: Cell, point: volvisor_types::crash::StoreSav
 
 /// One grant_set mid-commit cell: the witness dies inside the
 /// destination's promote batch. The restart's replay lands the grant
-/// (the lease is live for the destination — epoch exactly 2), and
-/// the source's startup pass drives the cut forward: `drive_forward`
-/// sees the witness lease held by the target and skips the grant
-/// step (the failed peer attempt's journaled outcome is never
-/// consulted again), promotes, restores and COMPLETES.
+/// (the lease is live for the destination — epoch exactly 2), but
+/// THE FINDING: B's peer-grant op journaled its failure over the
+/// connection that died with the witness, and the ops pipeline
+/// replays recorded failures forever — so every re-drive's promote
+/// step re-serves it and the migration PARKS SAFE at
+/// `destination_authorized` (source fenced, destination never
+/// promotes, no dual writer, no data loss). The recorded product
+/// defect (the retry task spins on it at its 5s tick) — never
+/// papered over; see the body's finding block for the full trace.
 async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSavePoint) {
     let seq = next_id();
     let (mut rig, writer, _transport) = live_scenario(&format!("wg{seq}")).await;

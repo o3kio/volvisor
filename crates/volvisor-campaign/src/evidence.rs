@@ -307,7 +307,7 @@ pub fn render_report(dir: &Path) {
             .unwrap_or("unknown"),
         records.len(),
     );
-    report.push_str("\n## Coverage matrix (stage A: §9 rows 1–3)\n\n");
+    report.push_str("\n## Coverage matrix (stages A+B: §9 rows 1–7)\n\n");
     report.push_str(
         "| Scenario | Fault | Outcome | Acknowledged | Verified | Corrupted | Tail | Duration |\n",
     );
@@ -331,12 +331,19 @@ pub fn render_report(dir: &Path) {
         );
     }
     report.push_str(
-        "\nStage B will extend this matrix with the remaining fault\n\
-         families (§9 rows 4+): store-save kills, the generated kill\n\
-         matrix, the §5 injections, the abort storm, witness/VMM kills\n\
-         and partitions. Stage A's rows prove the oracle, the boundary\n\
-         rules and the kill/recovery machinery on the migration\n\
-         pipeline's own durable-write boundaries.\n",
+        "\nStage A proved the oracle, the boundary rules and the\n\
+         kill/recovery machinery on the migration pipeline's own\n\
+         durable-write boundaries (§9 rows 1–3). Stage B added the\n\
+         store-save seams, the generated kill matrix (59 cells) and\n\
+         rows 4–7 — volume mutations, consumer mobility, peer routes\n\
+         and the witness journal, every recovery asserted against the\n\
+         full invariant set. The recorded grant_set wedge (a safe,\n\
+         permanent park at destination_authorized after a witness\n\
+         kill inside the grant commit — the retry task spins at its\n\
+         5s tick) is a product defect this campaign records, not a\n\
+         test weakened. Stage C adds the §5 injections and the abort\n\
+         storm; stage D the Tier R scaffolding and this report's\n\
+         final form.\n",
     );
     let path = dir.join("REPORT.md");
     if let Some(parent) = path.parent() {

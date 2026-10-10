@@ -631,9 +631,6 @@ fn take_slot<T>(slot: &Mutex<Option<T>>) -> Option<T> {
 
 /// Everything immutable one daemon needs, built once and wired with
 /// its kill switch (the switch is permanent; each launch refreshes
-/// the group slot it aborts).
-/// Everything immutable one daemon needs, built once and wired with
-/// its kill switch (the switch is permanent; each launch refreshes
 /// the group slot it aborts). Construct the struct and call
 /// [`DaemonCore::install_kill_switch`] — the constructor-as-struct
 /// keeps the twelve-fixture field list readable.
