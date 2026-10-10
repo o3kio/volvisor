@@ -104,7 +104,8 @@ Online operation acceptance suite: growing attached thick and thin LVs, host blo
 Per the [readiness plan](../plans/2026-10-10-post-p5-readiness-questions.md)
 decision D4, exactly one slice of this ADR is accepted for
 implementation; everything else keeps its existing gate. The scope of
-the acceptance:
+the acceptance (points 1–2 are the accepted work; points 3–4 record
+what remains closed):
 
 1. **Grow-notification (Option "online grow", step 4 above).**
    `GrowVolume` on an attached `native-local` volume completes the VMM

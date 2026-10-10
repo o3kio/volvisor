@@ -2,6 +2,9 @@
 
 Status: Proposed (P8 implementation scope)
 Decision-accepted: pending (record acceptance date and accepting authority here)
+Note: the decision itself is already recorded by the readiness plan D2
+(PR #17); this ADR is its normative elaboration, and its status flips to
+Accepted when the P8-A completion gate passes.
 Date: 2026-10-10
 Related: [P5 plan](../plans/2026-10-10-p5-aggressive-failure-campaign.md) §0 (the tier model and claim discipline this extends), [readiness plan](../plans/2026-10-10-post-p5-readiness-questions.md) §2/D2 (the gap this closes), [post-P5 implementation plan](../plans/2026-10-10-post-p5-implementation-plan.md) (P8 staging), [ADR-0006](0006-online-resize-and-live-local-block-relocation.md) (the resize notification Tier V re-verifies), [nearline contract](../../contracts/nearline-replication-v2.md) §10 (the evidence ledger this tier joins)
 

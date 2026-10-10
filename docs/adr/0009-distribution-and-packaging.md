@@ -2,6 +2,13 @@
 
 Status: Proposed (P7 implementation scope)
 Decision-accepted: pending (record acceptance date and accepting authority here)
+Note: the decision itself is already recorded by the readiness plan D5
+(PR #17); this ADR is its normative elaboration, and its status flips to
+Accepted when the P7 completion gate passes. Two deltas from D5's summary
+shape are deliberate extensions recorded here: the witness daemon ships in
+the same package with its own unit (and its own `--version`/
+`--check-config`), and package-signing infrastructure is narrowed to
+signed git tags + `SHA256SUMS` for P7.
 Date: 2026-10-10
 Related: [ADR-0007](0007-drbd9-nearline-replication-provider.md) (the DRBD kernel-module reality the dependency metadata must carry), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md) §12 (implementation sequence, P7), [readiness plan](../plans/2026-10-10-post-p5-readiness-questions.md) §5/D5 (the decision this ADR normatively records), [post-P5 implementation plan](../plans/2026-10-10-post-p5-implementation-plan.md) (P7 staging)
 
