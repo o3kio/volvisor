@@ -343,7 +343,8 @@ impl GrowNotificationEngine {
                 vm_id,
                 vmm_disk_id,
                 target,
-                "vmm.api_socket_dir is not configured; the resize-disk call cannot be addressed"
+                "the VMM controller is not wired (vmm.api_socket_dir and vmm.ch_remote_bin \
+                 must both be configured); the resize-disk call cannot be addressed"
                     .to_owned(),
             );
         };

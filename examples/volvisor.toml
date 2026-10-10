@@ -121,3 +121,11 @@ peer_api_token = "replace-with-a-generated-secret"
 # ({api_socket_dir}/{vm_id}.sock). Required when migration is enabled.
 ch_remote_bin = "/usr/bin/ch-remote"
 api_socket_dir = "/run/volvisor/vms"
+# The grow-notification version gate (P6-B, lvm provider): probed
+# once at daemon startup (<cloud_hypervisor_bin> --version); the
+# notification of an attached volume's grow is refused with a
+# recorded reason below this minimum (fail-closed: the grow still
+# succeeds, the response says retry_required). Pin the release you
+# have actually qualified; unset fields leave the gate refused.
+cloud_hypervisor_bin = "/usr/bin/cloud-hypervisor"
+minimum_version = "37.0"

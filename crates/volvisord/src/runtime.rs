@@ -15,8 +15,11 @@ use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
 use volvisor_drbd::{AuthorityContext, DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
 use volvisor_lvm::{LvmProvider, RealRunner};
-use volvisor_provider::vmm::{ChRemoteConfig, ChRemoteVmm};
-use volvisor_provider::{AdminSurface, AdoptionSurface};
+use volvisor_provider::vmm::{ChRemoteConfig, ChRemoteVmm, VmmController};
+use volvisor_provider::{
+    AdminSurface, AdoptionSurface, GrowAttachmentFacts, GrowNotificationEngine,
+    GrowNotificationStore, VmmVersionGate, grow::Clock,
+};
 use volvisor_types::{ApiError, HostId};
 use volvisor_witness::client::HttpWitnessConnection;
 use volvisor_witness::{BlockingWitness, BlockingWitnessConnection};
@@ -40,6 +43,12 @@ const WITNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// deadline on **every** pass, so a passed deadline is caught within
 /// one tick, not within one renewal interval.
 const RENEWAL_TICK: Duration = Duration::from_secs(1);
+
+/// The grow-notification retry tick (P6-B): the migration retry's
+/// cadence — the reconciliation it performs (re-driving outstanding
+/// notifications, resolving detached pendings) is the same class of
+/// bounded, idempotent control-path work.
+const GROW_RETRY_TICK: Duration = Duration::from_secs(5);
 
 /// Build the shared server state: open (and replay) the journal, construct
 /// the configured provider and reconcile it.
@@ -73,7 +82,24 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
         ProviderKind::Lvm => {
             let provider = Arc::new(lvm_provider(config)?);
             let admin: Arc<dyn AdminSurface> = provider.clone();
-            AppState::new(provider, Some(admin), journal, config.admin_token.clone())
+            // Grow notification (P6-B, ADR-0006 first slice part 1):
+            // the LVM daemon path ALWAYS wires the engine — the
+            // fail-closed posture. When `[vmm]` carries no
+            // cloud-hypervisor binary or no minimum version, the gate
+            // refuses and every attached grow reports
+            // `retry_required` with the recorded reason — never a
+            // silent un-notified success, never an unwired
+            // placeholder. The same engine instance serves the grow
+            // operation and the retry task (one durable store).
+            let grow = wire_grow_notification(config, &provider)?;
+            let state = AppState::new(provider, Some(admin), journal, config.admin_token.clone())
+                .with_grow_notifier(grow.clone());
+            // Detached by design (the renewal-task pattern): the task
+            // owns the notification reconcile for the daemon's
+            // lifetime and never fails the startup that spawned it —
+            // every outcome is a structured event.
+            let _detached = spawn_grow_retry_task(grow);
+            state
         }
         ProviderKind::Ceph => {
             let provider = Arc::new(ceph_provider(config)?);
@@ -146,6 +172,126 @@ fn lvm_provider(config: &Config) -> Result<LvmProvider, DaemonError> {
         claim_token,
     )
     .map_err(|e| DaemonError::Config(format!("lvm provider construction failed: {e}")))
+}
+
+/// Compose the grow-notification engine (P6-B, ADR-0006 first slice
+/// part 1) for the LVM daemon path. Every seam is injected:
+///
+/// - the **version gate**, probed exactly once, here, at startup —
+///   `<cloud_hypervisor_bin> --version` through the real runner
+///   (argv-exact, shell-free) when both the binary and the minimum
+///   are configured; anything less leaves the gate refused with the
+///   recorded reason (the fail-closed posture: the daemon serves,
+///   and every attached grow reports `retry_required` until the
+///   configuration is fixed);
+/// - the **VMM controller** (`ChRemoteVmm` over the per-VM API
+///   sockets) when both `api_socket_dir` and `ch_remote_bin` are
+///   configured — the adapter's construction needs both, and
+///   wiring it half-configured would be a guess; otherwise the
+///   engine's not-wired posture records the refusal;
+/// - the **attachment facts** — the provider's own durable
+///   enumeration under its state lock, never a consumer assertion;
+/// - the **durable store** — one `grow-notifications.json` under
+///   the journal directory (the LVM state file's convention); a
+///   corrupt file refuses startup typed rather than silently
+///   dropping notification obligations;
+/// - the **clock** — wall time.
+fn wire_grow_notification(
+    config: &Config,
+    provider: &Arc<LvmProvider>,
+) -> Result<Arc<GrowNotificationEngine>, DaemonError> {
+    let gate = VmmVersionGate::probe(
+        config.vmm.cloud_hypervisor_bin.as_deref(),
+        config.vmm.minimum_version.as_deref(),
+        &RealRunner::default(),
+    );
+    let vmm = match (
+        config.vmm.api_socket_dir.as_ref(),
+        config.vmm.ch_remote_bin.as_ref(),
+    ) {
+        (Some(socket_dir), Some(ch_remote_bin)) => Some(Arc::new(ChRemoteVmm::new(
+            ChRemoteConfig {
+                ch_remote_bin: ch_remote_bin.clone(),
+                api_socket_dir: socket_dir.clone(),
+            },
+            Arc::new(RealRunner::default()),
+        )) as Arc<dyn VmmController>),
+        _ => None,
+    };
+    let facts: GrowAttachmentFacts = {
+        let provider = Arc::clone(provider);
+        Arc::new(move || provider.grow_attachment_facts())
+    };
+    let store = GrowNotificationStore::open(config.journal_dir.join("grow-notifications.json"))
+        .map_err(|e| {
+            DaemonError::Config(format!("grow-notification store construction failed: {e}"))
+        })?;
+    let clock: Clock = Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs())
+    });
+    Ok(Arc::new(GrowNotificationEngine::new(
+        vmm, gate, facts, store, clock,
+    )))
+}
+
+/// Spawn the grow-notification retry task (P6-B): one pass
+/// immediately (the startup reconcile — it re-drives notifications
+/// left pending by a crash and heals volumes grown under the
+/// pre-P6-B placeholder, which were never notified), then one pass
+/// per [`GROW_RETRY_TICK`]). Detached by design (the
+/// `spawn_migration_retry_task` pattern): the task owns the
+/// reconcile for the daemon's lifetime and never fails the startup
+/// that spawned it.
+fn spawn_grow_retry_task(engine: Arc<GrowNotificationEngine>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        grow_retry_pass(&engine);
+        loop {
+            tokio::time::sleep(GROW_RETRY_TICK).await;
+            grow_retry_pass(&engine);
+        }
+    })
+}
+
+/// One grow-notification reconcile pass (see
+/// [`spawn_grow_retry_task`]). The engine's pass is synchronous and
+/// bounded per volume by the resize-disk timeout — the same
+/// control-path blocking class as the renewal task's witness waits.
+/// Every outcome is a structured event, never a crash.
+fn grow_retry_pass(engine: &GrowNotificationEngine) {
+    match engine.retry_pass() {
+        Ok(report) => {
+            for (volume_id, size_bytes) in &report.notified {
+                tracing::info!(
+                    kind = "grow_notify",
+                    volume_id = %volume_id,
+                    size_bytes,
+                    "guest resize-disk notified"
+                );
+            }
+            for (volume_id, reason) in &report.retry_required {
+                tracing::warn!(
+                    kind = "grow_retry",
+                    volume_id = %volume_id,
+                    detail = %reason,
+                    "grow notification outstanding; retried next pass"
+                );
+            }
+            for volume_id in &report.not_applicable {
+                tracing::info!(
+                    kind = "grow_notify",
+                    volume_id = %volume_id,
+                    "pending grow notification resolved not_applicable (detached)"
+                );
+            }
+        }
+        Err(error) => tracing::error!(
+            kind = "grow_retry",
+            error = %error,
+            "grow reconcile pass failed; retried next pass"
+        ),
+    }
 }
 
 /// Resolve the durable ceph provider state path (defaults to
