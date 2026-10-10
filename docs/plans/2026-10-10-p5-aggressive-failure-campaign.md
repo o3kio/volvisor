@@ -558,7 +558,7 @@ the report):
 | 12 | concurrent multi-volume cut + resync-under-foreground + source-VMM death mid-cut + kills during an in-flight resync (the dirty-bitmap window) | multi-disk final cut; resync while foreground continues; VMM crash; SIGKILL during dirty bitmap (logical window — §1 records the durable boundary as Tier R) | convergence or exact `IN_DOUBT` participant report; the convergence gate never lies over a partition, an in-flight resync, or an un-drained apply queue |
 | 13 | replication partition mid-migration | storage network disconnect | no caught-up claim over a partition; cut refuses/parks; async tail covered |
 | 14 | abort storm (25 cycles, rotating pre-cut faults) | repeated migration aborts | no state residue, no lease leak, terminal records immutable, fresh-id recovery idempotent |
-| 15 | evidence bundle + summary render | exact versions, independent harness, full logs | the coverage matrix exists, budget-adherent, and is truthful |
+| 15 | evidence bundle + summary render | exact versions, independent harness, full logs | the coverage matrix exists, is budget-adherent, and the completion gates pass over it |
 
 Tier R rows (env-gated, `skipped` records until hardware): the same
 families against real DRBD/CH, plus the rows with no Tier S

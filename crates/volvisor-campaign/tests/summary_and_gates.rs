@@ -1,6 +1,9 @@
 //! Row 15 (§9, stage D): the evidence bundle + summary render —
-//! "the coverage matrix exists, budget-adherent, and is truthful" —
-//! and the §11 completion definition made checkable (CG1-CG5).
+//! "the coverage matrix exists, is budget-adherent, and the
+//! completion gates pass over it" (the plan's original "is
+//! truthful" was a self-referential overclaim, softened in the
+//! comprehensive review) — and the §11 completion definition made
+//! checkable (CG1-CG5).
 //!
 //! The tests render from a FIXTURE run directory: a complete,
 //! clearly-labeled record set (commit `fixture-commit` — a temp
