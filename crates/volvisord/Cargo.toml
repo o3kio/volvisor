@@ -31,6 +31,13 @@ volvisor-ceph = { workspace = true }
 volvisor-drbd = { workspace = true }
 volvisor-witness = { workspace = true }
 volvisor-api = { workspace = true }
+volvisor-handoff = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+hyper = { version = "1", default-features = false, features = ["http1", "client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+serde_json = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

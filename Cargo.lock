@@ -1209,9 +1209,15 @@ dependencies = [
 name = "volvisord"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1221,6 +1227,7 @@ dependencies = [
  "volvisor-api",
  "volvisor-ceph",
  "volvisor-drbd",
+ "volvisor-handoff",
  "volvisor-journal",
  "volvisor-lvm",
  "volvisor-provider",
