@@ -414,6 +414,7 @@ fn pvs_report(world: &FakeLvm) -> CommandOutput {
 }
 
 /// The scripted behavior for one command.
+#[allow(clippy::too_many_lines)] // one arm per LVM verb — the kit's table
 fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
     match program {
         "lvs" => {

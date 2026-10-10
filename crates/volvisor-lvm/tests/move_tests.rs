@@ -957,7 +957,7 @@ async fn a_crash_after_the_preparing_save_re_drives_on_the_retry_pass() {
     // mirror is live, the record already says so)...
     let report = restarted.move_reconcile_pass().expect("pass");
     assert_eq!(report.marked_copying, vec![volume_id(volume)]);
-    assert!(report.completed.is_empty());
+    assert_eq!(report.completed, Vec::new());
 
     // ...and the landing completes it (pass 3): one verified
     // completion, one generation bump.
@@ -1162,7 +1162,7 @@ async fn an_in_doubt_record_rolls_forward_when_the_world_proves_completion() {
     let restarted =
         provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
     let report = restarted.move_reconcile_pass().expect("pass");
-    assert!(report.completed.is_empty());
+    assert_eq!(report.completed, Vec::new());
     let (_, generation) = recorded_move(&fixture.state_path, volume);
     assert_eq!(generation, 2, "no second bump for a settled record");
 }
@@ -1205,7 +1205,7 @@ async fn a_dropped_volume_loses_its_move_record() {
     // The retry pass over the settled state has nothing to report.
     let restarted = provider_from_with_timing(&state_path, &fixture.world, default_move_timing());
     let report = restarted.move_reconcile_pass().expect("pass");
-    assert!(report.dropped.is_empty());
+    assert_eq!(report.dropped, Vec::new());
 }
 
 // ---------------------------------------------------------------------------
