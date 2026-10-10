@@ -1528,15 +1528,24 @@ async fn witness_barrier_cell(cell: Cell, point: volvisor_types::crash::StoreSav
 
 /// One grant_set mid-commit cell: the witness dies inside the
 /// destination's promote batch. The restart's replay lands the grant
-/// (the lease is live for the destination — epoch exactly 2), but
-/// THE FINDING: B's peer-grant op journaled its failure over the
-/// connection that died with the witness, and the ops pipeline
-/// replays recorded failures forever — so every re-drive's promote
-/// step re-serves it and the migration PARKS SAFE at
-/// `destination_authorized` (source fenced, destination never
-/// promotes, no dual writer, no data loss). The recorded product
-/// defect (the retry task spins on it at its 5s tick) — never
-/// papered over; see the body's finding block for the full trace.
+/// (the lease is live for the destination — epoch exactly 2). B's
+/// peer-grant op journaled its FAILURE over the connection that died
+/// with the witness — the recorded `grant_set` wedge (P6-A part 3's
+/// defect of record, now FIXED): the ops pipeline used to replay that
+/// recorded failure forever, parking the migration SAFE at
+/// `destination_authorized` (fail-closed: no dual writer, the source
+/// fenced, the destination never promoted) with no route recourse —
+/// recovery required operator action. With re-resolvable peer acts,
+/// the re-drive RE-ISSUES the failed act: the landed-ness inspection
+/// cannot prove it landed (the act died before any promote or
+/// device-path recording), so it re-executes under its idempotency
+/// discipline — the witness batch under its deterministic operation
+/// id (the journal replay re-serves the grant: epoch exactly 2, never
+/// a second epoch), the promote idempotent per migration — and the
+/// migration CONVERGES to COMPLETE. The recovery: the witness
+/// restarts (the replay lands the grant), then the source restarts
+/// and its startup pass folds the landed grant and drives forward
+/// through the re-issue.
 async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSavePoint) {
     let seq = next_id();
     let (mut rig, writer, _transport) = live_scenario(&format!("wg{seq}")).await;
@@ -1550,37 +1559,44 @@ async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSaveP
 
     // The recovery: the witness restarts — the replay lands the
     // grant exactly once (W3) — then the source restarts and its
-    // startup pass folds the landed grant into the record.
+    // startup pass folds the landed grant into the record and drives
+    // forward.
     rig.witness.restart().await;
     rig.a.restart().await;
-    let summary = poll_migration(rig.a.addr, "mig-x", "destination_authorized").await;
 
-    // THE FINDING (recorded, never papered over — §7's honesty): the
-    // drive cannot complete. B's peer-grant op journaled its FAILURE
-    // over the connection that died with the witness, and the ops
-    // pipeline replays recorded failures forever (fail-closed
-    // idempotency: a failed act is never re-executed) — so every
-    // re-drive's promote step, which re-calls B's grant route for
-    // the promoted device paths, re-serves that recorded 500. The
-    // cut is durable, so there is no rollback; the consumer has no
-    // route recourse (the transfer answers 202 and the drive
-    // refuses the terminal-stall internally). The migration parks
-    // SAFE: the source stays fenced, the destination never promotes
-    // (no dual writer, no data loss), the barrier's attestation
-    // holds, and the acknowledged prefix is durable at the
-    // destination. The remedy — re-resolvable peer acts, or a
-    // promote path that does not route through the failed grant op
-    // — is a design decision this campaign records rather than
-    // makes.
+    // THE FIX'S CONVERGENCE (the grant_set wedge, healed): the drive's
+    // promote step re-issues B's peer-grant act. B's journal holds the
+    // act's recorded failure; the re-issue re-evaluates it against the
+    // world — nothing is provable, so the act re-executes under its
+    // idempotency discipline (the witness batch replays its recorded
+    // outcome, the promote runs, the device paths are recorded) and
+    // the migration completes through the restore-vm and resume steps.
+    let summary = poll_migration(rig.a.addr, "mig-x", "complete").await;
+
+    // The healed path is visible in the record's history: the fold
+    // landed destination_authorized, then the re-issued promote drove
+    // vm_resumed and complete — the convergence went through the
+    // re-issue, not around it.
+    let history: Vec<&str> = summary["state_history"]
+        .as_array()
+        .expect("the summary carries the state history")
+        .iter()
+        .map(|entry| entry["state"].as_str().expect("a state name"))
+        .collect();
+    let authorized = history
+        .iter()
+        .position(|state| *state == "destination_authorized")
+        .expect("the fold landed destination_authorized");
+    let resumed = history
+        .iter()
+        .position(|state| *state == "vm_resumed")
+        .expect("the re-issued promote drove the restore and resume");
     assert!(
-        summary["in_doubt_detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("stalled")),
-        "the parked record's detail is honest: {}",
-        summary["in_doubt_detail"]
+        authorized < resumed,
+        "the healed path is ordered: {history:?}"
     );
 
-    // The safety set over the parked record.
+    // The safety set over the CONVERGED record.
     assert_eq!(
         rig.vmm_a.vm_state(&rig.vm).expect("the source VM observes"),
         VmState::Absent,
@@ -1589,12 +1605,12 @@ async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSaveP
     assert_eq!(
         role_of(&rig.world_a, &rig.resource()),
         Role::Secondary,
-        "the source stays demoted (fenced)"
+        "the source stays demoted (fenced, never resumed)"
     );
     assert_eq!(
         role_of(&rig.world_b, &rig.resource()),
-        Role::Secondary,
-        "the destination never promoted over the wedged grant (no dual writer)"
+        Role::Primary,
+        "the destination promoted through the healed path"
     );
 
     let (acked, boundary) = writer.join().await;
@@ -1602,7 +1618,8 @@ async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSaveP
     let destination = verify_against(&rig.world_b, SEED_MINOR, &acked, WRITER_ID);
     assert!(
         destination.prefix_intact(),
-        "the destination keeps every acknowledged write: {destination:?}"
+        "the destination keeps every acknowledged write through the healed \
+         completion: {destination:?}"
     );
     evidence.invariant(
         "g5_barrier_all_true",
@@ -1618,18 +1635,22 @@ async fn witness_grant_cell(cell: Cell, point: volvisor_types::crash::StoreSaveP
     );
     evidence.invariant(
         "d6a_provider_inspect",
-        "not applicable: the destination never promoted, so no authority block exists to \
-         inspect — the witness view (epoch 2, node-b, live) is the authority observation",
+        &assert_d6a(&rig, rig.b.addr, 2, PEER_NODE).await,
     );
     evidence.invariant(
         "rule8_idempotency",
-        "pass: B's peer-grant op replays its recorded failure on every re-drive — the \
-         fail-closed reading; it never re-executes the (witness-idempotent) grant act",
+        "pass: the re-issued grant act re-executed under its idempotency \
+         discipline — the witness batch replayed its recorded outcome (the \
+         epoch is exactly 2, never a second grant) and the promote is \
+         idempotent per migration; its success outcome superseded the \
+         recorded failure",
     );
     evidence.outcome(
-        "parked: SAFE but wedged post-cut (destination_authorized) — B's recorded peer-grant \
-         failure replays on every re-drive; the source stays fenced, the destination never \
-         promotes, no dual writer, no data loss; recovery needs operator action",
+        "recovered: COMPLETE — the recorded peer-grant failure was re-issued \
+         (the grant_set wedge, fixed in P6-A part 3): the re-drive's promote \
+         re-evaluated the failed act, re-executed it idempotently and \
+         converged; the epoch is exactly 2 (no dual writer), the source stays \
+         fenced, the acknowledged prefix is byte-exact at the destination",
     );
     emit_oracle(
         &rig,

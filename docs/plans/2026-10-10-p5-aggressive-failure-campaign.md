@@ -563,8 +563,8 @@ the report):
 | 4 | kill matrix: volume mutations | SIGKILL during ACK/WAL commit | replay idempotency, fail-closed generation checks |
 | 5 | kill matrix: consumer mobility routes | SIGKILL during WAL commit | 202/201 replay, intent resolution by observation |
 | 6 | kill matrix: peer routes | SIGKILL during peer stream/replay | grant/restore idempotency, no half-promote called done |
-| 7 | kill matrix: witness journal (stop/restart + mid-save) | SIGKILL during meta commit, quorum loss window | authority fail-closed on divergence |
-| 8 | stale source write after fence | source-after-fence stale writes | destination untouched; source promotion is `UNSAFE` |
+| 7 | kill matrix: witness journal (stop/restart + mid-save) | SIGKILL during meta commit, quorum loss window | authority fail-closed on divergence; the grant_set mid-commit windows heal — the re-issued peer act converges, epoch exactly 2, prefix byte-exact (the P6-A part 3 wedge fix; the park was the recorded stage-B finding) |
+| 8 | stale source write after fence | source-after-fence stale writes | destination untouched — through the witness-down window AND through the healed completion (the wedge fix's convergence); source promotion is `UNSAFE`; no route resumes the source |
 | 9 | wrong-lineage injection at the target | wrong-epoch data injection (lineage-shaped, §1) | typed refusal; never `COMPLETE` over foreign data |
 | 9b | the same injection landing after prepare, mid-drive (P6-A F1 delivery: the barrier-time lineage re-check) | the post-prepare window of the same lineage-shaped injection | typed refusal at the barrier, pre-cut: the record parks carrying the typed marker, the source stays fenced/intact, the cut never crosses foreign data |
 | 10 | forged barrier proofs | wrong-epoch barrier injection | void keys by migration; mismatch refuses typed |
