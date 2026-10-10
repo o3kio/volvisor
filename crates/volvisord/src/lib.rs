@@ -20,6 +20,7 @@
 pub mod config;
 pub mod handoff;
 pub mod runtime;
+pub mod version;
 pub mod witness;
 
 use std::net::SocketAddr;

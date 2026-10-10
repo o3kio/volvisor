@@ -48,6 +48,29 @@ pub fn load_config(path: &Path) -> Result<WitnessConfig, DaemonError> {
     Ok(config)
 }
 
+/// Check a witness configuration file the way `--check-config` does
+/// (P7-A, ADR-0009): load and validate it, and render the concise
+/// summary the operator sees. The witness journal is NOT opened —
+/// this is the install smoke surface, not a startup.
+///
+/// # Errors
+/// [`DaemonError::Config`] when the file is unreadable, malformed or
+/// fails validation; the caller prints the typed error to stderr and
+/// exits non-zero.
+pub fn check_config(path: &Path) -> Result<String, DaemonError> {
+    let config = load_config(path)?;
+    Ok(format!(
+        "config ok: listen {}, state_dir {}, lease_ttl {}s, grace {}s, suspend_budget {}s, \
+         host_credentials {}",
+        config.listen,
+        config.state_dir.display(),
+        config.lease_ttl_secs,
+        config.lease_grace_secs,
+        config.suspend_budget_secs,
+        config.host_tokens.len()
+    ))
+}
+
 /// Serve the witness surface until a shutdown signal arrives, then
 /// drain in-flight requests gracefully.
 ///

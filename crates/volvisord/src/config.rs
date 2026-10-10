@@ -28,6 +28,20 @@ pub enum ProviderKind {
     Drbd,
 }
 
+impl ProviderKind {
+    /// The TOML name of the provider (the `provider` field's value,
+    /// and what `--check-config`'s summary prints).
+    #[must_use]
+    pub const fn as_toml_name(self) -> &'static str {
+        match self {
+            ProviderKind::Fake => "fake",
+            ProviderKind::Lvm => "lvm",
+            ProviderKind::Ceph => "ceph",
+            ProviderKind::Drbd => "drbd",
+        }
+    }
+}
+
 /// Default Ceph entity name (`--name`) when `ceph_user` is unset.
 ///
 /// The ceph CLI resolves the matching keyring itself (CEPH_CONF /
@@ -301,6 +315,30 @@ impl Config {
             .map_err(|e| DaemonError::Config(format!("cannot parse {}: {e}", path.display())))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Render the concise `--check-config` summary (P7-A, ADR-0009):
+    /// the facts an operator verifies at a glance — bind address,
+    /// provider, state location, witness and migration posture. Never
+    /// includes token values (SPEC-0002 section 9); the witness URL
+    /// and the paths are configuration facts, not secrets.
+    #[must_use]
+    pub fn check_summary(&self) -> String {
+        let witness = match (&self.witness_url, self.witness_renewal_interval_secs) {
+            (Some(url), Some(secs)) => format!("witness {url} (renews every {secs}s)"),
+            _ => "no witness".to_owned(),
+        };
+        let migration = if self.migration.enabled {
+            "migration enabled"
+        } else {
+            "migration disabled"
+        };
+        format!(
+            "config ok: listen {}, provider {}, journal_dir {}, {witness}, {migration}",
+            self.listen,
+            self.provider.as_toml_name(),
+            self.journal_dir.display()
+        )
     }
 
     /// Validate cross-field constraints.
@@ -762,6 +800,22 @@ impl Config {
             .as_ref()
             .unwrap_or_else(|| DEFAULT.get_or_init(|| PathBuf::from("/proc")))
     }
+}
+
+/// Check a configuration file the way `--check-config` does (P7-A,
+/// ADR-0009): load and validate it, and render the concise summary
+/// the operator sees. This is the install smoke surface — it proves
+/// the binary reads and accepts its configuration without devices or
+/// a running daemon. The journal is not opened and the server does
+/// not start.
+///
+/// # Errors
+/// [`DaemonError::Config`] when the file is unreadable, malformed or
+/// fails validation; the caller prints the typed error to stderr and
+/// exits non-zero.
+pub fn check_config(path: &std::path::Path) -> Result<String, DaemonError> {
+    let config = Config::load(path)?;
+    Ok(config.check_summary())
 }
 
 /// Whether `value` is 1..=`max_len` characters of ASCII alphanumerics,
