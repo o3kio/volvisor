@@ -1276,6 +1276,17 @@ impl MigrationHandle {
         &self.drive
     }
 
+    /// The migration store's store-save crash seam (P5 plan §3.1):
+    /// the armed table a campaign rig aims and the kill switch fires
+    /// into. Inert unless a rig arms it; no route or input reaches
+    /// it (the doc-gated trust class in `volvisor-types::crash`).
+    /// Fresh per `wire_migration` call - a rig re-registers its kill
+    /// switch on every daemon restart.
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> Arc<volvisor_types::crash::StoreCrashHooks> {
+        self.coordinator.store_crash_hooks()
+    }
+
     /// The number of live transfer drive tasks (plan §3.3: the
     /// supervisor's kill-group enumeration input — the detached drive
     /// is part of the task group the rig aborts as one unit).

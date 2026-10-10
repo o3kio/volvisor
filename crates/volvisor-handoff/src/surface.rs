@@ -141,10 +141,15 @@ pub trait MigrationSurface: Send + Sync {
     /// the observation at drive start — the drive continues in the
     /// background and progress is read through [`Self::observe`].
     ///
+    /// A transfer on a TERMINAL record also answers `202` with the
+    /// record: the route's contract is 202-always (the proof is
+    /// recorded durably either way); the drive itself refuses
+    /// terminal records internally and logs the refusal — it never
+    /// surfaces as a route error.
+    ///
     /// # Errors
-    /// `NOT_FOUND` for an unknown migration; `INVALID_STATE` for a
-    /// terminal one; the surface's typed error when the proof cannot
-    /// be recorded durably.
+    /// `NOT_FOUND` for an unknown migration; the surface's typed
+    /// error when the proof cannot be recorded durably.
     async fn transfer(
         &self,
         migration_id: &MigrationId,

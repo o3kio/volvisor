@@ -69,6 +69,7 @@
 #![allow(clippy::panic)] // scenario-abort assertions (see above)
 
 pub mod evidence;
+pub mod matrix;
 pub mod oracle;
 pub mod rig;
 

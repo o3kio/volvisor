@@ -433,7 +433,7 @@ pub enum ClearedAttachmentReason {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DrbdState {
     volumes: BTreeMap<VolumeId, StoredVolume>,
     /// Next DRBD minor to hand out (monotonic; see [`Self::allocate_minor`]).
@@ -442,7 +442,25 @@ pub struct DrbdState {
     /// Next local replication port to hand out (monotonic).
     #[serde(default)]
     next_port: u16,
+    /// The store-save crash seam (P5 plan §3.1): never serialized,
+    /// never compared — test plumbing the owning provider attaches,
+    /// inert (`None`) in every production construction.
+    #[serde(skip)]
+    crash: Option<std::sync::Arc<volvisor_types::crash::StoreCrashHooks>>,
 }
+
+// The crash seam is test plumbing, not state: two states with equal
+// durable content are equal (the derived impl would have required
+// the seam itself to be comparable, which it deliberately is not).
+impl PartialEq for DrbdState {
+    fn eq(&self, other: &Self) -> bool {
+        self.volumes == other.volumes
+            && self.next_minor == other.next_minor
+            && self.next_port == other.next_port
+    }
+}
+
+impl Eq for DrbdState {}
 
 impl DrbdState {
     /// Load the state from `path`.
@@ -473,7 +491,8 @@ impl DrbdState {
     /// placements, so it is owner-only), fsync, rename over `path`, fsync
     /// the directory. If any step fails, the temporary file is removed
     /// and an `INTERNAL` error is returned; the previous state file
-    /// remains intact.
+    /// remains intact. The store-save crash seam (P5 plan §3.1) can
+    /// terminate the saving task inside this sequence.
     pub fn save(&mut self, path: &Path) -> Result<(), ApiError> {
         let tmp_path = sibling_tmp_path(path);
         let result = self.save_to(&tmp_path, path);
@@ -482,6 +501,17 @@ impl DrbdState {
             drop(fs::remove_file(&tmp_path));
         }
         result
+    }
+
+    /// Attach the store-save crash seam (P5 plan §3.1) this state's
+    /// saves consult. Test-rig plumbing only (the doc-gated trust
+    /// class in `volvisor-types::crash`): the provider's owning rig
+    /// registers its kill switch on the same shared instance.
+    pub fn attach_store_crash_hooks(
+        &mut self,
+        hooks: std::sync::Arc<volvisor_types::crash::StoreCrashHooks>,
+    ) {
+        self.crash = Some(hooks);
     }
 
     fn save_to(&mut self, tmp_path: &Path, path: &Path) -> Result<(), ApiError> {
@@ -494,14 +524,35 @@ impl DrbdState {
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         file.write_all(&data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
+        // The store-save crash points (P5 plan §3.1): after the tmp
+        // content write, after its fsync, after the rename. Inert
+        // unless the rig armed this provider's seam.
+        if let Some(crash) = &self.crash {
+            crash.consult(
+                volvisor_types::crash::STORE_DRBD_STATE,
+                volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+            );
+        }
         file.sync_all()
             .map_err(|e| internal(format!("failed to fsync {tmp_display}: {e}")))?;
         drop(file);
+        if let Some(crash) = &self.crash {
+            crash.consult(
+                volvisor_types::crash::STORE_DRBD_STATE,
+                volvisor_types::crash::StoreSavePoint::AfterFsyncBeforeRename,
+            );
+        }
         fs::rename(tmp_path, path).map_err(|e| {
             internal(format!(
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
+        if let Some(crash) = &self.crash {
+            crash.consult(
+                volvisor_types::crash::STORE_DRBD_STATE,
+                volvisor_types::crash::StoreSavePoint::AfterRename,
+            );
+        }
         // fsync the directory so the rename itself is durable.
         let dir = fs::File::open(
             path.parent()

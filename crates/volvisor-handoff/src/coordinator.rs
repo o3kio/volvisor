@@ -358,6 +358,21 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         }
     }
 
+    /// The migration store's store-save crash seam (P5 plan §3.1)
+    /// — the pass-through a daemon's migration handle exposes to the
+    /// constructing test rig. Inert unless a rig arms it. Returns the
+    /// shared `Arc` (the store behind the coordinator's mutex keeps
+    /// the same instance for its lifetime).
+    #[must_use]
+    pub fn store_crash_hooks(&self) -> Arc<volvisor_types::crash::StoreCrashHooks> {
+        Arc::clone(
+            self.store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .store_crash_hooks(),
+        )
+    }
+
     /// Prepare a migration: validate the request, verify/prepare the
     /// target through the driver, then persist the `Prepared` record.
     ///

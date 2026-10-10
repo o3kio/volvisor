@@ -76,8 +76,11 @@ pub type KillSwitch = Arc<dyn Fn() + Send + Sync>;
 
 /// The prefix every crash-injection panic payload starts with — a
 /// campaign test binary filters its panic hook on this so injected
-/// kills stay silent while real panics print normally.
-pub const CRASH_PANIC_PREFIX: &str = "volvisor-campaign-crash:";
+/// kills stay silent while real panics print normally. The
+/// canonical constant lives in `volvisor-types` (the store-save seam
+/// shares it); this re-export keeps the journal seam's call sites
+/// stable.
+pub use volvisor_types::crash::CRASH_PANIC_PREFIX;
 
 /// The per-daemon armed table (P5 plan §3.1): operation kind → the
 /// crash point its next matching durable write dies at. Inert until
@@ -185,5 +188,62 @@ impl CrashHooks {
 impl Default for CrashHooks {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::ALL_OP_KINDS;
+
+    /// P5 stage B (plan §3.1): the armed table's key space must
+    /// cover every journaled operation kind the router exposes —
+    /// `ALL_OP_KINDS` is the generated kill matrix's enumeration
+    /// input, so a kind missing from it would be a kind the matrix
+    /// can never account for. The expected side below is
+    /// deliberately hand-enumerated (mirroring the router table)
+    /// so a constant added without a list entry fails here rather
+    /// than vanishing from the campaign.
+    #[test]
+    fn all_op_kinds_covers_the_journaled_surface_exactly() {
+        assert_eq!(
+            Vec::from(ALL_OP_KINDS),
+            vec![
+                "create_volume",
+                "attach_volume",
+                "detach_volume",
+                "grow_volume",
+                "delete_volume",
+                "claim_device",
+                "release_device",
+                "adopt_volume",
+                "clear_cut_marker",
+                "migration_prepare",
+                "migration_transfer",
+                "migration_abort",
+                "peer_prepare",
+                "peer_grant",
+                "peer_restore_vm",
+                "peer_discard",
+            ],
+            "ALL_OP_KINDS must list exactly the router's journaled kinds"
+        );
+        // No kind may appear twice (a duplicate would arm ambiguously).
+        let mut sorted = Vec::from(ALL_OP_KINDS);
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ALL_OP_KINDS.len());
+    }
+
+    /// Every kind is armable: the table accepts it (the fire itself
+    /// is a panic, so this test only arms and clears — the firing
+    /// paths are the campaign's job).
+    #[test]
+    fn every_kind_is_armable() {
+        let hooks = CrashHooks::new();
+        for kind in ALL_OP_KINDS {
+            hooks.arm(kind, CrashPoint::AfterIntent);
+        }
+        hooks.clear();
     }
 }
