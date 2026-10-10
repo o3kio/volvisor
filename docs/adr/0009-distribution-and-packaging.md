@@ -45,7 +45,7 @@ release CI.
 
 | Path | Contents |
 |---|---|
-| `/etc/volvisor/` | configuration; a documented example config ships with the package (the daemon already requires a TOML `--config` path) |
+| `/etc/volvisor/` | configuration; a documented example config ships with the package (the daemon already requires a TOML `--config` path) — see the [configuration documentation](../configuration.md) and the annotated [examples/volvisor.toml](../../examples/volvisor.toml) / [examples/witnessd.toml](../../examples/witnessd.toml) |
 | `/var/lib/volvisor/` | persistent state: journals, provider state, the witness registry |
 | `/run/volvisor/` | runtime sockets — the P4b `--api-socket` convention already assumes `/run/volvisor/vms` |
 | logs | via journald (the tracing stack already emits structured events; the units route them to the journal, no separate log files) |
@@ -73,6 +73,9 @@ P7 adds `volvisord --check-config <path>` (and the witnessd equivalent):
 load and validate the configuration file, print the typed error or exit 0.
 This is the smoke surface both package tests and operators use — it proves
 the installed binary runs and parses its config without needing devices.
+Every field is documented in [docs/configuration.md](../configuration.md);
+the annotated examples above are validated by a repository test, so the
+examples and the validator cannot drift apart.
 
 ### Dependency honesty
 

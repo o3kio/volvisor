@@ -31,6 +31,11 @@ shape and its completion gate. PR numbers are assigned as stages open —
 stages are labeled (P6-A, P6-B, …), never hard-coded to future PR numbers.
 The house review-until-clean loop applies to every PR.
 
+Execution order (operator direction, 2026-10-10): delivery runs
+easy-first — P7-A, P6-B, P6-A (flakes → triage → wedge), P6-C,
+P7-B/C, P8-A/B/C, P9-A/B. The stage scopes below are unchanged by
+this ordering; only the sequence in which they open differs.
+
 ## 0. The honesty rules carried forward
 
 [Readiness plan §8](2026-10-10-post-p5-readiness-questions.md), verbatim in
@@ -166,7 +171,9 @@ the compiled-in version (derived from `git describe` in release builds).
 `volvisord --check-config <path>` (and the witnessd equivalent) loads and
 validates a configuration file and exits 0 or a typed error. A documented
 example config ships in the repository (the future `/etc/volvisor/`
-content).
+content): [docs/configuration.md](../configuration.md),
+[examples/volvisor.toml](../../examples/volvisor.toml) and
+[examples/witnessd.toml](../../examples/witnessd.toml).
 
 **Test/evidence shape.** Unit tests for config validation surfaces; the
 `--check-config` exit codes pinned (valid example config → 0; each
