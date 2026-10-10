@@ -846,6 +846,8 @@ struct FakeVm {
 struct FakeVmmWorld {
     vms: BTreeMap<String, FakeVm>,
     fail: BTreeMap<String, FakeFailKnobs>,
+    /// The ordered controller-call log (see [`FakeVmm::calls`]).
+    calls: Vec<(&'static str, String)>,
 }
 
 /// TEST-ONLY fake VMM (plan §5): an in-memory state machine over real
@@ -917,6 +919,29 @@ impl FakeVmm {
     #[must_use]
     pub fn snapshot_root(&self) -> &Path {
         &self.snapshot_root
+    }
+
+    /// Append one entry to the ordered call log (see
+    /// [`Self::calls`]). Called at the entry of every
+    /// [`VmmController`] method — before preconditions and before the
+    /// injected-failure knobs — so the log proves a call HAPPENED even
+    /// when it failed (crash-window tests fault an operation and then
+    /// assert the retry re-enters it).
+    fn note(&self, method: &'static str, vm_id: &str) -> Result<(), ApiError> {
+        let mut world = lock(&self.world)?;
+        world.calls.push((method, vm_id.to_owned()));
+        Ok(())
+    }
+
+    /// The ordered log of [`VmmController`] calls against this fake:
+    /// `(method, vm_id)` pairs in call order (e.g. `pause`, `snapshot`,
+    /// `destroy`, `restore`, `resume`, `state`), including calls that
+    /// failed. The harness-side `create`/`start` seeding acts are NOT
+    /// logged — the log records what the VMM controller did, not what
+    /// the consumer set up.
+    pub fn calls(&self) -> Result<Vec<(&'static str, String)>, ApiError> {
+        let world = lock(&self.world)?;
+        Ok(world.calls.clone())
     }
 
     /// Edit one VM's failure-injection knobs (created on first use;
@@ -1020,6 +1045,7 @@ impl FakeVmm {
 
 impl VmmController for FakeVmm {
     fn pause(&self, vm_id: &str) -> Result<PauseProof, ApiError> {
+        self.note("pause", vm_id)?;
         let mut world = lock(&self.world)?;
         if world.fail.get(vm_id).is_some_and(|knobs| knobs.pause) {
             return Err(Self::injected("pause", vm_id));
@@ -1047,6 +1073,7 @@ impl VmmController for FakeVmm {
     }
 
     fn snapshot(&self, vm_id: &str, dir: &Path) -> Result<(), ApiError> {
+        self.note("snapshot", vm_id)?;
         let devices = {
             let world = lock(&self.world)?;
             if world.fail.get(vm_id).is_some_and(|knobs| knobs.snapshot) {
@@ -1109,6 +1136,7 @@ impl VmmController for FakeVmm {
     }
 
     fn destroy(&self, vm_id: &str) -> Result<(), ApiError> {
+        self.note("destroy", vm_id)?;
         let devices = {
             let mut world = lock(&self.world)?;
             if world.fail.get(vm_id).is_some_and(|knobs| knobs.destroy) {
@@ -1126,6 +1154,7 @@ impl VmmController for FakeVmm {
     }
 
     fn restore(&self, vm_id: &str, dir: &Path, disks: &[DiskMapping]) -> Result<(), ApiError> {
+        self.note("restore", vm_id)?;
         {
             let world = lock(&self.world)?;
             if world.fail.get(vm_id).is_some_and(|knobs| knobs.restore) {
@@ -1204,6 +1233,7 @@ impl VmmController for FakeVmm {
     }
 
     fn resume(&self, vm_id: &str) -> Result<(), ApiError> {
+        self.note("resume", vm_id)?;
         let mut world = lock(&self.world)?;
         if world.fail.get(vm_id).is_some_and(|knobs| knobs.resume) {
             return Err(Self::injected("resume", vm_id));
@@ -1226,6 +1256,7 @@ impl VmmController for FakeVmm {
     }
 
     fn state(&self, vm_id: &str) -> Result<VmState, ApiError> {
+        self.note("state", vm_id)?;
         let world = lock(&self.world)?;
         if world.fail.get(vm_id).is_some_and(|knobs| knobs.state) {
             return Err(Self::injected("state", vm_id));
@@ -1472,6 +1503,37 @@ mod tests {
         assert_eq!(proof.vm_id, "vm-1");
         assert_eq!(proof.state, VmState::Paused);
         assert_eq!(proof.observed_at, 1_700_000_042);
+    }
+
+    #[test]
+    fn fake_vmm_call_log_records_every_controller_call_in_order() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fake = FakeVmm::new(root.path());
+        // The harness-side seeding acts (create/start) are NOT
+        // controller calls — the log starts empty.
+        assert_eq!(fake.calls().expect("calls"), Vec::<(&str, String)>::new());
+        fake.create("vm-1", &["/dev/drbd1"]).expect("create");
+        fake.start("vm-1").expect("start");
+        assert_eq!(fake.calls().expect("calls"), Vec::<(&str, String)>::new());
+
+        fake.pause("vm-1").expect("pause");
+        let dir = root.path().join("mig-1");
+        fake.snapshot("vm-1", &dir).expect("snapshot");
+
+        // A faulted call is still logged: the log proves the call
+        // HAPPENED — exactly what a crash-window retry asserts
+        // against (the re-drive re-enters the operation).
+        fake.set_fail("vm-1", |knobs| knobs.destroy = true)
+            .expect("knobs");
+        fake.destroy("vm-1").expect_err("injected destroy failure");
+        fake.set_fail("vm-1", |knobs| knobs.destroy = false)
+            .expect("knobs");
+        fake.destroy("vm-1").expect("destroy");
+
+        let calls = fake.calls().expect("calls");
+        let methods: Vec<&str> = calls.iter().map(|(method, _)| *method).collect();
+        assert_eq!(methods, vec!["pause", "snapshot", "destroy", "destroy"]);
+        assert!(calls.iter().all(|(_, vm_id)| vm_id == "vm-1"), "{calls:?}");
     }
 
     #[test]

@@ -393,6 +393,13 @@ pub struct FakeDrbd {
     pub fail_lvextend: bool,
     /// `drbdadm primary` (and `primary --force`) fails.
     pub fail_primary: bool,
+    /// `drbdadm primary` (and `primary --force`) fails for exactly
+    /// these resource names — the per-volume scalpel next to the
+    /// world-wide [`Self::fail_primary`]: a multi-volume handoff faults
+    /// one participant's promotion while the others succeed, so a test
+    /// can pin the all-or-nothing stall shape (the coordinator must
+    /// never half-promote and call it done).
+    pub fail_primary_resources: BTreeSet<String>,
     /// `drbdadm secondary` fails (with [`Self::fail_secondary_message`]
     /// when set, else a generic failure).
     pub fail_secondary: bool,
@@ -447,6 +454,7 @@ impl Default for FakeDrbd {
             fail_lvcreate: false,
             fail_lvextend: false,
             fail_primary: false,
+            fail_primary_resources: BTreeSet::new(),
             fail_secondary: false,
             fail_secondary_message: None,
             fail_down: false,
@@ -824,7 +832,7 @@ fn script_drbdadm_primary(
     resource: &str,
     force: bool,
 ) -> Option<CommandOutput> {
-    if world.fail_primary {
+    if world.fail_primary || world.fail_primary_resources.contains(resource) {
         return Some(CommandOutput::failure("drbdadm primary: simulated failure"));
     }
     let state = world.resources.get_mut(resource)?;
@@ -1642,6 +1650,116 @@ pub fn seed_volume_with_identity(
             peer_node: PEER_NODE.to_owned(),
         },
     );
+}
+
+/// The resource definition as the PEER host sees the same volume: the
+/// node names, addresses and port sides swapped, the same backing path
+/// (the P3 operator model deploys the identical definition on both
+/// ends). The local node of THIS definition (`node-b`) carries
+/// `node-id 0` and the original node `node-id 1` (resgen pins local to
+/// 0, peer to 1 — so from the peer host's world the original node is
+/// addressed as peer device 1, the default [`FakeDrbd::peer_node_id`]).
+///
+/// Symmetric replication ports keep the peer view self-contained: the
+/// endpoint identity the witness sees is host/resource/disk (see the
+/// provider's `endpoint_backing_identity`), never the port.
+pub fn peer_definition(
+    resource: &str,
+    minor: u32,
+    port: u16,
+    protocol: ReplicationMode,
+) -> ResourceDefinition {
+    let (peer_ip, _peer_port) = peer_endpoint();
+    ResourceDefinition {
+        resource_name: resource.to_owned(),
+        minor,
+        protocol,
+        local_node: PEER_NODE.to_owned(),
+        local_address: peer_ip,
+        local_port: port,
+        peer_node: NODE.to_owned(),
+        peer_address: LOCAL_ADDR.to_owned(),
+        peer_port: port,
+        disk_path: format!("/dev/{VG}/{resource}"),
+        shared_secret: SECRET.to_owned(),
+    }
+}
+
+/// Seed a volume's PEER-side replica into a second simulated world:
+/// the backing LV (with the ownership tag and data on it), the on-LV
+/// metadata, the running resource (`Secondary`, both ends `UpToDate`,
+/// the original node as its peer), the peer-view res file and the
+/// FIXED lineage set — and **no state-file entry**.
+///
+/// This is the destination host of a cross-host handoff: its replica
+/// is established (adoption's lineage comparison must match the
+/// source's [`seed_volume_with_identity`] — hence the same
+/// deterministic [`GiSet::for_resource`]), but volvisor on that host
+/// has never tracked the volume, so the destination-side promote
+/// (`primary --force` through the provider's seeding promotion, which
+/// is why the world's `peer_role` never blocks it) starts from a
+/// clean slate exactly as a real peer would.
+///
+/// The world's `uname -n` answer is set to [`PEER_NODE`] here (the
+/// peer host's identity); construct its provider with
+/// [`config_for_peer`] over the same `base`.
+pub fn seed_peer_volume(
+    base: &Path,
+    world: &Arc<Mutex<FakeDrbd>>,
+    volume_id: &str,
+    size_bytes: u64,
+    protocol: ReplicationMode,
+    minor: u32,
+    port: u16,
+) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let resource = resource_name_for(&volume_id);
+    peer_definition(&resource, minor, port, protocol)
+        .write(&base.join("drbd.d"))
+        .expect("write fixture peer res file");
+    let mut world = world.lock().expect("world");
+    PEER_NODE.clone_into(&mut world.node_name);
+    let key = format!("{VG}/{resource}");
+    let extent = world.vg_extent_size;
+    world.lvs.insert(
+        key.clone(),
+        FakeLv {
+            size: extent_round_up(size_bytes, extent),
+            tags: vec![
+                format!("volvisor.owner={}", volume_id.as_str()),
+                "volvisor.generation=1".to_owned(),
+            ],
+            // The replica holds data on both ends (the source's
+            // seeding resync reached it).
+            has_data: true,
+        },
+    );
+    world.metadata.insert(resource.clone());
+    // The SAME fixed identity set the source's world carries for this
+    // resource: the replica shares the source's data-generation
+    // lineage, which is what adoption-time comparison proves.
+    world
+        .lineage
+        .insert(resource.clone(), GiSet::for_resource(&resource));
+    let local = world.lvs.get(&key).map_or(size_bytes, |lv| lv.size);
+    let device = local.min(world.peer_backing(local));
+    world.resources.insert(
+        resource.clone(),
+        FakeResource {
+            minor,
+            role: Role::Secondary,
+            local_disk: DiskState::UpToDate,
+            peer_disk: DiskState::UpToDate,
+            peer_role: Role::Secondary,
+            resyncing: false,
+            device_size: device,
+            peer_node: NODE.to_owned(),
+        },
+    );
+    // Deliberately NO state-file entry: the destination host has never
+    // tracked this volume (the peer-side promote must be able to run
+    // from the res file and a live witness grant alone — a pre-existing
+    // foreign entry is exactly what its re-drive gate refuses).
 }
 
 /// Seed an LV into the simulated world without a state entry: owned
