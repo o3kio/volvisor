@@ -2,6 +2,13 @@
 
 Volvisor is the **volume virtualization and orchestration layer** for O3K and CellHV. It presents one managed block-volume API across **three distinct backends**, while preserving their real locality, durability, and mobility semantics.
 
+> **Maturity: implemented prototype; no production support.** Start with
+> [docs/START_HERE.md](docs/START_HERE.md) and the
+> [support matrix](SUPPORT_MATRIX.md). The v0.1.0 release is being
+> prepared; **no tag or GitHub release exists yet**, and the tag is
+> currently blocked on the gates in the
+> [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md).
+
 | v2 volume class | What it means | Live migration |
 |---|---|---|
 | `native-local` | One or more logical VM volumes provisioned from host-attached local disks/pools; optional independent local mirror | Pinned while attached in v0 |
@@ -29,7 +36,7 @@ Conventional stacks often tie a VM to one storage implementation. Volvisor separ
 
 Local SSD protection (e.g. a qualified local mirror) and remote host replication are independent. Planned migration requires a verified storage handoff; unplanned failover can lose the async replication tail.
 
-## Current proposal / normative v2 documents
+## Normative v2 documents
 
 - [ADR-0003 — volume architecture](docs/adr/0003-tiered-volume-virtualization.md)
 - [ADR-0004 — nearline replication and migration](docs/adr/0004-nearline-replication-and-mobility.md)
@@ -45,7 +52,7 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 - [2026-10-09 adversarial design review](docs/reviews/2026-10-09-volume-architecture-review.md)
 - [P0 implementation plan](docs/plans/2026-10-09-p0-implementation.md)
 
-## Implementation (P0 bootstrap, in progress)
+## Implementation (prototype)
 
 A Rust workspace implements the P0 control plane (stable IDs, device claiming,
 single-volume API/attachments, provider conformance — SPEC-0002 section 12)
@@ -85,7 +92,32 @@ The v1 drafts remain available for traceability and historical design research. 
 
 ## Status
 
-**Design proposal, not implementation.** No class is production supported; no durability, performance, zero-RPO failover, or live-migration capability is claimed until exact-SHA real-host conformance and fault-injection evidence passes. The first recommended implementations are a host-native logical-volume provider and an adapter to an existing Ceph RBD cluster. Nearline distributed authority is the highest-risk R&D area.
+**Implemented prototype; no production support.** The workspace implements
+the control-plane and provider slices above, but **no class is production
+supported** and no durability, performance, SLA, zero-RPO failover, or
+live-migration guarantee is claimed. Evidence is reported in the tiers the
+normative documents define: Tier S simulation, Tier R real-host gates (not
+run), and Tier V bounded real-VMM runs. Every positive claim below links to
+its record; anything not executed is explicitly **not run** or **blocked**.
+The full class-by-provider view is [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
+
+### Per-class evidence
+
+| Class / area | Implemented today | Recorded evidence | Not run / blocked |
+|---|---|---|---|
+| `native-local` | LVM provider over a host LVM volume group, stable volume identity, journaled/idempotent mutations, attach/detach/grow/delete and same-VG `pvmove` relocation. | Unit, provider-conformance, journal, and crash/replay tests in `crates/volvisor-lvm` and `crates/volvisor-provider`; the env-gated real-LVM suite is wired as a CI job (`lvm-integration` in [ci.yaml](.github/workflows/ci.yaml)). No committed real-host evidence bundle exists. | The SPEC-0002 §11 real-host campaign (SSD loss, thin-pool exhaustion, host power-cut, reboot identity) is **not run**. A local mirror is **declined** ([ADR-0011](docs/adr/0011-local-mirror-experiment-decline.md)). Live migration of an attached native-local volume is unsupported. |
+| `nearline-replicated` | DRBD 9 host-kernel adapter (local end), Protocol A/B/C selection, witness/lease fencing, and the DRBD-only migration/handoff surface. | Tier S simulated fault campaign ([report](docs/evidence/tier-v/2026-10-11-devhost-v51/REPORT.md): 91 Tier S records); Tier V migration, kill-window, snapshot-divergence, and resize scenarios against real Cloud Hypervisor v51.1 on **one physical development host with simulated storage** ([run](docs/evidence/tier-v/2026-10-11-devhost-v51/)). | The **three-physical-host campaign [#37](https://github.com/o3kio/volvisor/issues/37) is not run**; there is no real-DRBD, real-media, split-brain, power-cut, or 24 h soak evidence. The real-DRBD integration suite is env-gated and **not release-gated** ([#39](https://github.com/o3kio/volvisor/issues/39)). Async replication has a possible RPO tail. |
+| `ceph-rbd` | Adapter for an **existing, externally operated** Ceph cluster: FSID/pool fail-closed startup, ownership metadata, `exclusive-lock` single-writer attach, growth, delete policy, health/capacity reflection. | Unit, `FakeCeph`, and provider-conformance tests in `crates/volvisor-ceph`; the real-Ceph suite is env-gated. No committed real-cluster evidence bundle exists. | Real-cluster create/map/unmap, auth loss, OSD loss, host loss, Ceph degraded/full, upgrade, and live migration are **not run**. The real-Ceph suite is **not release-gated** ([#39](https://github.com/o3kio/volvisor/issues/39)). |
+| Rook-cell managed Ceph (experimental deployment mode, not a volume class) | Device-lending/reclaim/quarantine surface and the design plus example manifests. | Daemon-level Tier S tests for the six lending invariants; [POC design and GO/NO-GO matrix](docs/poc/rook-cells/README.md). No real-device result. | The three-physical-host POC [#38](https://github.com/o3kio/volvisor/issues/38) has **never been executed; there is no GO**. ADR-0008 remains **production NO-GO**; VFIO, CRUSH physical-host placement, and host loss are unproven. |
+| Daemons and packages | `volvisord` / `volvisor-witnessd`, `--version`/`--check-config`, systemd units, deb/rpm metadata, install smoke. | Local build, package, `--check-config`, and container-smoke results are recorded in the [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md); CI has package-build/package-smoke jobs. | No signed tag or GitHub release exists. Packaging does not prove unit start under the packaged install, upgrade/downgrade transitions, or any architecture other than x86_64. |
+
+Tier R gates are recorded as **skipped** in the campaign report, not passed.
+Tier V is not production support: it verifies the VMM seam at recorded
+versions while the storage below the seam is simulated
+([ADR-0010](docs/adr/0010-tier-v-real-vmm-verification.md)). See the
+[release notes draft](docs/releases/v0.1.0.md) for the intended v0.1.0
+scope and the [checklist](docs/releases/v0.1.0-checklist.md) for the
+currently blocked pre-tag gates.
 
 Online growth of a local LV is distinct from **same-host live relocation** of its backing storage, which is itself distinct from cross-host live VM migration. See ADR-0006 for native Cloud Hypervisor resize, same-VG LVM pvmove, and optional QEMU Storage Daemon + vhost-user-blk block mirroring.
 
