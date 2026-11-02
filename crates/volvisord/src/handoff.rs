@@ -1851,6 +1851,7 @@ mod tests {
     /// A minimal migration record for the driver's set-shaped methods.
     fn record_for(raw: &str, participants: Vec<Participant>) -> MigrationRecord {
         MigrationRecord {
+            schema_version: volvisor_handoff::MIGRATION_RECORD_SCHEMA_VERSION,
             migration_id: migration(raw),
             vm_id: "vm-1".to_owned(),
             source_host: host(NODE),

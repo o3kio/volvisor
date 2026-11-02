@@ -21,9 +21,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{
     AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, ProjectId, VolumeId, VolumeLifecycle,
 };
+
+/// Current durable Ceph-state schema version.
+///
+/// The baseline is the pre-versioning format; historical additive fields
+/// decode through serde defaults without a version bump.
+pub const CEPH_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// The volume→image cross-reference plus the durable volume attributes.
 ///
@@ -33,6 +40,7 @@ use volvisor_types::{
 /// proven by the `volvisor.owner` image metadata key, which is verified
 /// before every mutation — the name alone is never the ownership proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeEntry {
     /// RBD image name inside the configured pool.
     pub image_name: String,
@@ -59,6 +67,7 @@ pub struct VolumeEntry {
 
 /// The mutable runtime portion of a stored volume.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeRuntime {
     /// Current lifecycle state.
     pub state: VolumeLifecycle,
@@ -68,6 +77,7 @@ pub struct VolumeRuntime {
 
 /// A volume as stored in provider state: durable entry + runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredVolume {
     /// Durable cross-reference and attributes.
     pub entry: VolumeEntry,
@@ -77,6 +87,7 @@ pub struct StoredVolume {
 
 /// A recorded attachment (crash-replay never fabricates a second one).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentRecord {
     /// Attachment identity (caller-chosen, opaque).
     pub id: AttachmentId,
@@ -213,25 +224,54 @@ pub enum ClearedAttachmentReason {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CephState {
+    /// Durable schema version; absent in pre-versioning files (baseline 1).
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    schema_version: u32,
     volumes: BTreeMap<VolumeId, StoredVolume>,
+}
+
+impl Default for CephState {
+    fn default() -> Self {
+        Self {
+            schema_version: CEPH_STATE_SCHEMA_VERSION,
+            volumes: BTreeMap::new(),
+        }
+    }
 }
 
 impl CephState {
     /// Load the state from `path`.
     ///
-    /// A missing file is an empty state (first start); a corrupt file is an
-    /// `INTERNAL` error — state is never guessed or reset silently.
+    /// A missing file is an empty state (first start). A corrupt file, an
+    /// unknown field at a supported version, or a version newer than
+    /// [`CEPH_STATE_SCHEMA_VERSION`] is a typed `INTERNAL` error — state is
+    /// never guessed, partially decoded or reset silently.
     pub fn load(path: &Path) -> Result<Self, ApiError> {
         let path_display = path.display();
         match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!("failed to parse provider state {path_display}: {e}"),
-                )
-            }),
+            Ok(text) => {
+                let probe: SchemaVersionProbe = serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })?;
+                ensure_supported_schema_version(
+                    "ceph",
+                    path,
+                    probe.schema_version,
+                    CEPH_STATE_SCHEMA_VERSION,
+                )?;
+                serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ApiError::new(
                 ApiErrorCode::Internal,
@@ -262,6 +302,9 @@ impl CephState {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
         let path_display = path.display();
+        // Upgrade-on-write: an older file decoded at open is persisted at
+        // the current schema version by its first save.
+        self.schema_version = CEPH_STATE_SCHEMA_VERSION;
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
@@ -483,5 +526,102 @@ mod tests {
         assert!(!text.to_lowercase().contains("key"));
         assert!(!text.to_lowercase().contains("secret"));
         assert!(!text.to_lowercase().contains("token"));
+    }
+
+    // -----------------------------------------------------------------
+    // Golden historical fixture. Ceph issued one additive change
+    // (`vmm_disk_id`), so only N-1 exists; there is no N-2 format to
+    // fabricate (see docs/schema-compatibility.md).
+    // -----------------------------------------------------------------
+
+    const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/ceph-state-v1-n1.json");
+
+    fn write_fixture(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn n_minus_one_fixture_loads_attachment_without_the_disk_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "ceph-state-v1-n1.json", N1_FIXTURE);
+        let state = CephState::load(&path).expect("N-1 state loads");
+        let volume_id = VolumeId::new("vol-ceph-n1").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        assert_eq!(volume.runtime.state, VolumeLifecycle::Attached);
+        assert_eq!(volume.entry.generation, 2);
+        let attachment = volume.runtime.attachment.as_ref().expect("attachment");
+        assert_eq!(attachment.vm_id, "vm-upgrade");
+        assert_eq!(attachment.generation, 1);
+        assert_eq!(attachment.device, "/dev/rbd3");
+        assert_eq!(attachment.vmm_disk_id, None, "never guessed");
+    }
+
+    #[test]
+    fn old_fixture_upgrades_on_save_and_round_trips_losslessly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "n1.json", N1_FIXTURE);
+        let mut state = CephState::load(&source).expect("load");
+        let target = dir.path().join("upgraded.json");
+        state.save(&target).expect("save");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\": 1"),
+            "upgrade-on-write stamps the current schema version: {text}"
+        );
+        assert_eq!(
+            CephState::load(&target).expect("reload"),
+            state,
+            "no durable field is lost by load/save"
+        );
+    }
+
+    #[test]
+    fn future_schema_version_is_refused_typed_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let future = N1_FIXTURE.replacen(
+            '{',
+            "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "future.json", &future);
+        let err = CephState::load(&path).expect_err("future version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.is_unsupported_schema_version(), "{err}");
+        assert!(err.detail.contains("schema_version 2"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read refused file"),
+            future,
+            "a refused future-version file is never truncated or rewritten"
+        );
+    }
+
+    #[test]
+    fn zero_and_unknown_field_versions_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let zero = N1_FIXTURE.replacen('{', "{\n  \"schema_version\": 0,", 1);
+        let path = write_fixture(&dir, "zero.json", &zero);
+        let err = CephState::load(&path).expect_err("zero version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version());
+        assert!(err.detail.contains("invalid schema_version 0"), "{err}");
+
+        let top = N1_FIXTURE.replacen('{', "{\n  \"future_field\": true,", 1);
+        let path = write_fixture(&dir, "top.json", &top);
+        let err = CephState::load(&path).expect_err("top-level unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version(), "{err}");
+
+        let nested = N1_FIXTURE.replacen(
+            "\"runtime\": {",
+            "\"runtime\": {\n        \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "nested.json", &nested);
+        let err = CephState::load(&path).expect_err("nested unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("unknown field"), "{err}");
     }
 }

@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 use volvisor_types::authority::BarrierAttestation;
 use volvisor_types::id::{HostId, MigrationId, VolumeId};
 
+/// Current durable migration-record schema version.
+///
+/// The baseline is the pre-versioning format; historical additive fields
+/// (consumer proof, cut timestamps, barrier-lineage refusal) decode through
+/// serde defaults without a version bump.
+pub const MIGRATION_RECORD_SCHEMA_VERSION: u32 = 1;
+
 /// The canonical handoff states (nearline contract v2 §6; P4b plan
 /// §3), plus the terminal observations.
 ///
@@ -225,12 +232,14 @@ pub struct StateHistoryEntry {
 /// gone (a crash, a restart), and the marker is what makes the
 /// refusal re-observable without re-executing the gate first.
 ///
-/// No `deny_unknown_fields`, by the additive-record discipline: the
-/// marker is embedded in the durable [`MigrationRecord`], and a
-/// future additive field must decode on readers of this version —
-/// unknown fields are skipped, never a decode failure of the
-/// migration's own history.
+/// `deny_unknown_fields` is deliberate: the marker is embedded in the
+/// durable [`MigrationRecord`], so an unknown nested field at a
+/// supported version is either corruption or a newer shape that
+/// failed to bump its version. Both are refused rather than silently
+/// dropped; a genuinely newer record is caught by the version probe
+/// before this strict decode (see `docs/schema-compatibility.md`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedRefusal {
     /// The contract-spelled error code (e.g. `FOREIGN_DEVICE_STATE`)
     /// — the same wire vocabulary [`volvisor_types::ApiErrorCode`]
@@ -302,6 +311,9 @@ pub struct PrepareHandoffRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationRecord {
+    /// Durable schema version; absent in pre-versioning files (baseline 1).
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    pub schema_version: u32,
     /// The migration identity (store key).
     pub migration_id: MigrationId,
     /// The migrated VM.
@@ -524,6 +536,7 @@ mod tests {
 
     fn record(state: HandoffState, cut: Option<CutProgress>) -> MigrationRecord {
         MigrationRecord {
+            schema_version: MIGRATION_RECORD_SCHEMA_VERSION,
             migration_id: MigrationId::new("mig-1").expect("valid id"),
             vm_id: "vm-1".to_owned(),
             source_host: HostId::new("src").expect("valid id"),

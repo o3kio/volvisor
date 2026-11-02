@@ -53,6 +53,7 @@ pub use coordinator::{
 pub use store::MigrationStore;
 pub use surface::{MigrationSurface, MobilityRequest, migration_not_enabled};
 pub use types::{
-    AbortPolicy, BarrierProof, CutProgress, HandoffState, MigrationRecord, MigrationSummary,
-    ObservedRefusal, Participant, PrepareHandoffRequest, StateHistoryEntry, TypedRefusal,
+    AbortPolicy, BarrierProof, CutProgress, HandoffState, MIGRATION_RECORD_SCHEMA_VERSION,
+    MigrationRecord, MigrationSummary, ObservedRefusal, Participant, PrepareHandoffRequest,
+    StateHistoryEntry, TypedRefusal,
 };

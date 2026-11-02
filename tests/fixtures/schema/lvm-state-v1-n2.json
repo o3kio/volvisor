@@ -1,0 +1,35 @@
+{
+  "volumes": {
+    "vol-upgrade-n2": {
+      "entry": {
+        "vg_name": "vg-volvisor",
+        "lv_name": "vol-vol-upgrade-n2-abcd1234",
+        "size_bytes": 1073741824,
+        "generation": 4,
+        "data_epoch": 2,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-upgrade-n2",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 2,
+          "access_mode": "single_writer"
+        }
+      }
+    }
+  },
+  "devices": {
+    "dev-upgrade01": {
+      "stable_identity": "wwn-0x5000c500aabbccdd",
+      "path": "/dev/disk/by-id/wwn-0x5000c500aabbccdd",
+      "vg_name": "vg-volvisor",
+      "role": "native_pool",
+      "owner_generation": 3
+    }
+  }
+}

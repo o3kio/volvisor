@@ -21,9 +21,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use volvisor_types::id::MigrationId;
+use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{ApiError, ApiErrorCode};
 
-use crate::types::MigrationRecord;
+use crate::types::{MIGRATION_RECORD_SCHEMA_VERSION, MigrationRecord};
 
 /// The per-migration record store: an in-memory index over one
 /// directory of atomically-saved JSON records.
@@ -111,6 +112,10 @@ impl MigrationStore {
 
     /// Load one record file, failing typed on any parse or validation
     /// error (deny_unknown_fields is part of the record's serde shape).
+    ///
+    /// The version is probed before the strict decode so a record written
+    /// by a newer build is refused with the precise unsupported-version
+    /// error rather than a generic unknown-field failure.
     fn load_record(path: &Path) -> Result<MigrationRecord, ApiError> {
         let path_display = path.display();
         let text = fs::read_to_string(path).map_err(|e| {
@@ -119,6 +124,18 @@ impl MigrationStore {
                 format!("failed to read migration record {path_display}: {e}"),
             )
         })?;
+        let probe: SchemaVersionProbe = serde_json::from_str(&text).map_err(|e| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("failed to parse migration record {path_display}: {e}"),
+            )
+        })?;
+        ensure_supported_schema_version(
+            "migration record",
+            path,
+            probe.schema_version,
+            MIGRATION_RECORD_SCHEMA_VERSION,
+        )?;
         serde_json::from_str(&text).map_err(|e| {
             ApiError::new(
                 ApiErrorCode::Internal,
@@ -142,19 +159,22 @@ impl MigrationStore {
 
     /// Insert or replace one record, persisting it atomically.
     ///
-    /// The store is dumb: `updated_at` and the history are the
-    /// coordinator's responsibility; this method persists exactly the
-    /// record it is handed.
+    /// The store is dumb about migration semantics: `updated_at` and the
+    /// history are the coordinator's responsibility; this method persists
+    /// exactly the record it is handed, except that the current
+    /// [`MIGRATION_RECORD_SCHEMA_VERSION`] is stamped before the write
+    /// (upgrade-on-write; the stored in-memory copy is stamped too).
     ///
     /// # Errors
     /// `INTERNAL` when the atomic save (serialize, tmp-write, fsync,
     /// rename, directory fsync) fails; the previous record file
     /// remains intact.
     pub fn upsert(&mut self, record: &MigrationRecord) -> Result<(), ApiError> {
+        let mut record = record.clone();
+        record.schema_version = MIGRATION_RECORD_SCHEMA_VERSION;
         let path = self.record_path(&record.migration_id);
-        save_record_atomic(&path, record, &self.crash)?;
-        self.records
-            .insert(record.migration_id.clone(), record.clone());
+        save_record_atomic(&path, &record, &self.crash)?;
+        self.records.insert(record.migration_id.clone(), record);
         Ok(())
     }
 

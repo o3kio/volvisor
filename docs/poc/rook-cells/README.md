@@ -1,6 +1,6 @@
 # Rook-only Volvisor Cell experimental POC — GO / NO-GO
 
-Status: **DESIGN + EXAMPLE INPUTS ONLY; not run** — the Volvisor-side device-lending surface is now implemented and daemon-tested (see section 3), which changes nothing about the run status: no real-host scenario below has been executed.
+Status: **PREFLIGHT READY; POC NOT RUN — no evidence exists.** The design and example inputs are unchanged, the Volvisor-side device-lending surface is implemented and daemon-tested (see section 3), and read-only preflight/evidence tooling now exists (see section 1a). No real-host scenario below has been executed, so there is no GO/NO-GO result and no `docs/evidence/rook-cell/` bundle.
 Related: [ADR-0008](../../adr/0008-rook-only-hyperconverged-cells.md)
 Target: prove feasibility of hyperconverged Rook/Ceph inside fixed-budget Cloud Hypervisor storage microVMs without patching Rook.
 
@@ -29,6 +29,40 @@ client -> non-cell compute node or O3K RBD host adapter
 MONs and OSDs share the cell nodes (`allowMultiplePerNode: false`, one MON per cell): a physical-host loss takes out one MON **and** one OSD together, leaving MON quorum at 2/3 — the C06 pass condition covers exactly this case.
 
 First (optional) nested three-cell smoke test on a **single physical host** may validate Kubernetes/Rook API wiring, but not distinct host failure domains, PCI passthrough or HA, and never counts as the GO/NO-GO hardware gate.
+
+### 1a. Executable preflight and evidence collection (read-only)
+
+The POC is not automated end to end. Two executable helpers make the next run
+safer without pretending it happened:
+
+```bash
+# 1. Copy the placeholder inventory OUTSIDE the repository and fill it in.
+install -m 0600 scripts/rook-cell-inventory.example.env /etc/volvisor/rook-cell-inventory.env
+# edit /etc/volvisor/rook-cell-inventory.env
+
+# 2. Validate shape/tools/access before any bring-up. Read-only; no manifests.
+scripts/preflight-rook.sh /etc/volvisor/rook-cell-inventory.env
+# After bring-up, additionally require the named CephCluster and pool:
+scripts/preflight-rook.sh --require-ceph /etc/volvisor/rook-cell-inventory.env
+
+# 3. Validate the collector before a real snapshot (writes nothing):
+bash docs/poc/rook-cells/collect-evidence.sh --check /var/lib/volvisor-campaign/rook-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+`preflight-rook.sh` refuses a missing, empty, malformed or placeholder
+inventory (exit 2) before contacting a host or cluster, and needs no root for
+that failure path. It checks three distinct physical failure domains, three
+dedicated Kubernetes cell Nodes (Ready, trusted role/failure-domain labels,
+storage-only taint, no control-plane role, no non-allowlisted Pods), Rook CRDs
+and operator, per-host VFIO/IOMMU/NVMe evidence, and that `EVIDENCE_ROOT` is
+outside the repository. A pass means only that the environment *might* be
+eligible; it is **not** a POC result.
+
+`collect-evidence.sh` takes a read-only Kubernetes snapshot (nodes, Pods, Rook
+CRs, events), refuses a non-empty or symlink destination, and hashes the
+snapshot. Collect raw output outside the repository; commit only a curated,
+scrubbed bundle under `docs/evidence/rook-cell/<date>/` after a real run, per
+[the evidence standards](../../evidence/README.md).
 
 Reference conservative cell budget: 6 vCPUs pinned/charged to physical host allocation, 16 GiB fixed RAM with ballooning disabled, local 40 GiB persistent root/system disk **not on Ceph**, persist guest `/var/lib/rook` across cell restarts, 1 entire IOMMU-safe PCI NVMe controller dedicated to Ceph, separate VM storage data-path network. Adapt after measuring actual per-OSD and MON/MGR requirements. A guest disk's size is not restricted by Rook pod limits; Volvisor claims physical device capacity by stable identity and explicitly passes the whole controller. Reserve real host resources before tenants receive compute capacity.
 
@@ -86,7 +120,9 @@ Two boundaries are deliberately still open. The release/residue observation is a
 
 ## 5. Evidence bundle and follow-up
 
-The read-only [collect-evidence.sh](collect-evidence.sh) helper snapshots the Kubernetes-side state and runs the node pre-flight checks (names, Ready, trusted role label); it performs **no disk mutations**, is not an automated GO verdict, and the physical-host evidence below is still required manually.
+The read-only [collect-evidence.sh](collect-evidence.sh) helper snapshots the Kubernetes-side state and runs the node pre-flight checks (names, Ready, trusted role label); it performs **no disk mutations**, refuses to overwrite a non-empty destination, hashes its output, is not an automated GO verdict, and the physical-host evidence below is still required manually. Use `--check` first; collect raw output outside the repository and commit only a curated bundle under `docs/evidence/rook-cell/<date>/` after a real run (see [evidence standards](../../evidence/README.md)).
+
+**Current status: no POC evidence has been produced.** The collector has not been run against a real cell cluster as part of this repository change, and no C01–C14 gate is satisfied by the design, examples, preflight or collector.
 
 Each iteration stores:
 - immutable HostId/CellId, source commit, guest image/kernel, CHV/Rook/Ceph/K8s/containerd/CNI digests;
