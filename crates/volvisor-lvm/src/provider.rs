@@ -680,6 +680,7 @@ impl LvmProvider {
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
+                retired_attachment_ids: Vec::new(),
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
@@ -718,7 +719,7 @@ impl LvmProvider {
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
-                    return Err(ApiError::idempotency_conflict(&req.attachment_id));
+                    return Err(ApiError::attachment_id_conflict(&req.attachment_id));
                 }
             }
         }
@@ -726,6 +727,13 @@ impl LvmProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
+        if stored
+            .runtime
+            .retired_attachment_ids
+            .contains(&req.attachment_id)
+        {
+            return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+        }
         if req.expected_volume_generation != stored.entry.generation {
             return Err(ApiError::stale_generation(
                 req.expected_volume_generation,
@@ -801,7 +809,11 @@ impl LvmProvider {
         // one, though the provider cannot verify the claim itself
         // (Volume API v2 section 3).
 
+        let retired_id = record.id.clone();
         stored.runtime.attachment = None;
+        if !stored.runtime.retired_attachment_ids.contains(&retired_id) {
+            stored.runtime.retired_attachment_ids.push(retired_id);
+        }
         if stored.runtime.state == VolumeLifecycle::Attached {
             stored.runtime.state = VolumeLifecycle::Ready;
         }
@@ -818,6 +830,17 @@ impl LvmProvider {
         req: &ReportAttachmentStateRequest,
     ) -> Result<ReportAttachmentStateResponse, ApiError> {
         req.validate()?;
+        if !self
+            .capabilities()
+            .contains(Capability::AttachmentStateReport)
+        {
+            return Err(ApiError::not_found(format!(
+                "provider {} does not record attachment-state reports; attachment {} on \
+                 volume {volume_id} is not a reportable instance",
+                self.name(),
+                req.attachment_id
+            )));
+        }
         let mut state = self.lock_state()?;
         let applied;
         let response = {

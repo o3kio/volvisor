@@ -8,7 +8,7 @@
 //! state. It performs no real I/O: every support claim it makes is
 //! `PrototypeOnly` evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use volvisor_types::domain::{
@@ -43,6 +43,10 @@ struct FakeState {
     attachments: BTreeMap<AttachmentId, Attachment>,
     /// Canonical creation payload per volume id (idempotent-create check).
     creation_payloads: BTreeMap<VolumeId, String>,
+    /// Attachment ids retired by detach, keyed by volume. A report-capable
+    /// provider refuses to reuse one for the volume's lifetime: a delayed
+    /// report from the old instance must never label a new one.
+    retired_attachments: BTreeSet<(VolumeId, AttachmentId)>,
     /// Fault injected by [`FakeProvider::set_next_failure`].
     next_failure: Option<ApiError>,
     /// Whether the fake admin device is claimed (admin-surface tests).
@@ -419,6 +423,50 @@ fn apply_create(
     Ok(inspect_response(&state.attachments, &volume))
 }
 
+/// Resolve an attach against attachment identity before creating a new
+/// instance: replay a matching recorded payload, refuse a conflicting one,
+/// or refuse an id this volume already consumed. `None` means the id is
+/// fresh and the caller may create the attachment.
+fn resolve_attach_identity(
+    state: &FakeState,
+    volume_id: &VolumeId,
+    req: &AttachVolumeRequest,
+) -> Result<Option<AttachVolumeResponse>, ApiError> {
+    // Idempotent replay by attachment identity: a crash-replayed request
+    // must never fabricate a second attachment (Volume API v2 section 3).
+    if let Some(existing) = state.attachments.get(&req.attachment_id) {
+        let same_payload = existing.volume_id == *volume_id
+            && existing.vm_id == req.vm_id
+            && existing.host_id == req.host_id
+            && existing.access_mode == requested_mode(req.access_mode)
+            && existing.vmm_disk_id == req.vmm_disk_id;
+        if same_payload {
+            let vol = state.volumes.get(volume_id).ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "fake state invariant violated: attachment {} without volume {volume_id}",
+                        req.attachment_id
+                    ),
+                )
+            })?;
+            return Ok(Some(attach_response(existing, vol)));
+        }
+        return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+    }
+
+    // A report-capable provider must not reuse an attachment id that this
+    // volume already consumed: a delayed report from the old instance
+    // would otherwise be applied to the new one.
+    if state
+        .retired_attachments
+        .contains(&(volume_id.clone(), req.attachment_id.clone()))
+    {
+        return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+    }
+    Ok(None)
+}
+
 fn apply_attach(
     provider: &FakeProvider,
     state: &mut FakeState,
@@ -437,26 +485,8 @@ fn apply_attach(
         }
     }
 
-    // Idempotent replay by attachment identity: a crash-replayed request
-    // must never fabricate a second attachment (Volume API v2 section 3).
-    if let Some(existing) = state.attachments.get(&req.attachment_id) {
-        let same_payload = existing.volume_id == *volume_id
-            && existing.vm_id == req.vm_id
-            && existing.host_id == req.host_id
-            && existing.access_mode == requested_mode(req.access_mode);
-        if same_payload {
-            let vol = state.volumes.get(volume_id).ok_or_else(|| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!(
-                        "fake state invariant violated: attachment {} without volume {volume_id}",
-                        req.attachment_id
-                    ),
-                )
-            })?;
-            return Ok(attach_response(existing, vol));
-        }
-        return Err(ApiError::idempotency_conflict(&req.attachment_id));
+    if let Some(response) = resolve_attach_identity(state, volume_id, req)? {
+        return Ok(response);
     }
 
     let vol = state
@@ -567,6 +597,9 @@ fn apply_detach(
         .get_mut(volume_id)
         .ok_or_else(|| not_found(volume_id))?;
     state.attachments.remove(attachment_id);
+    state
+        .retired_attachments
+        .insert((volume_id.clone(), attachment_id.clone()));
     vol.attachment_ids.retain(|id| id != attachment_id);
     if vol.current_writer.as_ref() == Some(attachment_id) {
         vol.current_writer = None;
@@ -686,6 +719,11 @@ fn apply_delete(
     }
     state.volumes.remove(volume_id);
     state.creation_payloads.remove(volume_id);
+    // The volume's lifetime ends here: ids it consumed are not retired
+    // against a future volume that reuses the same volume id.
+    state
+        .retired_attachments
+        .retain(|(volume, _)| volume != volume_id);
     Ok(())
 }
 
@@ -828,10 +866,12 @@ fn inspect_response(
         failure_domain: vol.failure_domain,
         health: vol.health,
         attachment_ids: vol.attachment_ids.clone(),
-        attachments: vol
-            .attachment_ids
-            .iter()
-            .filter_map(|id| attachments.get(id))
+        // Project from the record map (the authoritative store) rather
+        // than indexing by `attachment_ids`, so an id/record divergence
+        // is never silently hidden by `filter_map`.
+        attachments: attachments
+            .values()
+            .filter(|attachment| attachment.volume_id == vol.id)
             .map(attachment_view)
             .collect(),
         current_writer: vol.current_writer.clone(),
@@ -951,8 +991,9 @@ mod tests {
     use crate::VolumeProvider;
     use crate::conformance::{
         fixture_attach_request, fixture_create_request, fixture_delete_request,
-        fixture_detach_request, fixture_grow_request,
+        fixture_detach_request, fixture_grow_request, fixture_report_request,
     };
+    use volvisor_types::AttachmentEvidence;
     use volvisor_types::request::{
         ErasurePolicy, LocalProtectionRequest, Placement, ReplicationModeRequest,
         ReplicationPolicyRequest,
@@ -1493,5 +1534,41 @@ mod tests {
         let inspected = provider.inspect_volume(&vid).await.expect("inspect");
         assert_eq!(inspected.generation, 3);
         assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    }
+
+    #[tokio::test]
+    async fn report_requires_the_capability() {
+        // The optional surface is capability-gated: a provider that does
+        // not advertise it answers the typed NOT_FOUND, never a silent
+        // accept.
+        let provider = FakeProvider::new().with_capabilities(CapabilitySet::of([
+            Capability::Create,
+            Capability::Attach,
+            Capability::Resize,
+        ]));
+        let created = provider
+            .create_volume(&fixture_create_request("cap-report", GIB))
+            .await
+            .expect("create");
+        provider
+            .attach_volume(
+                &created.volume_id,
+                &fixture_attach_request("cap-report", "cap-att", 1),
+            )
+            .await
+            .expect("attach");
+        let err = provider
+            .report_attachment_state(
+                &created.volume_id,
+                &fixture_report_request(
+                    "cap-att",
+                    1,
+                    AttachmentState::Advertised,
+                    AttachmentEvidence::VmmConfigured,
+                ),
+            )
+            .await
+            .expect_err("a provider without the capability must refuse");
+        assert_eq!(err.code, ApiErrorCode::NotFound);
     }
 }

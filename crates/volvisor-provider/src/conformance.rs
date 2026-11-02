@@ -823,9 +823,11 @@ pub async fn check_move_contract(provider: &dyn VolumeProvider) -> Result<(), St
 /// keep `attachment_generation` fixed as the detach fence, answer a
 /// repeated/lower report as an idempotent no-op (`applied=false` without
 /// downgrading), refuse a stale instance generation, expose the full
-/// per-attachment view on inspect, and answer `NOT_FOUND` after detach.
-/// A provider without the capability is skipped (its typed 404 is the
-/// default trait behavior, covered by its own tests).
+/// per-attachment view on inspect, answer `NOT_FOUND` after detach, and
+/// refuse reuse of a consumed attachment id (`IDEMPOTENCY_CONFLICT`).
+/// A provider without the capability is skipped; its typed `NOT_FOUND` is
+/// the default trait behavior, and the capability-gated path is covered by
+/// the fake's `report_requires_the_capability` test.
 #[allow(clippy::too_many_lines)]
 pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Result<(), String> {
     if !provider
@@ -895,6 +897,11 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         advertised.attachment_generation == 1,
         "a report must never advance attachment_generation",
     )?;
+    require(
+        advertised.reporter.as_deref() == Some("conformance-vmm")
+            && advertised.recorded_at_ms.is_some(),
+        "an applied report must return its reporter and the server receipt time",
+    )?;
 
     // active (guest_confirmed) advances again.
     let active = provider
@@ -912,6 +919,54 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
     require(
         active.applied && active.state == AttachmentState::Active && active.state_revision == 3,
         "active must apply at revision 3",
+    )?;
+    require(
+        active.evidence == Some(AttachmentEvidence::GuestConfirmed)
+            && active.reporter.as_deref() == Some("conformance-vmm")
+            && active.recorded_at_ms.is_some(),
+        "active must carry guest_confirmed evidence and observation provenance",
+    )?;
+
+    // An equal report is the same idempotent no-op as a lower one.
+    let equal = provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .map_err(|e| format!("report equal: {e}"))?;
+    require(
+        !equal.applied
+            && equal.state == AttachmentState::Active
+            && equal.state_revision == 3
+            && equal.recorded_at_ms == active.recorded_at_ms,
+        "an equal report must be a no-op preserving the applied projection",
+    )?;
+
+    // Inspect re-projects the applied evidence (a restarted consumer
+    // re-observes rather than replaying reports).
+    let observed = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume after report: {e}"))?;
+    let observed = observed
+        .attachments
+        .iter()
+        .find(|view| view.attachment_id == attach.attachment_id)
+        .ok_or_else(|| "inspect must still expose the reported instance".to_owned())?;
+    require(
+        observed.state == AttachmentState::Active
+            && observed.state_revision == 3
+            && observed.evidence == Some(AttachmentEvidence::GuestConfirmed)
+            && observed.reporter.as_deref() == Some("conformance-vmm")
+            && observed.recorded_at_ms == active.recorded_at_ms
+            && observed.attachment_generation == 1,
+        "inspect must project the applied evidence verbatim at the unchanged generation",
     )?;
 
     // A lower report is an idempotent no-op: no downgrade, no revision bump.
@@ -976,11 +1031,28 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         )
         .await
     {
-        Err(e) if e.code == ApiErrorCode::NotFound => Ok(()),
+        Err(e) if e.code == ApiErrorCode::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "a report after detach must fail with NOT_FOUND, got {e}"
+            ));
+        }
+        Ok(_) => return Err("a report after detach must not succeed".to_owned()),
+    }
+
+    // A report-capable provider must refuse to reuse the consumed id: a
+    // delayed report from the old instance must never label a new one.
+    let after_detach = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume after detach: {e}"))?;
+    let reattach = fixture_attach_request(volume_id, attachment_id, after_detach.generation);
+    match provider.attach_volume(&create.volume_id, &reattach).await {
+        Err(e) if e.code == ApiErrorCode::IdempotencyConflict => Ok(()),
         Err(e) => Err(format!(
-            "a report after detach must fail with NOT_FOUND, got {e}"
+            "reusing a consumed attachment id must fail with IDEMPOTENCY_CONFLICT, got {e}"
         )),
-        Ok(_) => Err("a report after detach must not succeed".to_owned()),
+        Ok(_) => Err("reusing a consumed attachment id must not succeed".to_owned()),
     }
 }
 

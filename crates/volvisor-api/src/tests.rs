@@ -408,6 +408,11 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(reported["state_revision"], json!(2));
     assert_eq!(reported["attachment_generation"], json!(1));
     assert_eq!(reported["evidence"], json!("vmm_configured"));
+    assert_eq!(reported["reporter"], json!("conformance-vmm"));
+    assert!(
+        reported["recorded_at_ms"].is_u64(),
+        "an applied report carries the server receipt time"
+    );
 
     // active requires guest_confirmed: a vmm_configured active report is a
     // typed pre-journal refusal (no record, the operation_id stays reusable).
@@ -448,6 +453,56 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(active_body["state"], json!("active"));
     assert_eq!(active_body["state_revision"], json!(3));
     assert_eq!(active_body["attachment_generation"], json!(1));
+    assert_eq!(active_body["evidence"], json!("guest_confirmed"));
+    assert_eq!(active_body["reporter"], json!("conformance-vmm"));
+    assert!(active_body["recorded_at_ms"].is_u64());
+
+    // An equal report (fresh operation id) is the same no-op as a lower
+    // one: applied=false, no revision bump, the applied projection kept.
+    let mut equal = active.clone();
+    equal["operation_id"] = json!("op-report-equal-active");
+    let (status, equal_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &equal,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(equal_body["applied"], json!(false));
+    assert_eq!(equal_body["state"], json!("active"));
+    assert_eq!(equal_body["state_revision"], json!(3));
+    assert_eq!(equal_body["recorded_at_ms"], active_body["recorded_at_ms"]);
+
+    // Inspect re-projects the applied evidence verbatim.
+    let (status, after_report) =
+        send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = &after_report["attachments"][0];
+    assert_eq!(view["state"], json!("active"));
+    assert_eq!(view["state_revision"], json!(3));
+    assert_eq!(view["evidence"], json!("guest_confirmed"));
+    assert_eq!(view["reporter"], json!("conformance-vmm"));
+    assert_eq!(view["recorded_at_ms"], active_body["recorded_at_ms"]);
+    assert_eq!(view["attachment_generation"], json!(1));
+
+    // Reusing the active operation_id with a different payload is the
+    // standard journal conflict, independent of the no-op rules.
+    let mut conflicting = active.clone();
+    conflicting["state"] = json!("advertised");
+    let (status, conflict_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &conflicting,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict_body["code"], json!("IDEMPOTENCY_CONFLICT"));
 
     // A lower report is an idempotent no-op: no downgrade, no revision bump.
     let lower = serde_json::to_value(fixture_report_request(
@@ -531,6 +586,20 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(gone["code"], json!("NOT_FOUND"));
+
+    // A consumed attachment id cannot be re-attached under a new operation:
+    // per-id evidence must never be misattributed to a new instance.
+    let mut reattach =
+        serde_json::to_value(fixture_attach_request("vol-report", "att-report-1", 3))
+            .expect("serialize attach fixture");
+    reattach["operation_id"] = json!("op-reattach-consumed-id");
+    let (status, reuse_body) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-report/attach", &reattach),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(reuse_body["code"], json!("IDEMPOTENCY_CONFLICT"));
 }
 
 // ---------------------------------------------------------------------------

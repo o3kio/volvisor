@@ -318,6 +318,9 @@ impl DetachVolumeRequest {
 /// Maximum length, in bytes, of a report's free-form `detail`.
 pub const ATTACHMENT_REPORT_DETAIL_MAX_BYTES: usize = 1024;
 
+/// Maximum length, in bytes, of a report's untrusted `reporter` label.
+pub const ATTACHMENT_REPORT_REPORTER_MAX_BYTES: usize = 1024;
+
 /// ReportAttachmentState request (contract section 3).
 ///
 /// A consumer (any VMM integration — Cloud Hypervisor, QEMU/KVM, Proxmox
@@ -343,7 +346,10 @@ pub struct ReportAttachmentStateRequest {
     pub state: crate::domain::AttachmentState,
     /// The evidence basis of the report.
     pub evidence: crate::domain::AttachmentEvidence,
-    /// Optional untrusted reporter label (never authentication).
+    /// Optional untrusted reporter label (never authentication). Bounded
+    /// by [`ATTACHMENT_REPORT_REPORTER_MAX_BYTES`]; ASCII control
+    /// characters are refused so a label cannot carry log/display
+    /// injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporter: Option<String>,
     /// Optional diagnostic detail; bounded by
@@ -357,8 +363,9 @@ impl ReportAttachmentStateRequest {
     ///
     /// # Errors
     /// `INVALID_REQUEST` for a bad api version, a `prepared` target, an
-    /// evidence basis that does not support the claimed state, an empty
-    /// reporter or over-long detail.
+    /// evidence basis that does not support the claimed state, an empty or
+    /// over-long reporter, a reporter carrying control characters, or
+    /// over-long detail.
     pub fn validate(&self) -> Result<(), ApiError> {
         crate::validate_api_version(&self.api_version)?;
         match self.state {
@@ -387,10 +394,22 @@ impl ReportAttachmentStateRequest {
                 }
             }
         }
-        if self.reporter.as_deref() == Some("") {
-            return Err(ApiError::invalid_request(
-                "reporter must not be empty when present",
-            ));
+        if let Some(reporter) = &self.reporter {
+            if reporter.is_empty() {
+                return Err(ApiError::invalid_request(
+                    "reporter must not be empty when present",
+                ));
+            }
+            if reporter.len() > ATTACHMENT_REPORT_REPORTER_MAX_BYTES {
+                return Err(ApiError::invalid_request(format!(
+                    "reporter must be at most {ATTACHMENT_REPORT_REPORTER_MAX_BYTES} bytes"
+                )));
+            }
+            if reporter.chars().any(char::is_control) {
+                return Err(ApiError::invalid_request(
+                    "reporter must not contain control characters",
+                ));
+            }
         }
         if let Some(detail) = &self.detail {
             if detail.len() > ATTACHMENT_REPORT_DETAIL_MAX_BYTES {
@@ -1076,6 +1095,20 @@ mod tests {
             req.validate().unwrap_err().code,
             crate::error::ApiErrorCode::InvalidRequest
         );
+        req.reporter = Some("x".repeat(ATTACHMENT_REPORT_REPORTER_MAX_BYTES + 1));
+        assert_eq!(
+            req.validate().unwrap_err().code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+        req.reporter = Some("x".repeat(ATTACHMENT_REPORT_REPORTER_MAX_BYTES));
+        assert!(req.validate().is_ok());
+        req.reporter = Some("chv\nagent".to_owned());
+        assert_eq!(
+            req.validate().unwrap_err().code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+        req.reporter = Some("chv-agent/1.0".to_owned());
+        assert!(req.validate().is_ok());
     }
 
     #[test]

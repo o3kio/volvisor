@@ -205,6 +205,22 @@ impl ApiError {
         )
     }
 
+    /// Convenience constructor for attachment-identity conflicts: the id
+    /// is already bound to a different instance payload, or the volume
+    /// already consumed it earlier in its lifetime. A report-capable
+    /// provider refuses the reuse so per-id evidence can never be
+    /// misattributed to a new instance (Volume API v2 section 3).
+    #[must_use]
+    pub fn attachment_id_conflict(attachment_id: impl fmt::Display) -> Self {
+        Self::new(
+            ApiErrorCode::IdempotencyConflict,
+            format!(
+                "attachment_id {attachment_id} is already bound to a different attachment \
+                 instance or was consumed earlier in this volume's lifetime"
+            ),
+        )
+    }
+
     /// Convenience constructor for the peer-daemon transport class:
     /// the source daemon's handoff driver cannot reach the
     /// destination daemon (connect, timeout, torn body). `INTERNAL`

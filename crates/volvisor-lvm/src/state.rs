@@ -65,6 +65,11 @@ pub struct VolumeRuntime {
     pub state: VolumeLifecycle,
     /// The single recorded attachment, if any (single-writer P0 profile).
     pub attachment: Option<AttachmentRecord>,
+    /// Attachment ids this volume consumed earlier in its lifetime. A
+    /// report-capable provider refuses to reuse one: per-id evidence
+    /// (`state_revision`) must never be applied to a different instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_attachment_ids: Vec<AttachmentId>,
 }
 
 /// A volume as stored in provider state: durable entry + runtime.
@@ -418,6 +423,7 @@ mod tests {
                 },
                 runtime: VolumeRuntime {
                     state: VolumeLifecycle::Ready,
+                    retired_attachment_ids: Vec::new(),
                     attachment: Some(AttachmentRecord {
                         id: AttachmentId::new("att-1").expect("valid id"),
                         vm_id: "vm-1".to_owned(),

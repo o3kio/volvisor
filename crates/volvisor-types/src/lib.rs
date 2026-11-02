@@ -71,11 +71,12 @@ pub use lending::{
     ReclaimDeviceRequest, ResidueAcknowledgement, ResidueCheck, ResolveQuarantineRequest,
 };
 pub use request::{
-    ATTACHMENT_REPORT_DETAIL_MAX_BYTES, AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse,
-    AttachmentView, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
-    ErasurePolicy, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
-    ListVolumesResponse, MoveVolumeBackingRequest, MoveVolumeBackingResponse, PROVIDER_API_VERSION,
-    ReportAttachmentStateRequest, ReportAttachmentStateResponse,
+    ATTACHMENT_REPORT_DETAIL_MAX_BYTES, ATTACHMENT_REPORT_REPORTER_MAX_BYTES, AccessModeRequest,
+    AdoptVolumeRequest, AdoptVolumeResponse, AttachmentView, CreateVolumeRequest,
+    DeleteVolumeRequest, DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest,
+    GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, MoveVolumeBackingRequest,
+    MoveVolumeBackingResponse, PROVIDER_API_VERSION, ReportAttachmentStateRequest,
+    ReportAttachmentStateResponse,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 
