@@ -3566,8 +3566,8 @@ use volvisor_witness::proto::{
 };
 
 use crate::peer::{
-    PeerGrantRequest, PeerRouteContext, PreparedParticipant, TargetPreparation,
-    TargetPreparationStore,
+    PeerGrantRequest, PeerRouteContext, PreparedParticipant, TARGET_PREPARATION_SCHEMA_VERSION,
+    TargetPreparation, TargetPreparationStore,
 };
 
 /// One volume's scripted witness authority state.
@@ -4693,6 +4693,7 @@ async fn peer_grant_resolves_an_in_flight_intent_by_inspection() {
     let migration = migration_id("mig-resolve");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-r".to_owned(),
             source_host: host_id("src-host"),
@@ -4932,6 +4933,7 @@ async fn peer_grant_reissues_a_recorded_failure_when_the_act_provably_landed() {
     let migration = migration_id("mig-wedge2");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-w2".to_owned(),
             source_host: host_id("src-host"),
@@ -5062,6 +5064,7 @@ async fn arrange_lapsed_park(kit: &PeerKit, raw_volume: &str, migration_raw: &st
     let migration = migration_id(migration_raw);
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-h".to_owned(),
             source_host: host_id("src-host"),
@@ -5256,6 +5259,7 @@ async fn peer_grant_refuses_the_re_mint_when_the_record_is_at_or_after_promote()
     }
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-h3".to_owned(),
             source_host: host_id("src-host"),
@@ -5332,6 +5336,7 @@ async fn peer_grant_refuses_the_re_mint_when_the_fence_evidence_moved() {
     let migration = migration_id("mig-h4");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-h4".to_owned(),
             source_host: host_id("src-host"),
@@ -5408,6 +5413,7 @@ async fn peer_grant_refuses_the_re_mint_when_the_lease_was_revoked() {
     }
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-h5".to_owned(),
             source_host: host_id("src-host"),
@@ -5510,6 +5516,7 @@ async fn peer_grant_uses_the_original_id_while_a_member_is_still_live() {
     let migration = migration_id("mig-mixed");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-m".to_owned(),
             source_host: host_id("src-host"),
@@ -5576,6 +5583,7 @@ async fn renew_grant_hold_leases_renews_due_pre_promote_leases() {
     let migration = migration_id("mig-renew1");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-r1".to_owned(),
             source_host: host_id("src-host"),
@@ -5646,6 +5654,7 @@ async fn renew_grant_hold_leases_skips_a_preparation_that_is_not_uniformly_live(
     let migration = migration_id("mig-renew2");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-r2".to_owned(),
             source_host: host_id("src-host"),
@@ -5704,6 +5713,7 @@ async fn renew_grant_hold_leases_stops_at_promoted_participants() {
     let migration = migration_id("mig-renew3");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration,
             vm_id: "vm-r3".to_owned(),
             source_host: host_id("src-host"),
@@ -5756,6 +5766,7 @@ async fn renew_grant_hold_leases_defers_honestly_on_witness_failure() {
     let migration = migration_id("mig-renew4");
     kit.store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-r4".to_owned(),
             source_host: host_id("src-host"),
@@ -5835,6 +5846,7 @@ fn target_preparation_store_journals_the_grant_attempt_durably() {
     let migration = migration_id("mig-attempt");
     store
         .install(&TargetPreparation {
+            schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
             migration_id: migration.clone(),
             vm_id: "vm-a".to_owned(),
             source_host: host_id("src-host"),

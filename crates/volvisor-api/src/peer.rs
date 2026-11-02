@@ -150,6 +150,7 @@ use volvisor_provider::provider::VolumeProvider;
 use volvisor_provider::vmm::{DiskMapping, VmState, VmmController};
 use volvisor_types::id::{HostId, MigrationId, VolumeId};
 use volvisor_types::request::{AccessModeRequest, AttachVolumeRequest};
+use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, AuthorityView, Frontend, LeaseState, OperationId,
 };
@@ -606,6 +607,13 @@ pub struct PreparedParticipant {
     pub device_path: Option<String>,
 }
 
+/// Current durable target-preparation schema version.
+///
+/// Baseline 1 is the pre-versioning shape; records written before the
+/// `schema_version` field existed decode as version 1 and are stamped on
+/// the first successful write (`docs/schema-compatibility.md`).
+pub const TARGET_PREPARATION_SCHEMA_VERSION: u32 = 1;
+
 /// The destination-side preparation record of one migration (plan §2:
 /// "target replica verified, resource present, Secondary, connected,
 /// no fence marker; snapshot dir readability verified"), persisted as
@@ -616,6 +624,9 @@ pub struct PreparedParticipant {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPreparation {
+    /// Durable schema version; absent in pre-versioning files (baseline 1).
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    pub schema_version: u32,
     /// The migration identity (store key).
     pub migration_id: MigrationId,
     /// The migrated VM (the restore's target).
@@ -741,6 +752,20 @@ impl TargetPreparationStore {
                     "failed to read peer preparation {path_display}: {e}"
                 ))
             })?;
+            // Probe the version first (unknown fields tolerated), so a
+            // record written by a newer build is refused with the precise
+            // unsupported-version error instead of a generic parse error.
+            let probe: SchemaVersionProbe = serde_json::from_str(&text).map_err(|e| {
+                internal(format!(
+                    "failed to parse peer preparation {path_display}: {e}"
+                ))
+            })?;
+            ensure_supported_schema_version(
+                "peer preparation",
+                &path,
+                probe.schema_version,
+                TARGET_PREPARATION_SCHEMA_VERSION,
+            )?;
             let record: TargetPreparation = serde_json::from_str(&text).map_err(|e| {
                 internal(format!(
                     "failed to parse peer preparation {path_display}: {e}"
@@ -830,9 +855,13 @@ impl TargetPreparationStore {
             )));
         }
         let path = record_path(&inner.dir, &record.migration_id);
+        // Upgrade-on-write: a record decoded from an older file is
+        // persisted at the current schema version.
+        let mut record = record.clone();
+        record.schema_version = TARGET_PREPARATION_SCHEMA_VERSION;
         save_atomic(
             &path,
-            &serde_json::to_vec_pretty(record).map_err(|e| {
+            &serde_json::to_vec_pretty(&record).map_err(|e| {
                 ApiError::new(
                     ApiErrorCode::Internal,
                     format!("failed to serialize peer preparation: {e}"),
@@ -888,7 +917,9 @@ impl TargetPreparationStore {
             return Ok(());
         }
         participant.device_path = Some(device_path.to_owned());
-        let updated = record.clone();
+        let mut updated = record.clone();
+        updated.schema_version = TARGET_PREPARATION_SCHEMA_VERSION;
+        record.schema_version = TARGET_PREPARATION_SCHEMA_VERSION;
         let path = record_path(&inner.dir, migration_id);
         let bytes = serde_json::to_vec_pretty(&updated).map_err(|e| {
             ApiError::new(
@@ -925,6 +956,7 @@ impl TargetPreparationStore {
         };
         record.grant_attempt = record.grant_attempt.saturating_add(1);
         let attempt = record.grant_attempt;
+        record.schema_version = TARGET_PREPARATION_SCHEMA_VERSION;
         let updated = record.clone();
         let path = record_path(&inner.dir, migration_id);
         let bytes = serde_json::to_vec_pretty(&updated).map_err(|e| {
@@ -1629,6 +1661,7 @@ fn preparation_from_request(
     created_at: u64,
 ) -> TargetPreparation {
     TargetPreparation {
+        schema_version: TARGET_PREPARATION_SCHEMA_VERSION,
         migration_id: req.migration_id.clone(),
         vm_id: req.vm_id.clone(),
         source_host: req.source_host.clone(),
