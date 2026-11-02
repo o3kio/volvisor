@@ -1,0 +1,14 @@
+{
+  "migration_id": "mig-peer-n1",
+  "vm_id": "vm-upgrade",
+  "source_host": "host-src",
+  "target_host": "host-dst",
+  "participants": [
+    {
+      "volume_id": "vol-drbd-n1",
+      "expected_generation": 6,
+      "device_path": "/dev/drbd9"
+    }
+  ],
+  "created_at": 1700000000
+}
