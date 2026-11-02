@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use serde::Deserialize;
+use volvisor_types::schema::ensure_supported_schema_version;
 use volvisor_types::{ApiError, ApiErrorCode, OperationId};
 
 use crate::frame;
@@ -117,6 +119,17 @@ struct Replayed {
     records: Vec<JournalRecord>,
 }
 
+/// Version-only probe for a frame payload.
+///
+/// Deliberately tolerates unknown fields: a record written by a newer build
+/// must be recognized by its version *before* the strict decode rejects the
+/// fields this build does not know, so the operator sees the precise
+/// unsupported-version refusal instead of a generic parse error.
+#[derive(Deserialize)]
+struct RecordVersionProbe {
+    record_version: u32,
+}
+
 impl Journal {
     /// Open (or create) the journal in `dir`, enforcing single-writer
     /// ownership and replaying the log.
@@ -202,7 +215,7 @@ impl Journal {
                 ))?;
         }
 
-        let replayed = replay(&mut log, collect_records)?;
+        let replayed = replay(&mut log, &log_path, collect_records)?;
 
         let journal = Self {
             lock_file,
@@ -497,8 +510,12 @@ impl Drop for Journal {
 }
 
 /// Replay the log file, rebuilding the idempotency registry and truncating
-/// any torn tail.
-fn replay(log: &mut File, collect_records: bool) -> Result<Replayed, ApiError> {
+/// a structurally torn tail.
+///
+/// A frame that decodes structurally but whose payload is undecodable, has
+/// unknown fields, or declares an unsupported record version is **not** a
+/// torn tail: replay fails typed and leaves the log byte-for-byte intact.
+fn replay(log: &mut File, log_path: &Path, collect_records: bool) -> Result<Replayed, ApiError> {
     log.seek(SeekFrom::Start(0))
         .map_err(io_err("failed to seek journal log for replay"))?;
     let mut data = Vec::new();
@@ -513,14 +530,37 @@ fn replay(log: &mut File, collect_records: bool) -> Result<Replayed, ApiError> {
     };
     let mut offset = 0usize;
     while let Some(raw) = frame::decode_at(&data, offset, replayed.next_sequence) {
-        let envelope = serde_json::from_slice::<Envelope>(raw.payload)
-            .ok()
-            .filter(|envelope| envelope.record_version == RECORD_VERSION);
-        let Some(envelope) = envelope else {
-            // Undecodable payload or unknown record version: torn/corrupt
-            // tail. Stop replay at this frame boundary.
-            break;
-        };
+        let probe: RecordVersionProbe = serde_json::from_slice(raw.payload).map_err(|err| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "journal log {} has a complete CRC-valid frame at sequence {} whose \
+                         payload has no decodable record_version: {err}; refusing to \
+                         truncate durable records",
+                    log_path.display(),
+                    raw.sequence
+                ),
+            )
+        })?;
+        ensure_supported_schema_version(
+            "journal record",
+            log_path,
+            probe.record_version,
+            RECORD_VERSION,
+        )?;
+        let envelope = serde_json::from_slice::<Envelope>(raw.payload).map_err(|err| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "journal log {} has a complete CRC-valid frame at sequence {} whose \
+                     payload does not decode at record_version {}: {err}; refusing to \
+                     truncate durable records (unknown fields are rejected by policy)",
+                    log_path.display(),
+                    raw.sequence,
+                    RECORD_VERSION
+                ),
+            )
+        })?;
         if collect_records {
             replayed.records.push(envelope.record.clone());
         }
@@ -683,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_record_version_is_treated_as_torn_tail() {
+    fn unknown_record_version_refuses_open_and_preserves_the_log() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join(JOURNAL_LOG_FILE);
         let envelope = Envelope {
@@ -696,12 +736,130 @@ mod tests {
         let frame = frame::encode(1, &payload).expect("encode");
         std::fs::write(&log_path, &frame).expect("write");
 
-        let journal = Journal::open(dir.path()).expect("open");
-        assert_eq!(journal.record_count(), 0);
+        let err = Journal::open(dir.path()).expect_err("future version must refuse open");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.is_unsupported_schema_version(), "{err}");
         assert_eq!(
             std::fs::metadata(&log_path).expect("stat").len(),
-            0,
-            "unreadable-version record is truncated away"
+            u64::try_from(frame.len()).expect("frame length"),
+            "a complete future-version frame is never truncated away"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Golden historical fixture: a record_version 1 journal written before
+    // `http_status` existed. There is no N-2 format (record_version has
+    // been 1 since the journal was introduced); see
+    // docs/schema-compatibility.md.
+    // -----------------------------------------------------------------
+
+    const N1_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/schema/journal-v1-n1.log");
+
+    fn write_journal_fixture(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join(JOURNAL_LOG_FILE);
+        std::fs::write(&path, N1_FIXTURE).expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn n_minus_one_fixture_replays_and_defaults_absent_http_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_journal_fixture(&dir);
+        let mut journal = Journal::open(dir.path()).expect("fixture opens");
+        assert_eq!(journal.record_count(), 3, "intent + outcome + checkpoint");
+
+        let id = op_id("op-upgrade-journal-n1");
+        let entry = journal.lookup(&id).expect("registry entry");
+        assert_eq!(entry.request_hash, [7; 32]);
+        let outcome = entry.outcome.expect("outcome record");
+        assert!(outcome.success);
+        assert_eq!(outcome.http_status, None, "pre-http-status outcome");
+        assert_eq!(
+            outcome.response,
+            serde_json::json!({"volume_id": "vol-upgrade-journal", "generation": 1})
+        );
+
+        // Idempotent replay returns the recorded outcome and appends nothing.
+        let replayed = journal
+            .append_intent(
+                id.clone(),
+                [7; 32],
+                "create_volume",
+                serde_json::json!({
+                    "volume_id": "vol-upgrade-journal",
+                    "size_bytes": 1_048_576
+                }),
+            )
+            .expect("replay");
+        assert_eq!(
+            replayed,
+            IntentAppend::Replayed {
+                success: true,
+                response: serde_json::json!({
+                    "volume_id": "vol-upgrade-journal",
+                    "generation": 1
+                }),
+                http_status: None,
+            }
+        );
+        assert_eq!(journal.record_count(), 3, "replay writes no record");
+
+        // The log remains appendable after replay, and the upgrade is inert
+        // (the replay is idempotent across a second crash/restart too).
+        journal
+            .append_checkpoint("after historical replay")
+            .expect("append after replay");
+        drop(journal);
+        let journal = Journal::open(dir.path()).expect("reopen");
+        assert_eq!(journal.record_count(), 4);
+        assert_eq!(
+            journal.lookup(&id).expect("entry after reopen").outcome,
+            Some(RecordedOutcome {
+                success: true,
+                response: serde_json::json!({
+                    "volume_id": "vol-upgrade-journal",
+                    "generation": 1
+                }),
+                http_status: None,
+            })
+        );
+    }
+
+    #[test]
+    fn complete_frame_with_unknown_field_refuses_open_and_preserves_the_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join(JOURNAL_LOG_FILE);
+        // A supported record_version carrying a field this build does not
+        // know: silent field loss is forbidden, so open refuses.
+        let payload = br#"{"record_version":1,"record":{"record_type":"checkpoint","note":"n","surprise":true}}"#;
+        let frame = frame::encode(1, payload).expect("encode");
+        std::fs::write(&log_path, &frame).expect("write");
+
+        let err = Journal::open(dir.path()).expect_err("unknown field must refuse open");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version(), "{err}");
+        assert!(err.detail.contains("unknown fields are rejected"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&log_path).expect("stat").len(),
+            u64::try_from(frame.len()).expect("frame length"),
+            "a complete unknown-field frame is never truncated away"
+        );
+    }
+
+    #[test]
+    fn future_version_with_unknown_fields_reports_the_version_not_a_parse_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join(JOURNAL_LOG_FILE);
+        let payload = br#"{"record_version":2,"future_field":true,"record":{"record_type":"checkpoint","note":"n"}}"#;
+        let frame = frame::encode(1, payload).expect("encode");
+        std::fs::write(&log_path, &frame).expect("write");
+
+        let err = Journal::open(dir.path()).expect_err("future version must refuse open");
+        assert!(err.is_unsupported_schema_version(), "{err}");
+        assert!(err.detail.contains("schema_version 2"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&log_path).expect("stat").len(),
+            u64::try_from(frame.len()).expect("frame length")
         );
     }
 

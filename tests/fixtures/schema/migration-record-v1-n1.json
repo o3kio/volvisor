@@ -1,0 +1,49 @@
+{
+  "migration_id": "mig-n1",
+  "vm_id": "vm-upgrade",
+  "source_host": "host-src",
+  "target_host": "host-dst",
+  "participants": [
+    {
+      "volume_id": "vol-drbd-n1",
+      "expected_generation": 6,
+      "resource": "vol-vol-drbd-n1-abcd1234",
+      "minor": 9
+    }
+  ],
+  "state": {
+    "aborted": {
+      "reason": "operator abort before the cut",
+      "at": 1700000200
+    }
+  },
+  "cut": null,
+  "state_history": [
+    {
+      "state": "prepared",
+      "cut": null,
+      "at": 1700000000,
+      "detail": null
+    },
+    {
+      "state": {
+        "aborted": {
+          "reason": "operator abort before the cut",
+          "at": 1700000200
+        }
+      },
+      "cut": null,
+      "at": 1700000200,
+      "detail": "operator abort"
+    }
+  ],
+  "barrier_proofs": [],
+  "abort_policy": "auto_before_cut",
+  "consumer_proof": {
+    "barrier": "consumer corroboration recorded, never trusted"
+  },
+  "created_at": 1700000000,
+  "updated_at": 1700000200,
+  "cut_started_at": null,
+  "cut_completed_at": null
+}

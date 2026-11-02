@@ -1,0 +1,28 @@
+{
+  "volumes": {
+    "vol-drbd-n2": {
+      "entry": {
+        "resource_name": "vol-vol-drbd-n2-abcd1234",
+        "vg_name": "vgdrbd",
+        "lv_name": "vol-vol-drbd-n2-abcd1234",
+        "minor": 7,
+        "port": 7901,
+        "size_bytes": 1073741824,
+        "requested_size_bytes": 1073741824,
+        "generation": 2,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "replication_mode": "A",
+        "creation_payload": "{\"class\":\"nearline-replicated\"}",
+        "created_at": 1700000000
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null,
+        "seeded": true
+      }
+    }
+  },
+  "next_minor": 8,
+  "next_port": 7902
+}

@@ -1,0 +1,314 @@
+name: real-backends
+
+# Real Ceph / DRBD / LVM evidence runs.
+#
+# Triggers:
+#   * schedule          -- weekly, suites declared `supported` in
+#                          release-scope.toml (drift detection);
+#   * workflow_dispatch -- an operator can run one suite or all;
+#   * workflow_call     -- called by release.yaml for every provider
+#                          declared `supported` in release-scope.toml.
+#
+# The Ceph and DRBD suites run on dedicated self-hosted runners because
+# they need a real kernel module, device nodes and a peer/cluster:
+#   ceph: [self-hosted, linux, x64, volvisor-ceph]
+#   drbd: [self-hosted, linux, x64, volvisor-drbd]
+# The LVM suite runs on ubuntu-latest (loop devices + device-mapper only).
+#
+# Every job runs scripts/test-<suite>.sh. A missing prerequisite exits 2
+# with a typed message; a skipped suite is rejected by the script after
+# the run. There is deliberately no `continue-on-error` and no bypass.
+#
+# Evidence: each run uploads target/real-backends/<suite>/ (run.log,
+# junit.xml, preflight.log, errors.txt, environment.txt, status.txt) as
+# `real-backends-<suite>` for 90 days. release.yaml downloads these into a
+# permanent release-evidence bundle attached to the GitHub release.
+#
+# Secrets/vars are passed as environment variables, never committed:
+#   vars.VOLVISOR_CEPH_FSID, _MONS, _POOL, _USER
+#   secrets.VOLVISOR_CEPH_KEYRING_B64 (base64 keyring; optional if the
+#     runner already has a conventional client keyring)
+#   vars.VOLVISOR_DRBD_VG, _CONFIG_DIR, _NODE_NAME, _LOCAL_ADDRESS,
+#     _PEER_NAME, _PEER_ADDRESS
+#   secrets.VOLVISOR_DRBD_SECRET (shared secret; optional if
+#     VOLVISOR_DRBD_SECRET_FILE is provisioned on the runner)
+# See docs/testing/real-backends.md for the full rig contract.
+
+on:
+  schedule:
+    # Monday 03:30 UTC. Adjust here, not in a downstream workflow.
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite to run (all runs every registered rig)"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - lvm
+          - ceph
+          - drbd
+  workflow_call:
+    inputs:
+      suite:
+        description: "Suite selected by the release-scope matrix"
+        required: true
+        type: string
+    secrets:
+      VOLVISOR_CEPH_KEYRING_B64:
+        required: false
+      VOLVISOR_DRBD_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  # The schedule runs only providers whose release-scope status is
+  # `supported`; a workflow_dispatch with suite=all deliberately runs
+  # every rig (useful while bringing one up). The release caller passes
+  # the suite selected by release-scope.py's matrix. This job makes that
+  # selection explicit and fails on an unknown suite input instead of
+  # silently skipping every job.
+  scope:
+    name: real-backends (scope)
+    runs-on: ubuntu-latest
+    outputs:
+      lvm: ${{ steps.scope.outputs.lvm }}
+      ceph: ${{ steps.scope.outputs.ceph }}
+      drbd: ${{ steps.scope.outputs.drbd }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the suite input
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -eu
+          case "${SUITE:-all}" in
+            all|lvm|ceph|drbd) ;;
+            *)
+              echo "unknown real-backend suite '${SUITE:-}'" >&2
+              exit 1
+              ;;
+          esac
+      - name: Read the declared release scope
+        id: scope
+        run: |
+          set -eu
+          python3 scripts/release-scope.py check
+          python3 scripts/release-scope.py status >> "$GITHUB_OUTPUT"
+
+  lvm:
+    name: real-backends (lvm)
+    needs: scope
+    if: >-
+      needs.scope.result == 'success' && (
+        inputs.suite == 'lvm' || inputs.suite == 'all' ||
+        (github.event_name == 'schedule' && needs.scope.outputs.lvm == 'supported')
+      )
+    runs-on: ubuntu-latest
+    concurrency:
+      group: real-backends-lvm
+      cancel-in-progress: false
+    env:
+      VOLVISOR_TEST_OUTPUT_DIR: ${{ github.workspace }}/target/real-backends/lvm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LVM2
+        run: sudo apt-get update && sudo apt-get install -y lvm2
+      - name: Run the real-LVM gate
+        run: sudo -E env "PATH=$PATH" ./scripts/test-lvm.sh
+      - name: Record the gate result in the run summary
+        if: always()
+        run: |
+          {
+            echo "## real-backends: lvm"
+            echo
+            echo "- job result: ${{ job.status }}"
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- evidence: \`real-backends-lvm\` artifact (target/real-backends/lvm)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload LVM evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-backends-lvm
+          path: target/real-backends/lvm/
+          if-no-files-found: warn
+          retention-days: 90
+
+  ceph:
+    name: real-backends (ceph)
+    needs: scope
+    if: >-
+      needs.scope.result == 'success' && (
+        inputs.suite == 'ceph' || inputs.suite == 'all' ||
+        (github.event_name == 'schedule' && needs.scope.outputs.ceph == 'supported')
+      )
+    # Dedicated runner: cluster config, rbd kernel module, ceph/rbd CLIs.
+    runs-on: [self-hosted, linux, x64, volvisor-ceph]
+    concurrency:
+      group: real-backends-ceph
+      cancel-in-progress: false
+    env:
+      VOLVISOR_TEST_OUTPUT_DIR: ${{ github.workspace }}/target/real-backends/ceph
+      VOLVISOR_CEPH_FSID: ${{ vars.VOLVISOR_CEPH_FSID }}
+      VOLVISOR_CEPH_MONS: ${{ vars.VOLVISOR_CEPH_MONS }}
+      VOLVISOR_CEPH_POOL: ${{ vars.VOLVISOR_CEPH_POOL }}
+      VOLVISOR_CEPH_USER: ${{ vars.VOLVISOR_CEPH_USER }}
+      VOLVISOR_CEPH_KEYRING_B64: ${{ secrets.VOLVISOR_CEPH_KEYRING_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the real-Ceph gate
+        run: sudo -E env "PATH=$PATH" ./scripts/test-ceph.sh
+      - name: Record the gate result in the run summary
+        if: always()
+        run: |
+          {
+            echo "## real-backends: ceph"
+            echo
+            echo "- job result: ${{ job.status }}"
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- runner: self-hosted / volvisor-ceph"
+            echo "- evidence: \`real-backends-ceph\` artifact (target/real-backends/ceph)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload Ceph evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-backends-ceph
+          path: target/real-backends/ceph/
+          if-no-files-found: warn
+          retention-days: 90
+
+  drbd:
+    name: real-backends (drbd)
+    needs: scope
+    if: >-
+      needs.scope.result == 'success' && (
+        inputs.suite == 'drbd' || inputs.suite == 'all' ||
+        (github.event_name == 'schedule' && needs.scope.outputs.drbd == 'supported')
+      )
+    # Dedicated runner: DRBD 9 module, drbd-utils, dedicated VG and peer.
+    runs-on: [self-hosted, linux, x64, volvisor-drbd]
+    concurrency:
+      group: real-backends-drbd
+      cancel-in-progress: false
+    env:
+      VOLVISOR_TEST_OUTPUT_DIR: ${{ github.workspace }}/target/real-backends/drbd
+      VOLVISOR_DRBD_VG: ${{ vars.VOLVISOR_DRBD_VG }}
+      VOLVISOR_DRBD_CONFIG_DIR: ${{ vars.VOLVISOR_DRBD_CONFIG_DIR }}
+      VOLVISOR_DRBD_NODE_NAME: ${{ vars.VOLVISOR_DRBD_NODE_NAME }}
+      VOLVISOR_DRBD_LOCAL_ADDRESS: ${{ vars.VOLVISOR_DRBD_LOCAL_ADDRESS }}
+      VOLVISOR_DRBD_PEER_NAME: ${{ vars.VOLVISOR_DRBD_PEER_NAME }}
+      VOLVISOR_DRBD_PEER_ADDRESS: ${{ vars.VOLVISOR_DRBD_PEER_ADDRESS }}
+      VOLVISOR_DRBD_SECRET: ${{ secrets.VOLVISOR_DRBD_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the real-DRBD gate
+        run: sudo -E env "PATH=$PATH" ./scripts/test-drbd.sh
+      - name: Record the gate result in the run summary
+        if: always()
+        run: |
+          {
+            echo "## real-backends: drbd"
+            echo
+            echo "- job result: ${{ job.status }}"
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- runner: self-hosted / volvisor-drbd"
+            echo "- evidence: \`real-backends-drbd\` artifact (target/real-backends/drbd)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload DRBD evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-backends-drbd
+          path: target/real-backends/drbd/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # The reusable workflow's own result must not be a silently skipped set
+  # of jobs. The gate checks exactly the suites selected by the trigger:
+  # schedule -> scope-supported suites; workflow_dispatch all -> every
+  # rig (explicit bring-up); single suite -> that suite. A selected but
+  # skipped/failed/cancelled suite fails the called workflow, which in
+  # turn fails release.yaml's real-backends-gate.
+  gate:
+    name: real-backends (gate)
+    needs: [scope, lvm, ceph, drbd]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce the selected suite results
+        env:
+          EVENT: ${{ github.event_name }}
+          SUITE: ${{ inputs.suite }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          LVM_SCOPE: ${{ needs.scope.outputs.lvm }}
+          CEPH_SCOPE: ${{ needs.scope.outputs.ceph }}
+          DRBD_SCOPE: ${{ needs.scope.outputs.drbd }}
+          LVM_RESULT: ${{ needs.lvm.result }}
+          CEPH_RESULT: ${{ needs.ceph.result }}
+          DRBD_RESULT: ${{ needs.drbd.result }}
+        run: |
+          set -eu
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "real-backends gate: scope selection failed ($SCOPE_RESULT)." >&2
+            echo "An unknown scope or suite input is a failure, not an empty run." >&2
+            exit 1
+          fi
+          suite=${SUITE:-all}
+          selected_lvm=no
+          selected_ceph=no
+          selected_drbd=no
+          if [ "$EVENT" = "schedule" ]; then
+            if [ "$LVM_SCOPE" = "supported" ]; then selected_lvm=yes; fi
+            if [ "$CEPH_SCOPE" = "supported" ]; then selected_ceph=yes; fi
+            if [ "$DRBD_SCOPE" = "supported" ]; then selected_drbd=yes; fi
+          else
+            case "$suite" in
+              all) selected_lvm=yes; selected_ceph=yes; selected_drbd=yes ;;
+              lvm) selected_lvm=yes ;;
+              ceph) selected_ceph=yes ;;
+              drbd) selected_drbd=yes ;;
+              *)
+                echo "real-backends gate: unknown suite '$suite'." >&2
+                exit 1
+                ;;
+            esac
+          fi
+          ran=0
+          check() {
+            name=$1
+            selected=$2
+            result=$3
+            if [ "$selected" = "yes" ]; then
+              ran=1
+              if [ "$result" != "success" ]; then
+                echo "real-backends gate: suite $name was selected but its result is '$result'." >&2
+                echo "Missing infrastructure, a skipped job and a failed test all fail the gate." >&2
+                exit 1
+              fi
+              echo "real-backends gate: suite $name passed."
+            fi
+          }
+          check lvm "$selected_lvm" "$LVM_RESULT"
+          check ceph "$selected_ceph" "$CEPH_RESULT"
+          check drbd "$selected_drbd" "$DRBD_RESULT"
+          if [ "$ran" -eq 0 ]; then
+            echo "real-backends gate: no supported suite is selected (release-scope declares none); nothing is claimed."
+          else
+            echo "real-backends gate: all selected suites ran and passed."
+          fi

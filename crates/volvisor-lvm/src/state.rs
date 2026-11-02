@@ -16,13 +16,21 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
+use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{
     AccessMode, ApiError, ApiErrorCode, AttachmentEvidence, AttachmentId, AttachmentState,
     DeviceId, DeviceRole, HostId, MoveVolumeBackingState, OperationId, ProjectId, VolumeId,
     VolumeLifecycle,
 };
+
+/// Current durable LVM-state schema version.
+///
+/// The baseline is the pre-versioning format; adding the `schema_version`
+/// field itself does not bump it because historical files decode unchanged
+/// (missing version means [`volvisor_types::BASELINE_SCHEMA_VERSION`]).
+pub const LVM_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
@@ -31,7 +39,7 @@ use volvisor_types::{
 /// rather than the sanitized segment itself);
 /// `vg_name` identifies the claimed pool the volume lives in (a
 /// provider-internal reference, never exposed to tenants).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VolumeEntry {
     /// Volume group holding the logical volume.
     pub vg_name: String,
@@ -44,6 +52,10 @@ pub struct VolumeEntry {
     /// rounds sizes up to the physical extent, so this can be smaller
     /// than `size_bytes`; idempotent-create replay compares *this*
     /// value (never the rounded one) against a replayed request.
+    ///
+    /// The initial P1 format had no requested-vs-effective distinction.
+    /// It decodes with this field equal to `size_bytes` (the only size
+    /// that file recorded), never with a guessed or zero value.
     pub requested_size_bytes: u64,
     /// Volume generation (optimistic concurrency fencing).
     pub generation: u64,
@@ -58,8 +70,48 @@ pub struct VolumeEntry {
     pub creation_payload: String,
 }
 
+/// Wire shape for [`VolumeEntry`]; differs only in the one legacy field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeEntryWire {
+    vg_name: String,
+    lv_name: String,
+    size_bytes: u64,
+    #[serde(default)]
+    requested_size_bytes: Option<u64>,
+    generation: u64,
+    data_epoch: u64,
+    project_id: ProjectId,
+    block_size: u32,
+    creation_payload: String,
+}
+
+impl<'de> Deserialize<'de> for VolumeEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = VolumeEntryWire::deserialize(deserializer)?;
+        Ok(Self {
+            vg_name: wire.vg_name,
+            lv_name: wire.lv_name,
+            size_bytes: wire.size_bytes,
+            // P1 files recorded only the effective size. That is the
+            // honest requested size for them; an absent field never
+            // becomes a fabricated zero.
+            requested_size_bytes: wire.requested_size_bytes.unwrap_or(wire.size_bytes),
+            generation: wire.generation,
+            data_epoch: wire.data_epoch,
+            project_id: wire.project_id,
+            block_size: wire.block_size,
+            creation_payload: wire.creation_payload,
+        })
+    }
+}
+
 /// The mutable runtime portion of a stored volume.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeRuntime {
     /// Current lifecycle state.
     pub state: VolumeLifecycle,
@@ -74,6 +126,7 @@ pub struct VolumeRuntime {
 
 /// A volume as stored in provider state: durable entry + runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredVolume {
     /// Durable cross-reference and attributes.
     pub entry: VolumeEntry,
@@ -83,6 +136,7 @@ pub struct StoredVolume {
 
 /// A recorded attachment (crash-replay never fabricates a second one).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentRecord {
     /// Attachment identity (caller-chosen, opaque).
     pub id: AttachmentId,
@@ -124,6 +178,7 @@ pub struct AttachmentRecord {
 
 /// A claimed physical device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceEntry {
     /// Stable hardware identity (WWN/serial) recorded at claim time.
     pub stable_identity: String,
@@ -161,6 +216,7 @@ pub struct DeviceEntry {
 /// fresh drive (the new record supersedes it at the drive's
 /// `PREPARING` journal write).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveRecord {
     /// The operation that started (or most recently re-attached to)
     /// this move — diagnostics only; the API-layer idempotency
@@ -179,8 +235,12 @@ pub struct MoveRecord {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LvmState {
+    /// Durable schema version; absent in pre-versioning files (baseline 1).
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    schema_version: u32,
     volumes: BTreeMap<VolumeId, StoredVolume>,
     devices: BTreeMap<DeviceId, DeviceEntry>,
     /// Online-move records, keyed by volume (at most one per
@@ -190,20 +250,50 @@ pub struct LvmState {
     moves: BTreeMap<VolumeId, MoveRecord>,
 }
 
+impl Default for LvmState {
+    fn default() -> Self {
+        Self {
+            schema_version: LVM_STATE_SCHEMA_VERSION,
+            volumes: BTreeMap::new(),
+            devices: BTreeMap::new(),
+            moves: BTreeMap::new(),
+        }
+    }
+}
+
 impl LvmState {
     /// Load the state from `path`.
     ///
-    /// A missing file is an empty state (first start); a corrupt file is an
-    /// `INTERNAL` error — state is never guessed or reset silently.
+    /// A missing file is an empty state (first start). A corrupt file, an
+    /// unknown field at a supported version, or a version newer than
+    /// [`LVM_STATE_SCHEMA_VERSION`] is a typed `INTERNAL` error — state is
+    /// never guessed, partially decoded or reset silently.
     pub fn load(path: &Path) -> Result<Self, ApiError> {
         let path_display = path.display();
         match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!("failed to parse provider state {path_display}: {e}"),
-                )
-            }),
+            Ok(text) => {
+                // Probe the version with unknown fields tolerated, so a file
+                // from a newer build gets the precise unsupported-version
+                // refusal rather than a generic parse error.
+                let probe: SchemaVersionProbe = serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })?;
+                ensure_supported_schema_version(
+                    "lvm",
+                    path,
+                    probe.schema_version,
+                    LVM_STATE_SCHEMA_VERSION,
+                )?;
+                serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ApiError::new(
                 ApiErrorCode::Internal,
@@ -258,6 +348,10 @@ impl LvmState {
                 crash.consult(STORE_LVM_STATE, point);
             }
         };
+        // A successful open may have decoded an older file; every save
+        // writes the current version so an upgrade becomes durable on the
+        // first mutation (or the startup reconcile's first save).
+        self.schema_version = LVM_STATE_SCHEMA_VERSION;
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
@@ -402,6 +496,17 @@ fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
+    const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json");
+    const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n2.json");
+    const TOMBSTONE_FIXTURE: &str =
+        include_str!("../../../tests/fixtures/schema/lvm-state-v1-tombstones.json");
+
+    fn write_fixture(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).expect("write fixture");
+        path
+    }
+
     fn sample_state() -> LvmState {
         let volume_id = VolumeId::new("vol-1").expect("valid id");
         let project_id = ProjectId::new("tenant-a").expect("valid id");
@@ -512,5 +617,164 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         // A failed save never leaves a .tmp residue behind.
         assert!(!sibling_tmp_path(&path).exists());
+    }
+
+    // -----------------------------------------------------------------
+    // Golden historical fixtures (real pre-tombstone / initial formats
+    // from git history; see docs/schema-compatibility.md).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn n_minus_one_fixture_loads_attachment_evidence_and_move_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "lvm-state-v1-n1.json", N1_FIXTURE);
+        let state = LvmState::load(&path).expect("N-1 state loads");
+        let volume_id = VolumeId::new("vol-upgrade-n1").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        assert_eq!(volume.runtime.state, VolumeLifecycle::Attached);
+        assert_eq!(volume.entry.generation, 7);
+        assert_eq!(volume.entry.data_epoch, 3);
+        let attachment = volume.runtime.attachment.as_ref().expect("attachment");
+        assert_eq!(attachment.vm_id, "vm-upgrade");
+        assert_eq!(attachment.generation, 5);
+        assert_eq!(attachment.vmm_disk_id.as_deref(), Some("disk-n1"));
+        assert_eq!(attachment.state, AttachmentState::Active);
+        assert_eq!(attachment.state_revision, 3);
+        assert_eq!(
+            attachment.evidence,
+            Some(AttachmentEvidence::GuestConfirmed)
+        );
+        assert_eq!(attachment.reporter.as_deref(), Some("consumer-upgrade"));
+        assert_eq!(attachment.recorded_at_ms, Some(1_700_000_000_123));
+        assert_eq!(
+            volume.runtime.retired_attachment_ids,
+            Vec::<AttachmentId>::new()
+        );
+
+        let device_id = DeviceId::new("dev-upgrade01").expect("valid id");
+        assert_eq!(
+            state.device(&device_id).expect("device").owner_generation,
+            3
+        );
+        let movement = state.move_record(&volume_id).expect("move preserved");
+        assert_eq!(movement.state, MoveVolumeBackingState::InDoubt);
+        assert_eq!(movement.target_pv, "/dev/disk/by-id/wwn-0x5000c500eeff0011");
+    }
+
+    #[test]
+    fn n_minus_two_fixture_defaults_pre_report_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "lvm-state-v1-n2.json", N2_FIXTURE);
+        let state = LvmState::load(&path).expect("N-2 state loads");
+        let volume_id = VolumeId::new("vol-upgrade-n2").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        let attachment = volume.runtime.attachment.as_ref().expect("attachment");
+        // Pre-report fields decode through their documented defaults.
+        assert_eq!(attachment.state, AttachmentState::Prepared);
+        assert_eq!(
+            attachment.state_revision,
+            volvisor_types::domain::initial_state_revision()
+        );
+        assert_eq!(attachment.vmm_disk_id, None);
+        assert_eq!(attachment.evidence, None);
+        assert_eq!(attachment.reporter, None);
+        assert_eq!(attachment.recorded_at_ms, None);
+        assert!(state.moves().is_empty(), "pre-P6-C fixture has no moves");
+        assert_eq!(
+            volume.runtime.retired_attachment_ids,
+            Vec::<AttachmentId>::new()
+        );
+        // The initial format had only the effective size; the requested
+        // size backfills from it rather than defaulting to zero.
+        assert_eq!(volume.entry.requested_size_bytes, volume.entry.size_bytes);
+    }
+
+    #[test]
+    fn tombstone_fixture_preserves_retired_attachment_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "lvm-state-v1-tombstones.json", TOMBSTONE_FIXTURE);
+        let state = LvmState::load(&path).expect("tombstone state loads");
+        let volume_id = VolumeId::new("vol-upgrade-tombstone").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        let retired: Vec<&str> = volume
+            .runtime
+            .retired_attachment_ids
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        assert_eq!(retired, vec!["att-retired-oldest", "att-retired-newer"]);
+    }
+
+    #[test]
+    fn old_fixture_upgrades_on_save_and_round_trips_losslessly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "n1.json", N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("load");
+        let target = dir.path().join("upgraded.json");
+        state.save(&target).expect("save");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\": 1"),
+            "upgrade-on-write stamps the current schema version: {text}"
+        );
+        assert_eq!(
+            LvmState::load(&target).expect("reload"),
+            state,
+            "no durable field is lost by load/save"
+        );
+    }
+
+    #[test]
+    fn future_schema_version_is_refused_typed_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let future = N1_FIXTURE.replacen(
+            '{',
+            "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "future.json", &future);
+        let err = LvmState::load(&path).expect_err("future version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.is_unsupported_schema_version(), "{err}");
+        assert!(err.detail.contains("schema_version 2"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read refused file"),
+            future,
+            "a refused future-version file is never truncated or rewritten"
+        );
+    }
+
+    #[test]
+    fn zero_schema_version_is_refused_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero = N1_FIXTURE.replacen('{', "{\n  \"schema_version\": 0,", 1);
+        let path = write_fixture(&dir, "zero.json", &zero);
+        let err = LvmState::load(&path).expect_err("zero version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version());
+        assert!(err.detail.contains("invalid schema_version 0"), "{err}");
+    }
+
+    #[test]
+    fn unknown_fields_at_a_supported_version_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Top-level unknown field.
+        let top = N1_FIXTURE.replacen('{', "{\n  \"future_field\": true,", 1);
+        let path = write_fixture(&dir, "top.json", &top);
+        let err = LvmState::load(&path).expect_err("top-level unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version(), "{err}");
+
+        // Nested unknown field inside a stored volume.
+        let nested = N1_FIXTURE.replacen(
+            "\"runtime\": {",
+            "\"runtime\": {\n        \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "nested.json", &nested);
+        let err = LvmState::load(&path).expect_err("nested unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("unknown field"), "{err}");
     }
 }

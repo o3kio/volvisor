@@ -30,10 +30,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{
     AccessMode, ApiError, ApiErrorCode, AttachmentId, HostId, LeaseId, MigrationId, ProjectId,
     VolumeId, VolumeLifecycle, WriterEpoch,
 };
+
+/// Current durable DRBD-state schema version.
+///
+/// The baseline is the pre-versioning format; historical additive fields
+/// (authority, fence, migration marker, VMM disk id) decode through serde
+/// defaults without a version bump.
+pub const DRBD_STATE_SCHEMA_VERSION: u32 = 1;
 
 /// The DRBD replication protocol of a resource, fixed at create time.
 ///
@@ -85,6 +93,7 @@ impl ReplicationMode {
 /// which is verified before every mutation — the name alone is never the
 /// ownership proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeEntry {
     /// DRBD resource name (== LV name; injective per volume identity).
     pub resource_name: String,
@@ -121,6 +130,7 @@ pub struct VolumeEntry {
 
 /// The mutable runtime portion of a stored volume.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeRuntime {
     /// Current lifecycle state.
     pub state: VolumeLifecycle,
@@ -165,6 +175,7 @@ pub struct VolumeRuntime {
 /// A recorded, incomplete migration cut (see
 /// [`VolumeRuntime::migration`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MigrationCut {
     /// The coordinated handoff this cut belongs to (the marker's
     /// owner: every release or abort must name it back).
@@ -177,6 +188,7 @@ pub struct MigrationCut {
 /// A recorded, incomplete self-fence (see
 /// [`VolumeRuntime::fence`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PendingFence {
     /// Why the writer fenced (stale epoch, local deadline passed,
     /// failed validation) — recorded, never inferred later.
@@ -192,6 +204,7 @@ pub struct PendingFence {
 /// lease itself is validated against the witness, never trusted from
 /// this record).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeAuthorityBlock {
     /// The granted writer epoch (never 0: a block exists only for a
     /// witnessed lease).
@@ -215,6 +228,7 @@ pub struct VolumeAuthorityBlock {
 
 /// A volume as stored in provider state: durable entry + runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredVolume {
     /// Durable cross-reference and attributes.
     pub entry: VolumeEntry,
@@ -224,6 +238,7 @@ pub struct StoredVolume {
 
 /// A recorded attachment (crash-replay never fabricates a second one).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentRecord {
     /// Attachment identity (caller-chosen, opaque).
     pub id: AttachmentId,
@@ -439,8 +454,12 @@ pub enum ClearedAttachmentReason {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DrbdState {
+    /// Durable schema version; absent in pre-versioning files (baseline 1).
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    schema_version: u32,
     volumes: BTreeMap<VolumeId, StoredVolume>,
     /// Next DRBD minor to hand out (monotonic; see [`Self::allocate_minor`]).
     #[serde(default)]
@@ -455,12 +474,25 @@ pub struct DrbdState {
     crash: Option<std::sync::Arc<volvisor_types::crash::StoreCrashHooks>>,
 }
 
+impl Default for DrbdState {
+    fn default() -> Self {
+        Self {
+            schema_version: DRBD_STATE_SCHEMA_VERSION,
+            volumes: BTreeMap::new(),
+            next_minor: 0,
+            next_port: 0,
+            crash: None,
+        }
+    }
+}
+
 // The crash seam is test plumbing, not state: two states with equal
 // durable content are equal (the derived impl would have required
 // the seam itself to be comparable, which it deliberately is not).
 impl PartialEq for DrbdState {
     fn eq(&self, other: &Self) -> bool {
-        self.volumes == other.volumes
+        self.schema_version == other.schema_version
+            && self.volumes == other.volumes
             && self.next_minor == other.next_minor
             && self.next_port == other.next_port
     }
@@ -471,17 +503,33 @@ impl Eq for DrbdState {}
 impl DrbdState {
     /// Load the state from `path`.
     ///
-    /// A missing file is an empty state (first start); a corrupt file is
-    /// an `INTERNAL` error — state is never guessed or reset silently.
+    /// A missing file is an empty state (first start). A corrupt file, an
+    /// unknown field at a supported version, or a version newer than
+    /// [`DRBD_STATE_SCHEMA_VERSION`] is a typed `INTERNAL` error — state is
+    /// never guessed, partially decoded or reset silently.
     pub fn load(path: &Path) -> Result<Self, ApiError> {
         let path_display = path.display();
         match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!("failed to parse provider state {path_display}: {e}"),
-                )
-            }),
+            Ok(text) => {
+                let probe: SchemaVersionProbe = serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })?;
+                ensure_supported_schema_version(
+                    "drbd",
+                    path,
+                    probe.schema_version,
+                    DRBD_STATE_SCHEMA_VERSION,
+                )?;
+                serde_json::from_str(&text).map_err(|e| {
+                    ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!("failed to parse provider state {path_display}: {e}"),
+                    )
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ApiError::new(
                 ApiErrorCode::Internal,
@@ -524,6 +572,9 @@ impl DrbdState {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
         let path_display = path.display();
+        // Upgrade-on-write: an older file decoded at open is persisted at
+        // the current schema version by its first save.
+        self.schema_version = DRBD_STATE_SCHEMA_VERSION;
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
@@ -883,5 +934,130 @@ mod tests {
         assert_eq!(ReplicationMode::C.as_str(), "C");
         let back: ReplicationMode = serde_json::from_str("\"B\"").expect("deserialize");
         assert_eq!(back, ReplicationMode::B);
+    }
+
+    // -----------------------------------------------------------------
+    // Golden historical fixtures. N-1 is the pre-`vmm_disk_id` shape
+    // (already carrying authority and the migration-cut marker); N-2 is
+    // the initial DRBD state format. See docs/schema-compatibility.md.
+    // -----------------------------------------------------------------
+
+    const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/drbd-state-v1-n1.json");
+    const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/drbd-state-v1-n2.json");
+
+    fn write_fixture(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, text).expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn n_minus_one_fixture_loads_authority_and_cut_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "drbd-state-v1-n1.json", N1_FIXTURE);
+        let state = DrbdState::load(&path).expect("N-1 state loads");
+        let volume_id = VolumeId::new("vol-drbd-n1").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        assert_eq!(volume.runtime.state, VolumeLifecycle::Attached);
+        assert!(volume.runtime.seeded);
+        let attachment = volume.runtime.attachment.as_ref().expect("attachment");
+        assert_eq!(attachment.device, "/dev/drbd9");
+        assert_eq!(attachment.generation, 3);
+        assert_eq!(attachment.vmm_disk_id, None, "never guessed");
+        let authority = volume.runtime.authority.as_ref().expect("authority");
+        assert_eq!(authority.epoch.0, 11);
+        assert_eq!(authority.lease_id.0, 41);
+        assert_eq!(authority.lease_proof_ref, 41);
+        assert_eq!(authority.deadline_at, 1_700_000_030);
+        let cut = volume.runtime.migration.as_ref().expect("cut marker");
+        assert_eq!(cut.migration_id.as_ref(), "mig-drbd-n1");
+        assert_eq!(cut.suspended_at, 1_700_000_100);
+        assert!(volume.runtime.fence.is_none());
+        assert_eq!(state.next_minor, 10);
+        assert_eq!(state.next_port, 7904);
+    }
+
+    #[test]
+    fn n_minus_two_fixture_defaults_later_runtime_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(&dir, "drbd-state-v1-n2.json", N2_FIXTURE);
+        let state = DrbdState::load(&path).expect("N-2 state loads");
+        let volume_id = VolumeId::new("vol-drbd-n2").expect("valid id");
+        let volume = state.volume(&volume_id).expect("volume preserved");
+        assert_eq!(volume.runtime.state, VolumeLifecycle::Ready);
+        assert!(volume.runtime.seeded);
+        assert!(volume.runtime.attachment.is_none());
+        assert!(volume.runtime.authority.is_none());
+        assert!(volume.runtime.fence.is_none());
+        assert!(volume.runtime.migration.is_none());
+        assert_eq!(state.next_minor, 8);
+        assert_eq!(state.next_port, 7902);
+    }
+
+    #[test]
+    fn old_fixture_upgrades_on_save_and_round_trips_losslessly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "n1.json", N1_FIXTURE);
+        let mut state = DrbdState::load(&source).expect("load");
+        let target = dir.path().join("upgraded.json");
+        state.save(&target).expect("save");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\": 1"),
+            "upgrade-on-write stamps the current schema version: {text}"
+        );
+        assert_eq!(
+            DrbdState::load(&target).expect("reload"),
+            state,
+            "no durable field is lost by load/save"
+        );
+    }
+
+    #[test]
+    fn future_schema_version_is_refused_typed_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let future = N1_FIXTURE.replacen(
+            '{',
+            "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "future.json", &future);
+        let err = DrbdState::load(&path).expect_err("future version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.is_unsupported_schema_version(), "{err}");
+        assert!(err.detail.contains("schema_version 2"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read refused file"),
+            future,
+            "a refused future-version file is never truncated or rewritten"
+        );
+    }
+
+    #[test]
+    fn zero_and_unknown_field_versions_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let zero = N1_FIXTURE.replacen('{', "{\n  \"schema_version\": 0,", 1);
+        let path = write_fixture(&dir, "zero.json", &zero);
+        let err = DrbdState::load(&path).expect_err("zero version must be refused");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version());
+        assert!(err.detail.contains("invalid schema_version 0"), "{err}");
+
+        let top = N1_FIXTURE.replacen('{', "{\n  \"future_field\": true,", 1);
+        let path = write_fixture(&dir, "top.json", &top);
+        let err = DrbdState::load(&path).expect_err("top-level unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(!err.is_unsupported_schema_version(), "{err}");
+
+        let nested = N1_FIXTURE.replacen(
+            "\"runtime\": {",
+            "\"runtime\": {\n        \"future_field\": true,",
+            1,
+        );
+        let path = write_fixture(&dir, "nested.json", &nested);
+        let err = DrbdState::load(&path).expect_err("nested unknown field");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("unknown field"), "{err}");
     }
 }

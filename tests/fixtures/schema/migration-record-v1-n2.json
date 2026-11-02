@@ -1,0 +1,28 @@
+{
+  "migration_id": "mig-n2",
+  "vm_id": "vm-upgrade",
+  "source_host": "host-src",
+  "target_host": "host-dst",
+  "participants": [
+    {
+      "volume_id": "vol-drbd-n2",
+      "expected_generation": 2,
+      "resource": "vol-vol-drbd-n2-abcd1234",
+      "minor": 7
+    }
+  ],
+  "state": "prepared",
+  "cut": null,
+  "state_history": [
+    {
+      "state": "prepared",
+      "cut": null,
+      "at": 1700000000,
+      "detail": null
+    }
+  ],
+  "barrier_proofs": [],
+  "abort_policy": "auto_before_cut",
+  "created_at": 1700000000,
+  "updated_at": 1700000000
+}
