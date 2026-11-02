@@ -199,6 +199,24 @@ are rejected at parse time.
 | `lease_grace_secs` | integer (seconds) | 5 | Response-latency bound the fence window assumes (W5). Must cover witness round-trip latency under load — an operator network responsibility. Must be positive. |
 | `suspend_budget_secs` | integer (seconds) | 5 | Self-fencing suspend budget (W7): the assumed time for a writer to freeze its data path (`drbdsetup suspend-io`). Must be positive. |
 
+## Durable-state schema compatibility
+
+The daemon's durable files are versioned and fail-closed: the intent journal
+(`journal.log`, `record_version`), the provider state files
+(`lvm-state.json`, `ceph-state.json`, `drbd-state.json`, `schema_version`),
+the migration records (`migrations/*.json`) and the peer preparations
+(`peer-preparations/*.json`). A file written by a newer schema refuses
+startup with a typed `INTERNAL` error instead of being partially decoded or
+rewritten; unknown fields at a supported version are rejected. Older
+supported files are read in place and upgraded by their first successful
+write. There is no in-place downgrade — rollback requires restoring a
+pre-upgrade backup of the whole state directory and the matching binary.
+
+Take that backup while the daemon is stopped, and keep it until the new
+version is proven. See
+[schema compatibility](schema-compatibility.md) for the exact store paths,
+N-1/N-2 fixture matrix and rollback steps.
+
 ## The checked-in examples
 
 [examples/volvisor.toml](../examples/volvisor.toml) (the richest

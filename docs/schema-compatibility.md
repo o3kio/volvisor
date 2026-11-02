@@ -1,0 +1,197 @@
+# Durable-state schema compatibility and upgrade policy
+
+Status: implemented for the stores listed below; enforced by the normal
+workspace test job.
+Related: [Volume API v2](../contracts/volume-api-v2.md),
+[nearline replication contract v2](../contracts/nearline-replication-v2.md),
+[provider contract v1](../contracts/volvisor-provider-v1.md),
+[configuration](configuration.md).
+
+Volvisor's durable state is authoritative recovery input: a daemon that
+opens it must either interpret all of it or refuse to start. Guessing a
+missing field, silently dropping an unknown one, or partially decoding a
+file is never allowed (AGENTS rule 8's fail-closed reading).
+
+## Covered stores and exact paths
+
+| Store | File(s) | Version carrier | Current version |
+|---|---|---|---|
+| Intent journal | `<journal_dir>/journal.log` (binary frames) | `record_version` inside each frame payload | `RECORD_VERSION = 1` |
+| LVM provider state | `lvm_state_path`, default `<journal_dir>/lvm-state.json` | `schema_version` | `LVM_STATE_SCHEMA_VERSION = 1` |
+| Ceph provider state | `ceph_state_path`, default `<journal_dir>/ceph-state.json` | `schema_version` | `CEPH_STATE_SCHEMA_VERSION = 1` |
+| DRBD provider state | `drbd_state_path`, default `<journal_dir>/drbd-state.json` | `schema_version` | `DRBD_STATE_SCHEMA_VERSION = 1` |
+| Migration records | `<journal_dir>/migrations/<migration_id>.json` | `schema_version` | `MIGRATION_RECORD_SCHEMA_VERSION = 1` |
+| Peer target preparations | `<journal_dir>/peer-preparations/<migration_id>.json` | `schema_version` | `TARGET_PREPARATION_SCHEMA_VERSION = 1` |
+| Attachment records and tombstones | embedded in LVM/Ceph/DRBD state | containing store's `schema_version` | same as the containing store |
+
+The LVM store's `retired_attachment_ids` tombstone list is part of
+`VolumeRuntime`; it is never a separate file. The journal lock file
+(`journal.log`'s sibling `journal.lock`) carries no durable schema.
+
+Out of scope for this policy (follow-up work; they need the same treatment
+before any format change): the grow-notification store
+(`grow-notifications.json`), the lending/device-ownership store
+(`ownership.json`), and the witness registry (which is derived from the
+journal, not a second on-disk format).
+
+## Versioning rules
+
+1. **Baseline 1 is the pre-versioning shape.** Files written before the
+   explicit version field existed decode as version 1. Adding the
+   `schema_version` metadata field itself did not bump any store: the
+   historical shape and the current shape decode identically, so a bump
+   would claim a compatibility break that does not exist.
+2. **Any future serialized-shape change requires a version bump**, including
+   an additive field. Increment the affected store's version constant (or
+   `RECORD_VERSION` for the journal). Do not rely on a serde default to make
+   an additive change invisible: a bump is what lets an older binary refuse
+   the file instead of silently losing the field.
+3. **A bump ships with a new N-1 fixture.** Before changing the shape, keep
+   a dump of the last released format under `tests/fixtures/schema/` and add
+   a decode test for it. The previous N-1 fixture becomes the N-2 fixture
+   only when a real N-2 format exists; never fabricate an intermediate
+   shape.
+4. **Upgrade-on-write.** An older supported file is read in place and is
+   rewritten at the current version by the first successful mutation/save
+   (for the journal, the next appended frame carries the current
+   `record_version`; existing frames are not rewritten). Loading alone never
+   mutates the file.
+5. **No silent field loss.** Unknown fields at a supported version are
+   rejected by the record's `deny_unknown_fields` shape. A decode failure is
+   a typed `INTERNAL` startup error; it never drops a field, file or record.
+
+### Historical additive changes grandfathered at version 1
+
+These changes were made before this policy existed. They are covered by the
+golden fixtures below and remain version 1; the current decoder accepts all
+of them.
+
+| Store | Additive change | Source commit |
+|---|---|---|
+| LVM | `requested_size_bytes` (initial format recorded only the effective size) | `c532b4c` |
+| LVM | `vmm_disk_id` | `fe16f05` |
+| LVM | attachment `state`, `state_revision`, `evidence`, `reporter`, `recorded_at_ms`; `retired_attachment_ids` | `a8c0254`, `c00bc3e` |
+| LVM | `moves` map | `f235238` |
+| Ceph, DRBD | `vmm_disk_id` | `fe16f05` |
+| DRBD | authority block, pending fence, migration-cut marker | `398fd44`, `f686531` |
+| Handoff | `consumer_proof`, `cut_started_at`, `cut_completed_at` | `88d8174` |
+| Handoff | `barrier_lineage_refusal` | `531d340` |
+| Peer preparation | `grant_attempt` (absent means 0) | `d6e91a3` |
+| Journal | `http_status` (absent means `None`) | `88d8174` |
+
+The initial LVM format had no requested-vs-effective distinction. Its
+decoder backfills `requested_size_bytes` from `size_bytes` — the only size
+that file recorded — rather than defaulting to zero or guessing a different
+value.
+
+## Unknown, future and older versions
+
+Every covered store probes the version **before** the strict decode. The
+probe tolerates unknown fields on purpose: a file written by a newer build
+must be recognized as newer before its unknown fields can produce a generic
+parse error.
+
+- **Version newer than supported** (or a journal `record_version` newer than
+  `RECORD_VERSION`): typed `INTERNAL` error whose detail starts with
+  `unsupported durable-state schema version`. Startup refuses to open the
+  store. The file is left byte-for-byte intact; no partial decode, rewrite,
+  truncation or reset occurs.
+- **Version 0**: typed `INTERNAL` error (`invalid schema_version 0`). Zero is
+  not a valid version; it is not treated as legacy.
+- **Version ≤ supported**: strict decode. Older files are accepted,
+  interpreted by the documented defaults/backfills above, and upgraded on
+  the first successful write.
+- **Missing file**: an empty state (first start), not an error.
+- **Unparseable/corrupt file**: typed `INTERNAL` error; the store is not
+  opened empty and the file is not replaced.
+
+The journal has one deliberate distinction. A structurally torn tail
+(incomplete frame, bad magic, bad CRC, broken sequence chain) contains no
+complete durable record and is truncated on replay, as before. A **complete
+CRC-valid frame** whose payload is undecodable, carries an unknown field at
+a supported version, or declares an unsupported version is durable state:
+replay refuses open and leaves the log untouched. Truncating it would be
+silent data loss.
+
+## Downgrade and rollback policy
+
+**There is no in-place downgrade.** A store at version N can only be opened
+by a binary that supports N or newer. An older binary sees a future version
+and refuses startup with the typed unsupported-version error. Volvisor does
+not down-convert records, strip fields, edit `schema_version` by hand, or
+truncate the journal to make an older binary accept it.
+
+Rolling back a deployment therefore requires restoring state, not just
+installing the old binary:
+
+1. Stop the daemon so no writer holds the journal lock.
+2. Restore the pre-upgrade backup of the whole state directory (journal log
+   plus all provider states, migration records and peer preparations) taken
+   while stopped.
+3. Install and start the binary matching that backup's schema versions.
+
+Restoring a backup discards every operation committed after it. Backend
+resources created or mutated after that point must be reconciled by the
+operator before the restored daemon is trusted; the daemon will not invent
+the missing intent records. Keep the pre-upgrade backup until the new
+version has been exercised, and never run an older binary against the
+newer directory in place.
+
+## Golden fixture matrix
+
+All fixtures are real historical shapes, taken from git history or (for the
+tombstone and journal cases) the current shape immediately before the
+`schema_version` field was added. They are not synthetic variants of the
+current struct.
+
+| Fixture | Store | Provenance | What it locks down |
+|---|---|---|---|
+| `tests/fixtures/schema/lvm-state-v1-n1.json` | LVM | `a8c0254` (consumer reporting, before retired ids) | attachment state/revision/generation, `vmm_disk_id`, evidence, move record |
+| `tests/fixtures/schema/lvm-state-v1-n2.json` | LVM N-2 | `fafb62e` (initial P1 format) | absent `requested_size_bytes` backfills from `size_bytes`; pre-P6 fields default |
+| `tests/fixtures/schema/lvm-state-v1-tombstones.json` | LVM | `c00bc3e` (tombstones, before version field) | `retired_attachment_ids` preserved |
+| `tests/fixtures/schema/ceph-state-v1-n1.json` | Ceph N-1 | `ab9cedd` (before `vmm_disk_id`) | attachment mapping, absent disk id is `None` |
+| `tests/fixtures/schema/drbd-state-v1-n1.json` | DRBD N-1 | `f686531` (before `vmm_disk_id`) | authority block, migration-cut marker, counters |
+| `tests/fixtures/schema/drbd-state-v1-n2.json` | DRBD N-2 | `97e6841` (initial P3 format) | defaulted authority/fence/migration/disk id |
+| `tests/fixtures/schema/migration-record-v1-n1.json` | Handoff N-1 | `01b440d` (consumer proof/cut timestamps, before barrier refusal) | proof, timestamps, history |
+| `tests/fixtures/schema/migration-record-v1-n2.json` | Handoff N-2 | `124cc55` (initial P4b B1 record) | initial shape decodes |
+| `tests/fixtures/schema/peer-preparation-v1-n1.json` | Peer preparation N-1 | `d6e91a3^` (before `grant_attempt`) | absent attempt counter defaults to 0 |
+| `tests/fixtures/schema/journal-v1-n1.log` | Journal N-1 | `3cf2e18` (before `http_status`) | binary replay, absent status is `None`, idempotency |
+
+**Where N-2 does not exist, it is stated rather than fabricated:**
+
+- **Ceph** has no N-2. The state store was introduced at `ab9cedd` with
+  `requested_size_bytes`; the only later shape change was the additive
+  `vmm_disk_id`, so both historical eras are the N-1 fixture above.
+- **Journal** has no N-2. `record_version` has been 1 since the journal was
+  introduced at `3cf2e18`; the only shape change was additive `http_status`.
+- **Peer preparations** have no N-2. The store was introduced at `b1d52c2`
+  and the only later change was additive `grant_attempt`; the initial and
+  N-1 shapes are otherwise identical.
+
+## Tests and CI
+
+The compatibility matrix runs in the ordinary workspace job
+(`cargo test --workspace --locked` in `.github/workflows/ci.yaml`); it needs
+no privileged devices, cluster or network.
+
+- Store-unit tests: `crates/volvisor-lvm/src/state.rs`,
+  `crates/volvisor-ceph/src/state.rs`,
+  `crates/volvisor-drbd/src/state.rs`,
+  `crates/volvisor-journal/src/journal.rs`.
+- Handoff store fixtures: `crates/volvisor-handoff/tests/schema_fixtures.rs`.
+- Populated-directory upgrade (every covered store at once, including
+  attachment state/revision, tombstones, journal replay/idempotency and
+  future-version refusal): `crates/volvisord/tests/schema_upgrade.rs`.
+
+A dedicated CI job would duplicate the same tests without adding signal, so
+the normal workspace job is the compatibility gate.
+
+## Changing a covered format
+
+1. Add the new field/record shape and bump the store's version constant.
+2. Add the last released shape as a new fixture (retain the existing N-2).
+3. Add a decode test and an upgrade-on-write test; assert a future version
+   is refused typed and the file is untouched.
+4. Update the matrix above and the store's doc comment.
+5. Run `cargo fmt --all --check`, clippy with `-D warnings`, and
+   `cargo test --workspace --locked`.

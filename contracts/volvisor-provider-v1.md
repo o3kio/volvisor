@@ -300,3 +300,13 @@ migration, Ceph integration and performance.
 Breaking changes to provider plan shape, journal semantics, ownership
 invariants, destructive-operation authority or fencing require a new contract
 version and a migration note.
+
+Durable provider state has its own explicit schema versions (journal
+`record_version`, LVM/Ceph/DRBD `schema_version`, migration-record and peer
+preparation versions). Readers accept versions up to the build's supported
+version, refuse newer or invalid versions with a typed error before any
+partial decode, reject unknown fields at a supported version, and upgrade
+older supported files only on the first successful write. Downgrade is not
+in place: rollback restores a pre-upgrade backup and the matching binary.
+The exact stores, fixtures and procedure are in
+[schema compatibility](../docs/schema-compatibility.md).
