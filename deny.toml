@@ -1,5 +1,5 @@
 [licenses]
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
 # Note: `r-efi` is "MIT OR Apache-2.0 OR LGPL-2.1-or-later" and passes via the
 # MIT alternative; the LGPL alternative never applies to our build.
@@ -7,6 +7,15 @@ confidence-threshold = 0.93
 [advisories]
 version = 2
 yanked = "deny"
+# `time` is only reachable through rcgen, a dev-dependency used to mint
+# throwaway test certificates. RUSTSEC-2026-0009 is a DoS in RFC 2822
+# parsing of untrusted input; the tests only format certificate validity
+# dates and never parse untrusted date strings. The fixed release
+# (time 0.3.47) requires Rust 1.88, above the workspace MSRV of 1.85.
+# Revisit when the MSRV rises or rcgen drops the dependency.
+ignore = [
+    { id = "RUSTSEC-2026-0009", reason = "dev-only rcgen test certificates; no RFC 2822 parsing of untrusted input; fixed time requires Rust 1.88 > MSRV 1.85" },
+]
 
 [bans]
 multiple-versions = "allow"

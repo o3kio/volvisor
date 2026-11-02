@@ -105,6 +105,8 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+/// Scoped credentials, role enforcement and the request audit event.
+pub mod auth;
 mod config;
 /// The journal-append crash hook (P5 plan §3.1) — test-gated,
 /// doc-gated trust class; see the module docs.

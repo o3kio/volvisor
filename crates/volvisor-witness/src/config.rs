@@ -60,6 +60,32 @@ pub struct WitnessConfig {
     /// Self-fencing suspend budget in seconds (W7).
     #[serde(default = "default_suspend_budget_secs")]
     pub suspend_budget_secs: u64,
+    /// Native TLS for the witness listener. Non-loopback plain HTTP is
+    /// refused unless `allow_insecure` is explicitly set.
+    #[serde(default)]
+    pub tls: WitnessTlsConfig,
+    /// Explicit cleartext-downgrade opt-out for a non-loopback listener.
+    #[serde(default)]
+    pub allow_insecure: bool,
+}
+
+/// Native TLS settings for the witness listener.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessTlsConfig {
+    /// Serve the witness over TLS.
+    #[serde(default)]
+    pub enabled: bool,
+    /// PEM server certificate chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key matching the served certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
+    /// Optional PEM client CA: when set, every storage daemon must present
+    /// a certificate issued by one of these roots (mTLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca_file: Option<PathBuf>,
 }
 
 fn default_lease_ttl_secs() -> u64 {
@@ -101,6 +127,43 @@ impl WitnessConfig {
             ));
         }
         self.validate_host_tokens()?;
+        self.validate_transport()?;
+        Ok(())
+    }
+
+    /// Transport posture: TLS fields are all-or-nothing (and their files
+    /// must exist), and a non-loopback plain-HTTP listener is refused
+    /// unless the operator explicitly set `allow_insecure`.
+    fn validate_transport(&self) -> Result<(), ApiError> {
+        if self.tls.enabled {
+            validate_tls_file(self.tls.cert_file.as_ref(), "tls.cert_file")?;
+            validate_tls_file(self.tls.key_file.as_ref(), "tls.key_file")?;
+            if let Some(ca) = &self.tls.client_ca_file {
+                if ca.as_os_str().is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "witness tls.client_ca_file must not be empty when set",
+                    ));
+                }
+                validate_tls_file(Some(ca), "tls.client_ca_file")?;
+            }
+        } else {
+            if self.tls.cert_file.is_some()
+                || self.tls.key_file.is_some()
+                || self.tls.client_ca_file.is_some()
+            {
+                return Err(ApiError::invalid_request(
+                    "witness tls.cert_file/key_file/client_ca_file are set while \
+                     tls.enabled = false",
+                ));
+            }
+            if !self.listen.ip().is_loopback() && !self.allow_insecure {
+                return Err(ApiError::invalid_request(format!(
+                    "witness listen {} is a non-loopback plain-HTTP bind; configure \
+                     [tls] enabled = true or set allow_insecure = true",
+                    self.listen
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -149,6 +212,27 @@ impl WitnessConfig {
     }
 }
 
+/// Require a TLS path to be set and name a readable regular file.
+fn validate_tls_file(path: Option<&PathBuf>, field: &str) -> Result<(), ApiError> {
+    let path = path.ok_or_else(|| {
+        ApiError::invalid_request(format!(
+            "witness {field} is required when tls.enabled = true"
+        ))
+    })?;
+    if path.as_os_str().is_empty() {
+        return Err(ApiError::invalid_request(format!(
+            "witness {field} must not be empty when set"
+        )));
+    }
+    if !path.is_file() {
+        return Err(ApiError::invalid_request(format!(
+            "witness {field} {} does not exist or is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +246,8 @@ mod tests {
             lease_ttl_secs: DEFAULT_LEASE_TTL_SECS,
             lease_grace_secs: DEFAULT_LEASE_GRACE_SECS,
             suspend_budget_secs: DEFAULT_SUSPEND_BUDGET_SECS,
+            tls: WitnessTlsConfig::default(),
+            allow_insecure: false,
         }
     }
 
@@ -176,10 +262,49 @@ mod tests {
         let mut cfg = config("0.0.0.0:9101");
         assert!(cfg.validate().is_err());
         cfg.auth_token = Some("secret".to_owned());
+        assert!(
+            cfg.validate().is_err(),
+            "a token alone does not authorize plain HTTP on a public bind"
+        );
+        cfg.allow_insecure = true;
         assert!(cfg.validate().is_ok());
         // An empty token is no token.
         cfg.auth_token = Some("  ".to_owned());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn non_loopback_plain_http_needs_an_explicit_allow_insecure() {
+        let mut cfg = config("0.0.0.0:9101");
+        cfg.auth_token = Some("secret".to_owned());
+        let error = cfg.validate().expect_err("plain HTTP public bind");
+        assert!(
+            error.to_string().contains("allow_insecure = true"),
+            "error names the opt-in: {error}"
+        );
+        cfg.allow_insecure = true;
+        cfg.validate().expect("the explicit downgrade is accepted");
+    }
+
+    #[test]
+    fn tls_listener_requires_readable_certificate_and_key() {
+        let mut cfg = config("127.0.0.1:9101");
+        cfg.tls.enabled = true;
+        let error = cfg.validate().expect_err("missing TLS identity");
+        assert!(
+            error.to_string().contains("tls.cert_file"),
+            "error names the missing field: {error}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("witness.crt");
+        let key = dir.path().join("witness.key");
+        std::fs::write(&cert, b"certificate").expect("write cert");
+        std::fs::write(&key, b"key").expect("write key");
+        cfg.tls.cert_file = Some(cert);
+        cfg.tls.key_file = Some(key);
+        cfg.validate()
+            .expect("an existing cert/key pair is accepted");
     }
 
     #[test]

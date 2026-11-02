@@ -46,7 +46,7 @@ fn the_checked_in_example_config_validates_and_summarizes() {
     assert!(summary.contains("127.0.0.1:8787"), "summary: {summary}");
     assert!(summary.contains("provider drbd"), "summary: {summary}");
     assert!(
-        summary.contains("witness http://10.0.0.3:9101"),
+        summary.contains("witness https://10.0.0.3:9101"),
         "summary: {summary}"
     );
     assert!(summary.contains("migration disabled"), "summary: {summary}");

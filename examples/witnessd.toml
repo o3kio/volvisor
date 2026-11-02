@@ -15,8 +15,24 @@
 
 # HTTP bind address of the witness surface. Without auth_token the
 # witness refuses non-loopback binds (fail closed); this example is
-# the third-host deployment shape.
+# the third-host deployment shape. A non-loopback listener also
+# requires native TLS ([tls] enabled = true) or the explicit
+# cleartext downgrade below.
 listen = "10.0.0.3:9101"
+
+# Explicit opt-in to the cleartext downgrade so this annotated
+# third-host example stays checkable without provisioned certificates.
+# A real deployment should instead enable native TLS:
+#
+#   [tls]
+#   enabled = true
+#   cert_file = "/etc/volvisor-witness/tls/server.crt"
+#   key_file = "/etc/volvisor-witness/tls/server.key"
+#   client_ca_file = "/etc/volvisor-witness/tls/client-ca.crt"  # mTLS
+#
+# Setting allow_insecure emits a startup warning: bearer tokens and
+# lease state are visible on the network.
+allow_insecure = true
 
 # Directory holding the witness journal and lock file (a competing
 # witness on the same directory fails at startup).

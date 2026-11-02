@@ -14,7 +14,7 @@
 // Test bodies favor linear readability over clippy's size heuristics.
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use axum::Router;
 use axum::body::Body;
@@ -30,6 +30,7 @@ use volvisor_provider::conformance::{
 use volvisor_provider::fake::FakeProvider;
 use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode, AttachmentEvidence, AttachmentState};
 
+use crate::auth::{Credential, Role};
 use crate::{ApiConfig, AppState, SharedState, ops, router};
 
 /// Fixture size used throughout (1 GiB, 512-aligned).
@@ -66,6 +67,55 @@ fn setup() -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
 /// Tokenless state: the fail-closed auth mode (loopback-only dev/test).
 fn setup_tokenless() -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
     setup_with_token(None)
+}
+
+const ADMIN_TOKEN: &str = "scoped-admin-token";
+const OPERATOR_TOKEN: &str = "scoped-operator-token";
+const READ_ONLY_TOKEN: &str = "scoped-read-only-token";
+
+fn scoped_credentials() -> Vec<Credential> {
+    vec![
+        Credential {
+            id: "admin-a".to_owned(),
+            token: ADMIN_TOKEN.to_owned(),
+            role: Role::Admin,
+        },
+        Credential {
+            id: "operator-a".to_owned(),
+            token: OPERATOR_TOKEN.to_owned(),
+            role: Role::Operator,
+        },
+        Credential {
+            id: "reader-a".to_owned(),
+            token: READ_ONLY_TOKEN.to_owned(),
+            role: Role::ReadOnly,
+        },
+    ]
+}
+
+fn setup_scoped_with(
+    credentials: Vec<Credential>,
+) -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let (state, provider) = setup_scoped_in(&dir, credentials);
+    (state, provider, dir)
+}
+
+fn setup_scoped_in(
+    dir: &tempfile::TempDir,
+    credentials: Vec<Credential>,
+) -> (SharedState, Arc<FakeProvider>) {
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let state = Arc::new(
+        AppState::new(provider.clone(), Some(admin), journal, None).with_credentials(credentials),
+    );
+    (state, provider)
+}
+
+fn setup_scoped() -> (SharedState, Arc<FakeProvider>, tempfile::TempDir) {
+    setup_scoped_with(scoped_credentials())
 }
 
 /// State without an admin surface: `/v2/admin` routes must 404.
@@ -1974,6 +2024,282 @@ async fn tokenless_server_fails_closed_for_mutations() {
     let (status, health) = send_json(&app, request(Method::GET, "/healthz")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(health, json!({ "status": "ok" }));
+}
+
+// ---------------------------------------------------------------------------
+// Scoped roles, read protection and rotation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scoped_credentials_enforce_the_role_matrix_and_protect_reads() {
+    let (state, _provider, _dir) = setup_scoped();
+    let app = app(&state);
+
+    // Reads are closed to anonymous callers once credentials are scoped.
+    for uri in ["/v2/volumes", "/v2/capabilities"] {
+        let (status, unauthorized) = send_json(&app, request(Method::GET, uri)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {uri}");
+        assert_eq!(unauthorized["code"], json!("UNAUTHORIZED"));
+    }
+    let (status, _) = send(&app, request(Method::GET, "/metrics")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Read-only, operator and admin can all read.
+    for token in [READ_ONLY_TOKEN, OPERATOR_TOKEN, ADMIN_TOKEN] {
+        let (status, _) = send_json(
+            &app,
+            with_bearer(request(Method::GET, "/v2/volumes"), token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "read with {token}");
+        let (status, _) = send_json(
+            &app,
+            with_bearer(request(Method::GET, "/v2/capabilities"), token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "capabilities with {token}");
+        let (status, _) = send(&app, with_bearer(request(Method::GET, "/metrics"), token)).await;
+        assert_eq!(status, StatusCode::OK, "metrics with {token}");
+    }
+
+    // Liveness stays open for probes.
+    let (status, health) = send_json(&app, request(Method::GET, "/healthz")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health, json!({ "status": "ok" }));
+
+    let create = serde_json::to_value(fixture_create_request("vol-role", GIB))
+        .expect("serialize create fixture");
+
+    // Read-only cannot mutate; the denial is a typed 403 and never journals.
+    let (status, forbidden) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::POST, "/v2/volumes", &create),
+            READ_ONLY_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden["code"], json!("FORBIDDEN"));
+    assert_eq!(journal_record_count(&state), 0);
+
+    // Operator can mutate consumer volumes.
+    let (status, created) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::POST, "/v2/volumes", &create),
+            OPERATOR_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["volume_id"], json!("vol-role"));
+
+    // Operator is denied the admin surface; admin is allowed.
+    let (status, forbidden) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/admin/devices"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden["code"], json!("FORBIDDEN"));
+    let (status, _) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/admin/devices"), ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The admin-only mobility eligibility check is denied to operator
+    // principals before the handler runs (the handler itself serves 404
+    // without a handoff surface).
+    let (status, _) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(
+                Method::POST,
+                "/v2/vms/vm-role/check-mobility",
+                &json!({"api_version": "volvisor.volume.v2", "operation_id": "op-mobility"}),
+            ),
+            OPERATOR_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rotated_token_is_rejected_and_the_new_token_is_accepted() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let old = vec![Credential {
+        id: "operator-a".to_owned(),
+        token: "old-rotation-token".to_owned(),
+        role: Role::Operator,
+    }];
+    {
+        let (state, _provider) = setup_scoped_in(&dir, old);
+        let app = app(&state);
+        let (status, _) = send_json(
+            &app,
+            with_bearer(request(Method::GET, "/v2/volumes"), "old-rotation-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send_json(
+            &app,
+            with_bearer(request(Method::GET, "/v2/volumes"), "new-rotation-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // Restart over the same journal directory with the rotated credential.
+    let (state, _provider) = setup_scoped_in(
+        &dir,
+        vec![Credential {
+            id: "operator-a".to_owned(),
+            token: "new-rotation-token".to_owned(),
+            role: Role::Operator,
+        }],
+    );
+    let app = app(&state);
+    let (status, _) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/volumes"), "old-rotation-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/volumes"), "new-rotation-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[derive(Clone, Default)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl CaptureWriter {
+    fn snapshot(&self) -> String {
+        let bytes = self.0.lock().expect("capture lock").clone();
+        String::from_utf8(bytes).expect("captured logs are UTF-8")
+    }
+
+    fn clear(&self) {
+        self.0.lock().expect("capture lock").clear();
+    }
+}
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install one process-wide capture subscriber for the audit test. A
+/// thread-local subscriber is unreliable here: the test harness runs other
+/// tests concurrently and `tracing`'s callsite interest is process-wide.
+fn captured_audit_log() -> CaptureWriter {
+    static CAPTURE: OnceLock<CaptureWriter> = OnceLock::new();
+    static INSTALL: Once = Once::new();
+    let writer = CAPTURE.get_or_init(CaptureWriter::default).clone();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer.clone())
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+    writer
+}
+
+/// The audit event is the security record: it must name the resolved
+/// principal/role, method, matched route, outcome and journaled operation id,
+/// and must never contain bearer tokens.
+#[tokio::test]
+async fn audit_events_name_the_principal_route_and_operation_without_tokens() {
+    let writer = captured_audit_log();
+    writer.clear();
+
+    let (state, _provider, _dir) = setup_scoped();
+    let app = app(&state);
+    let mut create = serde_json::to_value(fixture_create_request("vol-audit", GIB))
+        .expect("serialize create fixture");
+    create["operation_id"] = json!("op-audit-create");
+    let (status, _) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::POST, "/v2/volumes", &create),
+            OPERATOR_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A denied mutation is audited too, with the read-only principal.
+    let (status, _) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::POST, "/v2/volumes", &create),
+            READ_ONLY_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let logs = writer.snapshot();
+    let events: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["fields"]["kind"] == json!("audit"))
+        .filter(|event| {
+            event["fields"]["operation_id"] == json!("op-audit-create")
+                || event["fields"]["principal"] == json!("reader-a")
+        })
+        .collect();
+    assert_eq!(events.len(), 2, "one event per request: {logs}");
+
+    let success = events
+        .iter()
+        .find(|event| event["fields"]["outcome"] == json!("success"))
+        .expect("successful mutation audit");
+    assert_eq!(success["fields"]["principal"], json!("operator-a"));
+    assert_eq!(success["fields"]["role"], json!("operator"));
+    assert_eq!(success["fields"]["method"], json!("POST"));
+    assert_eq!(success["fields"]["route"], json!("/v2/volumes"));
+    assert_eq!(success["fields"]["status"], json!(200));
+    assert_eq!(success["fields"]["operation_id"], json!("op-audit-create"));
+
+    let denied = events
+        .iter()
+        .find(|event| event["fields"]["outcome"] == json!("denied"))
+        .expect("denied mutation audit");
+    assert_eq!(denied["fields"]["principal"], json!("reader-a"));
+    assert_eq!(denied["fields"]["role"], json!("read-only"));
+    assert_eq!(denied["fields"]["method"], json!("POST"));
+    assert_eq!(denied["fields"]["route"], json!("/v2/volumes"));
+    assert_eq!(denied["fields"]["status"], json!(403));
+
+    for token in [ADMIN_TOKEN, OPERATOR_TOKEN, READ_ONLY_TOKEN] {
+        assert!(
+            !logs.contains(token),
+            "audit logs must never contain bearer token {token}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

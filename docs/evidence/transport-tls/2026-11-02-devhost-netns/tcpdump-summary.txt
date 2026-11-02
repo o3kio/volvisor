@@ -1,0 +1,11 @@
+reading from file /tmp/opencode/transport-tls-evidence/tls.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+23:21:52.671266 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [S], seq 2501272435, win 64240, options [mss 1460,sackOK,TS val 3283132720 ecr 0,nop,wscale 7], length 0
+23:21:52.671286 IP 10.200.40.2.8443 > 10.200.40.1.50084: Flags [S.], seq 207501726, ack 2501272436, win 65160, options [mss 1460,sackOK,TS val 3459401869 ecr 3283132720,nop,wscale 7], length 0
+23:21:52.671295 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [.], ack 1, win 502, options [nop,nop,TS val 3283132720 ecr 3459401869], length 0
+23:21:52.672617 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [P.], seq 1:518, ack 1, win 502, options [nop,nop,TS val 3283132721 ecr 3459401869], length 517
+23:21:52.672628 IP 10.200.40.2.8443 > 10.200.40.1.50084: Flags [.], ack 518, win 506, options [nop,nop,TS val 3459401870 ecr 3283132721], length 0
+23:21:52.674052 IP 10.200.40.2.8443 > 10.200.40.1.50084: Flags [P.], seq 1:1347, ack 518, win 506, options [nop,nop,TS val 3459401872 ecr 3283132721], length 1346
+23:21:52.674062 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [.], ack 1347, win 525, options [nop,nop,TS val 3283132723 ecr 3459401872], length 0
+23:21:52.674563 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [P.], seq 518:598, ack 1347, win 525, options [nop,nop,TS val 3283132723 ecr 3459401872], length 80
+23:21:52.674624 IP 10.200.40.1.50084 > 10.200.40.2.8443: Flags [P.], seq 598:765, ack 1347, win 525, options [nop,nop,TS val 3283132723 ecr 3459401872], length 167
+23:21:52.674719 IP 10.200.40.2.8443 > 10.200.40.1.50084: Flags [P.], seq 1347:1531, ack 765, win 505, options [nop,nop,TS val 3459401872 ecr 3283132723], length 184

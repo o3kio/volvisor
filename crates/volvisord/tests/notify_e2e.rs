@@ -115,6 +115,9 @@ fn fake_config(journal_dir: std::path::PathBuf, listen: std::net::SocketAddr) ->
         migration: MigrationConfig::default(),
         vmm: VmmConfig::default(),
         witness_renewal_interval_secs: None,
+        credentials: volvisord::config::CredentialsConfig::default(),
+        tls: volvisord::config::TlsConfig::default(),
+        allow_insecure: false,
     }
 }
 
@@ -143,6 +146,8 @@ fn witness_config(state_dir: std::path::PathBuf) -> WitnessConfig {
         lease_ttl_secs: 60,
         lease_grace_secs: 5,
         suspend_budget_secs: 5,
+        tls: volvisor_witness::config::WitnessTlsConfig::default(),
+        allow_insecure: false,
     }
 }
 

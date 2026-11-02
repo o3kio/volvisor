@@ -12,6 +12,7 @@ members = [
     "crates/volvisor-campaign",
     "crates/volvisor-handoff",
     "crates/volvisor-api",
+    "crates/volvisor-tls",
     "crates/volvisord",
 ]
 
@@ -34,6 +35,7 @@ volvisor-witness = { path = "crates/volvisor-witness" }
 volvisor-campaign = { path = "crates/volvisor-campaign" }
 volvisor-handoff = { path = "crates/volvisor-handoff" }
 volvisor-api = { path = "crates/volvisor-api" }
+volvisor-tls = { path = "crates/volvisor-tls" }
 volvisord = { path = "crates/volvisord" }
 
 serde = { version = "1", features = ["derive"] }

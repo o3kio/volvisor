@@ -291,19 +291,49 @@ pub trait PeerClient: Send + Sync {
 pub struct HttpPeerClient {
     base_url: String,
     token: String,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    client: Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        Full<Bytes>,
+    >,
     timeout: Duration,
 }
 
 impl HttpPeerClient {
     /// Build a client for the peer daemon at `base_url` (e.g.
-    /// `http://10.0.0.2:7780`) with the daemon-to-daemon credential.
+    /// `https://10.0.0.2:7780`) with the daemon-to-daemon credential.
+    ///
+    /// Outbound `https://` uses the Mozilla root program. A deployment with a
+    /// private CA or an mTLS client identity builds the rustls configuration
+    /// with [`volvisor_tls::ClientTls`] and calls
+    /// [`HttpPeerClient::with_tls`] instead.
     #[must_use]
     pub fn new(base_url: impl Into<String>, token: impl Into<String>, timeout: Duration) -> Self {
+        Self::with_tls(
+            base_url,
+            token,
+            timeout,
+            &volvisor_tls::ClientTls::webpki_default(),
+        )
+    }
+
+    /// Build a client with an explicit rustls client configuration (private
+    /// CA trust and/or mTLS identity).
+    #[must_use]
+    pub fn with_tls(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        timeout: Duration,
+        tls: &std::sync::Arc<volvisor_tls::rustls::ClientConfig>,
+    ) -> Self {
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config((**tls).clone())
+            .https_or_http()
+            .enable_http1()
+            .build();
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client: Client::builder(TokioExecutor::new()).build(https),
             timeout,
         }
     }
@@ -457,18 +487,27 @@ where
 /// validation treats as colocation-check inputs, refused here because
 /// a witness the daemon cannot address is unusable for the probe.
 fn witness_probe_addr(url: &str) -> Result<SocketAddr, DaemonError> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         DaemonError::Config(format!(
-            "witness_url {url} must use the http:// scheme (the witness surface is plain HTTP)"
+            "witness_url {url} must use the http:// or https:// scheme"
         ))
     })?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => {
+            return Err(DaemonError::Config(format!(
+                "witness_url {url} must use the http:// or https:// scheme"
+            )));
+        }
+    };
     let authority = rest.split('/').next().unwrap_or(rest);
     // A whole literal (IPv4, or a bracketed IPv6 literal with its
     // port) needs no resolution.
     if let Ok(addr) = authority.parse::<SocketAddr>() {
         return Ok(addr);
     }
-    let (host, port) = split_authority(url, authority)?;
+    let (host, port) = split_authority(url, authority, default_port)?;
     // A name (or a portless literal): resolve through the system
     // resolver against the resolved port.
     (host, port)
@@ -486,13 +525,17 @@ fn witness_probe_addr(url: &str) -> Result<SocketAddr, DaemonError> {
         })
 }
 
-/// Split an authority into its host and port (the port defaulting to
-/// 80), honoring the bracketed IPv6 literal form.
+/// Split an authority into its host and port (the port defaulting to the
+/// scheme's well-known port), honoring the bracketed IPv6 literal form.
 ///
 /// # Errors
 /// [`DaemonError::Config`] for a malformed port or an unterminated
 /// bracketed literal.
-fn split_authority<'a>(url: &str, authority: &'a str) -> Result<(&'a str, u16), DaemonError> {
+fn split_authority<'a>(
+    url: &str,
+    authority: &'a str,
+    default_port: u16,
+) -> Result<(&'a str, u16), DaemonError> {
     let bad_port = || {
         DaemonError::Config(format!(
             "witness_url {url} carries a malformed port in {authority}"
@@ -504,18 +547,20 @@ fn split_authority<'a>(url: &str, authority: &'a str) -> Result<(&'a str, u16), 
                 "witness_url {url} carries an unterminated bracketed host in {authority}"
             ))
         })?;
-        let port = tail.strip_prefix(':').unwrap_or("80");
-        return port
-            .parse::<u16>()
-            .map_err(|_| bad_port())
-            .map(|port| (host, port));
+        if let Some(port) = tail.strip_prefix(':') {
+            return port
+                .parse::<u16>()
+                .map_err(|_| bad_port())
+                .map(|port| (host, port));
+        }
+        return Ok((host, default_port));
     }
     match authority.rsplit_once(':') {
         Some((host, port)) => port
             .parse::<u16>()
             .map_err(|_| bad_port())
             .map(|port| (host, port)),
-        None => Ok((authority, 80)),
+        None => Ok((authority, default_port)),
     }
 }
 
@@ -2371,12 +2416,17 @@ mod tests {
             named.ip().is_loopback(),
             "localhost resolves to loopback: {named}"
         );
-        // Only the plain-HTTP scheme is the witness surface.
-        let scheme =
-            witness_probe_addr("https://127.0.0.1:9101").expect_err("https must be refused");
-        assert!(scheme.to_string().contains("http:// scheme"), "{scheme}");
+        // Both HTTP(S) schemes are the witness surface; portless URLs use
+        // the scheme's default port.
+        let https = witness_probe_addr("https://127.0.0.1:9101").expect("https");
+        assert_eq!(https.to_string(), "127.0.0.1:9101");
+        let https_default = witness_probe_addr("https://127.0.0.1").expect("https default port");
+        assert_eq!(https_default.port(), 443);
         let garbage = witness_probe_addr("not a url").expect_err("garbage must be refused");
-        assert!(garbage.to_string().contains("http:// scheme"), "{garbage}");
+        assert!(
+            garbage.to_string().contains("http:// or https://"),
+            "{garbage}"
+        );
     }
 
     #[test]

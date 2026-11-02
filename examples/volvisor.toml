@@ -82,8 +82,12 @@ drbd_state_path = "/var/lib/volvisor/journal/drbd-state.json"
 # THIRD failure domain: the daemon refuses a loopback witness and one
 # colocated with either replication end.
 
-# Base URL of the witness surface (plain http:// in this phase).
-witness_url = "http://10.0.0.3:9101"
+# Base URL of the witness surface. The witness is a control-plane
+# authority: use https:// in any multi-host deployment (the daemon
+# refuses plain http to a non-loopback host unless allow_insecure =
+# true). The outbound trust bundle / mTLS identity for https witness
+# and peer endpoints is configured under [tls.client] (see below).
+witness_url = "https://10.0.0.3:9101"
 
 # The shared bearer token; required for a non-loopback witness. On a
 # v2 witness this token is read-only (inspect/health). Never logged.
@@ -110,10 +114,11 @@ enabled = false
 # Shared snapshot directory; must exist when enabled (its cross-host
 # readability is verified at PREPARED by the destination daemon).
 snapshot_dir = "/var/lib/volvisor/snapshots"
-# The peer daemon's base URL (plain http:// in this phase) and the
+# The peer daemon's base URL (https:// for any non-loopback peer; plain
+# http is refused unless allow_insecure = true) and the
 # daemon-to-daemon credential (distinct from the witness and consumer
 # tokens). Never logged.
-peer_api_url = "http://10.0.0.2:7780"
+peer_api_url = "https://10.0.0.2:7780"
 peer_api_token = "replace-with-a-generated-secret"
 
 [vmm]
@@ -129,3 +134,47 @@ api_socket_dir = "/run/volvisor/vms"
 # have actually qualified; unset fields leave the gate refused.
 cloud_hypervisor_bin = "/usr/bin/cloud-hypervisor"
 minimum_version = "37.0"
+
+# --------------------------------------------------------------- transport
+# Native TLS for the Volume API listener and outbound clients.
+#
+# The example listener is loopback, so plain HTTP is allowed for local
+# dev/test. A non-loopback listener requires [tls] enabled = true (a
+# certificate/key pair, optionally a client CA for mTLS) or the explicit
+# cleartext downgrade allow_insecure = true.
+#
+# Outbound https witness/peer URLs verify server certificates against the
+# Mozilla root program by default; a private CA or an mTLS client identity
+# goes in [tls.client]. See docs/security/deployment.md.
+#
+# [tls]
+# enabled = true
+# cert_file = "/etc/volvisor/tls/server.crt"
+# key_file = "/etc/volvisor/tls/server.key"
+# client_ca_file = "/etc/volvisor/tls/client-ca.crt"   # mTLS (optional)
+#
+# [tls.client]
+# ca_file = "/etc/volvisor/tls/private-ca.crt"
+# cert_file = "/etc/volvisor/tls/client.crt"           # mTLS (optional)
+# key_file = "/etc/volvisor/tls/client.key"
+#
+# allow_insecure = true   # explicit non-loopback plain-HTTP downgrade
+
+# ------------------------------------------------------------ credentials
+# Scoped named principals (rotation-friendly: list the next token beside
+# the current one, roll clients, then remove the old entry). When any of
+# these tables is non-empty, read routes (volume metadata, capabilities
+# and /metrics) require at least read-only. The legacy admin_token above
+# remains one admin principal and keeps the historical open-read posture
+# when no scoped credentials are configured. /healthz stays open.
+#
+# [credentials]
+# admin = [
+#   { id = "ops-admin-2026-11", token = "replace-with-a-generated-secret" },
+# ]
+# operator = [
+#   { id = "storage-operator-2026-11", token = "replace-with-a-generated-secret" },
+# ]
+# read_only = [
+#   { id = "monitoring-2026-11", token = "replace-with-a-generated-secret" },
+# ]

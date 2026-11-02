@@ -162,7 +162,9 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             state
         }
     };
-    Ok(Arc::new(state))
+    Ok(Arc::new(
+        state.with_credentials(config.credentials.to_credentials()),
+    ))
 }
 
 /// Construct the native-local LVM provider from validated configuration.
@@ -563,10 +565,11 @@ fn drbd_authority(config: &Config) -> Result<Option<AuthorityContext>, DaemonErr
     // The shared `witness_token` is read-only on a v2 witness; the
     // daemon's grant/renew/self-revoke/register calls require the
     // per-host credential (config refuses a witness_url without it).
-    let connection = HttpWitnessConnection::new(
+    let connection = HttpWitnessConnection::with_tls(
         url,
         config.witness_host_token.clone(),
         WITNESS_REQUEST_TIMEOUT,
+        &outbound_tls(config)?,
     );
     let blocking: Arc<dyn BlockingWitnessConnection> = Arc::new(BlockingWitness::new(
         Arc::new(connection),
@@ -621,10 +624,11 @@ fn wire_daemon_migration(
     // credential and timeout the authority context uses; the driver's
     // witness mutations (RecordBarrier, VoidBarrier, RevokeSet) and the
     // destination-side peer routes share it.
-    let witness = Arc::new(HttpWitnessConnection::new(
+    let witness = Arc::new(HttpWitnessConnection::with_tls(
         witness_url.clone(),
         config.witness_host_token.clone(),
         WITNESS_REQUEST_TIMEOUT,
+        &outbound_tls(config)?,
     ));
     let witness_probe = migration_witness_probe(&witness_url)?;
     let vmm = Arc::new(ChRemoteVmm::new(
@@ -642,7 +646,7 @@ fn wire_daemon_migration(
         },
         Arc::new(RealRunner::default()),
     ));
-    let peer: Arc<dyn PeerClient> = Arc::new(HttpPeerClient::new(
+    let peer: Arc<dyn PeerClient> = Arc::new(HttpPeerClient::with_tls(
         config.migration.peer_api_url.clone().ok_or_else(|| {
             DaemonError::Config(
                 "migration.peer_api_url is required when migration is enabled".to_owned(),
@@ -654,6 +658,7 @@ fn wire_daemon_migration(
             )
         })?,
         PEER_REQUEST_TIMEOUT,
+        &outbound_tls(config)?,
     ));
     let snapshot_root = config.migration.snapshot_dir.clone().ok_or_else(|| {
         DaemonError::Config(
@@ -816,12 +821,22 @@ fn drbd_state_path(config: &Config) -> std::path::PathBuf {
 /// [`DaemonError::Http`] when binding or serving fails.
 pub async fn serve(config: Config) -> Result<(), DaemonError> {
     ensure_tokened_or_loopback(&config)?;
+    if config.allow_insecure && !config.tls.enabled && !config.listen.ip().is_loopback() {
+        tracing::warn!(
+            listen = %config.listen,
+            "allow_insecure = true: serving the Volume API over plain HTTP on a \
+             non-loopback address; bearer tokens and volume metadata are visible on \
+             the network. Use native [tls] or an external TLS terminator"
+        );
+    }
     let state = build_state(&config)?;
     let app = router(state, config.max_body_bytes);
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
+    let listener = std::net::TcpListener::bind(config.listen)
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
-    tracing::info!(listen = %config.listen, "volvisor API serving");
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| DaemonError::Http(format!("set_nonblocking {}: {e}", config.listen)))?;
+    tracing::info!(listen = %config.listen, tls = config.tls.enabled, "volvisor API serving");
     // P7-B (ADR-0009's service model): READY=1 only now — startup
     // reconciliation completed above (`build_state`: journal lock +
     // replay, provider construction and its reconcile) and the
@@ -832,10 +847,67 @@ pub async fn serve(config: Config) -> Result<(), DaemonError> {
     // logged, never fatal (`notify` module docs). The ordering is
     // pinned from both sides in tests/notify_e2e.rs.
     notify::ready("volvisord");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    if let Some(tls) = server_tls(&config)? {
+        let handle = axum_server::Handle::new();
+        let shutdown = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown.graceful_shutdown(None);
+        });
+        axum_server::from_tcp_rustls(
+            listener,
+            axum_server::tls_rustls::RustlsConfig::from_config(tls),
+        )
+        .map_err(|e| DaemonError::Http(format!("TLS listener: {e}")))?
+        .handle(handle)
+        .serve(app.into_make_service())
         .await
         .map_err(|e| DaemonError::Http(format!("serve: {e}")))
+    } else {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| DaemonError::Http(format!("tokio listener: {e}")))?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| DaemonError::Http(format!("serve: {e}")))
+    }
+}
+
+/// Build the native TLS server configuration, when `[tls] enabled = true`.
+fn server_tls(
+    config: &Config,
+) -> Result<Option<std::sync::Arc<volvisor_tls::rustls::ServerConfig>>, DaemonError> {
+    if !config.tls.enabled {
+        return Ok(None);
+    }
+    let cert_file = config.tls.cert_file.clone().ok_or_else(|| {
+        DaemonError::Config("tls.cert_file is required when tls.enabled = true".to_owned())
+    })?;
+    let key_file = config.tls.key_file.clone().ok_or_else(|| {
+        DaemonError::Config("tls.key_file is required when tls.enabled = true".to_owned())
+    })?;
+    volvisor_tls::ServerTls {
+        cert_file,
+        key_file,
+        client_ca_file: config.tls.client_ca_file.clone(),
+    }
+    .build()
+    .map(Some)
+    .map_err(|error| DaemonError::Config(format!("TLS server configuration failed: {error}")))
+}
+
+/// Build the outbound rustls client configuration (private CA trust and/or
+/// mTLS identity) for `https://` witness and peer endpoints.
+fn outbound_tls(
+    config: &Config,
+) -> Result<std::sync::Arc<volvisor_tls::rustls::ClientConfig>, DaemonError> {
+    volvisor_tls::ClientTls {
+        ca_file: config.tls.client.ca_file.clone(),
+        cert_file: config.tls.client.cert_file.clone(),
+        key_file: config.tls.client.key_file.clone(),
+    }
+    .build()
+    .map_err(|error| DaemonError::Config(format!("TLS client configuration failed: {error}")))
 }
 
 /// Fail-closed bind check: a daemon without an `admin_token` may only bind
@@ -847,10 +919,10 @@ pub async fn serve(config: Config) -> Result<(), DaemonError> {
 /// Binding a non-loopback address in that state would silently expose a
 /// read-only control plane to the network; refuse to start instead.
 fn ensure_tokened_or_loopback(config: &Config) -> Result<(), DaemonError> {
-    if config.admin_token.is_none() && !config.listen.ip().is_loopback() {
+    if !config.has_credentials() && !config.listen.ip().is_loopback() {
         return Err(DaemonError::Config(format!(
-            "admin_token is not configured and the bind address {} is not loopback; \
-             refusing to start (fail closed). Configure admin_token, or bind a \
+            "no admin_token or [credentials] are configured and the bind address {} is not \
+             loopback; refusing to start (fail closed). Configure credentials, or bind a \
              loopback address for the tokenless dev/test mode",
             config.listen
         )));
@@ -925,6 +997,9 @@ mod tests {
             migration: MigrationConfig::default(),
             vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
+            credentials: crate::config::CredentialsConfig::default(),
+            tls: crate::config::TlsConfig::default(),
+            allow_insecure: false,
         }
     }
 
@@ -966,6 +1041,9 @@ mod tests {
             migration: MigrationConfig::default(),
             vmm: VmmConfig::default(),
             witness_renewal_interval_secs: None,
+            credentials: crate::config::CredentialsConfig::default(),
+            tls: crate::config::TlsConfig::default(),
+            allow_insecure: false,
         }
     }
 
@@ -1117,6 +1195,9 @@ mod tests {
             drbd_minor_max: 999,
             drbd_proc_root: None,
             drbd_state_path: None,
+            credentials: crate::config::CredentialsConfig::default(),
+            tls: crate::config::TlsConfig::default(),
+            allow_insecure: false,
         }
     }
 

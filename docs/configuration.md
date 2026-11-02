@@ -2,7 +2,7 @@
 
 Status: documents the implemented configuration surface (P7-A; kept
 current with the code by a repository test that validates the examples)
-Date: 2026-10-10
+Date: 2026-11-02
 Applies to: `volvisord` and `volvisor-witnessd` — the TOML file each
 daemon takes at `--config`
 Normative context: [ADR-0009 (distribution and packaging)](adr/0009-distribution-and-packaging.md),
@@ -10,6 +10,7 @@ Normative context: [ADR-0009 (distribution and packaging)](adr/0009-distribution
 stage P7-A, [SPEC-0002 section 9](specs/SPEC-0002-volvisor-volume-virtualization.md) (security)
 Examples: [examples/volvisor.toml](../examples/volvisor.toml),
 [examples/witnessd.toml](../examples/witnessd.toml)
+Security deployment guide: [security/deployment.md](security/deployment.md)
 
 ## Command-line surface
 
@@ -36,12 +37,18 @@ volvisor-witnessd --version
 
 ## Secrets policy
 
-Tokens (`admin_token`, `device_claim_token`, `witness_token`,
-`witness_host_token`, `peer_api_token`, `auth_token`, `host_tokens`
-values) are **never logged** (SPEC-0002 section 9). The `--check-config`
-summary reports posture (bind address, provider, witness URL, lease
-knobs, credential counts), never values. The witness URL, directory
+Tokens (`admin_token`, every `[credentials]` token, `device_claim_token`,
+`witness_token`, `witness_host_token`, `peer_api_token`, `auth_token`,
+`host_tokens` values) are **never logged** (SPEC-0002 section 9). The
+`--check-config` summary reports posture (bind address, provider, witness URL,
+lease knobs, credential counts, transport mode), never values. Credential ids
+are audit identities, not secrets; the witness URL, directory paths, TLS file
 paths and port ranges are configuration facts, not secrets.
+
+Private TLS keys are loaded into rustls and never formatted or logged. No
+configuration has an "accept any certificate" switch: outbound `https://`
+verification always checks the certificate chain and the URL hostname/IP
+against the configured private CA or the Mozilla root program.
 
 ## `volvisord` configuration
 
@@ -52,11 +59,76 @@ typo'd key is a startup refusal, never a silently ignored setting.
 
 | Field | Type | Default | Controls |
 |---|---|---|---|
-| `listen` | socket address | required | HTTP bind of the Volume API v2 surface. Without `admin_token` the daemon refuses non-loopback binds (fail closed). |
+| `listen` | socket address | required | Bind of the Volume API v2 surface. A non-loopback bind is served over native TLS only when `[tls] enabled = true`; otherwise startup refuses unless `allow_insecure = true` is set explicitly. A tokenless daemon may bind loopback only. |
 | `journal_dir` | path | required | Directory holding the intent journal and its lock file. A second daemon on the same directory fails at startup, not mid-flight. |
 | `provider` | `lvm` \| `ceph` \| `drbd` \| `fake` | required | Backend selection. `fake` is the in-memory test provider — never production. Each provider's required fields below apply only to that provider; well-formed foreign fields are ignored. |
-| `admin_token` | string | unset | Static bearer token guarding the privileged surface (every mutating endpoint and the whole `/v2/admin` group, `GET` included). Unset = the loopback-only fail-closed mode (privileged requests get `401`). Must be non-empty when set. |
+| `admin_token` | string | unset | Legacy static bearer token: one full **admin** principal (audit id `admin_token`). Unset = no legacy admin principal; mutations/admin still fail closed. Must be non-empty when set. Prefer `[credentials]` for named principals and role separation. |
+| `credentials` | tables, below | empty | Named admin / operator / read-only bearers. When any entry exists, read routes also require authentication. |
+| `tls` | table, below | disabled | Native TLS listener identity and outbound trust/mTLS. |
+| `allow_insecure` | boolean | `false` | Explicit opt-in to plain HTTP on a non-loopback listener and to plain-HTTP witness/peer URLs. Emits a startup warning. Never a silent fallback. |
 | `max_body_bytes` | integer (bytes) | 1048576 (1 MiB) | Maximum accepted request body size. |
+
+### TLS and transport fields
+
+Native TLS is rustls (no OpenSSL dependency). The server identity must be
+provisioned explicitly: the daemon never generates a throwaway certificate.
+
+| Field | Type | Default | Controls |
+|---|---|---|---|
+| `tls.enabled` | boolean | `false` | Serve the Volume API listener over TLS. Requires `tls.cert_file` and `tls.key_file`; their presence and regular-file shape are checked at startup and by `--check-config`. |
+| `tls.cert_file` | path | required when enabled | PEM server certificate chain. |
+| `tls.key_file` | path | required when enabled | PEM private key matching the served certificate. Never logged. |
+| `tls.client_ca_file` | path | unset | Optional PEM client CA. When set, the listener requires a client certificate issued by one of these roots (mTLS); a client without one fails the TLS handshake. |
+| `tls.client.ca_file` | path | unset | Outbound trust bundle for `https://` witness/peer endpoints. Unset uses the Mozilla root program. |
+| `tls.client.cert_file` / `tls.client.key_file` | path | unset | Optional outbound mTLS identity. Must be configured together; both files must exist. |
+| `allow_insecure` | boolean | `false` | Permits a plain-HTTP non-loopback listener and plain-HTTP witness/peer URLs. A deliberate downgrade with a startup warning; there is no automatic `https` → `http` fallback. |
+
+Setting `tls.cert_file`, `tls.key_file` or `tls.client_ca_file` while
+`tls.enabled = false` is refused as orphan configuration. Loopback plain HTTP
+remains available for local development without `allow_insecure`.
+
+### Scoped credentials and authorization
+
+`[credentials]` holds named principal entries per role. Each entry is
+`{ id = "<stable-audit-id>", token = "<bearer-token>" }` and may be written as
+an array of tables or an inline array:
+
+```toml
+[[credentials.admin]]
+id = "ops-admin-2026-11"
+token = "generated-secret"
+
+[[credentials.operator]]
+id = "storage-operator-2026-11"
+token = "generated-secret"
+
+[[credentials.read_only]]
+id = "monitoring-2026-11"
+token = "generated-secret"
+```
+
+Ids are 1..=64 characters of ASCII alphanumerics, `-`, `_` or `.`. Ids and
+token values must be unique across every role; no scoped token may equal the
+legacy `admin_token` (ambiguous identity resolution is a startup refusal).
+Tokens are compared in constant time.
+
+When **any** `[credentials]` entry is configured, read routes require at least
+the read-only role: volume listing/inspection, capabilities, migration
+observation and `/metrics`. `/healthz` and `/v2/healthz` stay open for probes.
+Without scoped credentials, the legacy behavior is preserved: `admin_token` (or
+a tokenless loopback dev instance) leaves reads open while mutations and
+`/v2/admin/*` remain token-guarded. The full matrix and threat model are in the
+[security deployment guide](security/deployment.md).
+
+Role summary:
+
+| Surface | Required role |
+|---|---|
+| `GET /healthz`, `GET /v2/healthz` | public |
+| `GET /v2/volumes`, `GET /v2/volumes/{id}`, `GET /v2/capabilities`, `GET /metrics`, `GET /v2/migrations/{id}` | read-only (when scoped credentials are configured) |
+| Volume create/delete/attach/detach/attachment-state/grow/move-backing, migration prepare/transfer/abort | operator |
+| `/v2/admin/*` (device/admin inventory included) and `POST /v2/vms/{id}/check-mobility` | admin |
+| `/v2/internal/peer/*` | the separate daemon-to-daemon `peer_api_token` |
 
 ### LVM provider (`provider = "lvm"`, native-local class)
 
@@ -114,13 +186,16 @@ W5 deadline, and startup/reconcile fail closed on unproven primaries
 
 | Field | Type | Default | Controls |
 |---|---|---|---|
-| `witness_url` | URL string | unset | Base URL of the witness surface (plain `http://` in this phase). Must be a **third failure domain**: a loopback witness, or one colocated with either replication end, is refused at validation. |
+| `witness_url` | URL string | unset | Base URL of the witness surface. `https://` is the production shape; `http://` is allowed only on loopback or with explicit `allow_insecure = true`. Must be a **third failure domain**: a loopback witness, or one colocated with either replication end, is refused at validation. |
 | `witness_token` | string | required with `witness_url` | The shared bearer token; required for a non-loopback witness. On a v2 witness this token is read-only (inspect/health). Never logged. |
 | `witness_host_token` | string | required with `witness_url` | This host's per-host credential (W8): every mutating witness call (grant/renew/revoke/register) authenticates as `drbd_node_name`. Never logged. |
 | `witness_renewal_interval_secs` | integer (seconds) | required with `witness_url` | Renewal interval; must be positive and stay under half the witness's `lease_ttl_secs` (checked against every grant/renew response, since the TTL lives on the witness). |
 
 Witness fields set without `witness_url` are refused (they would
-silently imply a configuration the daemon does not follow).
+silently imply a configuration the daemon does not follow). An `https://`
+witness URL verifies the witness certificate with `tls.client.ca_file` when
+set, otherwise the Mozilla roots; a private-CA or mTLS identity is configured
+under `[tls.client]`.
 
 ### Migration and VMM tables (P4b, opt-in)
 
@@ -132,7 +207,7 @@ the peer daemon's URL and credential, and a configured `[vmm]` table.
 |---|---|---|---|
 | `migration.enabled` | boolean | `false` | Whether the migration surface (mobility routes, peer routes, the coordinator's retry task) is served. |
 | `migration.snapshot_dir` | path | required when enabled | The shared snapshot directory; must exist locally (its cross-host readability is verified at `PREPARED` by the destination daemon). |
-| `migration.peer_api_url` | URL string | required when enabled | The peer daemon's base URL (plain `http://`; by design colocated with the peer replication end — only the witness is a third failure domain). |
+| `migration.peer_api_url` | URL string | required when enabled | The peer daemon's base URL. `https://` is the production shape; plain `http://` is refused for a non-loopback peer unless `allow_insecure = true`. By design the peer is colocated with the peer replication end — only the witness is a third failure domain. |
 | `migration.peer_api_token` | string | required when enabled | The daemon-to-daemon credential (distinct from the witness and consumer tokens). Never logged. |
 | `vmm.ch_remote_bin` | path | required when migration is enabled | Path of the `ch-remote` binary. |
 | `vmm.api_socket_dir` | path | required when migration is enabled | Directory holding the per-VM API sockets (`{api_socket_dir}/{vm_id}.sock`). |
@@ -191,13 +266,20 @@ are rejected at parse time.
 
 | Field | Type | Default | Controls |
 |---|---|---|---|
-| `listen` | socket address | required | HTTP bind of the witness surface. Without `auth_token` the witness refuses non-loopback binds (fail closed). |
+| `listen` | socket address | required | Bind of the witness surface. A non-loopback bind requires native TLS (`[tls] enabled = true`) or explicit `allow_insecure = true`; without `auth_token` it also refuses non-loopback binds (fail closed). |
 | `state_dir` | path | required | Directory holding the witness journal and lock file. A competing witness on the same directory fails at startup. |
 | `auth_token` | string | unset | Shared bearer token; required for non-loopback binds. On the v2 witness protocol this token is **read-only** (inspect/health) — every mutation requires a host credential. Never logged. |
 | `host_tokens` | table (host id → token) | empty | Per-host credentials (W8): a mutation is accepted only when the presented token resolves to the host the request asserts. Keys must be valid host ids; token values must be non-empty, unique, and distinct from `auth_token` (ambiguous identity resolution is refused). Never logged. |
 | `lease_ttl_secs` | integer (seconds) | 60 | Lease time-to-live (W5/W7). A writer's lease expires after this; renewals keep it alive. Must be positive. |
 | `lease_grace_secs` | integer (seconds) | 5 | Response-latency bound the fence window assumes (W5). Must cover witness round-trip latency under load — an operator network responsibility. Must be positive. |
 | `suspend_budget_secs` | integer (seconds) | 5 | Self-fencing suspend budget (W7): the assumed time for a writer to freeze its data path (`drbdsetup suspend-io`). Must be positive. |
+| `tls.enabled` | boolean | `false` | Serve the witness listener over TLS. Requires `tls.cert_file` and `tls.key_file`, checked at startup and by `--check-config`. |
+| `tls.cert_file` / `tls.key_file` | path | required when enabled | PEM certificate chain and matching private key. Never logged. |
+| `tls.client_ca_file` | path | unset | Optional PEM client CA: when set, every storage daemon must present a certificate issued by one of these roots (mTLS). |
+| `allow_insecure` | boolean | `false` | Explicit opt-in to plain HTTP on a non-loopback witness listener; emits a startup warning. A real deployment should use native TLS instead. |
+
+As with `volvisord`, setting TLS file fields while `tls.enabled = false` is
+refused, and loopback plain HTTP remains valid without `allow_insecure`.
 
 ## Durable-state schema compatibility
 
@@ -220,10 +302,12 @@ N-1/N-2 fixture matrix and rollback steps.
 ## The checked-in examples
 
 [examples/volvisor.toml](../examples/volvisor.toml) (the richest
-validating shape: the drbd provider with witness and inert migration)
-and [examples/witnessd.toml](../examples/witnessd.toml) (the
-third-host witness deployment shape) are the annotated future
-`/etc/volvisor/` content. A repository test runs each through
-`--check-config`, so the examples and the validator cannot drift
-apart. Token values in the examples are placeholders — replace them
-with generated secrets in any real deployment.
+validating shape: the drbd provider with witness and inert migration,
+https witness/peer URLs, and commented TLS/credential tables) and
+[examples/witnessd.toml](../examples/witnessd.toml) (the third-host
+witness deployment shape, plain HTTP only through an explicit
+`allow_insecure = true` with commented native-TLS configuration) are the
+annotated future `/etc/volvisor/` content. A repository test runs each
+through `--check-config`, so the examples and the validator cannot drift
+apart. Token values in the examples are placeholders — replace them with
+generated secrets in any real deployment.

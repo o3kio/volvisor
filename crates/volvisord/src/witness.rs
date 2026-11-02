@@ -60,9 +60,16 @@ pub fn load_config(path: &Path) -> Result<WitnessConfig, DaemonError> {
 /// exits non-zero.
 pub fn check_config(path: &Path) -> Result<String, DaemonError> {
     let config = load_config(path)?;
+    let transport = if config.tls.enabled {
+        "tls".to_owned()
+    } else if config.allow_insecure {
+        "plain-http (allow_insecure)".to_owned()
+    } else {
+        "plain-http loopback".to_owned()
+    };
     Ok(format!(
-        "config ok: listen {}, state_dir {}, lease_ttl {}s, grace {}s, suspend_budget {}s, \
-         host_credentials {}",
+        "config ok: listen {}, state_dir {}, transport {transport}, lease_ttl {}s, \
+         grace {}s, suspend_budget {}s, host_credentials {}",
         config.listen,
         config.state_dir.display(),
         config.lease_ttl_secs,
@@ -94,11 +101,21 @@ pub async fn serve(config: WitnessConfig) -> Result<(), DaemonError> {
         Arc::new(crate::unix_now_secs),
     ));
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
+    let listener = std::net::TcpListener::bind(config.listen)
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| DaemonError::Http(format!("set_nonblocking {}: {e}", config.listen)))?;
+    if config.allow_insecure && !config.tls.enabled && !config.listen.ip().is_loopback() {
+        tracing::warn!(
+            listen = %config.listen,
+            "witness allow_insecure = true: bearer tokens and lease state are visible \
+             on the network; use native [tls] or an external TLS terminator"
+        );
+    }
     tracing::info!(
         listen = %config.listen,
+        tls = config.tls.enabled,
         host_credentials = config.host_tokens.len(),
         "volvisor-witnessd serving (protocol v2; prototype; not production supported)"
     );
@@ -108,10 +125,53 @@ pub async fn serve(config: WitnessConfig) -> Result<(), DaemonError> {
     // discipline. Failure paths return before this line; a send
     // failure is logged, never fatal (`notify` module docs).
     notify::ready("volvisor-witnessd");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    if let Some(tls) = witness_tls(&config)? {
+        let handle = axum_server::Handle::new();
+        let shutdown = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown.graceful_shutdown(None);
+        });
+        axum_server::from_tcp_rustls(
+            listener,
+            axum_server::tls_rustls::RustlsConfig::from_config(tls),
+        )
+        .map_err(|e| DaemonError::Http(format!("TLS listener: {e}")))?
+        .handle(handle)
+        .serve(app.into_make_service())
         .await
         .map_err(|e| DaemonError::Http(format!("serve: {e}")))
+    } else {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| DaemonError::Http(format!("tokio listener: {e}")))?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| DaemonError::Http(format!("serve: {e}")))
+    }
+}
+
+/// Build the witness's native TLS server configuration, when enabled.
+fn witness_tls(
+    config: &WitnessConfig,
+) -> Result<Option<Arc<volvisor_tls::rustls::ServerConfig>>, DaemonError> {
+    if !config.tls.enabled {
+        return Ok(None);
+    }
+    let cert_file = config.tls.cert_file.clone().ok_or_else(|| {
+        DaemonError::Config("witness tls.cert_file is required when tls.enabled = true".to_owned())
+    })?;
+    let key_file = config.tls.key_file.clone().ok_or_else(|| {
+        DaemonError::Config("witness tls.key_file is required when tls.enabled = true".to_owned())
+    })?;
+    volvisor_tls::ServerTls {
+        cert_file,
+        key_file,
+        client_ca_file: config.tls.client_ca_file.clone(),
+    }
+    .build()
+    .map(Some)
+    .map_err(|error| DaemonError::Config(format!("witness TLS configuration failed: {error}")))
 }
 
 #[cfg(test)]

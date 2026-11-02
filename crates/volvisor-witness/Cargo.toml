@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 volvisor-types = { workspace = true }
 volvisor-journal = { workspace = true }
+volvisor-tls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
@@ -21,6 +22,7 @@ tokio = { workspace = true }
 sha2 = "0.10"
 bytes = "1"
 hyper = { version = "1", default-features = false, features = ["http1", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "webpki-roots"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 
