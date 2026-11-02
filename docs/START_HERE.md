@@ -52,10 +52,14 @@ can mutate it, or that a volume is safe to use.
 - **Nearline is not proven on three physical hosts.** The only executed VMM
   evidence is single-host with simulated storage; campaign
   [#37](https://github.com/o3kio/volvisor/issues/37) is **not run**.
-- **Real DRBD and real Ceph integration suites are not release-gated
-  yet.** They are env-gated and can skip when infrastructure is absent;
-  [#39](https://github.com/o3kio/volvisor/issues/39) tracks making them a
-  required release gate.
+- **Ceph and DRBD are not claimed by this release.** The real-backend
+  release gate landed in [#39](https://github.com/o3kio/volvisor/issues/39):
+  `native-local` is release-scope `supported` and gated by the LVM suite,
+  while `ceph-rbd` and `nearline-replicated` are `not-run` and explicitly
+  **not claimed** in [release-scope.toml](../release-scope.toml). No green
+  Ceph/DRBD rig run exists, and publish is blocked if a provider is flipped
+  to `supported` without a passing suite. See
+  [real-backends.md](testing/real-backends.md).
 - **The Rook-cell managed-Ceph mode has never been run.** The POC
   [#38](https://github.com/o3kio/volvisor/issues/38) has no GO;
   [ADR-0008](adr/0008-rook-only-hyperconverged-cells.md) is production
@@ -94,21 +98,26 @@ cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-Real backends are opt-in and skip without their prerequisites:
+Real backends are opt-in and have one-command gates that fail loudly
+(exit `2`) before running cargo when their rig is missing:
 
 ```sh
 # Needs root, lvm2, and disposable loop/block devices.
-VOLVISOR_TEST_LVM=1 cargo test --locked -p volvisor-lvm --features integration-lvm
+sudo ./scripts/test-lvm.sh
 
 # Needs VOLVISOR_CEPH_* cluster configuration and ceph-common.
-VOLVISOR_TEST_CEPH=1 cargo test --locked -p volvisor-ceph --test integration_ceph
+sudo -E ./scripts/test-ceph.sh
 
 # Needs drbd-utils, the DRBD 9 kernel module, and a provisioned peer.
-VOLVISOR_TEST_DRBD=1 cargo test --locked -p volvisor-drbd --test integration_drbd
+sudo -E ./scripts/test-drbd.sh
 ```
 
-A skipped real-backend test is **not** a pass and is not evidence for a
-production claim.
+The scripts support `--check` and write JUnit/log evidence. The release
+pipeline runs every provider declared `supported` in
+[release-scope.toml](../release-scope.toml); providers declared `not-run`
+are explicit non-claims. A skipped or failed real-backend gate is **not** a
+pass and is not evidence for a production claim. See
+[real-backends.md](testing/real-backends.md).
 
 ### 2. Check the shipped configuration examples
 
@@ -153,8 +162,17 @@ checksums, and no support commitment.
 ## Release status
 
 The intended v0.1.0 notes are a **draft**
-([docs/releases/v0.1.0.md](releases/v0.1.0.md)). The tag is blocked on
-nearline three-physical-host evidence (#37), the Rook-cell POC (#38),
-release-gated Ceph/DRBD suites (#39), transport/auth hardening (#40), the
-CHV consumer path and pin (#48), and a configured signing key. No tag or
-GitHub release may be created until those gates pass.
+([docs/releases/v0.1.0.md](releases/v0.1.0.md)). Two decisions are recorded
+separately:
+
+- **Distribution tag:** may be cut before the three-physical-host campaigns
+  (#37/#38) if the support matrix and release notes explicitly mark them
+  **not-run**. It is blocked in this workstream by the missing signing key
+  and by any code gate this release actually claims.
+- **Pre-production exit gate (milestone
+  [#36](https://github.com/o3kio/volvisor/issues/36)):** still requires the
+  real runs (#37/#38/#39 where claimed), transport/auth hardening (#40),
+  day-2 runbooks (#46), the CHV consumer path and pin (#48), and the exit
+  review. A distribution tag does not satisfy this gate.
+
+No tag or GitHub release may be created in this workstream.
