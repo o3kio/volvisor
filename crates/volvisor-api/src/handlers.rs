@@ -32,14 +32,14 @@ use volvisor_types::{
 };
 
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
-use crate::extract::{RequireAdmin, ValidJson};
+use crate::extract::{RequireAdmin, RequireOperator, RequireRead, ValidJson};
 use crate::ops;
 use crate::state::SharedState;
 
 /// `POST /v2/volumes` — CreateVolume.
 pub(crate) async fn create_volume(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     ValidJson(req): ValidJson<CreateVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
     req.validate()?;
@@ -70,6 +70,7 @@ pub(crate) async fn create_volume(
 /// an invalid `project_id` value is rejected with `INVALID_REQUEST`.
 pub(crate) async fn list_volumes(
     State(state): State<SharedState>,
+    _read: RequireRead,
     query: Result<Query<ListVolumesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Response, ApiErrorReply> {
     let query = query
@@ -88,6 +89,7 @@ pub(crate) async fn list_volumes(
 /// `GET /v2/volumes/{volume_id}` — InspectVolume.
 pub(crate) async fn inspect_volume(
     State(state): State<SharedState>,
+    _read: RequireRead,
     Path(volume_id): Path<String>,
 ) -> Result<Response, ApiErrorReply> {
     let volume_id = parse_volume_id(&volume_id)?;
@@ -99,7 +101,7 @@ pub(crate) async fn inspect_volume(
 /// `POST /v2/volumes/{volume_id}/attach` — AttachVolume.
 pub(crate) async fn attach_volume(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(req): ValidJson<AttachVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
@@ -140,7 +142,7 @@ pub(crate) async fn attach_volume(
 /// the provider trait passes the attachment identity separately).
 pub(crate) async fn detach_volume(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(wire): ValidJson<DetachRequestWire>,
 ) -> Result<Response, ApiErrorReply> {
@@ -183,7 +185,7 @@ pub(crate) async fn detach_volume(
 /// (`applied=false`).
 pub(crate) async fn report_attachment_state(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(req): ValidJson<ReportAttachmentStateRequest>,
 ) -> Result<Response, ApiErrorReply> {
@@ -225,7 +227,7 @@ pub(crate) async fn report_attachment_state(
 /// journaled and replays byte-compatibly.
 pub(crate) async fn grow_volume(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(req): ValidJson<GrowVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
@@ -297,7 +299,7 @@ pub(crate) async fn grow_volume(
 /// window, not a claim that the move finished.
 pub(crate) async fn move_volume_backing(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(req): ValidJson<MoveVolumeBackingRequest>,
 ) -> Result<Response, ApiErrorReply> {
@@ -328,7 +330,7 @@ pub(crate) async fn move_volume_backing(
 /// `DELETE /v2/volumes/{volume_id}` — DeleteVolume.
 pub(crate) async fn delete_volume(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(volume_id): Path<String>,
     ValidJson(req): ValidJson<DeleteVolumeRequest>,
 ) -> Result<Response, ApiErrorReply> {
@@ -363,6 +365,7 @@ pub(crate) async fn delete_volume(
 /// `GET /v2/capabilities` — provider name, capability set and served classes.
 pub(crate) async fn capabilities(
     State(state): State<SharedState>,
+    _read: RequireRead,
 ) -> Result<Response, ApiErrorReply> {
     let body = to_json_value(&CapabilitiesResponse {
         provider: state.provider.name().to_owned(),
@@ -781,7 +784,7 @@ pub(crate) async fn check_mobility(
 /// byte-for-byte.
 pub(crate) async fn prepare_migration(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     ValidJson(req): ValidJson<MobilityRequest>,
 ) -> Result<Response, ApiErrorReply> {
     let migration = state
@@ -825,7 +828,7 @@ pub(crate) async fn prepare_migration(
 /// `OPERATION_IN_DOUBT` (never a second drive).
 pub(crate) async fn transfer_migration(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(migration_id): Path<String>,
     ValidJson(req): ValidJson<TransferRequestWire>,
 ) -> Result<Response, ApiErrorReply> {
@@ -866,6 +869,7 @@ pub(crate) async fn transfer_migration(
 /// Read-only: no journal record.
 pub(crate) async fn observe_migration(
     State(state): State<SharedState>,
+    _read: RequireRead,
     Path(migration_id): Path<String>,
 ) -> Result<Response, ApiErrorReply> {
     let migration = state
@@ -890,7 +894,7 @@ pub(crate) async fn observe_migration(
 /// return). Journaled like every mobility mutation.
 pub(crate) async fn abort_migration(
     State(state): State<SharedState>,
-    _admin: RequireAdmin,
+    _operator: RequireOperator,
     Path(migration_id): Path<String>,
 ) -> Result<Response, ApiErrorReply> {
     let migration = state
@@ -935,7 +939,7 @@ pub(crate) async fn healthz() -> Response {
 }
 
 /// `GET /metrics` — Prometheus text exposition.
-pub(crate) async fn metrics(State(state): State<SharedState>) -> Response {
+pub(crate) async fn metrics(State(state): State<SharedState>, _read: RequireRead) -> Response {
     text_response(StatusCode::OK, state.metrics.render())
 }
 

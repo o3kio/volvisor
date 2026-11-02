@@ -100,6 +100,9 @@ fn e2e_config(dir: &tempfile::TempDir) -> volvisord::Config {
         migration: volvisord::config::MigrationConfig::default(),
         vmm: volvisord::config::VmmConfig::default(),
         witness_renewal_interval_secs: None,
+        credentials: volvisord::config::CredentialsConfig::default(),
+        tls: volvisord::config::TlsConfig::default(),
+        allow_insecure: false,
     }
 }
 
@@ -235,6 +238,9 @@ async fn daemon_journal_lock_fails_fast_for_second_instance() {
         migration: volvisord::config::MigrationConfig::default(),
         vmm: volvisord::config::VmmConfig::default(),
         witness_renewal_interval_secs: None,
+        credentials: volvisord::config::CredentialsConfig::default(),
+        tls: volvisord::config::TlsConfig::default(),
+        allow_insecure: false,
     };
     // Hold one state (and thus the journal lock) ...
     let first = volvisord::runtime::build_state(&config).expect("first instance");

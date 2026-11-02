@@ -6,6 +6,7 @@ use axum::response::Response;
 use serde::de::DeserializeOwned;
 use volvisor_types::ApiError;
 
+use crate::auth::{AuthContext, Role};
 use crate::error::{ApiErrorReply, json_response};
 use crate::state::SharedState;
 
@@ -36,62 +37,108 @@ where
     }
 }
 
-/// Extractor enforcing admin bearer authentication on privileged endpoints.
+/// Extractor enforcing admin-role access on privileged endpoints.
 ///
-/// Requests must present `Authorization: Bearer <token>` matching the
-/// configured [`crate::AppState`] `admin_token`; a missing or mismatching
-/// token fails with `401` and body `{"code":"UNAUTHORIZED", ...}`.
-/// `UNAUTHORIZED` is a transport-level code: it is deliberately not part of
-/// the volume error taxonomy in `volvisor-types` (which models *storage*
-/// failures).
+/// Authentication happens once, in the [`crate::auth::authorize_and_audit`]
+/// middleware, which inserts an [`AuthContext`](crate::auth::AuthContext)
+/// into the request extensions. This extractor re-checks the resolved role
+/// (defense in depth: a route wired without the middleware fails closed
+/// instead of silently skipping authorization).
 ///
-/// **Fail closed**: when no `admin_token` is configured, privileged requests
-/// are *rejected*, never permitted. Mutating endpoints cannot be exposed
-/// without authentication; the tokenless mode is a loopback-only dev/test
-/// convenience (the daemon refuses non-loopback binds without a token).
+/// Requests must present `Authorization: Bearer <token>` resolving to an
+/// admin credential; a missing or insufficient credential fails with `401`
+/// (unauthenticated) or `403` (authenticated but under-privileged) and the
+/// contract's `{"code","message"}` body. `UNAUTHORIZED`/`FORBIDDEN` are
+/// transport-level codes: deliberately not part of the volume error taxonomy
+/// in `volvisor-types` (which models *storage* failures).
 ///
-/// Two route groups use this extractor:
+/// **Fail closed**: when no credential is configured at all, privileged
+/// requests are *rejected*, never permitted. Mutating endpoints cannot be
+/// exposed without authentication; the tokenless mode is a loopback-only
+/// dev/test convenience (the daemon refuses non-loopback binds without a
+/// credential).
 ///
-/// - every mutating volume endpoint (`POST`/`DELETE` under `/v2/volumes`);
-/// - the whole `/v2/admin` surface, `GET` included, since device inventory
-///   is host-privileged information.
-///
-/// The remaining read-only `GET` routes (`/v2/volumes`, `/v2/capabilities`,
-/// `/healthz`, `/metrics`) stay open in P0 because the daemon binds
-/// host-local and they expose nothing a local process could not already
-/// observe. **This changes with multi-tenant exposure** — every route will
-/// require authorization then.
-///
-/// The token comparison walks all bytes without an early exit (length is
-/// compared separately), avoiding the obvious timing oracle without pulling
-/// in a constant-time crate.
+/// The whole `/v2/admin` surface uses this extractor (`GET` included, since
+/// device inventory is host-privileged information); volume and migration
+/// mutations use [`RequireOperator`]. Read routes use [`RequireRead`], which
+/// is open only in the documented legacy/tokenless posture.
 pub(crate) struct RequireAdmin;
 
 impl FromRequestParts<SharedState> for RequireAdmin {
     type Rejection = Response;
 
-    // The trait mandates an async signature; the check itself is synchronous
-    // (header comparison only).
+    // The trait mandates an async signature; the check itself is synchronous.
     #[allow(clippy::unused_async_trait_impl)]
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(expected) = state.admin_token.as_deref() else {
-            // Fail closed: without a configured token there is nothing to
-            // authenticate against, so privileged requests are disabled.
-            return Err(unauthorized_response(
-                "admin_token is not configured; mutating endpoints are disabled (fail closed)",
-            ));
-        };
-        let presented = bearer_token(&parts.headers);
-        if presented.is_some_and(|token| fixed_time_eq(token, expected)) {
-            Ok(Self)
-        } else {
-            Err(unauthorized_response(
-                "mutating operations require a valid admin bearer token",
-            ))
+        require_role(parts, state, Role::Admin)?;
+        Ok(Self)
+    }
+}
+
+/// Extractor requiring operator-or-admin access on consumer mutations.
+pub(crate) struct RequireOperator;
+
+impl FromRequestParts<SharedState> for RequireOperator {
+    type Rejection = Response;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
+        require_role(parts, state, Role::Operator)?;
+        Ok(Self)
+    }
+}
+
+/// Extractor requiring read access on metadata/capability/metrics routes.
+///
+/// Reads stay open when no scoped `[credentials]` are configured (the
+/// documented legacy and loopback-dev posture). Once any scoped credential
+/// exists, a read-only, operator or admin principal is required.
+pub(crate) struct RequireRead;
+
+impl FromRequestParts<SharedState> for RequireRead {
+    type Rejection = Response;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
+        if !state.auth.protect_reads() {
+            return Ok(Self);
         }
+        require_role(parts, state, Role::ReadOnly)?;
+        Ok(Self)
+    }
+}
+
+/// Shared role check over the middleware-inserted context.
+#[allow(clippy::result_large_err)] // axum's extractor rejection is a Response
+fn require_role(
+    parts: &axum::http::request::Parts,
+    state: &SharedState,
+    required: Role,
+) -> Result<(), Response> {
+    let context = parts.extensions.get::<AuthContext>();
+    match context {
+        Some(context) if context.role >= required => Ok(()),
+        Some(context) => Err(forbidden_response(&format!(
+            "the presented credential role {} is less privileged than the required {} role",
+            context.role.as_str(),
+            required.as_str()
+        ))),
+        None if !state.auth.is_configured() => Err(unauthorized_response(
+            "admin_token is not configured; mutating endpoints are disabled (fail closed)",
+        )),
+        None => Err(unauthorized_response(&format!(
+            "this endpoint requires a valid {} bearer token",
+            required.as_str()
+        ))),
     }
 }
 
@@ -121,4 +168,13 @@ fn unauthorized_response(message: &str) -> Response {
         "message": message,
     });
     json_response(StatusCode::UNAUTHORIZED, &body)
+}
+
+/// The `403 FORBIDDEN` reply (authenticated but insufficient role).
+fn forbidden_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "code": "FORBIDDEN",
+        "message": message,
+    });
+    json_response(StatusCode::FORBIDDEN, &body)
 }

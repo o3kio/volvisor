@@ -14,6 +14,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Uri};
+use hyper_rustls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
@@ -142,19 +144,46 @@ pub trait WitnessConnection: Send + Sync {
 pub struct HttpWitnessConnection {
     base_url: String,
     token: Option<String>,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>,
     timeout: Duration,
 }
 
 impl HttpWitnessConnection {
     /// Build a connection to `base_url` (e.g. `http://127.0.0.1:9101`)
     /// with an optional bearer token and per-request timeout.
+    ///
+    /// Outbound `https://` uses the Mozilla root program. A deployment with a
+    /// private CA or an mTLS client identity builds the rustls configuration
+    /// with [`volvisor_tls::ClientTls`] and calls
+    /// [`HttpWitnessConnection::with_tls`] instead.
     #[must_use]
     pub fn new(base_url: impl Into<String>, token: Option<String>, timeout: Duration) -> Self {
+        Self::with_tls(
+            base_url,
+            token,
+            timeout,
+            &volvisor_tls::ClientTls::webpki_default(),
+        )
+    }
+
+    /// Build a connection with an explicit rustls client configuration
+    /// (private CA trust and/or mTLS identity).
+    #[must_use]
+    pub fn with_tls(
+        base_url: impl Into<String>,
+        token: Option<String>,
+        timeout: Duration,
+        tls: &std::sync::Arc<volvisor_tls::rustls::ClientConfig>,
+    ) -> Self {
+        let https = HttpsConnectorBuilder::new()
+            .with_tls_config((**tls).clone())
+            .https_or_http()
+            .enable_http1()
+            .build();
         Self {
             base_url: base_url.into(),
             token,
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client: Client::builder(TokioExecutor::new()).build(https),
             timeout,
         }
     }

@@ -8,6 +8,7 @@ use volvisor_provider::{
     AdminSurface, AdoptionSurface, GrowNotifier, HandoffSurface, LendingSurface, VolumeProvider,
 };
 
+use crate::auth::AuthPolicy;
 use crate::metrics::Metrics;
 use crate::peer::PeerRouteContext;
 
@@ -68,11 +69,11 @@ pub struct AppState {
     pub(crate) journal: std::sync::Mutex<Journal>,
     /// Prometheus-format counters served on `/metrics`.
     pub(crate) metrics: Arc<Metrics>,
-    /// Admin bearer token guarding every mutating endpoint and the whole
-    /// `/v2/admin` surface. `None` fails closed: mutations are rejected
-    /// with `401` (the tokenless mode is loopback-only dev/test; the daemon
-    /// refuses non-loopback binds without a token).
-    pub(crate) admin_token: Option<String>,
+    /// Scoped credential policy guarding the API surface. Built from the
+    /// legacy `admin_token` and/or the named `[credentials]` entries; an
+    /// empty policy fails closed for mutations/admin (the tokenless mode is
+    /// loopback-only dev/test).
+    pub(crate) auth: AuthPolicy,
     /// The journal-append crash hook (P5 plan §3.1), when the
     /// constructing test rig attached one. `None` — every production
     /// path — is fully inert: the pipeline consults nothing. Doc-gated
@@ -105,9 +106,18 @@ impl AppState {
             peer_token: None,
             journal: std::sync::Mutex::new(journal),
             metrics: Arc::new(Metrics::new()),
-            admin_token,
+            auth: AuthPolicy::new(admin_token),
             crash: None,
         }
+    }
+
+    /// Attach scoped named credentials. When the list is non-empty, read
+    /// routes (volume metadata, capabilities and `/metrics`) also require a
+    /// credential; the legacy `admin_token` behavior is unchanged.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Vec<crate::auth::Credential>) -> Self {
+        self.auth = self.auth.with_credentials(credentials);
+        self
     }
 
     /// Attach the journal-append crash hook (P5 plan §3.1). **Test

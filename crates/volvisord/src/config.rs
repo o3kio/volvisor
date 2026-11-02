@@ -3,10 +3,12 @@
 //! Configuration is explicit and validated at startup; defaults are
 //! conservative. No secret material is ever logged (SPEC-0002 section 9).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use volvisor_api::auth::{Credential, Role};
 
 use crate::DaemonError;
 
@@ -140,13 +142,30 @@ pub struct Config {
     /// included). When unset, those endpoints reject every request with
     /// `401` (fail closed) and the daemon refuses to bind a non-loopback
     /// address: the tokenless mode is loopback-only dev/test. Never logged.
+    ///
+    /// This legacy single token remains a full admin credential. Prefer
+    /// `[credentials]` for named principals, role separation and rotation.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Scoped named credentials (admin / operator / read-only). When this
+    /// table is non-empty, read routes also require authentication.
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+    /// Native TLS configuration for the listener and outbound clients.
+    #[serde(default)]
+    pub tls: TlsConfig,
+    /// Explicit opt-out of the plain-HTTP non-loopback refusal. A listener
+    /// on a non-loopback address without TLS is refused unless this is
+    /// `true`; setting it emits a startup warning and is a deliberate
+    /// "trusted network / external terminator" decision, never a silent
+    /// downgrade.
+    #[serde(default)]
+    pub allow_insecure: bool,
     /// Maximum request body size in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
     /// Base URL of the writer-authority witness (drbd provider only,
-    /// e.g. `http://10.0.0.3:9101`). When set, the provider is
+    /// e.g. `https://10.0.0.3:9101`). When set, the provider is
     /// witness-managed: every promotion acquires a lease first, a
     /// background task renews leases and enforces the local W5
     /// deadline, and startup/reconcile fail closed on unproven
@@ -242,10 +261,108 @@ pub struct VmmConfig {
     pub minimum_version: Option<String>,
 }
 
+/// The `[tls]` table: native TLS for the Volume API listener and the
+/// outbound witness/peer clients.
+///
+/// `enabled` controls the *listener*. The `[tls.client]` sub-table is
+/// always meaningful for outbound `https://` URLs: it supplies a private-CA
+/// trust bundle and/or an mTLS client identity. Unset client settings use
+/// the Mozilla root program.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Serve the Volume API over TLS. Requires `cert_file` and `key_file`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// PEM server certificate chain.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key matching the served certificate.
+    pub key_file: Option<PathBuf>,
+    /// Optional PEM client CA. When set, clients must present a certificate
+    /// issued by one of these roots (mTLS).
+    pub client_ca_file: Option<PathBuf>,
+    /// Outbound trust and identity for `https://` witness/peer endpoints.
+    #[serde(default)]
+    pub client: TlsClientConfig,
+}
+
+/// Outbound TLS settings for https witness and peer endpoints.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsClientConfig {
+    /// PEM trust bundle for a private CA. Unset uses the Mozilla roots.
+    pub ca_file: Option<PathBuf>,
+    /// Optional PEM client certificate chain (mTLS).
+    pub cert_file: Option<PathBuf>,
+    /// Optional PEM private key matching `cert_file`.
+    pub key_file: Option<PathBuf>,
+}
+
+/// Scoped API credentials: named principals with rotation-friendly token
+/// lists per role.
+///
+/// The legacy top-level `admin_token` remains supported as one admin
+/// principal. When any `[credentials]` entry is configured, read routes
+/// (volume metadata, capabilities and `/metrics`) require at least a
+/// read-only credential; without this table they keep the historical
+/// loopback-dev posture (reads open, mutations token-guarded).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialsConfig {
+    /// Named admin principals (full access).
+    #[serde(default)]
+    pub admin: Vec<NamedCredential>,
+    /// Named operator principals (volume/migration mutations, no device
+    /// enrollment or other `/v2/admin` routes).
+    #[serde(default)]
+    pub operator: Vec<NamedCredential>,
+    /// Named read-only principals.
+    #[serde(default)]
+    pub read_only: Vec<NamedCredential>,
+}
+
+/// One named credential in [`CredentialsConfig`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedCredential {
+    /// Stable principal id used in audit events (never the token).
+    pub id: String,
+    /// The bearer token presented by this principal. Never logged.
+    pub token: String,
+}
+
+impl CredentialsConfig {
+    /// Whether any scoped credential is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.admin.is_empty() && self.operator.is_empty() && self.read_only.is_empty()
+    }
+
+    /// Convert the TOML entries to API-layer credentials.
+    #[must_use]
+    pub fn to_credentials(&self) -> Vec<Credential> {
+        let mut credentials =
+            Vec::with_capacity(self.admin.len() + self.operator.len() + self.read_only.len());
+        for (role, entries) in [
+            (Role::Admin, &self.admin),
+            (Role::Operator, &self.operator),
+            (Role::ReadOnly, &self.read_only),
+        ] {
+            for entry in entries {
+                credentials.push(Credential {
+                    id: entry.id.clone(),
+                    token: entry.token.clone(),
+                    role,
+                });
+            }
+        }
+        credentials
+    }
+}
+
 fn default_max_body_bytes() -> usize {
     1 << 20
 }
-
 fn default_drbd_port_min() -> u16 {
     7100
 }
@@ -264,28 +381,42 @@ fn default_drbd_minor_max() -> u32 {
 
 /// Resolve a witness URL's host to the addresses it names (P4a plan
 /// §3): a literal IP maps to itself; a **name** resolves through the
-/// system resolver with every returned address counting. The witness
-/// surface is plain HTTP in P4a, so only the `http://` scheme is
-/// accepted.
+/// system resolver with every returned address counting. Both `http://`
+/// and `https://` are accepted; the scheme decides the default port used
+/// for name resolution.
 ///
 /// # Errors
-/// [`DaemonError::Config`] for a non-HTTP scheme, an unparseable or
+/// [`DaemonError::Config`] for a non-HTTP(S) scheme, an unparseable or
 /// empty host, or a name that cannot be resolved — the guard treats
 /// ambiguity as colocation and refuses, and a witness the daemon
 /// cannot resolve is unusable anyway.
+/// Extract the host from a URL authority, handling a bracketed IPv6 literal
+/// with or without a port (`[::1]`, `[::1]:9101`) and the usual
+/// `host:port` form.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some((host, _)) = rest.split_once(']') {
+            return host;
+        }
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+}
+
 fn witness_host(url: &str) -> Result<Vec<std::net::IpAddr>, DaemonError> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         DaemonError::Config(format!(
-            "witness_url {url} must use the http:// scheme (the witness surface is plain \
-             HTTP in P4a)"
+            "witness_url {url} must use the http:// or https:// scheme"
         ))
     })?;
+    if scheme != "http" && scheme != "https" {
+        return Err(DaemonError::Config(format!(
+            "witness_url {url} must use the http:// or https:// scheme"
+        )));
+    }
     let authority = rest.split('/').next().unwrap_or(rest);
-    // `host:port` (IPv6 literals are bracketed, as in `[::1]:9101`).
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = authority_host(authority);
     if host.is_empty() {
         return Err(DaemonError::Config(format!(
             "witness_url {url} carries no host"
@@ -294,8 +425,9 @@ fn witness_host(url: &str) -> Result<Vec<std::net::IpAddr>, DaemonError> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(vec![ip]);
     }
+    let default_port = if scheme == "https" { 443 } else { 80 };
     let resolved: Vec<std::net::IpAddr> =
-        std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:80"))
+        std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:{default_port}"))
             .map_err(|err| {
                 DaemonError::Config(format!(
                     "witness_url {url} host {host} cannot be resolved (the failure-domain \
@@ -310,6 +442,34 @@ fn witness_host(url: &str) -> Result<Vec<std::net::IpAddr>, DaemonError> {
         )));
     }
     Ok(resolved)
+}
+
+/// Parse an outbound URL into its scheme and host authority.
+fn outbound_url_parts<'a>(url: &'a str, field: &str) -> Result<(&'a str, &'a str), DaemonError> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        DaemonError::Config(format!("{field} must use the http:// or https:// scheme"))
+    })?;
+    if scheme != "http" && scheme != "https" {
+        return Err(DaemonError::Config(format!(
+            "{field} must use the http:// or https:// scheme"
+        )));
+    }
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority_host(authority);
+    if host.is_empty() {
+        return Err(DaemonError::Config(format!("{field} carries no host")));
+    }
+    Ok((scheme, host))
+}
+
+/// Whether a host literal is loopback. Names other than `localhost` are
+/// deliberately treated as non-loopback: a plain-HTTP URL that only *might*
+/// resolve locally is refused unless the operator explicitly opted in.
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The host portion of a configured `<host>:<port>` peer address.
@@ -332,6 +492,16 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Whether any credential (legacy admin token or scoped named
+    /// credentials) is configured.
+    #[must_use]
+    pub fn has_credentials(&self) -> bool {
+        self.admin_token.is_some()
+            || !self.credentials.admin.is_empty()
+            || !self.credentials.operator.is_empty()
+            || !self.credentials.read_only.is_empty()
+    }
+
     /// Render the concise `--check-config` summary (P7-A, ADR-0009):
     /// the facts an operator verifies at a glance — bind address,
     /// provider, state location, witness and migration posture. Never
@@ -348,8 +518,26 @@ impl Config {
         } else {
             "migration disabled"
         };
+        let transport = if self.tls.enabled {
+            "tls".to_owned()
+        } else if self.allow_insecure {
+            "plain-http (allow_insecure)".to_owned()
+        } else {
+            "plain-http loopback".to_owned()
+        };
+        let read_auth = if self.credentials.is_empty() {
+            "open (legacy)".to_owned()
+        } else {
+            format!(
+                "scoped ({} admin, {} operator, {} read-only)",
+                self.credentials.admin.len(),
+                self.credentials.operator.len(),
+                self.credentials.read_only.len()
+            )
+        };
         format!(
-            "config ok: listen {}, provider {}, journal_dir {}, {witness}, {migration}",
+            "config ok: listen {}, provider {}, journal_dir {}, transport {transport}, \
+             read-auth {read_auth}, {witness}, {migration}",
             self.listen,
             self.provider.as_toml_name(),
             self.journal_dir.display()
@@ -369,6 +557,8 @@ impl Config {
         }
         self.validate_witness_fields()?;
         self.validate_migration_fields()?;
+        self.validate_transport_fields()?;
+        self.validate_credentials()?;
         self.validate_field_shapes()
     }
 
@@ -417,14 +607,12 @@ impl Config {
                     .to_owned(),
             )
         })?;
-        if !peer_url.starts_with("http://")
-            || peer_url
-                .strip_prefix("http://")
-                .is_some_and(|rest| rest.trim_matches('/').is_empty())
-        {
-            return Err(DaemonError::Config(
-                "migration.peer_api_url must use the http:// scheme and name a host".to_owned(),
-            ));
+        let (scheme, host) = outbound_url_parts(&peer_url, "migration.peer_api_url")?;
+        if scheme == "http" && !self.allow_insecure && !host_is_loopback(host) {
+            return Err(DaemonError::Config(format!(
+                "migration.peer_api_url {peer_url} is plain HTTP to a non-loopback host; \
+                 use https:// or set allow_insecure = true (a deliberate downgrade)"
+            )));
         }
         if self
             .migration
@@ -516,6 +704,14 @@ impl Config {
                  not a third failure domain (P4a plan §3); colocation is refused"
             )));
         }
+        let (scheme, _host) = outbound_url_parts(url, "witness_url")?;
+        if scheme == "http" && !self.allow_insecure {
+            return Err(DaemonError::Config(format!(
+                "witness_url {url} is plain HTTP; the witness is a control-plane authority \
+                 and must be encrypted. Use https:// or set allow_insecure = true (a \
+                 deliberate downgrade that emits a startup warning)"
+            )));
+        }
         if self
             .witness_token
             .as_deref()
@@ -542,6 +738,111 @@ impl Config {
                      protocol is v2: this host's credential for grant/renew/revoke/register)"
                         .to_owned(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Transport posture: a non-loopback plain-HTTP listener is refused
+    /// unless the operator explicitly set `allow_insecure = true`. TLS
+    /// server fields are required together and must name readable files;
+    /// outbound client identity is likewise all-or-nothing. The URL-level
+    /// plain-HTTP refusals live in the witness/migration validators, where
+    /// the endpoint is known.
+    fn validate_transport_fields(&self) -> Result<(), DaemonError> {
+        if self.tls.enabled {
+            require_readable_file(self.tls.cert_file.as_ref(), "tls.cert_file")?;
+            require_readable_file(self.tls.key_file.as_ref(), "tls.key_file")?;
+            if let Some(ca) = &self.tls.client_ca_file {
+                if ca.as_os_str().is_empty() {
+                    return Err(DaemonError::Config(
+                        "tls.client_ca_file must not be empty when set".to_owned(),
+                    ));
+                }
+                require_readable_file(Some(ca), "tls.client_ca_file")?;
+            }
+        } else {
+            if self.tls.cert_file.is_some()
+                || self.tls.key_file.is_some()
+                || self.tls.client_ca_file.is_some()
+            {
+                return Err(DaemonError::Config(
+                    "tls.cert_file/key_file/client_ca_file are set while tls.enabled = false; \
+                     serve TLS or remove the orphan fields"
+                        .to_owned(),
+                ));
+            }
+            if !self.listen.ip().is_loopback() && !self.allow_insecure {
+                return Err(DaemonError::Config(format!(
+                    "listen {} is a non-loopback plain-HTTP bind; refusing to start. \
+                     Configure [tls] enabled = true (native TLS), or set \
+                     allow_insecure = true to accept an explicit cleartext downgrade",
+                    self.listen
+                )));
+            }
+        }
+        if self.tls.client.cert_file.is_some() != self.tls.client.key_file.is_some() {
+            return Err(DaemonError::Config(
+                "tls.client.cert_file and tls.client.key_file must be configured together \
+                 (the outbound mTLS identity)"
+                    .to_owned(),
+            ));
+        }
+        if self.tls.client.ca_file.is_some() {
+            require_readable_file(self.tls.client.ca_file.as_ref(), "tls.client.ca_file")?;
+        }
+        if self.tls.client.cert_file.is_some() {
+            require_readable_file(self.tls.client.cert_file.as_ref(), "tls.client.cert_file")?;
+            require_readable_file(self.tls.client.key_file.as_ref(), "tls.client.key_file")?;
+        }
+        Ok(())
+    }
+
+    /// Scoped credential validation: named principals must be unique, token
+    /// values must be non-empty and unique across every role, and no scoped
+    /// token may duplicate the legacy `admin_token` (ambiguous resolution).
+    fn validate_credentials(&self) -> Result<(), DaemonError> {
+        let mut ids = BTreeSet::new();
+        let mut tokens = BTreeSet::new();
+        for (role, entries) in [
+            ("admin", &self.credentials.admin),
+            ("operator", &self.credentials.operator),
+            ("read_only", &self.credentials.read_only),
+        ] {
+            for entry in entries {
+                if !is_credential_id(&entry.id) {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id {:?} must be 1..=64 characters of alphanumeric, \
+                         '-', '_' or '.' (a stable audit principal id)",
+                        entry.id
+                    )));
+                }
+                if entry.token.trim().is_empty() {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id {:?} requires a non-empty token",
+                        entry.id
+                    )));
+                }
+                if !ids.insert(entry.id.as_str()) {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id {:?} is duplicated; principal ids must be unique",
+                        entry.id
+                    )));
+                }
+                if !tokens.insert(entry.token.as_str()) {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id {:?} reuses a token value; identity resolution \
+                         must be unambiguous",
+                        entry.id
+                    )));
+                }
+                if self.admin_token.as_deref() == Some(entry.token.as_str()) {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id {:?} reuses the legacy admin_token value; \
+                         identity resolution must be unambiguous",
+                        entry.id
+                    )));
+                }
             }
         }
         Ok(())
@@ -866,6 +1167,35 @@ fn is_simple_name(value: &str, max_len: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Whether `value` is a sane audit principal id: non-empty, bounded and
+/// free of whitespace/control characters (it lands in structured logs).
+fn is_credential_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Require an optional path to be set and name a readable regular file.
+fn require_readable_file(path: Option<&PathBuf>, field: &str) -> Result<(), DaemonError> {
+    let path = path.ok_or_else(|| {
+        DaemonError::Config(format!("{field} is required when tls.enabled = true"))
+    })?;
+    if path.as_os_str().is_empty() {
+        return Err(DaemonError::Config(format!(
+            "{field} must not be empty when set"
+        )));
+    }
+    if !path.is_file() {
+        return Err(DaemonError::Config(format!(
+            "{field} {} does not exist or is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Whether `value` is a canonical hyphenated UUID (8-4-4-4-12 ASCII
 /// hex groups), the format `ceph fsid` reports and the configuration
 /// must match exactly.
@@ -1024,6 +1354,186 @@ provider = \"lvm\"
         let raw = minimal_toml() + "admin_token = \"real-token\"\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn non_loopback_plain_http_listener_requires_an_explicit_downgrade() {
+        let raw = minimal_toml().replace("127.0.0.1:8787", "0.0.0.0:8787");
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("plain HTTP on a public bind");
+        assert!(
+            error.to_string().contains("non-loopback plain-HTTP bind"),
+            "error explains the refusal: {error}"
+        );
+
+        let raw = raw + "allow_insecure = true\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate()
+            .expect("allow_insecure is the explicit downgrade opt-in");
+
+        // Loopback plain HTTP remains the supported dev/test posture.
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        cfg.validate().expect("loopback plain HTTP stays valid");
+    }
+
+    #[test]
+    fn tls_listener_requires_certificate_and_key_files() {
+        let raw = minimal_toml() + "[tls]\nenabled = true\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("missing TLS identity");
+        assert!(
+            error.to_string().contains("tls.cert_file"),
+            "error names the missing field: {error}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        std::fs::write(&cert, b"certificate").expect("write cert");
+        std::fs::write(&key, b"key").expect("write key");
+        let raw = minimal_toml()
+            + &format!(
+                "[tls]\nenabled = true\ncert_file = \"{}\"\nkey_file = \"{}\"\n",
+                cert.display(),
+                key.display()
+            );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate()
+            .expect("an existing cert/key pair is accepted");
+
+        // A TLS identity with enabled = false is orphan configuration, not
+        // a silent fallback to plain HTTP.
+        let raw = minimal_toml()
+            + &format!(
+                "[tls]\ncert_file = \"{}\"\nkey_file = \"{}\"\n",
+                cert.display(),
+                key.display()
+            );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("orphan TLS fields");
+        assert!(
+            error.to_string().contains("tls.enabled = false"),
+            "error explains the orphan fields: {error}"
+        );
+    }
+
+    #[test]
+    fn tls_client_identity_is_all_or_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("client.crt");
+        std::fs::write(&cert, b"certificate").expect("write cert");
+        let raw = minimal_toml() + &format!("[tls.client]\ncert_file = \"{}\"\n", cert.display());
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("client cert without key");
+        assert!(
+            error.to_string().contains("configured together"),
+            "error explains the pair rule: {error}"
+        );
+    }
+
+    #[test]
+    fn plain_http_witness_and_peer_need_the_explicit_downgrade() {
+        let witness = minimal_drbd_toml()
+            + "witness_url = \"http://10.0.0.3:9101\"\n\
+               witness_token = \"witness-secret\"\n\
+               witness_host_token = \"host-a-secret\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&witness).expect("parse");
+        let error = cfg.validate().expect_err("plain HTTP witness");
+        assert!(
+            error.to_string().contains("must be encrypted"),
+            "error explains the witness encryption rule: {error}"
+        );
+        let cfg: Config = toml::from_str(&(witness + "allow_insecure = true\n")).expect("parse");
+        cfg.validate().expect("allow_insecure opts into plain HTTP");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full = migration_toml(dir.path());
+        let plain_peer = full.replace("https://10.0.0.2:7780", "http://10.0.0.2:7780");
+        let cfg: Config = toml::from_str(&plain_peer).expect("parse");
+        let error = cfg.validate().expect_err("plain HTTP peer");
+        assert!(
+            error.to_string().contains("migration.peer_api_url"),
+            "error names the peer URL: {error}"
+        );
+        let cfg: Config =
+            toml::from_str(&format!("allow_insecure = true\n{plain_peer}")).expect("parse");
+        cfg.validate()
+            .expect("allow_insecure opts into a plain HTTP peer");
+    }
+
+    #[test]
+    fn scoped_credentials_are_unique_and_role_mapped() {
+        let raw = minimal_toml()
+            + "[[credentials.admin]]\nid = \"admin-a\"\ntoken = \"admin-secret\"\n\
+               [[credentials.operator]]\nid = \"operator-a\"\ntoken = \"operator-secret\"\n\
+               [[credentials.read_only]]\nid = \"reader-a\"\ntoken = \"reader-secret\"\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        cfg.validate().expect("unique named credentials");
+        assert!(cfg.has_credentials());
+        assert!(
+            cfg.check_summary()
+                .contains("scoped (1 admin, 1 operator, 1 read-only)")
+        );
+        assert_eq!(
+            cfg.credentials.to_credentials(),
+            vec![
+                Credential {
+                    id: "admin-a".to_owned(),
+                    token: "admin-secret".to_owned(),
+                    role: Role::Admin,
+                },
+                Credential {
+                    id: "operator-a".to_owned(),
+                    token: "operator-secret".to_owned(),
+                    role: Role::Operator,
+                },
+                Credential {
+                    id: "reader-a".to_owned(),
+                    token: "reader-secret".to_owned(),
+                    role: Role::ReadOnly,
+                },
+            ]
+        );
+
+        let duplicate_id = minimal_toml()
+            + "[[credentials.admin]]\nid = \"same\"\ntoken = \"one\"\n\
+               [[credentials.operator]]\nid = \"same\"\ntoken = \"two\"\n";
+        let cfg: Config = toml::from_str(&duplicate_id).expect("parse");
+        let error = cfg.validate().expect_err("duplicate principal id");
+        assert!(
+            error.to_string().contains("duplicated"),
+            "error names the duplicate id: {error}"
+        );
+
+        let duplicate_token = minimal_toml()
+            + "[[credentials.admin]]\nid = \"admin-a\"\ntoken = \"shared\"\n\
+               [[credentials.read_only]]\nid = \"reader-a\"\ntoken = \"shared\"\n";
+        let cfg: Config = toml::from_str(&duplicate_token).expect("parse");
+        let error = cfg.validate().expect_err("duplicate token");
+        assert!(
+            error.to_string().contains("reuses a token value"),
+            "error names the ambiguous token: {error}"
+        );
+
+        let legacy_collision = minimal_toml()
+            + "admin_token = \"legacy\"\n\
+               [[credentials.operator]]\nid = \"operator-a\"\ntoken = \"legacy\"\n";
+        let cfg: Config = toml::from_str(&legacy_collision).expect("parse");
+        let error = cfg.validate().expect_err("legacy token collision");
+        assert!(
+            error.to_string().contains("legacy admin_token"),
+            "error names the collision: {error}"
+        );
+
+        let bad_id = minimal_toml()
+            + "[[credentials.read_only]]\nid = \"has space\"\ntoken = \"reader-secret\"\n";
+        let cfg: Config = toml::from_str(&bad_id).expect("parse");
+        let error = cfg.validate().expect_err("unstable audit id");
+        assert!(
+            error.to_string().contains("stable audit principal id"),
+            "error explains the id rule: {error}"
+        );
     }
 
     fn minimal_ceph_toml() -> String {
@@ -1374,7 +1884,7 @@ provider = \"drbd\"
     /// on a distinct third address, with tokens and renewal interval.
     fn witness_toml() -> String {
         minimal_drbd_toml()
-            + "witness_url = \"http://10.0.0.3:9101\"\n\
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
                witness_token = \"witness-secret\"\n\
                witness_host_token = \"host-a-secret\"\n\
                witness_renewal_interval_secs = 15\n"
@@ -1402,7 +1912,7 @@ provider = \"drbd\"
             "{}[migration]\n\
              enabled = true\n\
              snapshot_dir = \"{}\"\n\
-             peer_api_url = \"http://10.0.0.2:7780\"\n\
+             peer_api_url = \"https://10.0.0.2:7780\"\n\
              peer_api_token = \"peer-secret\"\n\
              [vmm]\n\
              ch_remote_bin = \"/usr/bin/ch-remote\"\n\
@@ -1511,7 +2021,7 @@ provider = \"drbd\"
         let dir = tempfile::tempdir().expect("tempdir");
         let full = migration_toml(dir.path());
         for removed in [
-            "peer_api_url = \"http://10.0.0.2:7780\"\n",
+            "peer_api_url = \"https://10.0.0.2:7780\"\n",
             "peer_api_token = \"peer-secret\"\n",
             "[vmm]\nch_remote_bin = \"/usr/bin/ch-remote\"\napi_socket_dir = \"/run/volvisor/vms\"\n",
         ] {
@@ -1520,11 +2030,11 @@ provider = \"drbd\"
             let error = cfg.validate().expect_err("incomplete migration section");
             assert!(!error.to_string().is_empty(), "a typed refusal is produced");
         }
-        // An https peer URL is refused (the peer surface is plain
-        // HTTP in this phase, like the witness).
-        let raw = full.replace("http://10.0.0.2:7780", "https://10.0.0.2:7780");
+        // The peer surface accepts https (and http on loopback); a
+        // different scheme is refused up front.
+        let raw = full.replace("https://10.0.0.2:7780", "ftp://10.0.0.2:7780");
         let cfg: Config = toml::from_str(&raw).expect("parse");
-        let error = cfg.validate().expect_err("https peer url");
+        let error = cfg.validate().expect_err("non-http peer url");
         assert!(
             error.to_string().contains("peer_api_url"),
             "error names the field: {error}"
@@ -1546,7 +2056,7 @@ provider = \"drbd\"
         // daemon's own grant/renew/revoke path needs the per-host
         // credential or it would fail at the first attach.
         let raw = minimal_drbd_toml()
-            + "witness_url = \"http://10.0.0.3:9101\"\n\
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
                witness_token = \"t\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
@@ -1557,7 +2067,7 @@ provider = \"drbd\"
         );
         // An empty host token is no host token.
         let raw = minimal_drbd_toml()
-            + "witness_url = \"http://10.0.0.3:9101\"\n\
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
                witness_token = \"t\"\n\
                witness_host_token = \"  \"\n\
                witness_renewal_interval_secs = 15\n";
@@ -1588,7 +2098,7 @@ provider = \"drbd\"
     #[test]
     fn witness_url_requires_the_drbd_provider() {
         let raw = minimal_toml()
-            + "witness_url = \"http://10.0.0.3:9101\"\n\
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
                witness_token = \"t\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
@@ -1603,7 +2113,7 @@ provider = \"drbd\"
     fn witness_requires_a_positive_renewal_interval() {
         for interval in [None, Some(0)] {
             let raw = minimal_drbd_toml()
-                + "witness_url = \"http://10.0.0.3:9101\"\n\
+                + "witness_url = \"https://10.0.0.3:9101\"\n\
                    witness_token = \"t\"\n"
                 + &interval.map_or(String::new(), |i| {
                     format!("witness_renewal_interval_secs = {i}\n")
@@ -1640,7 +2150,7 @@ provider = \"drbd\"
     #[test]
     fn non_loopback_witness_requires_a_token() {
         let raw = minimal_drbd_toml()
-            + "witness_url = \"http://10.0.0.3:9101\"\n\
+            + "witness_url = \"https://10.0.0.3:9101\"\n\
                witness_host_token = \"h\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
@@ -1654,8 +2164,8 @@ provider = \"drbd\"
     #[test]
     fn witness_colocated_with_either_replication_end_is_refused() {
         for (url, side) in [
-            ("http://10.0.0.1:9101", "local"),
-            ("http://10.0.0.2:9101", "peer"),
+            ("https://10.0.0.1:9101", "local"),
+            ("https://10.0.0.2:9101", "peer"),
         ] {
             let raw = minimal_drbd_toml()
                 + &format!(
@@ -1676,15 +2186,26 @@ provider = \"drbd\"
     }
 
     #[test]
-    fn witness_url_must_be_plain_http() {
+    fn witness_url_accepts_https_and_refuses_other_schemes() {
+        // https is the production shape; the host credential is required
+        // exactly as for plain http, and the scheme itself validates.
         let raw = minimal_drbd_toml()
             + "witness_url = \"https://10.0.0.3:9101\"\n\
-               witness_token = \"t\"\n\
+               witness_token = \"witness-secret\"\n\
+               witness_host_token = \"host-a-secret\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
-        let error = cfg.validate().expect_err("https witness");
+        cfg.validate().expect("https witness is valid");
+
+        let raw = minimal_drbd_toml()
+            + "witness_url = \"ftp://10.0.0.3:9101\"\n\
+               witness_token = \"t\"\n\
+               witness_host_token = \"h\"\n\
+               witness_renewal_interval_secs = 15\n";
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg.validate().expect_err("ftp witness");
         assert!(
-            error.to_string().contains("http://"),
+            error.to_string().contains("http:// or https://"),
             "error names the scheme rule: {error}"
         );
     }
@@ -1692,7 +2213,7 @@ provider = \"drbd\"
     #[test]
     fn unresolvable_witness_names_refuse_startup() {
         let raw = minimal_drbd_toml()
-            + "witness_url = \"http://witness.invalid:9101\"\n\
+            + "witness_url = \"https://witness.invalid:9101\"\n\
                witness_token = \"t\"\n\
                witness_renewal_interval_secs = 15\n";
         let cfg: Config = toml::from_str(&raw).expect("parse");
@@ -1723,12 +2244,30 @@ provider = \"drbd\"
     #[test]
     fn witness_host_parses_urls_with_ports_and_paths() {
         let addresses =
-            witness_host("http://10.0.0.3:9101/v1").expect("literal with port and path");
+            witness_host("https://10.0.0.3:9101/v1").expect("literal with port and path");
         let expected: std::net::IpAddr = "10.0.0.3".parse().expect("ip");
         assert_eq!(addresses, vec![expected]);
         let addresses = witness_host("http://10.0.0.3").expect("literal without port");
         assert_eq!(addresses, vec![expected]);
-        assert!(witness_host("http://10.0.0.3:9101").is_ok());
+        assert!(witness_host("https://10.0.0.3:9101").is_ok());
+        let loopback: std::net::IpAddr = "::1".parse().expect("ip");
+        assert_eq!(
+            witness_host("https://[::1]").expect("bracketed IPv6 without port"),
+            vec![loopback]
+        );
+        assert_eq!(
+            witness_host("https://[::1]:9101").expect("bracketed IPv6 with port"),
+            vec![loopback]
+        );
+        assert_eq!(
+            outbound_url_parts("http://[::1]", "peer").expect("bracketed IPv6"),
+            ("http", "::1")
+        );
+        assert_eq!(
+            outbound_url_parts("https://[2001:db8::1]:9101/v1", "peer")
+                .expect("bracketed IPv6 with port"),
+            ("https", "2001:db8::1")
+        );
         assert!(witness_host("http://").is_err(), "no host");
         assert!(witness_host("ftp://10.0.0.3").is_err(), "wrong scheme");
     }

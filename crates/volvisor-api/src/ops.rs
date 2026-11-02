@@ -57,6 +57,7 @@ use volvisor_types::{
     VolumeId,
 };
 
+use crate::auth::OperationAuditId;
 use crate::crash::CrashPoint;
 use crate::error::{json_response, status_for_wire_code, to_json_value};
 use crate::state::SharedState;
@@ -399,6 +400,7 @@ where
                         outcome.success,
                         outcome.http_status,
                         &outcome.response,
+                        &operation_id,
                     );
                 }
             }
@@ -467,7 +469,7 @@ where
                     // Same reconstruction as the first-lookup replay above: a
                     // concurrently recorded failure must serve the recorded error
                     // status, never a 200 wrapping the error body.
-                    return replay_response(success, http_status, &response);
+                    return replay_response(success, http_status, &response, &operation_id);
                 }
             }
             IntentAppend::AlreadyInFlight => {
@@ -540,7 +542,7 @@ where
                 );
             }
             state.metrics.record_operation(op_kind, "success");
-            Ok(json_response(status, &body))
+            Ok(with_audit_id(json_response(status, &body), operation_id))
         }
         Err(error) => {
             let body = to_json_value(&ApiErrorBody::from(error.clone()))?;
@@ -656,9 +658,9 @@ where
                 "resolved by inspection: the act is proven done (a recorded \
                  failure is superseded, never served past this point)"
             );
-            Ok(Some(json_response(
-                success_status.unwrap_or(StatusCode::OK),
-                &body,
+            Ok(Some(with_audit_id(
+                json_response(success_status.unwrap_or(StatusCode::OK), &body),
+                operation_id,
             )))
         }
         Ok(None) => {
@@ -762,6 +764,7 @@ fn replay_response(
     success: bool,
     http_status: Option<u16>,
     response: &Value,
+    operation_id: &OperationId,
 ) -> Result<Response, ApiError> {
     if let Some(status) = http_status {
         let status = StatusCode::from_u16(status).map_err(|_| {
@@ -770,10 +773,13 @@ fn replay_response(
                 "recorded outcome carries an invalid HTTP status",
             )
         })?;
-        return Ok(json_response(status, response));
+        return Ok(with_audit_id(json_response(status, response), operation_id));
     }
     if success {
-        return Ok(json_response(StatusCode::OK, response));
+        return Ok(with_audit_id(
+            json_response(StatusCode::OK, response),
+            operation_id,
+        ));
     }
     let status = response
         .get("code")
@@ -791,7 +797,17 @@ fn replay_response(
             "recorded failure outcome carries an invalid HTTP status",
         )
     })?;
-    Ok(json_response(status, response))
+    Ok(with_audit_id(json_response(status, response), operation_id))
+}
+
+/// Attach the journaled operation id as a response extension so the
+/// authentication/audit middleware can carry it into the audit event. This is
+/// deliberately not a wire header: the contract is unchanged.
+fn with_audit_id(mut response: Response, operation_id: &OperationId) -> Response {
+    response
+        .extensions_mut()
+        .insert(OperationAuditId(operation_id.as_str().to_owned()));
+    response
 }
 
 // ---------------------------------------------------------------------------

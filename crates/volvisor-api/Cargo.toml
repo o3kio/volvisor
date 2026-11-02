@@ -30,6 +30,8 @@ async-trait = "0.1"
 # `oneshot` for driving the router in tests without a TCP listener; test-only,
 # never linked into the library.
 tower = { version = "0.5", features = ["util"] }
+# Structured audit-event capture (JSON) in the auth tests.
+tracing-subscriber = { workspace = true }
 # Journal fault injection (`Journal::inject_append_failures_after`) for the
 # journal-before-mutate fault tests; the feature is never enabled for the
 # library itself or for downstream consumers (resolver v3 keeps dev-dep

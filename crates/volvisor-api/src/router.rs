@@ -1,13 +1,14 @@
 //! Router construction: the Volume API v2 HTTP surface.
 //!
-//! All routes share one [`crate::AppState`]. A metrics middleware records
-//! `http_requests_total` (route pattern + status code) for every matched
-//! route; a request body limit from [`crate::ApiConfig`] guards every
-//! endpoint. Mutating endpoints and the whole `/v2/admin` surface (device
-//! inventory is privileged, `GET` included) enforce admin bearer auth
-//! through the [`crate::extract::RequireAdmin`] extractor (see its
-//! documentation for the fail-closed tokenless behavior and why the
-//! remaining `GET` routes are open in P0).
+//! All routes share one [`crate::AppState`]. The
+//! [`crate::auth::authorize_and_audit`] middleware authenticates every
+//! request exactly once, enforces the route's role rule and emits one
+//! structured audit event; the role extractors are defense in depth. A
+//! metrics middleware records `http_requests_total` (route pattern + status
+//! code) for every matched route; a request body limit from
+//! [`crate::ApiConfig`] guards every endpoint. `<healthz>` stays open for
+//! liveness probes; reads are open only in the documented legacy/tokenless
+//! posture (see [`crate::auth`]).
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
@@ -15,6 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 
+use crate::auth;
 use crate::handlers;
 use crate::peer;
 use crate::state::SharedState;
@@ -143,6 +145,13 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
         .route("/v2/healthz", get(handlers::healthz))
         .route("/metrics", get(handlers::metrics))
         .fallback(handlers::not_found)
+        // Authentication/authorization/audit runs inside the metrics layer so
+        // denied requests are still counted; `MatchedPath` is resolved by
+        // then, which is what the route access matrix keys on.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authorize_and_audit,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_http_request,
