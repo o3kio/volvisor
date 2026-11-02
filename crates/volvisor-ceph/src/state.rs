@@ -92,8 +92,9 @@ pub struct AttachmentRecord {
     /// host-local, ephemeral handle — never a secret.
     pub device: String,
     /// The consumer's own VMM device identity, when it supplied one at
-    /// attach (Volume API v2 section 3). `None` for pre-P6-B records and
-    /// for attaches that carried no id; never guessed.
+    /// attach (Volume API v2 section 3). `None` for records written before
+    /// this field existed and for attaches that carried no id; never
+    /// guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vmm_disk_id: Option<String>,
 }
