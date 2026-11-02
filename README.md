@@ -68,13 +68,25 @@ crates/volvisord           daemon binary
 ```
 
 Build and test: `cargo build`, `cargo test --workspace`,
-`cargo clippy --all-targets` (CI denies warnings). Real-LVM integration tests
-run only when `VOLVISOR_TEST_LVM=1` and root are available; real-Ceph
-integration tests run only when `VOLVISOR_TEST_CEPH=1` plus
-`VOLVISOR_CEPH_*` cluster configuration are present; real-DRBD integration
-tests run only when `VOLVISOR_TEST_DRBD=1` plus `VOLVISOR_DRBD_*` host/peer
-configuration are present (they need the drbd-utils toolchain, the DRBD
-kernel module and a provisioned peer). This is prototype software: no
+`cargo clippy --all-targets` (CI denies warnings). Real-backend suites have
+one-command gates with typed, loud failures when their rig is missing:
+
+```sh
+sudo ./scripts/test-lvm.sh          # locally runnable (root + lvm2 + loop)
+sudo -E ./scripts/test-ceph.sh      # external cluster; self-hosted runner
+sudo -E ./scripts/test-drbd.sh      # DRBD 9 peer; self-hosted runner
+```
+
+Each script supports `--check`. Ceph needs `VOLVISOR_TEST_CEPH=1` plus
+`VOLVISOR_CEPH_*` cluster configuration; DRBD needs `VOLVISOR_TEST_DRBD=1`
+plus `VOLVISOR_DRBD_*` host/peer configuration, the drbd-utils toolchain,
+the DRBD 9 kernel module and a provisioned peer. The release pipeline refuses
+to publish unless every provider declared `supported` in
+[`release-scope.toml`](release-scope.toml) ran and passed its suite; providers
+declared `not-run` are explicit non-claims. See
+[`docs/testing/real-backends.md`](docs/testing/real-backends.md) for rig
+topology, runner labels, least-privilege credentials, secret handling,
+artifact retention and failure triage. This is prototype software: no
 production-support claim is made or implied (AGENTS rule 12).
 
 ## Historical draft v1 (superseded proposals)

@@ -106,15 +106,22 @@ always carry one version. Examples:
    convention.
 2. `.github/workflows/release.yaml` runs: the full gate set (fmt,
    clippy on both feature sets, workspace tests, cargo doc, the
-   real-LVM integration suite) and the **campaign certification**
-   (`campaign-summary --all --check` over freshly emitted evidence)
-   for the exact tagged commit; then the release build
+   real-LVM integration suite), the **campaign certification**
+   (`campaign-summary --all --check` over freshly emitted evidence), and
+   the **real-backend gate** for every provider declared `supported` in
+   [`release-scope.toml`](../release-scope.toml) for the exact tagged
+   commit; then the release build
    (x86_64-unknown-linux-gnu — the only target this pipeline
    builds), the `.deb`, the `.rpm`, the binary tarball, `SHA256SUMS`,
-   and `BUILD_INFO.txt` (the exact toolchain, per ADR-0009's
-   provenance discipline: signed tags + checksums, not package
-   signatures); then the container smokes below; then the GitHub
-   release with the certification embedded in its notes.
+   `BUILD_INFO.txt` (the exact toolchain, per ADR-0009's provenance
+   discipline: signed tags + checksums, not package signatures), and the
+   per-provider log/JUnit evidence bundle; then the container smokes
+   below; then the GitHub release with the certification and the
+   generated provider scope embedded in its notes.
+   Providers declared `not-run` are explicitly **not claimed** by that
+   release; publish is refused if a `supported` provider's suite did not
+   run and pass. See
+   [`docs/testing/real-backends.md`](../docs/testing/real-backends.md).
 3. `workflow_dispatch` on any branch runs the identical graph
    **without** creating the release — that is how the pipeline is
    proven before any tag exists.
