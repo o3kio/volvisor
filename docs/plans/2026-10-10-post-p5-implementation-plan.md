@@ -555,9 +555,10 @@ upstream v51.1 binary (#32, a second committed evidence bundle) and the
 convergence-horizon closure (#33, grant-hold lease renewal during parks
 plus the gated fresh-grant re-mint); and, after this record's first
 draft, the corrected attachment-state reporting design of issue #34 is
-open for review as PR #35 — a hypervisor-neutral consumer-evidence route
-proven against the native-local LVM provider and the conformance fake,
-with no claim of a consumer integration, upstream VMM adoption, or merge.
+merged as PR #35 (`a6d1508`) — a hypervisor-neutral consumer-evidence
+route proven against the native-local LVM provider and the conformance fake,
+with no claim of a consumer integration, upstream VMM adoption, release, or
+production support.
 The workspace suite stands at 1086 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
