@@ -39,9 +39,9 @@ where
 
 /// Extractor enforcing admin-role access on privileged endpoints.
 ///
-/// Authentication happens once, in the [`crate::auth::authorize_and_audit`]
-/// middleware, which inserts an [`AuthContext`](crate::auth::AuthContext)
-/// into the request extensions. This extractor re-checks the resolved role
+/// Authentication happens once, in the authorization middleware, which
+/// inserts an [`AuthContext`] into the request extensions. This extractor
+/// re-checks the resolved role
 /// (defense in depth: a route wired without the middleware fails closed
 /// instead of silently skipping authorization).
 ///

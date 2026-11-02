@@ -36,6 +36,7 @@ pub use rustls;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
@@ -200,9 +201,8 @@ pub fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Tl
         path: path.to_path_buf(),
         source,
     })?;
-    let mut reader = std::io::Cursor::new(bytes);
     let mut certificates = Vec::new();
-    for item in rustls_pemfile::certs(&mut reader) {
+    for item in CertificateDer::pem_slice_iter(&bytes) {
         certificates.push(item.map_err(|error| TlsError::InvalidPem {
             path: path.to_path_buf(),
             detail: error.to_string(),
@@ -226,13 +226,15 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
         path: path.to_path_buf(),
         source,
     })?;
-    let mut reader = std::io::Cursor::new(bytes);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| TlsError::InvalidPem {
+    let mut keys = PrivateKeyDer::pem_slice_iter(&bytes);
+    match keys.next() {
+        Some(Ok(key)) => Ok(key),
+        Some(Err(error)) => Err(TlsError::InvalidPem {
             path: path.to_path_buf(),
             detail: error.to_string(),
-        })?
-        .ok_or_else(|| TlsError::NoPrivateKey {
+        }),
+        None => Err(TlsError::NoPrivateKey {
             path: path.to_path_buf(),
-        })
+        }),
+    }
 }

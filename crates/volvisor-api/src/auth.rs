@@ -78,7 +78,7 @@ pub struct Credential {
 }
 
 /// The authenticated request principal, inserted into request extensions by
-/// [`authorize_and_audit`] and read by the role extractors.
+/// the authorization middleware and read by the role extractors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthContext {
     /// Credential id (or `admin_token` for the legacy token).

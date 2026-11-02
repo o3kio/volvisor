@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 thiserror = { workspace = true }
 webpki-roots = "1"
