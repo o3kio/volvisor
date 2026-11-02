@@ -11,7 +11,7 @@ resources**. It is not ready for production data, production availability
 targets, or a support commitment of any kind.
 
 If you only read one more document, read the
-[support matrix](SUPPORT_MATRIX.md). It records what is actually proven and
+[support matrix](../SUPPORT_MATRIX.md). It records what is actually proven and
 what is explicitly not run.
 
 ## What works today
@@ -39,7 +39,7 @@ The implementation and its in-repo tests cover:
 - **Test evidence that is real within its tier**: the Tier S simulated fault
   campaign, and four bounded Tier V scenarios against real Cloud Hypervisor
   v51.1 on one physical development host (storage simulated). See
-  [the evidence index](SUPPORT_MATRIX.md#evidence-index).
+  [the evidence index](../SUPPORT_MATRIX.md#evidence-index).
 
 A `--check-config` pass proves the binary runs and accepts a configuration.
 It does **not** prove that the configured storage exists, that a provider
