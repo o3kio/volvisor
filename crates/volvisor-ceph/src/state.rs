@@ -360,6 +360,24 @@ pub(crate) fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_pre_report_attachment_record_loads_without_the_disk_id() {
+        // Old state files carry no `vmm_disk_id`: it loads as absent,
+        // never guessed.
+        let record: AttachmentRecord = serde_json::from_str(
+            r#"{
+                "id": "att-old",
+                "vm_id": "vm-old",
+                "host_id": "host-old",
+                "generation": 1,
+                "access_mode": "single_writer",
+                "device": "/dev/rbd0"
+            }"#,
+        )
+        .expect("a pre-report record loads unchanged");
+        assert_eq!(record.vmm_disk_id, None);
+    }
+
     fn sample_state() -> CephState {
         let volume_id = VolumeId::new("vol-1").expect("valid id");
         let project_id = ProjectId::new("tenant-a").expect("valid id");

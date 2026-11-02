@@ -2530,7 +2530,8 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
         frontend: Frontend::VirtioBlk {
             host_device_path: format!("/dev/{}/{}", entry.vg_name, entry.lv_name),
         },
-        // No VMM integration exists: evidence honestly starts at Prepared.
-        state: AttachmentState::Prepared,
+        // A fresh record is provider-recorded Prepared; a replay answers
+        // the recorded evidence, exactly as the conformance fake does.
+        state: record.state,
     }
 }

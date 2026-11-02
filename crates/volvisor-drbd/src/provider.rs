@@ -3249,6 +3249,7 @@ impl DrbdProvider {
                 if record.vm_id == req.vm_id
                     && record.host_id == req.host_id
                     && record.access_mode == mode
+                    && record.vmm_disk_id == req.vmm_disk_id
                 {
                     return Ok(attach_response(&record, &stored.entry));
                 }

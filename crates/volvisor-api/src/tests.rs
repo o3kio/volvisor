@@ -546,6 +546,22 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(stale_body["code"], json!("STALE_GENERATION"));
 
+    // The refusal is a journaled terminal outcome: the same operation_id
+    // replays it verbatim and adds no record.
+    let records_after_stale = journal_record_count(&state);
+    let (status, replayed_stale) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &stale_report,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(replayed_stale, stale_body);
+    assert_eq!(journal_record_count(&state), records_after_stale);
+
     // Reports never moved the generation: detach fences on 1.
     let mut detach = serde_json::to_value(fixture_detach_request("att-report-1", 1))
         .expect("serialize detach fixture");

@@ -765,6 +765,14 @@ async fn report_state_survives_a_provider_restart_and_never_moves_the_generation
     assert_eq!(advanced.state_revision, 3);
     assert_eq!(advanced.evidence, Some(AttachmentEvidence::GuestConfirmed));
 
+    // A provider-level attach replay answers the recorded evidence, not a
+    // fresh `prepared` (the conformance fake does the same).
+    let replayed = restarted
+        .attach_volume(&created.volume_id, &attach)
+        .await
+        .expect("attach replay after a report");
+    assert_eq!(replayed.state, AttachmentState::Active);
+
     // Reports never moved the generation: detach still fences on it.
     restarted
         .detach_volume(

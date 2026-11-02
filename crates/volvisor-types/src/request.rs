@@ -851,7 +851,8 @@ pub struct AttachVolumeResponse {
     pub volume_generation: u64,
     /// Frontend descriptor that the VMM should consume.
     pub frontend: Frontend,
-    /// Attach evidence state (`prepared` until VMM integration exists).
+    /// Recorded attach evidence state (`prepared` until a consumer report
+    /// advances it; a replay carries the recorded value).
     pub state: crate::domain::AttachmentState,
 }
 

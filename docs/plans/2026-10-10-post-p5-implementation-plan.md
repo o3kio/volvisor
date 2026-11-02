@@ -558,7 +558,7 @@ draft, the corrected attachment-state reporting design of issue #34 is
 proposed as draft PR #35 — a hypervisor-neutral consumer-evidence route
 proven against the native-local LVM provider and the conformance fake,
 with no claim of a consumer integration, upstream VMM adoption, or merge.
-The workspace suite stands at 1084 tests, and the campaign
+The workspace suite stands at 1086 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
 support, real-media durability, or anything else its evidence does not
