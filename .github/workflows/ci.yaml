@@ -26,6 +26,31 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo doc --locked --no-deps --document-private-items
 
+  # The real-backend harness is itself code: keep the one-command scripts
+  # syntactically sound, the release scope machine-readable, and the
+  # release gate graph non-bypassable on every change. This job does not
+  # run Ceph/DRBD (no rig exists in hosted CI); the scheduled
+  # real-backends workflow does that on self-hosted runners.
+  test-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the real-backend shell scripts
+        run: |
+          bash -n scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
+            scripts/lib/real-backends-common.sh
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -x scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
+            scripts/lib/real-backends-common.sh
+      - name: Validate the release scope
+        run: python3 scripts/release-scope.py check
+      - name: Validate the release gate graph
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f) }' \
+            .github/workflows/real-backends.yaml .github/workflows/release.yaml
+          ruby scripts/lib/check-release-graph.rb \
+            .github/workflows/release.yaml .github/workflows/real-backends.yaml
+
   lvm-integration:
     runs-on: ubuntu-latest
     steps:
@@ -34,8 +59,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install LVM2
         run: sudo apt-get update && sudo apt-get install -y lvm2
-      - name: Run LVM-gated integration tests
-        run: sudo -E env "PATH=$PATH" VOLVISOR_TEST_LVM=1 cargo test --locked -p volvisor-lvm --features integration-lvm
+      - name: Run the real-LVM gate through the release script
+        run: sudo -E env "PATH=$PATH" VOLVISOR_TEST_OUTPUT_DIR="$GITHUB_WORKSPACE/target/real-backends/lvm" ./scripts/test-lvm.sh
+      - name: Upload the LVM gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-real-backends-lvm
+          path: target/real-backends/lvm/
+          if-no-files-found: warn
+          retention-days: 7
 
   msrv:
     runs-on: ubuntu-latest

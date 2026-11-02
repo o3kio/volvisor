@@ -1,0 +1,43 @@
+# Release scope: which providers this release claims, and therefore which
+# real-backend suites the release pipeline MUST run and pass before publish.
+#
+# This file is machine-readable on purpose. The release workflow parses it:
+#   * every provider with status = "supported" is added to the
+#     `real-backends` matrix; its suite runs on the declared rig and a
+#     missing/failed/skipped run FAILS the release (the `release` publish
+#     job needs `real-backends-gate`);
+#   * every provider with status = "not-run" is explicitly NOT claimed in
+#     the generated support matrix/release notes. It is not a silent pass:
+#     the reason is printed in the notes, and flipping the status to
+#     "supported" without a green suite blocks the next release.
+#
+# A provider name here is a release-scope claim, not a production-support
+# claim. AGENTS rule 12 still requires exact-SHA real-host evidence before
+# any production-support statement; this file only prevents distribution
+# from claiming more than the pipeline exercised.
+#
+# To add a provider:
+#   1. provision the rig and register the runner labels documented in
+#      docs/testing/real-backends.md;
+#   2. add an entry with status = "supported", suite = one of lvm|ceph|drbd;
+#   3. prove the release graph with workflow_dispatch before tagging.
+# To withdraw a claim, set status = "not-run" and write a truthful reason.
+# Never leave a provider absent: absent is ambiguous, and the parser's
+# schema check is deliberately strict.
+
+schema = 1
+
+[providers.native-local]
+status = "supported"
+suite = "lvm"
+claim = "native-local LVM volumes: create/attach/grow/detach/delete and same-VG relocation on a real loop-device rig"
+
+[providers.ceph-rbd]
+status = "not-run"
+suite = "ceph"
+reason = "No self-hosted Ceph runner is registered (labels: self-hosted, linux, x64, volvisor-ceph) and no external test cluster/keyring is provisioned for this release. The provider is NOT claimed by this release."
+
+[providers.nearline-replicated]
+status = "not-run"
+suite = "drbd"
+reason = "No self-hosted DRBD runner is registered (labels: self-hosted, linux, x64, volvisor-drbd), no DRBD 9 kernel module is available on the build host, and no peer rig is provisioned. The provider is NOT claimed by this release."
