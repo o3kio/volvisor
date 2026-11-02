@@ -28,11 +28,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::missing_panics_doc)]
 
 use crate::VolumeProvider;
-use volvisor_types::domain::{EvidenceStatus, Health, VolumeClass};
+use volvisor_types::domain::{AttachmentEvidence, EvidenceStatus, Health, VolumeClass};
 use volvisor_types::request::{
     AccessModeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, ErasurePolicy, GrowGuestNotification, GrowVolumeRequest,
-    MoveVolumeBackingRequest,
+    MoveVolumeBackingRequest, ReportAttachmentStateRequest,
 };
 use volvisor_types::{
     ApiErrorCode, AttachmentId, AttachmentState, Capability, Frontend, HostId,
@@ -112,6 +112,29 @@ pub fn fixture_detach_request(
             .expect("valid fixture operation id"),
         expected_attachment_generation,
         vm_stopped_or_io_drained_proof: DrainProof::VmStopped,
+    }
+}
+
+/// A minimal valid attachment-state report.
+#[must_use]
+pub fn fixture_report_request(
+    attachment_id: &str,
+    expected_attachment_generation: u64,
+    state: AttachmentState,
+    evidence: AttachmentEvidence,
+) -> ReportAttachmentStateRequest {
+    ReportAttachmentStateRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: OperationId::new(format!(
+            "op-report-{attachment_id}-{expected_attachment_generation}-{state:?}-{evidence:?}"
+        ))
+        .expect("valid fixture operation id"),
+        attachment_id: AttachmentId::new(attachment_id).expect("valid fixture attachment id"),
+        expected_attachment_generation,
+        state,
+        evidence,
+        reporter: Some("conformance-vmm".to_owned()),
+        detail: None,
     }
 }
 
@@ -793,6 +816,246 @@ pub async fn check_move_contract(provider: &dyn VolumeProvider) -> Result<(), St
     }
 }
 
+/// Check: consumer attachment-state reporting (contract section 3).
+///
+/// A provider advertising [`Capability::AttachmentStateReport`] must:
+/// advance evidence monotonically (`prepared < advertised < active`),
+/// keep `attachment_generation` fixed as the detach fence, answer a
+/// repeated/lower report as an idempotent no-op (`applied=false` without
+/// downgrading), refuse a stale instance generation, expose the full
+/// per-attachment view on inspect, answer `NOT_FOUND` after detach, and
+/// refuse reuse of a consumed attachment id (`IDEMPOTENCY_CONFLICT`).
+/// A provider without the capability is skipped; its typed `NOT_FOUND` is
+/// the default trait behavior, and the capability-gated path is covered by
+/// the fake's `report_requires_the_capability` test.
+#[allow(clippy::too_many_lines)]
+pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Result<(), String> {
+    if !provider
+        .capabilities()
+        .contains(Capability::AttachmentStateReport)
+    {
+        return Ok(());
+    }
+    let volume_id = "cc-report-volume";
+    let attachment_id = "cc-report-attachment";
+    let create = fixture_create_request(volume_id, GIB);
+    provider
+        .create_volume(&create)
+        .await
+        .map_err(|e| format!("create_volume: {e}"))?;
+    let attach = fixture_attach_request(volume_id, attachment_id, 1);
+    let attached = provider
+        .attach_volume(&create.volume_id, &attach)
+        .await
+        .map_err(|e| format!("attach_volume: {e}"))?;
+    require(
+        attached.state == AttachmentState::Prepared,
+        "attach must report the provider-recorded prepared state",
+    )?;
+
+    let inspected = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume: {e}"))?;
+    let view = inspected
+        .attachments
+        .iter()
+        .find(|view| view.attachment_id == attach.attachment_id)
+        .ok_or_else(|| "inspect must expose the attached instance in `attachments`".to_owned())?;
+    require(
+        view.state == AttachmentState::Prepared && view.state_revision == 1,
+        "a fresh attachment must project prepared at revision 1",
+    )?;
+    require(
+        view.attachment_generation == 1,
+        "the initial attachment generation must be 1",
+    )?;
+    require(
+        view.evidence.is_none() && view.reporter.is_none(),
+        "prepared evidence must not fabricate a reporter",
+    )?;
+
+    // advertised (vmm_configured) advances the revision, not the generation.
+    let advertised = provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Advertised,
+                AttachmentEvidence::VmmConfigured,
+            ),
+        )
+        .await
+        .map_err(|e| format!("report advertised: {e}"))?;
+    require(advertised.applied, "the first advertised report must apply")?;
+    require(
+        advertised.state == AttachmentState::Advertised && advertised.state_revision == 2,
+        "advertised must project revision 2",
+    )?;
+    require(
+        advertised.attachment_generation == 1,
+        "a report must never advance attachment_generation",
+    )?;
+    require(
+        advertised.reporter.as_deref() == Some("conformance-vmm")
+            && advertised.recorded_at_ms.is_some(),
+        "an applied report must return its reporter and the server receipt time",
+    )?;
+
+    // active (guest_confirmed) advances again.
+    let active = provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .map_err(|e| format!("report active: {e}"))?;
+    require(
+        active.applied && active.state == AttachmentState::Active && active.state_revision == 3,
+        "active must apply at revision 3",
+    )?;
+    require(
+        active.evidence == Some(AttachmentEvidence::GuestConfirmed)
+            && active.reporter.as_deref() == Some("conformance-vmm")
+            && active.recorded_at_ms.is_some(),
+        "active must carry guest_confirmed evidence and observation provenance",
+    )?;
+
+    // An equal report is the same idempotent no-op as a lower one.
+    let equal = provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .map_err(|e| format!("report equal: {e}"))?;
+    require(
+        !equal.applied
+            && equal.state == AttachmentState::Active
+            && equal.state_revision == 3
+            && equal.recorded_at_ms == active.recorded_at_ms,
+        "an equal report must be a no-op preserving the applied projection",
+    )?;
+
+    // Inspect re-projects the applied evidence (a restarted consumer
+    // re-observes rather than replaying reports).
+    let observed = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume after report: {e}"))?;
+    let observed = observed
+        .attachments
+        .iter()
+        .find(|view| view.attachment_id == attach.attachment_id)
+        .ok_or_else(|| "inspect must still expose the reported instance".to_owned())?;
+    require(
+        observed.state == AttachmentState::Active
+            && observed.state_revision == 3
+            && observed.evidence == Some(AttachmentEvidence::GuestConfirmed)
+            && observed.reporter.as_deref() == Some("conformance-vmm")
+            && observed.recorded_at_ms == active.recorded_at_ms
+            && observed.attachment_generation == 1,
+        "inspect must project the applied evidence verbatim at the unchanged generation",
+    )?;
+
+    // A lower report is an idempotent no-op: no downgrade, no revision bump.
+    let lower = provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Advertised,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .map_err(|e| format!("report lower: {e}"))?;
+    require(
+        !lower.applied && lower.state == AttachmentState::Active && lower.state_revision == 3,
+        "a lower report must be a no-op preserving the current projection",
+    )?;
+
+    // A stale instance generation is fenced with the typed conflict.
+    match provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                2,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::StaleGeneration => {}
+        Err(e) => {
+            return Err(format!(
+                "a stale report generation must fail with STALE_GENERATION, got {e}"
+            ));
+        }
+        Ok(_) => return Err("a stale report generation must not succeed".to_owned()),
+    }
+
+    // Detach still fences on generation 1 (reports never moved it), and a
+    // report against the detached instance is NOT_FOUND for a new operation.
+    provider
+        .detach_volume(
+            &create.volume_id,
+            &attach.attachment_id,
+            &fixture_detach_request(attachment_id, 1),
+        )
+        .await
+        .map_err(|e| format!("detach at the unchanged generation 1: {e}"))?;
+    match provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                1,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "a report after detach must fail with NOT_FOUND, got {e}"
+            ));
+        }
+        Ok(_) => return Err("a report after detach must not succeed".to_owned()),
+    }
+
+    // A report-capable provider must refuse to reuse the consumed id: a
+    // delayed report from the old instance must never label a new one.
+    let after_detach = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume after detach: {e}"))?;
+    let reattach = fixture_attach_request(volume_id, attachment_id, after_detach.generation);
+    match provider.attach_volume(&create.volume_id, &reattach).await {
+        Err(e) if e.code == ApiErrorCode::IdempotencyConflict => Ok(()),
+        Err(e) => Err(format!(
+            "reusing a consumed attachment id must fail with IDEMPOTENCY_CONFLICT, got {e}"
+        )),
+        Ok(_) => Err("reusing a consumed attachment id must not succeed".to_owned()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Suite entry points
 // ---------------------------------------------------------------------------
@@ -815,6 +1078,9 @@ pub async fn run_conformance(provider: &dyn VolumeProvider) -> Vec<String> {
     }
     if let Err(failure) = check_attach_single_writer(provider).await {
         failures.push(format!("attach_single_writer: {failure}"));
+    }
+    if let Err(failure) = check_attachment_state_report(provider).await {
+        failures.push(format!("attachment_state_report: {failure}"));
     }
     if let Err(failure) = check_attach_stale_generation(provider).await {
         failures.push(format!("attach_stale_generation: {failure}"));
@@ -924,6 +1190,14 @@ macro_rules! provider_conformance_tests {
                 let provider = $make_provider();
                 let provider: &dyn $crate::VolumeProvider = &*provider;
                 let outcome = $crate::conformance::check_attach_stale_generation(provider).await;
+                assert_eq!(outcome, Ok(()), "conformance failure");
+            }
+
+            #[tokio::test]
+            async fn attachment_state_report() {
+                let provider = $make_provider();
+                let provider: &dyn $crate::VolumeProvider = &*provider;
+                let outcome = $crate::conformance::check_attachment_state_report(provider).await;
                 assert_eq!(outcome, Ok(()), "conformance failure");
             }
 

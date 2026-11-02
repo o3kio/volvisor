@@ -112,6 +112,7 @@ Operations are specified in [Volume API v2](../../contracts/volume-api-v2.md). E
 Canonical operation phases:
 - `create`: `Requested -> Provisioning -> Ready` or `Failed/Quarantined`
 - `attach`: `Detached -> Preparing -> Attached`, with one active writer
+- attachment evidence: provider-recorded `prepared`, consumer-reported `advertised` and `active` (monotonic; `active` requires a guest-confirmed observation and is never claimed from host configuration alone); the detach-fencing `attachment_generation` never advances on a report — a separate `state_revision` orders evidence
 - `detach`: drain VMM I/O, revoke attachment generation, verify endpoint teardown
 - `delete`: reject non-detached or snapshot-dependent volumes; quarantine ambiguous leftover data
 - `migrate`: `PREPARED -> PRECOPY -> QUIESCED -> BARRIER_DURABLE -> SOURCE_REVOKED -> DESTINATION_AUTHORIZED -> VM_RESUMED -> COMPLETE` (canonical states, nearline contract section 6); an interruption between `SOURCE_REVOKED` and `DESTINATION_AUTHORIZED` is `IN_DOUBT`, never a generic `ABORTED`

@@ -319,7 +319,10 @@ pub struct Gap {
 /// journal and its effect, the force/residue paths — is carried by
 /// volvisor-api's lending test module (the daemon-level Tier S
 /// suite over the durable fake, the same sibling-fault-row
-/// discipline move_rows established).
+/// discipline move_rows established). One further gap is the
+/// consumer attachment-state report: the rig's DRBD provider does not
+/// advertise the capability, and the monotonic-evidence rule is
+/// carried by the provider conformance kit plus the API route test.
 #[must_use]
 pub fn recorded_gaps() -> Vec<Gap> {
     vec![
@@ -383,6 +386,15 @@ pub fn recorded_gaps() -> Vec<Gap> {
                      family proves, and the move's own durable boundaries (the LvmState \
                      move-record saves, pvmove start, verified completion) are carried by \
                      §9 row 16 (move_rows, the LVM sibling fault rows)",
+        },
+        Gap {
+            op: op_kinds::OP_REPORT_ATTACHMENT_STATE,
+            reason: "consumer attachment-state report: the rig's DRBD provider does not \
+                     advertise attachment_state_report (the route answers the typed 404), so \
+                     no matrix cell can drive it; the route's journal pipeline is the same \
+                     ops::execute the volume-mutation family proves, and the monotonic \
+                     evidence/no-generation-advance invariants are carried by the provider \
+                     conformance kit and volvisor-api's attachment-state route test",
         },
     ]
 }

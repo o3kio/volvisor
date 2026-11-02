@@ -5,7 +5,8 @@ use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
-    MoveVolumeBackingRequest, MoveVolumeBackingResponse,
+    MoveVolumeBackingRequest, MoveVolumeBackingResponse, ReportAttachmentStateRequest,
+    ReportAttachmentStateResponse,
 };
 use volvisor_types::{ApiError, ApiErrorCode, AttachmentId, CapabilitySet, ProjectId, VolumeId};
 
@@ -100,6 +101,37 @@ pub trait VolumeProvider: Send + Sync {
         attachment_id: &AttachmentId,
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError>;
+
+    /// Record a consumer-reported attachment state (`advertised`/`active`).
+    ///
+    /// The report is fenced by `expected_attachment_generation` (the
+    /// attachment instance) but **never advances** that generation — the
+    /// generation is the detach token. Evidence advances monotonically
+    /// (`prepared < advertised < active`); a repeated or lower report is an
+    /// idempotent no-op (`applied=false`) carrying the current projection,
+    /// never a downgrade. An unknown or detached attachment is `NOT_FOUND`
+    /// for a new operation.
+    ///
+    /// The default implementation is the fail-closed refusal: a provider
+    /// that has not qualified consumer reports (no
+    /// [`volvisor_types::Capability::AttachmentStateReport`]) answers
+    /// `NOT_FOUND`.
+    async fn report_attachment_state(
+        &self,
+        volume_id: &VolumeId,
+        req: &ReportAttachmentStateRequest,
+    ) -> Result<ReportAttachmentStateResponse, ApiError> {
+        Err(ApiError::new(
+            ApiErrorCode::NotFound,
+            format!(
+                "provider {} does not record attachment-state reports; attachment {} on \
+                 volume {} is not a reportable instance",
+                self.name(),
+                req.attachment_id,
+                volume_id
+            ),
+        ))
+    }
 
     /// Grow a volume (grow-only).
     ///

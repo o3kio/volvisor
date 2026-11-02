@@ -36,14 +36,16 @@ use volvisor_types::domain::{
 
 use volvisor_types::crash::StoreCrashHooks;
 use volvisor_types::request::{
-    AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
-    DetachVolumeRequest, ErasurePolicy, GrowGuestNotification, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
-    MoveVolumeBackingRequest, MoveVolumeBackingResponse,
+    AttachVolumeRequest, AttachVolumeResponse, AttachmentView, CreateVolumeRequest,
+    DeleteVolumeRequest, DetachVolumeRequest, ErasurePolicy, GrowGuestNotification,
+    GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
+    MoveVolumeBackingRequest, MoveVolumeBackingResponse, ReportAttachmentStateRequest,
+    ReportAttachmentStateResponse,
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, DeviceId,
-    MoveVolumeBackingState, ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
+    MoveVolumeBackingState, ProjectId, VolumeId, VolumeLifecycle, unix_ms_now,
+    validate_api_version,
 };
 
 use crate::report::{LvRow, VgRow};
@@ -678,6 +680,7 @@ impl LvmProvider {
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
+                retired_attachment_ids: Vec::new(),
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
@@ -716,7 +719,7 @@ impl LvmProvider {
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
-                    return Err(ApiError::idempotency_conflict(&req.attachment_id));
+                    return Err(ApiError::attachment_id_conflict(&req.attachment_id));
                 }
             }
         }
@@ -724,6 +727,13 @@ impl LvmProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
+        if stored
+            .runtime
+            .retired_attachment_ids
+            .contains(&req.attachment_id)
+        {
+            return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+        }
         if req.expected_volume_generation != stored.entry.generation {
             return Err(ApiError::stale_generation(
                 req.expected_volume_generation,
@@ -753,6 +763,11 @@ impl LvmProvider {
             generation: 1,
             access_mode: mode,
             vmm_disk_id: req.vmm_disk_id.clone(),
+            state: AttachmentState::Prepared,
+            state_revision: volvisor_types::domain::initial_state_revision(),
+            evidence: None,
+            reporter: None,
+            recorded_at_ms: None,
         };
         stored.runtime.attachment = Some(record.clone());
         stored.runtime.state = VolumeLifecycle::Attached;
@@ -794,7 +809,11 @@ impl LvmProvider {
         // one, though the provider cannot verify the claim itself
         // (Volume API v2 section 3).
 
+        let retired_id = record.id.clone();
         stored.runtime.attachment = None;
+        if !stored.runtime.retired_attachment_ids.contains(&retired_id) {
+            stored.runtime.retired_attachment_ids.push(retired_id);
+        }
         if stored.runtime.state == VolumeLifecycle::Attached {
             stored.runtime.state = VolumeLifecycle::Ready;
         }
@@ -802,6 +821,72 @@ impl LvmProvider {
         stored.entry.data_epoch += 1;
         let response = inspect_response(volume_id, stored);
         self.persist(&mut state)?;
+        Ok(response)
+    }
+
+    fn report_attachment_state_inner(
+        &self,
+        volume_id: &VolumeId,
+        req: &ReportAttachmentStateRequest,
+    ) -> Result<ReportAttachmentStateResponse, ApiError> {
+        req.validate()?;
+        if !self
+            .capabilities()
+            .contains(Capability::AttachmentStateReport)
+        {
+            return Err(ApiError::not_found(format!(
+                "provider {} does not record attachment-state reports; attachment {} on \
+                 volume {volume_id} is not a reportable instance",
+                self.name(),
+                req.attachment_id
+            )));
+        }
+        let mut state = self.lock_state()?;
+        let applied;
+        let response = {
+            let stored = state
+                .volume_mut(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            let Some(record) = stored.runtime.attachment.as_mut() else {
+                return Err(ApiError::not_found(format!(
+                    "volume {volume_id} has no attachment"
+                )));
+            };
+            if record.id != req.attachment_id {
+                return Err(ApiError::not_found(format!(
+                    "attachment {} is not attached to volume {volume_id}",
+                    req.attachment_id
+                )));
+            }
+            // The generation is the detach fence: validate it, never advance it.
+            if req.expected_attachment_generation != record.generation {
+                return Err(ApiError::stale_generation(
+                    req.expected_attachment_generation,
+                    record.generation,
+                ));
+            }
+            applied = req.state > record.state;
+            if applied {
+                record.state = req.state;
+                record.state_revision += 1;
+                record.evidence = Some(req.evidence);
+                record.reporter.clone_from(&req.reporter);
+                record.recorded_at_ms = Some(unix_ms_now());
+            }
+            ReportAttachmentStateResponse {
+                attachment_id: record.id.clone(),
+                state: record.state,
+                state_revision: record.state_revision,
+                evidence: record.evidence,
+                reporter: record.reporter.clone(),
+                recorded_at_ms: record.recorded_at_ms,
+                attachment_generation: record.generation,
+                applied,
+            }
+        };
+        if applied {
+            self.persist(&mut state)?;
+        }
         Ok(response)
     }
 
@@ -2153,6 +2238,14 @@ impl VolumeProvider for LvmProvider {
         self.detach_volume_inner(volume_id, attachment_id, req)
     }
 
+    async fn report_attachment_state(
+        &self,
+        volume_id: &VolumeId,
+        req: &ReportAttachmentStateRequest,
+    ) -> Result<ReportAttachmentStateResponse, ApiError> {
+        self.report_attachment_state_inner(volume_id, req)
+    }
+
     async fn grow_volume(
         &self,
         volume_id: &VolumeId,
@@ -2394,12 +2487,36 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         // Unknown until proven; never a healthy default.
         health: Health::Unknown,
         attachment_ids: attachment.map(|a| vec![a.id.clone()]).unwrap_or_default(),
+        attachments: attachment
+            .map(|a| attachment_view(a, &stored.entry))
+            .into_iter()
+            .collect(),
         current_writer: attachment
             .filter(|a| a.access_mode == AccessMode::SingleWriter)
             .map(|a| a.id.clone()),
         backend_health: Health::Unknown,
         evidence_status: EvidenceStatus::PrototypeOnly,
         authority: None,
+    }
+}
+
+fn attachment_view(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachmentView {
+    AttachmentView {
+        attachment_id: record.id.clone(),
+        vm_id: record.vm_id.clone(),
+        host_id: record.host_id.clone(),
+        access_mode: record.access_mode,
+        attachment_generation: record.generation,
+        // Host-scoped, ephemeral backend handle; never a secret.
+        frontend: Frontend::VirtioBlk {
+            host_device_path: format!("/dev/{}/{}", entry.vg_name, entry.lv_name),
+        },
+        vmm_disk_id: record.vmm_disk_id.clone(),
+        state: record.state,
+        state_revision: record.state_revision,
+        evidence: record.evidence,
+        reporter: record.reporter.clone(),
+        recorded_at_ms: record.recorded_at_ms,
     }
 }
 
@@ -2413,7 +2530,8 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
         frontend: Frontend::VirtioBlk {
             host_device_path: format!("/dev/{}/{}", entry.vg_name, entry.lv_name),
         },
-        // No VMM integration exists: evidence honestly starts at Prepared.
-        state: AttachmentState::Prepared,
+        // A fresh record is provider-recorded Prepared; a replay answers
+        // the recorded evidence, exactly as the conformance fake does.
+        state: record.state,
     }
 }

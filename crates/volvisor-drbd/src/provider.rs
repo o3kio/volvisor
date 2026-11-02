@@ -63,10 +63,10 @@ use volvisor_types::domain::{
     LocalProtectionAxis, Provisioning, RemoteProtectionAxis, VolumeClass,
 };
 use volvisor_types::request::{
-    AccessModeRequest, AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest,
-    DeleteVolumeRequest, DetachVolumeRequest, ErasurePolicy, GrowGuestNotification,
-    GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
-    ReplicationModeRequest,
+    AccessModeRequest, AttachVolumeRequest, AttachVolumeResponse, AttachmentView,
+    CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, ErasurePolicy,
+    GrowGuestNotification, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
+    LocalProtectionModeRequest, ReplicationModeRequest,
 };
 use volvisor_types::{
     AdoptVolumeResponse, ApiError, ApiErrorCode, AttachmentId, AttachmentState, AuthoritySummary,
@@ -3249,6 +3249,7 @@ impl DrbdProvider {
                 if record.vm_id == req.vm_id
                     && record.host_id == req.host_id
                     && record.access_mode == mode
+                    && record.vmm_disk_id == req.vmm_disk_id
                 {
                     return Ok(attach_response(&record, &stored.entry));
                 }
@@ -3540,6 +3541,7 @@ impl DrbdProvider {
             generation: 1,
             access_mode: mode,
             device: format!("/dev/drbd{}", entry.minor),
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         let Some(stored) = state.volume_mut(volume_id) else {
             // Structurally unreachable (the lock is held and the entry
@@ -4150,6 +4152,7 @@ impl DrbdProvider {
                         && record.vm_id == req.vm_id
                         && record.host_id == req.host_id
                         && record.access_mode == mode
+                        && record.vmm_disk_id == req.vmm_disk_id
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
@@ -4333,6 +4336,7 @@ impl DrbdProvider {
             generation: 1,
             access_mode: mode,
             device,
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         // Re-acquire the record: the authority acquisition above ended
         // the earlier borrow when it saved the block.
@@ -6409,6 +6413,25 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         failure_domain: FailureDomain::Host,
         health: Health::Unknown,
         attachment_ids: attachment.map(|a| vec![a.id.clone()]).unwrap_or_default(),
+        attachments: attachment
+            .map(|a| AttachmentView {
+                attachment_id: a.id.clone(),
+                vm_id: a.vm_id.clone(),
+                host_id: a.host_id.clone(),
+                access_mode: a.access_mode,
+                attachment_generation: a.generation,
+                frontend: Frontend::VirtioBlk {
+                    host_device_path: a.device.clone(),
+                },
+                vmm_disk_id: a.vmm_disk_id.clone(),
+                state: AttachmentState::Prepared,
+                state_revision: volvisor_types::domain::initial_state_revision(),
+                evidence: None,
+                reporter: None,
+                recorded_at_ms: None,
+            })
+            .into_iter()
+            .collect(),
         current_writer: attachment
             .filter(|a| a.access_mode == AccessMode::SingleWriter)
             .map(|a| a.id.clone()),

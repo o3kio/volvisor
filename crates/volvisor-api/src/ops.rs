@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 use volvisor_journal::{IntentAppend, Journal};
 use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
-    GrowVolumeRequest, MoveVolumeBackingRequest,
+    GrowVolumeRequest, MoveVolumeBackingRequest, ReportAttachmentStateRequest,
 };
 use volvisor_types::{
     ApiError, ApiErrorBody, ApiErrorCode, AttachmentId, DeviceId, MigrationId, OperationId,
@@ -67,6 +67,9 @@ pub const OP_CREATE_VOLUME: &str = "create_volume";
 pub const OP_ATTACH_VOLUME: &str = "attach_volume";
 /// Operation kind: detach volume.
 pub const OP_DETACH_VOLUME: &str = "detach_volume";
+/// Operation kind: record a consumer-reported attachment state
+/// (`advertised`/`active`) — contract section 3.
+pub const OP_REPORT_ATTACHMENT_STATE: &str = "report_attachment_state";
 /// Operation kind: grow volume.
 pub const OP_GROW_VOLUME: &str = "grow_volume";
 /// Operation kind: delete volume.
@@ -113,10 +116,11 @@ pub const OP_PEER_DISCARD: &str = "peer_discard";
 /// either a matrix cell drives the kind, or the kind appears in the
 /// campaign's recorded-gaps table with its reason (never a silent
 /// cut).
-pub const ALL_OP_KINDS: [&str; 20] = [
+pub const ALL_OP_KINDS: [&str; 21] = [
     OP_CREATE_VOLUME,
     OP_ATTACH_VOLUME,
     OP_DETACH_VOLUME,
+    OP_REPORT_ATTACHMENT_STATE,
     OP_GROW_VOLUME,
     OP_DELETE_VOLUME,
     OP_MOVE_VOLUME_BACKING,
@@ -843,6 +847,17 @@ pub(crate) fn detach_hash(
         &req.api_version,
         &[volume_id.as_str(), attachment_id.as_str()],
     );
+    hashed.request_hash()
+}
+
+/// Immutable request hash for ReportAttachmentState (path volume folded
+/// in; the attachment id is already part of the typed request hash).
+pub(crate) fn report_attachment_state_hash(
+    req: &ReportAttachmentStateRequest,
+    volume_id: &VolumeId,
+) -> [u8; 32] {
+    let mut hashed = req.clone();
+    hashed.api_version = folded_domain(&req.api_version, &[volume_id.as_str()]);
     hashed.request_hash()
 }
 

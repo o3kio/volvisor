@@ -553,8 +553,12 @@ operation-id namespace hardening (F5 of PR #23's review) landed as PR
 followed by the Tier V resize notified leg proven against the pinned
 upstream v51.1 binary (#32, a second committed evidence bundle) and the
 convergence-horizon closure (#33, grant-hold lease renewal during parks
-plus the gated fresh-grant re-mint).
-The workspace suite stands at 1067 tests, and the campaign
+plus the gated fresh-grant re-mint); and, after this record's first
+draft, the corrected attachment-state reporting design of issue #34 is
+open for review as PR #35 — a hypervisor-neutral consumer-evidence route
+proven against the native-local LVM provider and the conformance fake,
+with no claim of a consumer integration, upstream VMM adoption, or merge.
+The workspace suite stands at 1086 tests, and the campaign
 certification (CG1–CG5) passed at every stage's head — the honesty
 rules of §0 held throughout: no artifact of P6–P9 claims production
 support, real-media durability, or anything else its evidence does not

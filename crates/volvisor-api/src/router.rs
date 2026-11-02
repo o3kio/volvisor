@@ -42,6 +42,10 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
             "/v2/volumes/{volume_id}/detach",
             post(handlers::detach_volume),
         )
+        .route(
+            "/v2/volumes/{volume_id}/attachment-state",
+            post(handlers::report_attachment_state),
+        )
         .route("/v2/volumes/{volume_id}/grow", post(handlers::grow_volume))
         .route(
             "/v2/volumes/{volume_id}/move-backing",

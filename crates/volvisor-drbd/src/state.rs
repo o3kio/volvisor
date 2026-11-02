@@ -238,6 +238,12 @@ pub struct AttachmentRecord {
     /// The host-scoped `/dev/drbdN` device this attachment promoted. It
     /// is a host-local, ephemeral handle — never a secret.
     pub device: String,
+    /// The consumer's own VMM device identity, when it supplied one at
+    /// attach (Volume API v2 section 3). `None` for records written before
+    /// this field existed and for attaches that carried no id; never
+    /// guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
 }
 
 /// A state entry whose backing could not be verified this pass.
@@ -711,6 +717,24 @@ pub(crate) fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_pre_report_attachment_record_loads_without_the_disk_id() {
+        // Old state files carry no `vmm_disk_id`: it loads as absent,
+        // never guessed.
+        let record: AttachmentRecord = serde_json::from_str(
+            r#"{
+                "id": "att-old",
+                "vm_id": "vm-old",
+                "host_id": "host-old",
+                "generation": 1,
+                "access_mode": "single_writer",
+                "device": "/dev/drbd7"
+            }"#,
+        )
+        .expect("a pre-report record loads unchanged");
+        assert_eq!(record.vmm_disk_id, None);
+    }
+
     fn sample_state() -> DrbdState {
         let volume_id = VolumeId::new("vol-1").expect("valid id");
         let project_id = ProjectId::new("tenant-a").expect("valid id");
@@ -746,6 +770,7 @@ mod tests {
                         generation: 1,
                         access_mode: AccessMode::SingleWriter,
                         device: "/dev/drbd7".to_owned(),
+                        vmm_disk_id: None,
                     }),
                 },
             },

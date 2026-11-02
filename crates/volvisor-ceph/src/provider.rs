@@ -42,9 +42,9 @@ use volvisor_types::domain::{
     LocalProtectionAxis, PoolProtection, Provisioning, RemoteProtectionAxis, VolumeClass,
 };
 use volvisor_types::request::{
-    AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest, DeleteVolumeRequest,
-    DetachVolumeRequest, ErasurePolicy, GrowGuestNotification, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
+    AttachVolumeRequest, AttachVolumeResponse, AttachmentView, CreateVolumeRequest,
+    DeleteVolumeRequest, DetachVolumeRequest, ErasurePolicy, GrowGuestNotification,
+    GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, Pool, PoolId,
@@ -1417,6 +1417,7 @@ impl CephRbdProvider {
                         && record.vm_id == req.vm_id
                         && record.host_id == req.host_id
                         && record.access_mode == mode
+                        && record.vmm_disk_id == req.vmm_disk_id
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
@@ -1476,6 +1477,7 @@ impl CephRbdProvider {
             generation: 1,
             access_mode: mode,
             device,
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         stored.runtime.attachment = Some(record.clone());
         stored.runtime.state = VolumeLifecycle::Attached;
@@ -2148,6 +2150,25 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
         // reflected on the read-only pool discovery surface instead.
         health: Health::Unknown,
         attachment_ids: attachment.map(|a| vec![a.id.clone()]).unwrap_or_default(),
+        attachments: attachment
+            .map(|a| AttachmentView {
+                attachment_id: a.id.clone(),
+                vm_id: a.vm_id.clone(),
+                host_id: a.host_id.clone(),
+                access_mode: a.access_mode,
+                attachment_generation: a.generation,
+                frontend: Frontend::VirtioBlk {
+                    host_device_path: a.device.clone(),
+                },
+                vmm_disk_id: a.vmm_disk_id.clone(),
+                state: AttachmentState::Prepared,
+                state_revision: volvisor_types::domain::initial_state_revision(),
+                evidence: None,
+                reporter: None,
+                recorded_at_ms: None,
+            })
+            .into_iter()
+            .collect(),
         current_writer: attachment
             .filter(|a| a.access_mode == AccessMode::SingleWriter)
             .map(|a| a.id.clone()),

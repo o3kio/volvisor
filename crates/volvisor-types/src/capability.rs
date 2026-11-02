@@ -43,6 +43,8 @@ pub enum Capability {
     ManagedCephOsd,
     /// Exclusive PCI passthrough attachment profile.
     PciPassthrough,
+    /// Consumer-reported attachment evidence (advertised/active).
+    AttachmentStateReport,
 }
 
 /// An owned set of capability tokens.
@@ -57,10 +59,18 @@ impl CapabilitySet {
         Self(items.into_iter().collect())
     }
 
-    /// The P0 native-local baseline: create, attach and grow only.
+    /// The P0 native-local baseline: create, attach, grow and consumer
+    /// attachment-state reporting. A provider adopting this preset must
+    /// implement `report_attachment_state` (or remove the token) so
+    /// advertisement and behavior cannot diverge.
     #[must_use]
     pub fn native_local_p0() -> Self {
-        Self::of([Capability::Create, Capability::Attach, Capability::Resize])
+        Self::of([
+            Capability::Create,
+            Capability::Attach,
+            Capability::Resize,
+            Capability::AttachmentStateReport,
+        ])
     }
 
     /// Whether the set contains the given capability.
@@ -120,6 +130,7 @@ impl Capability {
             Self::RbdClusterAdapter => "rbd_cluster_adapter",
             Self::ManagedCephOsd => "managed_ceph_osd",
             Self::PciPassthrough => "pci_passthrough",
+            Self::AttachmentStateReport => "attachment_state_report",
         }
     }
 }

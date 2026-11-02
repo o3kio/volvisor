@@ -17,10 +17,12 @@ use volvisor_lvm::state::LvmState;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
-    fixture_grow_request,
+    fixture_grow_request, fixture_report_request,
 };
 use volvisor_types::request::ErasurePolicy;
-use volvisor_types::{ApiErrorCode, DeviceId, VolumeId, VolumeLifecycle};
+use volvisor_types::{
+    ApiErrorCode, AttachmentEvidence, AttachmentState, DeviceId, VolumeId, VolumeLifecycle,
+};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -636,6 +638,150 @@ fn a_pre_p6b_attachment_record_loads_without_the_disk_id() {
     )
     .expect("a pre-P6-B record loads unchanged");
     assert_eq!(record.vmm_disk_id, None);
+    // Pre-report state files also lack the evidence fields: they load as
+    // the provider-recorded prepared state at revision 1, never as a
+    // fabricated observation.
+    assert_eq!(record.state, AttachmentState::Prepared);
+    assert_eq!(record.state_revision, 1);
+    assert_eq!(record.evidence, None);
+    assert_eq!(record.reporter, None);
+    assert_eq!(record.recorded_at_ms, None);
+}
+
+#[tokio::test]
+async fn attachment_id_reuse_after_detach_is_refused() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("reuse-vol", GIB))
+        .await
+        .expect("create");
+    let attach = fixture_attach_request("reuse-vol", "reuse-att", 1);
+    let first = fixture
+        .provider
+        .attach_volume(&created.volume_id, &attach)
+        .await
+        .expect("attach");
+    let detached = fixture
+        .provider
+        .detach_volume(
+            &created.volume_id,
+            &first.attachment_id,
+            &fixture_detach_request("reuse-att", first.attachment_generation),
+        )
+        .await
+        .expect("detach");
+
+    // A report-capable provider refuses to reuse a consumed id: a delayed
+    // report from the old instance must never label a new one.
+    let reused = fixture_attach_request("reuse-vol", "reuse-att", detached.generation);
+    let err = fixture
+        .provider
+        .attach_volume(&created.volume_id, &reused)
+        .await
+        .expect_err("consumed attachment id reuse");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+
+    // The tombstone is durable: a restart still refuses the reuse.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let err = restarted
+        .attach_volume(&created.volume_id, &reused)
+        .await
+        .expect_err("consumed attachment id reuse after restart");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+
+    // A fresh id is admitted normally.
+    let fresh = fixture_attach_request("reuse-vol", "reuse-att-2", detached.generation);
+    restarted
+        .attach_volume(&created.volume_id, &fresh)
+        .await
+        .expect("fresh attachment id");
+}
+
+#[tokio::test]
+async fn report_state_survives_a_provider_restart_and_never_moves_the_generation() {
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("report-restart-vol", GIB))
+        .await
+        .expect("create");
+    let attach = fixture_attach_request("report-restart-vol", "report-restart-att", 1);
+    let first = fixture
+        .provider
+        .attach_volume(&created.volume_id, &attach)
+        .await
+        .expect("attach");
+    let reported = fixture
+        .provider
+        .report_attachment_state(
+            &created.volume_id,
+            &fixture_report_request(
+                "report-restart-att",
+                first.attachment_generation,
+                AttachmentState::Advertised,
+                AttachmentEvidence::VmmConfigured,
+            ),
+        )
+        .await
+        .expect("report advertised");
+    assert!(reported.applied);
+    assert_eq!(reported.state_revision, 2);
+    assert_eq!(reported.attachment_generation, first.attachment_generation);
+    assert_eq!(reported.reporter.as_deref(), Some("conformance-vmm"));
+
+    // The durable state file is the source of truth across a restart.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&created.volume_id)
+        .await
+        .expect("inspect after restart");
+    let view = inspected
+        .attachments
+        .iter()
+        .find(|view| view.attachment_id == first.attachment_id)
+        .expect("the reported attachment view");
+    assert_eq!(view.state, AttachmentState::Advertised);
+    assert_eq!(view.state_revision, 2);
+    assert_eq!(view.evidence, Some(AttachmentEvidence::VmmConfigured));
+    assert_eq!(view.reporter.as_deref(), Some("conformance-vmm"));
+    assert_eq!(view.recorded_at_ms, reported.recorded_at_ms);
+    assert_eq!(view.attachment_generation, first.attachment_generation);
+
+    // The revision continues from the persisted value, not from 1.
+    let advanced = restarted
+        .report_attachment_state(
+            &created.volume_id,
+            &fixture_report_request(
+                "report-restart-att",
+                first.attachment_generation,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .expect("report active after restart");
+    assert!(advanced.applied);
+    assert_eq!(advanced.state_revision, 3);
+    assert_eq!(advanced.evidence, Some(AttachmentEvidence::GuestConfirmed));
+
+    // A provider-level attach replay answers the recorded evidence, not a
+    // fresh `prepared` (the conformance fake does the same).
+    let replayed = restarted
+        .attach_volume(&created.volume_id, &attach)
+        .await
+        .expect("attach replay after a report");
+    assert_eq!(replayed.state, AttachmentState::Active);
+
+    // Reports never moved the generation: detach still fences on it.
+    restarted
+        .detach_volume(
+            &created.volume_id,
+            &first.attachment_id,
+            &fixture_detach_request("report-restart-att", first.attachment_generation),
+        )
+        .await
+        .expect("detach at the unchanged generation");
 }
 
 // ---------------------------------------------------------------------------

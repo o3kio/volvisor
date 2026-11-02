@@ -1,6 +1,6 @@
 # Volvisor volume API contract v2
 
-Status: Proposed — normative for SPEC-0002; not implemented
+Status: Proposed — normative for SPEC-0002; partially implemented (see per-section notes)
 Version: 2
 Date: 2026-10-09
 Related: [ADR-0003](../docs/adr/0003-tiered-volume-virtualization.md), [SPEC-0002](../docs/specs/SPEC-0002-volvisor-volume-virtualization.md), [Nearline contract v2](nearline-replication-v2.md)
@@ -52,9 +52,30 @@ Expose:
 ```text
 volume_id, backend_class, project_id, generation, state,
 provisioned_bytes, allocated_bytes, effective_protection,
-failure_domain, health, attachment_ids, current_writer,
+failure_domain, health, attachment_ids, attachments[], current_writer,
 backend_health, evidence_status
 ```
+
+Each entry in `attachments[]` is the full, hypervisor-neutral per-attachment
+projection a consumer reconciles against:
+
+```text
+attachment_id, vm_id, host_id, access_mode, attachment_generation,
+frontend, vmm_disk_id, state, state_revision, evidence, reporter,
+recorded_at_ms
+```
+
+`attachment_generation` is the **detach-fencing token**. `state_revision` is the
+monotonic evidence revision and is the only ordering input for `state`
+advancement; `recorded_at_ms` is a server-assigned receipt timestamp and never
+an ordering authority. `evidence` and `reporter` describe the current state's
+basis and are absent for a provider-recorded `prepared` attachment. The array
+is additive: older payloads without it decode as empty, and consumers must
+tolerate unknown additive fields. Its order is not significant: consumers
+reconcile by `attachment_id`, never by position (first-party providers may
+emit attachment-id order or a single element). `attachment_ids` and
+`current_writer` remain for compatibility; `attachments[]` is authoritative
+when present.
 
 A backend may add typed details, but any unsupported status must report `unknown`, not false healthy. For `ceph-rbd`, reflect actual Ceph pool/OSD policy/health; for nearline, expose per-replica progress and data-loss risk; for native, show disk/pool/mirror health.
 
@@ -75,12 +96,17 @@ authority: { epoch, lease_state, holder, lease_remaining_secs }
 - volumes of other classes, and nearline volumes without witness
   management, omit the section entirely.
 
-## 3. AttachVolume / DetachVolume
+## 3. AttachVolume / DetachVolume / ReportAttachmentState
 
 ```text
 Attach(volume_id, vm_id, host_id, attachment_id, expected_volume_generation,
        access_mode=single_writer, requested_frontend, vmm_disk_id, idempotency_key)
 Detach(attachment_id, expected_attachment_generation, vm_stopped_or_io_drained_proof)
+ReportAttachmentState(volume_id, attachment_id, expected_attachment_generation,
+                      state=advertised|active, evidence=vmm_configured|guest_confirmed,
+                      reporter?, detail?, operation_id)
+  -> attachment_id, state, state_revision, evidence, reporter, recorded_at_ms,
+     attachment_generation, applied
 ```
 
 Conditions:
@@ -98,6 +124,62 @@ Conditions:
 - detach cannot release authority until in-flight writes are drained and stale device handles rejected;
 - stale generations return a typed conflict, not success;
 - a crash must not fabricate a second attachment.
+
+### Attachment-state reporting
+
+A consumer — any VMM integration, not only Cloud Hypervisor (QEMU/KVM, Proxmox
+VE and others share the same contract) — reports observed evidence through
+`POST /v2/volumes/{volume_id}/attachment-state` with the `attachment_id` in the
+JSON body (consistent with detach). The report is a **consumer attestation**:
+volvisor records it verbatim and never promotes it to a provider-verified fact.
+
+- Evidence rank is `prepared < advertised < active`. A report may only move
+  **up**; an equal or lower report is a successful idempotent no-op
+  (`applied=false`) carrying the current projection. There is no downgrade.
+- `advertised` requires `vmm_configured` or `guest_confirmed`; `active`
+  requires `guest_confirmed`. `prepared` is provider-recorded and is not a
+  reportable target.
+- `expected_attachment_generation` is a required instance precondition: a
+  mismatch fails with `STALE_GENERATION`. A report **never advances**
+  `attachment_generation` — that token remains the detach fence.
+- `state_revision` starts at `1` for a freshly attached instance and is scoped
+  to that instance; it advances by one only when a report applies. A no-op
+  report leaves the projection (including `evidence`, `reporter` and
+  `recorded_at_ms`) untouched. `recorded_at_ms` is server-assigned (Unix ms);
+  ordering depends only on `state_revision`.
+- An unknown or detached attachment is `NOT_FOUND` for a new `operation_id`.
+  Replaying a recorded `operation_id` returns the recorded outcome verbatim.
+- `detail` is optional, bounded to 1024 bytes, and is journal-only diagnostic
+  context: it is not part of the current projection. `reporter` is an
+  untrusted label, never authentication; when present it must be non-empty,
+  is bounded to 1024 bytes, and must not contain control characters (a label
+  cannot carry log injection).
+- The report is journaled like every other mutation (same idempotency rules,
+  section 7). Refusals split by where they occur: an **envelope** refusal
+  (invalid api version, `prepared` target, unsupported evidence/state pairing,
+  malformed or reserved `operation_id`, unknown fields, over-long `detail`,
+  or an over-long, empty or control-bearing `reporter`) is detected before
+  the journal write,
+  so the `operation_id` remains reusable. A **stale-generation** or
+  **not-found** refusal is detected by the provider after the journaled intent
+  and is recorded as a terminal outcome; the `operation_id` is consumed and
+  the recorded refusal replays verbatim, exactly like an apply.
+- The phase is per-attachment-instance evidence, not liveness. Removing the
+  frontend from the VMM must be followed by detach; it cannot un-report active.
+- A report never fabricates a `prepared` transition and never downgrades. When
+  a consumer needs to re-observe, it reads `attachments[]`; it does not replay
+  an old report.
+- Attachment ids must be unique for a volume's lifetime; a re-attach is a new
+  instance even if its generation restarts at `1`. Consumers must mint a fresh
+  id per attach. A provider that advertises `attachment_state_report` must
+  enforce this by refusing a consumed id with `IDEMPOTENCY_CONFLICT`, so a
+  delayed report can never be attributed to a new instance; providers without
+  the capability are not required to retain the tombstone.
+- **Implementation subset (not a wider claim):** this revision is implemented
+  by the `native-local` LVM provider and the conformance fake. `ceph-rbd` and
+  `nearline-replicated` (DRBD) do not advertise `attachment_state_report` and
+  answer the route's typed `NOT_FOUND`. The route and types are
+  hypervisor-neutral; no consumer-specific field is defined here.
 
 Ceph RBD exclusive-lock alone is not a substitute for O3K attachment authorization. For nearline, attachment admission must enforce authoritative writer epochs end-to-end.
 
@@ -232,7 +314,12 @@ Versioned provider capabilities:
 `create`, `attach`, `resize`, `snapshot`, `clone`, `local_mirror`,
 `encryption`, `replicate`, `live_migrate`, `offline_copy`,
 `same_vg_extent_move`, `same_host_live_backing_move`,
-`rbd_cluster_adapter`, `managed_ceph_osd`, `pci_passthrough`.
+`rbd_cluster_adapter`, `managed_ceph_osd`, `pci_passthrough`,
+`attachment_state_report`.
+`attachment_state_report` gates section 3's consumer evidence reporting. It is
+advertised by the providers that qualify it (the native-local LVM provider and
+the conformance fake); a provider without it answers the route's typed
+`NOT_FOUND` (the default trait behavior), never a silent accept.
 `managed_ceph_osd` includes the separately gated, disabled-by-default
 experimental `rook-cell-experimental` deployment mode ([ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)); it is not a fourth volume class.
 
