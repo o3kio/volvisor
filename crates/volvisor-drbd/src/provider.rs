@@ -3540,6 +3540,7 @@ impl DrbdProvider {
             generation: 1,
             access_mode: mode,
             device: format!("/dev/drbd{}", entry.minor),
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         let Some(stored) = state.volume_mut(volume_id) else {
             // Structurally unreachable (the lock is held and the entry
@@ -4150,6 +4151,7 @@ impl DrbdProvider {
                         && record.vm_id == req.vm_id
                         && record.host_id == req.host_id
                         && record.access_mode == mode
+                        && record.vmm_disk_id == req.vmm_disk_id
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
@@ -4333,6 +4335,7 @@ impl DrbdProvider {
             generation: 1,
             access_mode: mode,
             device,
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         // Re-acquire the record: the authority acquisition above ended
         // the earlier borrow when it saved the block.
@@ -6419,7 +6422,7 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
                 frontend: Frontend::VirtioBlk {
                     host_device_path: a.device.clone(),
                 },
-                vmm_disk_id: None,
+                vmm_disk_id: a.vmm_disk_id.clone(),
                 state: AttachmentState::Prepared,
                 state_revision: volvisor_types::domain::initial_state_revision(),
                 evidence: None,

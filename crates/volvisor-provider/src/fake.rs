@@ -1537,6 +1537,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_replay_conflicts_on_a_different_vmm_disk_id() {
+        let provider = FakeProvider::new();
+        let created = provider
+            .create_volume(&fixture_create_request("fake-id-vol", GIB))
+            .await
+            .expect("create");
+        let mut request = fixture_attach_request("fake-id-vol", "fake-id-att", 1);
+        request.vmm_disk_id = Some("disk-one".to_owned());
+        provider
+            .attach_volume(&created.volume_id, &request)
+            .await
+            .expect("attach");
+
+        // The recorded mapping is the durable truth: the same attachment
+        // id with a different VMM disk id is a conflict, never a replay.
+        let mut conflicting = fixture_attach_request("fake-id-vol", "fake-id-att", 1);
+        conflicting.vmm_disk_id = Some("disk-two".to_owned());
+        let err = provider
+            .attach_volume(&created.volume_id, &conflicting)
+            .await
+            .expect_err("disk id mismatch");
+        assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+    }
+
+    #[tokio::test]
     async fn report_requires_the_capability() {
         // The optional surface is capability-gated: a provider that does
         // not advertise it answers the typed NOT_FOUND, never a silent

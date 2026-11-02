@@ -748,6 +748,23 @@ async fn report_state_survives_a_provider_restart_and_never_moves_the_generation
     assert_eq!(view.recorded_at_ms, reported.recorded_at_ms);
     assert_eq!(view.attachment_generation, first.attachment_generation);
 
+    // The revision continues from the persisted value, not from 1.
+    let advanced = restarted
+        .report_attachment_state(
+            &created.volume_id,
+            &fixture_report_request(
+                "report-restart-att",
+                first.attachment_generation,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+        .expect("report active after restart");
+    assert!(advanced.applied);
+    assert_eq!(advanced.state_revision, 3);
+    assert_eq!(advanced.evidence, Some(AttachmentEvidence::GuestConfirmed));
+
     // Reports never moved the generation: detach still fences on it.
     restarted
         .detach_volume(

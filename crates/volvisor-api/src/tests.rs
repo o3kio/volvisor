@@ -602,6 +602,183 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(reuse_body["code"], json!("IDEMPOTENCY_CONFLICT"));
 }
 
+/// Report envelope rejections happen before the journal: no record, and
+/// the `operation_id` stays reusable for a corrected request.
+#[tokio::test]
+async fn report_envelope_rejections_leave_no_journal_record() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-report-envelope", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let attach = serde_json::to_value(fixture_attach_request(
+        "vol-report-envelope",
+        "att-report-envelope",
+        1,
+    ))
+    .expect("serialize attach fixture");
+    let (status, _) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report-envelope/attach",
+            &attach,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let records_after_attach = journal_record_count(&state);
+
+    // `active` with only `vmm_configured` is an invalid envelope pairing.
+    let mut malformed = serde_json::to_value(fixture_report_request(
+        "att-report-envelope",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::VmmConfigured,
+    ))
+    .expect("serialize report fixture");
+    malformed["operation_id"] = json!("op-report-envelope");
+    malformed["state"] = json!("active");
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report-envelope/attachment-state",
+            &malformed,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "envelope: {body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
+    assert_eq!(journal_record_count(&state), records_after_attach);
+
+    // A control-bearing reporter is also a pre-journal envelope refusal.
+    let mut bad_reporter = serde_json::to_value(fixture_report_request(
+        "att-report-envelope",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::VmmConfigured,
+    ))
+    .expect("serialize report fixture");
+    bad_reporter["operation_id"] = json!("op-report-bad-reporter");
+    bad_reporter["reporter"] = json!("chv\nagent");
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report-envelope/attachment-state",
+            &bad_reporter,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "envelope: {body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
+    assert_eq!(journal_record_count(&state), records_after_attach);
+
+    // The same operation_id, now with a well-formed envelope, applies —
+    // the rejected attempt left no journal record behind.
+    let mut corrected = serde_json::to_value(fixture_report_request(
+        "att-report-envelope",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::VmmConfigured,
+    ))
+    .expect("serialize report fixture");
+    corrected["operation_id"] = json!("op-report-envelope");
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report-envelope/attachment-state",
+            &corrected,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "corrected envelope: {body}");
+    assert_eq!(body["applied"], json!(true));
+    assert_eq!(body["state"], json!("advertised"));
+}
+
+/// A provider that does not advertise `attachment_state_report` answers the
+/// typed NOT_FOUND, and that refusal is a journaled terminal outcome: the
+/// recorded bytes replay under the same operation id.
+#[tokio::test]
+async fn report_without_the_capability_is_a_journaled_not_found_that_replays() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new().with_capabilities(
+        volvisor_types::CapabilitySet::of([
+            volvisor_types::Capability::Create,
+            volvisor_types::Capability::Attach,
+            volvisor_types::Capability::Resize,
+        ]),
+    ));
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let state = Arc::new(AppState::new(
+        provider,
+        Some(admin),
+        journal,
+        Some(TEST_TOKEN.to_owned()),
+    ));
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-no-cap-report", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let attach = serde_json::to_value(fixture_attach_request(
+        "vol-no-cap-report",
+        "att-no-cap-report",
+        1,
+    ))
+    .expect("serialize attach fixture");
+    let (status, _) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-no-cap-report/attach",
+            &attach,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let report = serde_json::to_value(fixture_report_request(
+        "att-no-cap-report",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::VmmConfigured,
+    ))
+    .expect("serialize report fixture");
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-no-cap-report/attachment-state",
+            &report,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], json!("NOT_FOUND"));
+    let records = journal_record_count(&state);
+
+    let (status, replayed) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-no-cap-report/attachment-state",
+            &report,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(replayed, body, "a journaled refusal replays verbatim");
+    assert_eq!(journal_record_count(&state), records);
+}
+
 // ---------------------------------------------------------------------------
 // Idempotency
 // ---------------------------------------------------------------------------

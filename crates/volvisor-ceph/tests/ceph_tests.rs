@@ -1241,6 +1241,43 @@ async fn attach_replay_is_idempotent_and_conflicts_are_typed() {
 }
 
 #[tokio::test]
+async fn attach_records_the_vmm_disk_id_and_conflicts_on_a_change() {
+    let fixture = fixture();
+    let id = volume_id("disk-id-att");
+    fixture
+        .provider
+        .create_volume(&create_request("disk-id-att", MIB))
+        .await
+        .expect("create");
+    let mut request = fixture_attach_request("disk-id-att", "disk-id-att-1", 1);
+    request.vmm_disk_id = Some("disk-one".to_owned());
+    fixture
+        .provider
+        .attach_volume(&id, &request)
+        .await
+        .expect("attach");
+
+    let inspected = fixture.provider.inspect_volume(&id).await.expect("inspect");
+    assert_eq!(
+        inspected.attachments[0].vmm_disk_id.as_deref(),
+        Some("disk-one"),
+        "the consumer's disk id is recorded and projected"
+    );
+    assert_eq!(inspected.attachments[0].state, AttachmentState::Prepared);
+
+    // The recorded mapping is the durable truth: the same attachment id
+    // with a different VMM disk id is a conflict, never a replay.
+    let mut conflicting = request.clone();
+    conflicting.vmm_disk_id = Some("disk-two".to_owned());
+    let err = fixture
+        .provider
+        .attach_volume(&id, &conflicting)
+        .await
+        .expect_err("disk id mismatch");
+    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
 async fn attach_replay_survives_a_provider_restart() {
     let fixture = fixture();
     let id = volume_id("restart-att");

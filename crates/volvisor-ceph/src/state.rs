@@ -91,6 +91,11 @@ pub struct AttachmentRecord {
     /// The host-scoped `/dev/rbd*` device this attachment mapped. It is a
     /// host-local, ephemeral handle — never a secret.
     pub device: String,
+    /// The consumer's own VMM device identity, when it supplied one at
+    /// attach (Volume API v2 section 3). `None` for pre-P6-B records and
+    /// for attaches that carried no id; never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
 }
 
 /// A state entry whose backing could not be verified this pass.
@@ -381,6 +386,7 @@ mod tests {
                         generation: 1,
                         access_mode: AccessMode::SingleWriter,
                         device: "/dev/rbd0".to_owned(),
+                        vmm_disk_id: None,
                     }),
                 },
             },

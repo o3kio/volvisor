@@ -151,13 +151,15 @@ volvisor records it verbatim and never promotes it to a provider-verified fact.
   Replaying a recorded `operation_id` returns the recorded outcome verbatim.
 - `detail` is optional, bounded to 1024 bytes, and is journal-only diagnostic
   context: it is not part of the current projection. `reporter` is an
-  untrusted label, never authentication; it is bounded to 1024 bytes and must
-  not contain ASCII control characters (a label cannot carry log injection).
+  untrusted label, never authentication; when present it must be non-empty,
+  is bounded to 1024 bytes, and must not contain control characters (a label
+  cannot carry log injection).
 - The report is journaled like every other mutation (same idempotency rules,
   section 7). Refusals split by where they occur: an **envelope** refusal
   (invalid api version, `prepared` target, unsupported evidence/state pairing,
-  malformed or reserved `operation_id`, unknown fields, over-long or
-  control-bearing `reporter`/`detail`) is detected before the journal write,
+  malformed or reserved `operation_id`, unknown fields, over-long `detail`,
+  or an over-long, empty or control-bearing `reporter`) is detected before
+  the journal write,
   so the `operation_id` remains reusable. A **stale-generation** or
   **not-found** refusal is detected by the provider after the journaled intent
   and is recorded as a terminal outcome; the `operation_id` is consumed and

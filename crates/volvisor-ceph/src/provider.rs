@@ -1417,6 +1417,7 @@ impl CephRbdProvider {
                         && record.vm_id == req.vm_id
                         && record.host_id == req.host_id
                         && record.access_mode == mode
+                        && record.vmm_disk_id == req.vmm_disk_id
                     {
                         return Ok(attach_response(record, &stored.entry));
                     }
@@ -1476,6 +1477,7 @@ impl CephRbdProvider {
             generation: 1,
             access_mode: mode,
             device,
+            vmm_disk_id: req.vmm_disk_id.clone(),
         };
         stored.runtime.attachment = Some(record.clone());
         stored.runtime.state = VolumeLifecycle::Attached;
@@ -2158,7 +2160,7 @@ fn inspect_response(volume_id: &VolumeId, stored: &StoredVolume) -> InspectVolum
                 frontend: Frontend::VirtioBlk {
                     host_device_path: a.device.clone(),
                 },
-                vmm_disk_id: None,
+                vmm_disk_id: a.vmm_disk_id.clone(),
                 state: AttachmentState::Prepared,
                 state_revision: volvisor_types::domain::initial_state_revision(),
                 evidence: None,
