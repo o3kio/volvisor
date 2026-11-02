@@ -68,6 +68,131 @@ jobs:
                   ;;
           esac
 
+  # Machine-readable release scope (release-scope.toml). This is the
+  # single source of truth for which providers the release claims:
+  # supported providers become rows in the real-backends matrix, not-run
+  # providers are explicit non-claims in the generated release notes.
+  # There is no hardcoded provider list in this workflow.
+  scope:
+    needs: guard
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.scope.outputs.matrix }}
+      supported_count: ${{ steps.scope.outputs.supported_count }}
+      supported_providers: ${{ steps.scope.outputs.supported_providers }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the release scope
+        run: python3 scripts/release-scope.py check
+      - name: Emit the required real-backend suites
+        id: scope
+        run: python3 scripts/release-scope.py matrix >> "$GITHUB_OUTPUT"
+
+  # Reusable real-backend suite, called once per provider whose scope
+  # status is `supported`. A missing runner, missing secret, failed run
+  # or skipped test fails the matrix job; fail-fast is off so the
+  # evidence bundle captures every suite that did run.
+  real-backends:
+    needs: [guard, scope]
+    if: needs.scope.outputs.supported_count != '0'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    uses: ./.github/workflows/real-backends.yaml
+    with:
+      suite: ${{ matrix.suite }}
+    secrets: inherit
+
+  # The gate the publish job needs. It is deliberately separate from the
+  # matrix job so a zero-provider scope is expressible without a skipped
+  # dependency silently allowing publish: supported_count == 0 is the
+  # only case where "nothing ran" is a pass, and it is printed. Any
+  # failure, cancellation or skip of a supported suite fails this job.
+  real-backends-gate:
+    needs: [scope, real-backends]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce the real-backend release gate
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SUPPORTED_COUNT: ${{ needs.scope.outputs.supported_count }}
+          SUITE_RESULT: ${{ needs.real-backends.result }}
+        run: |
+          set -eu
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "real-backends gate: release-scope parsing failed ($SCOPE_RESULT);" >&2
+            echo "publishing is refused because the provider claims are unknown." >&2
+            exit 1
+          fi
+          case "$SUPPORTED_COUNT" in
+            ''|*[!0-9]*)
+              echo "real-backends gate: supported_count is not numeric ('$SUPPORTED_COUNT');" >&2
+              echo "publishing is refused." >&2
+              exit 1
+              ;;
+          esac
+          if [ "$SUPPORTED_COUNT" -eq 0 ]; then
+            echo "real-backends gate: release-scope.toml declares no supported provider."
+            echo "Nothing is claimed; publishing may proceed with only explicit not-run providers."
+            exit 0
+          fi
+          if [ "$SUITE_RESULT" != "success" ]; then
+            echo "real-backends gate: a supported provider's suite did not run and pass" >&2
+            echo "(matrix result: $SUITE_RESULT). Missing infrastructure is a failure," >&2
+            echo "not a skip. Publishing is refused. Evidence: real-backends-* artifacts." >&2
+            exit 1
+          fi
+          echo "real-backends gate: all supported provider suites ran and passed."
+
+  # Collect every per-suite evidence directory for the release. This job
+  # runs even when a suite failed so the failure is triageable; publish
+  # is still blocked by real-backends-gate.
+  evidence-bundle:
+    needs: [scope, real-backends, real-backends-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download per-suite evidence
+        if: needs.scope.outputs.supported_count != '0' && needs.scope.outputs.supported_count != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: real-backends-*
+          path: real-backends-evidence
+          merge-multiple: true
+      - name: Write the evidence manifest
+        run: |
+          set -eu
+          mkdir -p real-backends-evidence
+          cp release-scope.toml real-backends-evidence/release-scope.toml
+          {
+            echo "# Real-backend release evidence"
+            echo
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- run: \`$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\`"
+            echo "- scope job: ${{ needs.scope.result }}"
+            echo "- suite matrix: ${{ needs.real-backends.result }}"
+            echo "- gate: ${{ needs.real-backends-gate.result }}"
+            echo "- generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## Declared scope"
+            echo
+            python3 scripts/release-scope.py check
+            echo
+            echo "## Collected evidence"
+            echo
+            find real-backends-evidence -maxdepth 2 -type f | sort || true
+          } > real-backends-evidence/README.md
+      - name: Upload the evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-backends-evidence
+          path: real-backends-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
   # The same gate set ci.yaml enforces per change (check + the LVM
   # feature surface), re-run for the exact release commit. This job
   # duplicates ci.yaml's steps deliberately: a release must not
@@ -246,8 +371,13 @@ jobs:
 
   # Tag builds only. workflow_dispatch runs prove the graph without
   # publishing anything.
-  release:
-    needs: [build, smoke]
+  publish:
+    # The publish job. The real-backends gate is a hard
+    # dependency: a supported provider whose suite did not run and pass
+    # fails real-backends-gate, so this job is skipped (never a silent
+    # publish). The evidence bundle is also required so every release
+    # carries the logs/JUnit it was gated on.
+    needs: [build, smoke, scope, real-backends-gate, evidence-bundle]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -255,6 +385,9 @@ jobs:
     env:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
       - uses: actions/download-artifact@v4
         with:
           name: packages
@@ -263,6 +396,15 @@ jobs:
         with:
           name: certification
           path: certification
+      - uses: actions/download-artifact@v4
+        with:
+          name: real-backends-evidence
+          path: real-backends-evidence
+      - name: Render the provider release scope
+        run: |
+          set -eu
+          python3 scripts/release-scope.py notes \
+            --sha "$GITHUB_SHA" --gate-state passed > provider-scope.md
       - name: Assemble the release notes
         run: |
           set -eu
@@ -277,11 +419,14 @@ jobs:
             echo
             cat certification/certification-summary.md
             echo
+            cat provider-scope.md
+            echo
             echo "## Artifacts"
             echo
             echo '- `volvisor_'"$VERSION"'_amd64.deb` — Debian/Ubuntu package'
             echo '- `volvisor-'"$VERSION"'-1.x86_64.rpm` — EL/Fedora package'
             echo '- `volvisor-'"$VERSION"'-x86_64-unknown-linux-gnu.tar.gz` — both release binaries'
+            echo '- `volvisor-'"$VERSION"'-real-backends-evidence.tar.gz` — per-provider logs, JUnit and gate manifest for this release'
             echo '- `SHA256SUMS` — checksums over the above; verify with `sha256sum -c SHA256SUMS`'
             echo '- `BUILD_INFO.txt` — the exact toolchain and build environment'
             echo
@@ -307,15 +452,20 @@ jobs:
             echo
             echo "Verified by this pipeline: the full gate set (fmt, clippy on"
             echo "both feature sets, the workspace test suite, cargo doc, the"
-            echo "real-LVM integration suite) and the campaign certification on"
-            echo "this exact commit; installation of both packages in stock"
+            echo "real-LVM integration suite), the campaign certification on"
+            echo "this exact commit, and the real-backend suite of every"
+            echo "provider declared \`supported\` in \`release-scope.toml\`"
+            echo "(see the Provider release scope table above); installation of"
+            echo "both packages in stock"
             echo "\`debian:stable\` and \`fedora:latest\` containers with dependency"
             echo "resolution, both binaries' version stamps, --check-config"
             echo "against the shipped example configs, the shipped file layout,"
             echo "and systemd-analyze verify of the installed units."
             echo
-            echo "Not verified (recorded, not skipped): unit START in the"
-            echo "container smokes — the containers do not run systemd as PID"
+            echo "Not verified (recorded, not skipped): any provider declared"
+            echo "\`not-run\` in \`release-scope.toml\` is explicitly NOT claimed"
+            echo "by this release; it has no suite result to cite. Unit START in"
+            echo "the container smokes — the containers do not run systemd as PID"
             echo "1; that path was verified against a real systemd in P7-B's"
             echo "sandbox smoke and is not re-proven per release. No package"
             echo "upgrade/downgrade transitions. A single architecture"
@@ -339,6 +489,12 @@ jobs:
             echo
             echo "</details>"
           } > dist/release-notes.md
+      - name: Bundle the real-backend evidence
+        run: |
+          set -eu
+          tar -czf "dist/volvisor-${VERSION}-real-backends-evidence.tar.gz" \
+            -C real-backends-evidence .
+          ( cd dist && sha256sum "volvisor-${VERSION}-real-backends-evidence.tar.gz" >> SHA256SUMS )
       - name: Create the release (tag builds only)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,6 +505,7 @@ jobs:
             "volvisor_${VERSION}_amd64.deb" \
             volvisor-*.x86_64.rpm \
             "volvisor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "volvisor-${VERSION}-real-backends-evidence.tar.gz" \
             SHA256SUMS BUILD_INFO.txt \
             --title "Volvisor $VERSION" \
             --notes-file release-notes.md

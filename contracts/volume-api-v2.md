@@ -412,3 +412,21 @@ incomplete fence leaves the lease to expire at the witness under its fence
 window), and the tracked entry is resolved through volume management (a
 retry adopt is the typed `INVALID_STATE` "already exists" refusal until the
 failed entry is deleted); there is no invisible re-adoption.
+
+## 11. Durable state and upgrades
+
+The provider-internal state behind this API (intent journal, LVM/Ceph/DRBD
+state, migration records and peer preparations) is versioned and
+fail-closed. A file declaring a newer schema than the running build is
+refused with a typed `INTERNAL` error and is never partially decoded,
+truncated or rewritten; an unknown field at a supported version is likewise
+a refusal, never silent field loss. Older supported files are read in place
+and upgraded only by their first successful write. There is no in-place
+downgrade: rollback requires restoring a pre-upgrade state backup and
+matching binary.
+
+The exact stores, version carriers, N-1/N-2 fixture matrix and rollback
+procedure are specified by
+[schema compatibility](../docs/schema-compatibility.md) and enforced by the
+workspace test job. This policy is implementation-facing; it does not add a
+tenant API error code.

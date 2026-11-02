@@ -1,0 +1,27 @@
+{
+  "volumes": {
+    "vol-upgrade-tombstone": {
+      "entry": {
+        "vg_name": "vg-volvisor",
+        "lv_name": "vol-vol-upgrade-tombstone-abcd1234",
+        "size_bytes": 1073741824,
+        "requested_size_bytes": 1073741824,
+        "generation": 9,
+        "data_epoch": 4,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null,
+        "retired_attachment_ids": [
+          "att-retired-oldest",
+          "att-retired-newer"
+        ]
+      }
+    }
+  },
+  "devices": {},
+  "moves": {}
+}

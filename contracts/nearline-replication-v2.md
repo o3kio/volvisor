@@ -32,6 +32,14 @@ block is derived rather than independently maintained.
 
 Sequence numbers without a lineage/epoch are not enough. `local_protection_health` is the runtime health of that replica's `local_protection` policy (section 3). A replica's `durable_prefix` must be a **contiguous exact-lineage prefix**; holes and reordered writes may never be declared durable merely because a later sequence reached disk. Durable metadata and payload must survive loss of the processes or host according to the published ACK contract.
 
+The on-disk form of that state (the DRBD provider state, migration records,
+peer target preparations and the intent journal) follows the
+[schema compatibility policy](../docs/schema-compatibility.md): explicit
+versions, strict decode with no silent field loss, typed refusal of newer
+formats, and no in-place downgrade. A migration record and its peer
+preparation must never be interpreted at a version this build does not
+support; the record is authority-relevant state, not an advisory cache.
+
 ## 2. Writer authority / quorum
 
 One writable authority per volume. Epochs increase monotonically, including after crash, promotion, cancellation and failback. A stale writer's I/O must be rejected at an enforcement point it cannot bypass (including stale host-native device mappings), not merely by a control-plane status flag.

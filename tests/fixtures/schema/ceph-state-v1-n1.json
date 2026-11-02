@@ -1,0 +1,27 @@
+{
+  "volumes": {
+    "vol-ceph-n1": {
+      "entry": {
+        "image_name": "vol-vol-ceph-n1-abcd1234",
+        "size_bytes": 10737418240,
+        "requested_size_bytes": 10737418240,
+        "generation": 2,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"ceph-rbd\"}",
+        "created_at": 1700000000
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-ceph-n1",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 1,
+          "access_mode": "single_writer",
+          "device": "/dev/rbd3"
+        }
+      }
+    }
+  }
+}

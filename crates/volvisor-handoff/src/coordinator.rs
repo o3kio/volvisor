@@ -503,6 +503,7 @@ impl<D: HandoffDriver> MigrationCoordinator<D> {
         }
         let now = (self.clock)();
         let record = MigrationRecord {
+            schema_version: crate::types::MIGRATION_RECORD_SCHEMA_VERSION,
             migration_id: request.migration_id.clone(),
             vm_id: request.vm_id,
             source_host: request.source_host,

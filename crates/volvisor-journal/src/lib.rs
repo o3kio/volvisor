@@ -13,9 +13,15 @@
 //!   `fsync` on the log file before returning; the journal directory is
 //!   fsynced once at creation time so the log's directory entry is durable.
 //! - A partially written or torn trailing record (truncated length, bad CRC,
-//!   bad magic, broken sequence, undecodable payload) is detected on replay
-//!   and the log is truncated back to the last valid record. Torn tails are
-//!   the expected outcome of power loss mid-append and are never an error.
+//!   bad magic, broken sequence) is detected on replay and the log is
+//!   truncated back to the last valid record. Torn tails are the expected
+//!   outcome of power loss mid-append and are never an error.
+//! - A **complete, CRC-valid frame** whose payload is undecodable, carries an
+//!   unknown field, or declares a `record_version` this build does not
+//!   support is not a torn tail: replay refuses with a typed `INTERNAL`
+//!   error and leaves the log untouched. Truncating it would silently
+//!   discard durable state written by a newer build (see
+//!   `docs/schema-compatibility.md`).
 //!
 //! ## Single-writer enforcement
 //!

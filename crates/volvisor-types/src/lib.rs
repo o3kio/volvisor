@@ -33,6 +33,7 @@ pub mod error;
 pub mod id;
 pub mod lending;
 pub mod request;
+pub mod schema;
 pub mod state;
 
 /// Server-assigned wall-clock time in Unix milliseconds.
@@ -77,6 +78,10 @@ pub use request::{
     GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, MoveVolumeBackingRequest,
     MoveVolumeBackingResponse, PROVIDER_API_VERSION, ReportAttachmentStateRequest,
     ReportAttachmentStateResponse,
+};
+pub use schema::{
+    BASELINE_SCHEMA_VERSION, SchemaVersionProbe, UNSUPPORTED_SCHEMA_VERSION_PREFIX,
+    baseline_schema_version, ensure_supported_schema_version,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 
