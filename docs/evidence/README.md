@@ -23,6 +23,13 @@ working directory. Read this page before adding a bundle or citing one.
   scoped exactly as its READMEs state: real Cloud Hypervisor processes at
   recorded versions, with the storage below the VMM seam simulated. It is not
   real-media or multi-host nearline evidence.
+- **Transport/TLS evidence exists** under
+  [`docs/evidence/transport-tls/`](transport-tls/2026-11-02-devhost-netns/).
+  It is a **same-host** netns/veth run: a real rustls listener, private-CA
+  verification, insecure-bind refusal, and an encrypted capture with no
+  token/path/header plaintext. It is not a second physical host, a
+  cross-host witness/peer hop, or a multi-host deployment; the bundle records
+  that its binary came from a dirty worktree at base `a6591d9`.
 - Tier S/R campaign records, when produced, remain under the git-ignored
   `target/campaign-evidence/` unless a separately reviewed committed bundle is
   added. A skipped Tier R record is a recorded gate, not evidence that a

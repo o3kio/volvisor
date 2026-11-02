@@ -64,10 +64,15 @@ can mutate it, or that a volume is safe to use.
   [#38](https://github.com/o3kio/volvisor/issues/38) has no GO;
   [ADR-0008](adr/0008-rook-only-hyperconverged-cells.md) is production
   NO-GO.
-- **Non-loopback deployment is not hardened.** The API is plain HTTP, the
-  admin token is shared, and peer/witness URLs reject `https://`
-  ([#40](https://github.com/o3kio/volvisor/issues/40)). Keep evaluation on
-  loopback or an isolated disposable network.
+- **Transport/auth hardening has landed, but only same-host evidence exists.**
+  [#40](https://github.com/o3kio/volvisor/issues/40) added native TLS/mTLS,
+  HTTPS witness/peer clients, refusal of non-loopback plain HTTP without
+  `allow_insecure`, scoped admin/operator/read-only credentials, read
+  authorization and audit attribution. The recorded capture is a same-host
+  netns/veth pair, not a second physical host or a cross-host witness/peer
+  hop. The legacy `admin_token`-only mode still leaves reads open; configure
+  scoped credentials and TLS for any shared network. See the
+  [security deployment guide](security/deployment.md).
 - **CHV is not pinned to a tagged Volvisor build.** CHV reports at most
   `advertised` (never `active` without guest confirmation); the pin update
   is [#48](https://github.com/o3kio/volvisor/issues/48) and waits for a
@@ -136,10 +141,12 @@ resources and generated secrets.
 
 Copy an example to a scratch path, replace the placeholder tokens, point
 `journal_dir` at a disposable directory, and keep `listen` on loopback. Full
-field documentation is in [configuration.md](configuration.md). Do not
-enable migration or point peer/witness URLs at shared infrastructure until
-the transport/auth gate [#40](https://github.com/o3kio/volvisor/issues/40)
-is done.
+field documentation is in [configuration.md](configuration.md). Native TLS,
+HTTPS witness/peer URLs and scoped credentials are implemented
+([security guide](security/deployment.md)); use them for any non-loopback
+evaluation. Cross-host TLS and witness/peer hops on separate physical hosts
+have **not** been validated, so keep multi-host experiments on a disposable,
+isolated network.
 
 ### 4. Build packages (optional, local only)
 
@@ -171,8 +178,9 @@ separately:
   and by any code gate this release actually claims.
 - **Pre-production exit gate (milestone
   [#36](https://github.com/o3kio/volvisor/issues/36)):** still requires the
-  real runs (#37/#38/#39 where claimed), transport/auth hardening (#40),
-  day-2 runbooks (#46), the CHV consumer path and pin (#48), and the exit
-  review. A distribution tag does not satisfy this gate.
+  real runs (#37/#38/#39 where claimed), cross-host transport validation
+  beyond #40's same-host capture, day-2 runbooks (#46), the CHV consumer
+  path and pin (#48), and the exit review. A distribution tag does not
+  satisfy this gate.
 
 No tag or GitHub release may be created in this workstream.
