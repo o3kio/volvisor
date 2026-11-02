@@ -2,13 +2,15 @@
 //!
 //! Each frame payload is the JSON serialization of an [`Envelope`]: a
 //! `record_version` discriminator plus one [`JournalRecord`]. Unknown fields
-//! are rejected (`deny_unknown_fields`) so a foreign or corrupt payload is
-//! treated as a torn tail on replay instead of being silently reinterpreted.
+//! are rejected (`deny_unknown_fields`), so a foreign or corrupt payload is
+//! never silently reinterpreted or reduced to the fields this build knows.
 //!
-//! `record_version` exists so a future format change can be detected
-//! explicitly: on replay, an envelope whose version differs from
-//! [`RECORD_VERSION`] is treated as an unread (torn) tail and truncated, never
-//! best-effort parsed.
+//! `record_version` exists so a future format change is detected explicitly:
+//! on replay, an envelope whose version differs from [`RECORD_VERSION`] is a
+//! typed startup refusal, not a torn tail. A complete, CRC-valid frame is
+//! durable state; truncating it because this build cannot read it would be
+//! silent data loss. Torn tails are detected structurally (incomplete frame,
+//! bad magic, bad CRC, broken sequence) before the payload is decoded.
 
 use serde::{Deserialize, Serialize};
 use volvisor_types::OperationId;
