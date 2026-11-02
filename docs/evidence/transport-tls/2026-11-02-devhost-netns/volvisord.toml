@@ -1,0 +1,21 @@
+listen = "10.200.40.2:8443"
+journal_dir = "/tmp/opencode/transport-tls-evidence/journal"
+provider = "fake"
+admin_token = "EVIDENCE-LEGACY-ADMIN-TOKEN-DO-NOT-USE"
+
+[[credentials.admin]]
+id = "admin-evidence"
+token = "EVIDENCE-ADMIN-TOKEN-DO-NOT-USE"
+
+[[credentials.operator]]
+id = "operator-evidence"
+token = "EVIDENCE-OPERATOR-TOKEN-DO-NOT-USE"
+
+[[credentials.read_only]]
+id = "reader-evidence"
+token = "EVIDENCE-READER-TOKEN-DO-NOT-USE"
+
+[tls]
+enabled = true
+cert_file = "/tmp/opencode/transport-tls-evidence/server.crt"
+key_file = "/tmp/opencode/transport-tls-evidence/server.key"

@@ -1,0 +1,4 @@
+listen = "10.200.40.2:8443"
+journal_dir = "/tmp/opencode/transport-tls-evidence/journal"
+provider = "fake"
+admin_token = "EVIDENCE-ADMIN-TOKEN-DO-NOT-USE"

@@ -1,0 +1,2 @@
+volvisord configuration check failed: configuration error: listen 10.200.40.2:8443 is a non-loopback plain-HTTP bind; refusing to start. Configure [tls] enabled = true (native TLS), or set allow_insecure = true to accept an explicit cleartext downgrade
+exit status: 1

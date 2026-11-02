@@ -1,0 +1,3 @@
+{"timestamp":"2026-11-02T23:21:51.588400Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"10.200.40.2:8443","provider":"Fake"}}
+{"timestamp":"2026-11-02T23:21:51.589977Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"10.200.40.2:8443","tls":true}}
+{"timestamp":"2026-11-02T23:21:52.675157Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"reader-evidence","role":"read-only","method":"GET","route":"/v2/volumes","status":200,"outcome":"success","operation_id":""}}
