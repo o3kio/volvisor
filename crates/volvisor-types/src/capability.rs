@@ -60,7 +60,9 @@ impl CapabilitySet {
     }
 
     /// The P0 native-local baseline: create, attach, grow and consumer
-    /// attachment-state reporting.
+    /// attachment-state reporting. A provider adopting this preset must
+    /// implement `report_attachment_state` (or remove the token) so
+    /// advertisement and behavior cannot diverge.
     #[must_use]
     pub fn native_local_p0() -> Self {
         Self::of([
