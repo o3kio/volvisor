@@ -142,7 +142,11 @@ pub enum AccessMode {
 
 /// VMM attachment evidence states (Volume API v2 section 3): prepared,
 /// advertised and active must be distinguished honestly.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The declaration order is the evidence rank: `Prepared < Advertised <
+/// Active`. A report may only move an attachment **up** this ladder; a
+/// repeated or lower report is an idempotent no-op, never a downgrade.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachmentState {
     /// Backend handle prepared; not yet advertised to a VMM.
@@ -152,6 +156,29 @@ pub enum AttachmentState {
     Advertised,
     /// Observed active in the guest.
     Active,
+}
+
+/// The state revision of a freshly prepared attachment.
+#[must_use]
+pub fn initial_state_revision() -> u64 {
+    1
+}
+
+/// Why a consumer reports an attachment state (Volume API v2 section 3).
+///
+/// This vocabulary is VMM-neutral: `vmm_configured` covers Cloud
+/// Hypervisor, QEMU/KVM, Proxmox VE and any other consumer that has
+/// installed the returned frontend into its hypervisor configuration;
+/// `guest_confirmed` covers a consumer that has a positive guest-side
+/// observation. A consumer report is an **attestation** — Volvisor records
+/// it verbatim and never promotes it to a provider-verified fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentEvidence {
+    /// The consumer configured the returned frontend into a VMM.
+    VmmConfigured,
+    /// A guest-side observation confirmed the device.
+    GuestConfirmed,
 }
 
 /// Frontend used to expose a volume to a VM.
@@ -291,8 +318,28 @@ pub struct Attachment {
     pub frontend: Frontend,
     /// Access mode.
     pub access_mode: AccessMode,
+    /// The VMM-side disk id the consumer configured for this frontend,
+    /// when it supplied one at attach (never invented by volvisor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
     /// Attachment evidence state.
     pub state: AttachmentState,
+    /// Monotonic evidence revision for this attachment; increments only
+    /// when an accepted report advances [`Self::state`]. It is **not** a
+    /// fencing token — `generation` remains the detach token.
+    #[serde(default = "initial_state_revision")]
+    pub state_revision: u64,
+    /// Evidence basis of the current state; absent for the
+    /// provider-recorded `prepared` state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<AttachmentEvidence>,
+    /// Consumer that reported the current state (untrusted label, never
+    /// authentication).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    /// Server-assigned receipt time of the current state, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<u64>,
 }
 
 /// A remote replica record (nearline; present in the model from day one).

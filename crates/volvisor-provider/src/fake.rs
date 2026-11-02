@@ -16,13 +16,15 @@ use volvisor_types::domain::{
     LocalProtectionAxis, Provisioning, RemoteProtectionAxis, Volume, VolumeClass,
 };
 use volvisor_types::request::{
-    AccessModeRequest, AttachVolumeRequest, AttachVolumeResponse, CreateVolumeRequest,
-    DeleteVolumeRequest, DetachVolumeRequest, GrowGuestNotification, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest, ReplicationModeRequest,
+    AccessModeRequest, AttachVolumeRequest, AttachVolumeResponse, AttachmentView,
+    CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, GrowGuestNotification,
+    GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
+    ReplicationModeRequest, ReportAttachmentStateRequest, ReportAttachmentStateResponse,
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, Attachment, AttachmentId, AttachmentState, Capability, CapabilitySet,
-    PoolId, ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
+    PoolId, ProjectId, VolumeId, VolumeLifecycle, initial_state_revision, unix_ms_now,
+    validate_api_version,
 };
 
 /// Host identity the fake places every volume on.
@@ -249,10 +251,10 @@ impl crate::VolumeProvider for FakeProvider {
 
     async fn inspect_volume(&self, id: &VolumeId) -> Result<InspectVolumeResponse, ApiError> {
         let state = self.state.lock().await;
-        state
-            .volumes
-            .get(id)
-            .map_or_else(|| Err(not_found(id)), |vol| Ok(inspect_response(vol)))
+        state.volumes.get(id).map_or_else(
+            || Err(not_found(id)),
+            |vol| Ok(inspect_response(&state.attachments, vol)),
+        )
     }
 
     async fn list_volumes(
@@ -264,7 +266,7 @@ impl crate::VolumeProvider for FakeProvider {
             .volumes
             .values()
             .filter(|vol| project.is_none_or(|p| &vol.project_id == p))
-            .map(inspect_response)
+            .map(|vol| inspect_response(&state.attachments, vol))
             .collect())
     }
 
@@ -284,6 +286,15 @@ impl crate::VolumeProvider for FakeProvider {
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         self.mutate(|state| apply_detach(state, volume_id, attachment_id, req))
+            .await
+    }
+
+    async fn report_attachment_state(
+        &self,
+        volume_id: &VolumeId,
+        req: &ReportAttachmentStateRequest,
+    ) -> Result<ReportAttachmentStateResponse, ApiError> {
+        self.mutate(|state| apply_report(self, state, volume_id, req))
             .await
     }
 
@@ -338,7 +349,7 @@ fn apply_create(
             .get(&req.volume_id)
             .is_some_and(|key| *key == payload_key)
         {
-            return Ok(inspect_response(existing));
+            return Ok(inspect_response(&state.attachments, existing));
         }
         return Err(ApiError::idempotency_conflict(&req.volume_id));
     }
@@ -405,7 +416,7 @@ fn apply_create(
         .creation_payloads
         .insert(req.volume_id.clone(), payload_key);
     state.volumes.insert(req.volume_id.clone(), volume.clone());
-    Ok(inspect_response(&volume))
+    Ok(inspect_response(&state.attachments, &volume))
 }
 
 fn apply_attach(
@@ -501,7 +512,12 @@ fn apply_attach(
             host_device_path: format!("/dev/volvisor-fake/{volume_id}"),
         },
         access_mode: mode,
+        vmm_disk_id: req.vmm_disk_id.clone(),
         state: AttachmentState::Prepared,
+        state_revision: initial_state_revision(),
+        evidence: None,
+        reporter: None,
+        recorded_at_ms: None,
     };
     vol.attachment_ids.push(attachment.id.clone());
     if mode == AccessMode::SingleWriter {
@@ -559,7 +575,7 @@ fn apply_detach(
         vol.state = VolumeLifecycle::Ready;
     }
     vol.generation = vol.generation.next();
-    Ok(inspect_response(vol))
+    Ok(inspect_response(&state.attachments, vol))
 }
 
 fn apply_grow(
@@ -795,7 +811,10 @@ fn attach_response(attachment: &Attachment, vol: &Volume) -> AttachVolumeRespons
     }
 }
 
-fn inspect_response(vol: &Volume) -> InspectVolumeResponse {
+fn inspect_response(
+    attachments: &BTreeMap<AttachmentId, Attachment>,
+    vol: &Volume,
+) -> InspectVolumeResponse {
     InspectVolumeResponse {
         volume_id: vol.id.clone(),
         backend_class: vol.class,
@@ -809,11 +828,105 @@ fn inspect_response(vol: &Volume) -> InspectVolumeResponse {
         failure_domain: vol.failure_domain,
         health: vol.health,
         attachment_ids: vol.attachment_ids.clone(),
+        attachments: vol
+            .attachment_ids
+            .iter()
+            .filter_map(|id| attachments.get(id))
+            .map(attachment_view)
+            .collect(),
         current_writer: vol.current_writer.clone(),
         backend_health: Health::Unknown,
         evidence_status: vol.evidence_status,
         authority: None,
     }
+}
+
+fn attachment_view(attachment: &Attachment) -> AttachmentView {
+    AttachmentView {
+        attachment_id: attachment.id.clone(),
+        vm_id: attachment.vm_id.clone(),
+        host_id: attachment.host_id.clone(),
+        access_mode: attachment.access_mode,
+        attachment_generation: attachment.generation.0,
+        frontend: attachment.frontend.clone(),
+        vmm_disk_id: attachment.vmm_disk_id.clone(),
+        state: attachment.state,
+        state_revision: attachment.state_revision,
+        evidence: attachment.evidence,
+        reporter: attachment.reporter.clone(),
+        recorded_at_ms: attachment.recorded_at_ms,
+    }
+}
+
+/// Apply a consumer report. The generation fence is checked but never
+/// advanced; evidence advances monotonically and a lower/equal report is an
+/// idempotent no-op.
+fn apply_report(
+    provider: &FakeProvider,
+    state: &mut FakeState,
+    volume_id: &VolumeId,
+    req: &ReportAttachmentStateRequest,
+) -> Result<ReportAttachmentStateResponse, ApiError> {
+    req.validate()?;
+    if !provider
+        .capabilities
+        .contains(Capability::AttachmentStateReport)
+    {
+        return Err(ApiError::not_found(format!(
+            "provider {} does not record attachment-state reports",
+            provider.name
+        )));
+    }
+    let (attachment_volume, attachment_generation, current_state) =
+        match state.attachments.get(&req.attachment_id) {
+            Some(att) => (att.volume_id.clone(), att.generation.0, att.state),
+            None => {
+                return Err(ApiError::not_found(format!(
+                    "attachment {} not found",
+                    req.attachment_id
+                )));
+            }
+        };
+    if attachment_volume != *volume_id {
+        return Err(ApiError::not_found(format!(
+            "attachment {} does not belong to volume {volume_id}",
+            req.attachment_id
+        )));
+    }
+    if req.expected_attachment_generation != attachment_generation {
+        return Err(ApiError::stale_generation(
+            req.expected_attachment_generation,
+            attachment_generation,
+        ));
+    }
+
+    let applied = req.state > current_state;
+    if applied {
+        let attachment = state
+            .attachments
+            .get_mut(&req.attachment_id)
+            .ok_or_else(|| {
+                ApiError::not_found(format!("attachment {} not found", req.attachment_id))
+            })?;
+        attachment.state = req.state;
+        attachment.state_revision += 1;
+        attachment.evidence = Some(req.evidence);
+        attachment.reporter.clone_from(&req.reporter);
+        attachment.recorded_at_ms = Some(unix_ms_now());
+    }
+    let attachment = state.attachments.get(&req.attachment_id).ok_or_else(|| {
+        ApiError::not_found(format!("attachment {} not found", req.attachment_id))
+    })?;
+    Ok(ReportAttachmentStateResponse {
+        attachment_id: attachment.id.clone(),
+        state: attachment.state,
+        state_revision: attachment.state_revision,
+        evidence: attachment.evidence,
+        reporter: attachment.reporter.clone(),
+        recorded_at_ms: attachment.recorded_at_ms,
+        attachment_generation: attachment.generation.0,
+        applied,
+    })
 }
 
 fn used_bytes(state: &FakeState) -> u64 {

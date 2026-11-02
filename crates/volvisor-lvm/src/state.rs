@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
 use volvisor_types::{
-    AccessMode, ApiError, ApiErrorCode, AttachmentId, DeviceId, DeviceRole, HostId,
-    MoveVolumeBackingState, OperationId, ProjectId, VolumeId, VolumeLifecycle,
+    AccessMode, ApiError, ApiErrorCode, AttachmentEvidence, AttachmentId, AttachmentState,
+    DeviceId, DeviceRole, HostId, MoveVolumeBackingState, OperationId, ProjectId, VolumeId,
+    VolumeLifecycle,
 };
 
 /// The volume→LV cross-reference plus the durable volume attributes.
@@ -97,6 +98,23 @@ pub struct AttachmentRecord {
     /// before P6-B load unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vmm_disk_id: Option<String>,
+    /// Current evidence state (contract section 3). Optional/defaulted so
+    /// state files written before consumer reporting load as `prepared`.
+    #[serde(default)]
+    pub state: AttachmentState,
+    /// Monotonic evidence revision; advances only on an applied report.
+    /// Defaulted to the initial revision for pre-report state files.
+    #[serde(default = "volvisor_types::domain::initial_state_revision")]
+    pub state_revision: u64,
+    /// Evidence basis of the current state; absent for `prepared`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<AttachmentEvidence>,
+    /// Consumer that reported the current state (untrusted label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    /// Server-assigned receipt time of the current state, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<u64>,
 }
 
 /// A claimed physical device.
@@ -407,6 +425,11 @@ mod tests {
                         generation: 1,
                         access_mode: AccessMode::SingleWriter,
                         vmm_disk_id: None,
+                        state: volvisor_types::AttachmentState::Prepared,
+                        state_revision: volvisor_types::domain::initial_state_revision(),
+                        evidence: None,
+                        reporter: None,
+                        recorded_at_ms: None,
                     }),
                 },
             },

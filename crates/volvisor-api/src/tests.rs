@@ -25,10 +25,10 @@ use volvisor_journal::Journal;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_create_request_in_project,
-    fixture_delete_request, fixture_detach_request, fixture_grow_request,
+    fixture_delete_request, fixture_detach_request, fixture_grow_request, fixture_report_request,
 };
 use volvisor_provider::fake::FakeProvider;
-use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode};
+use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode, AttachmentEvidence, AttachmentState};
 
 use crate::{ApiConfig, AppState, SharedState, ops, router};
 
@@ -352,6 +352,185 @@ async fn full_lifecycle_over_http() {
     let (status, missing) = send_json(&app, request(Method::GET, "/v2/volumes/vol-life")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], json!("NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
+    let (state, _provider, _dir) = setup();
+    let app = app(&state);
+
+    let create = serde_json::to_value(fixture_create_request("vol-report", GIB))
+        .expect("serialize create fixture");
+    let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
+    assert_eq!(status, StatusCode::OK);
+    let attach = serde_json::to_value(fixture_attach_request("vol-report", "att-report-1", 1))
+        .expect("serialize attach fixture");
+    let (status, _) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-report/attach", &attach),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Inspect exposes the full per-attachment projection at prepared/1.
+    let (status, inspected) = send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    assert_eq!(status, StatusCode::OK);
+    let views = inspected["attachments"]
+        .as_array()
+        .expect("attachments array");
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0]["attachment_id"], json!("att-report-1"));
+    assert_eq!(views[0]["state"], json!("prepared"));
+    assert_eq!(views[0]["state_revision"], json!(1));
+    assert_eq!(views[0]["attachment_generation"], json!(1));
+    assert!(views[0].get("evidence").is_none());
+
+    // advertised with vmm_configured: applied, revision 2, generation fixed.
+    let advertised = serde_json::to_value(fixture_report_request(
+        "att-report-1",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::VmmConfigured,
+    ))
+    .expect("serialize report fixture");
+    let (status, reported) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &advertised,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reported["applied"], json!(true));
+    assert_eq!(reported["state"], json!("advertised"));
+    assert_eq!(reported["state_revision"], json!(2));
+    assert_eq!(reported["attachment_generation"], json!(1));
+    assert_eq!(reported["evidence"], json!("vmm_configured"));
+
+    // active requires guest_confirmed: a vmm_configured active report is a
+    // typed pre-journal refusal (no record, the operation_id stays reusable).
+    let mut invalid_active = advertised.clone();
+    invalid_active["state"] = json!("active");
+    invalid_active["operation_id"] = json!("op-report-invalid-active");
+    let (status, rejected) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &invalid_active,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(rejected["code"], json!("INVALID_REQUEST"));
+
+    // active with guest_confirmed: applied at revision 3.
+    let active = serde_json::to_value(fixture_report_request(
+        "att-report-1",
+        1,
+        AttachmentState::Active,
+        AttachmentEvidence::GuestConfirmed,
+    ))
+    .expect("serialize report fixture");
+    let (status, active_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &active,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(active_body["applied"], json!(true));
+    assert_eq!(active_body["state"], json!("active"));
+    assert_eq!(active_body["state_revision"], json!(3));
+    assert_eq!(active_body["attachment_generation"], json!(1));
+
+    // A lower report is an idempotent no-op: no downgrade, no revision bump.
+    let lower = serde_json::to_value(fixture_report_request(
+        "att-report-1",
+        1,
+        AttachmentState::Advertised,
+        AttachmentEvidence::GuestConfirmed,
+    ))
+    .expect("serialize report fixture");
+    let (status, lower_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &lower,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(lower_body["applied"], json!(false));
+    assert_eq!(lower_body["state"], json!("active"));
+    assert_eq!(lower_body["state_revision"], json!(3));
+
+    // A stale attachment instance is fenced.
+    let stale_report = serde_json::to_value(fixture_report_request(
+        "att-report-1",
+        2,
+        AttachmentState::Active,
+        AttachmentEvidence::GuestConfirmed,
+    ))
+    .expect("serialize report fixture");
+    let (status, stale_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &stale_report,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(stale_body["code"], json!("STALE_GENERATION"));
+
+    // Reports never moved the generation: detach fences on 1.
+    let mut detach = serde_json::to_value(fixture_detach_request("att-report-1", 1))
+        .expect("serialize detach fixture");
+    detach["attachment_id"] = json!("att-report-1");
+    let (status, detached) = send_json(
+        &app,
+        json_request(Method::POST, "/v2/volumes/vol-report/detach", &detach),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detached["attachments"], json!([]));
+
+    // Replaying the recorded active report returns its recorded outcome even
+    // after detach (the journal outranks the provider's current NOT_FOUND).
+    let (status, replayed) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &active,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replayed, active_body);
+
+    // A new report against the detached instance is NOT_FOUND.
+    let mut fresh = lower.clone();
+    fresh["operation_id"] = json!("op-report-after-detach");
+    let (status, gone) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &fresh,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(gone["code"], json!("NOT_FOUND"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2773,6 +2952,7 @@ fn cleared_marker_inspect(
         failure_domain: volvisor_types::FailureDomain::Host,
         health: volvisor_types::Health::Unknown,
         attachment_ids: Vec::new(),
+        attachments: Vec::new(),
         current_writer: None,
         backend_health: volvisor_types::Health::Unknown,
         evidence_status: volvisor_types::domain::EvidenceStatus::default(),

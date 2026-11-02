@@ -2028,6 +2028,7 @@ mod tests {
             failure_domain: FailureDomain::Host,
             health: Health::Unknown,
             attachment_ids: Vec::new(),
+            attachments: Vec::new(),
             current_writer: None,
             backend_health: Health::Unknown,
             evidence_status: EvidenceStatus::default(),

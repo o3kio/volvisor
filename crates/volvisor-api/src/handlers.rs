@@ -23,7 +23,7 @@ use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
     AdoptVolumeRequest, AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest,
     DetachVolumeRequest, DrainProof, GrowVolumeRequest, GrowVolumeResponse, ListVolumesResponse,
-    MoveVolumeBackingRequest,
+    MoveVolumeBackingRequest, ReportAttachmentStateRequest,
 };
 use volvisor_types::{
     ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, LendDeviceRequest,
@@ -169,6 +169,43 @@ pub(crate) async fn detach_volume(
                 .detach_volume(&volume_id, &attachment_id, &req)
                 .await
         },
+    )
+    .await
+    .map_err(ApiErrorReply::from)
+}
+
+/// `POST /v2/volumes/{volume_id}/attachment-state` — ReportAttachmentState.
+///
+/// The wire body carries the `attachment_id` (as detach does), the
+/// evidence state and its basis. The report is journaled like every other
+/// mutation: a stale generation is a typed refusal, a replay is
+/// byte-compatible, and an equal/lower report is a successful no-op
+/// (`applied=false`).
+pub(crate) async fn report_attachment_state(
+    State(state): State<SharedState>,
+    _admin: RequireAdmin,
+    Path(volume_id): Path<String>,
+    ValidJson(req): ValidJson<ReportAttachmentStateRequest>,
+) -> Result<Response, ApiErrorReply> {
+    req.validate()?;
+    ops::require_consumer_operation_id(&req.operation_id)?;
+    let volume_id = parse_volume_id(&volume_id)?;
+    tracing::info!(
+        kind = ops::OP_REPORT_ATTACHMENT_STATE,
+        operation_id = %req.operation_id,
+        volume_id = %volume_id,
+        attachment_id = %req.attachment_id,
+        "accepting report_attachment_state"
+    );
+    let payload = ops::path_payload(&volume_id, &req)?;
+    let provider = state.provider.clone();
+    ops::execute(
+        &state,
+        ops::OP_REPORT_ATTACHMENT_STATE,
+        req.operation_id.clone(),
+        ops::report_attachment_state_hash(&req, &volume_id),
+        payload,
+        move || async move { provider.report_attachment_state(&volume_id, &req).await },
     )
     .await
     .map_err(ApiErrorReply::from)

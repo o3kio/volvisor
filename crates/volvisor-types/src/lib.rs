@@ -35,6 +35,19 @@ pub mod lending;
 pub mod request;
 pub mod state;
 
+/// Server-assigned wall-clock time in Unix milliseconds.
+///
+/// Used only for evidence receipt timestamps; ordering never depends on
+/// this value (the monotonic `state_revision` does that).
+#[must_use]
+pub fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 pub use admin::{ClaimDeviceRequest, DeviceListResponse, ReleaseDeviceRequest};
 pub use authority::{
     AuthoritySummary, AuthorityView, BarrierAttestation, EndpointBacking, EpochRetirement,
@@ -43,9 +56,9 @@ pub use authority::{
 };
 pub use capability::{Capability, CapabilitySet};
 pub use domain::{
-    AccessMode, Attachment, AttachmentState, DeviceRole, EffectiveProtection, FailureDomain,
-    Frontend, Health, LocalProtectionAxis, Migration, PhysicalDevice, Pool, PoolProtection,
-    RemoteProtectionAxis, Replica, Volume,
+    AccessMode, Attachment, AttachmentEvidence, AttachmentState, DeviceRole, EffectiveProtection,
+    FailureDomain, Frontend, Health, LocalProtectionAxis, Migration, PhysicalDevice, Pool,
+    PoolProtection, RemoteProtectionAxis, Replica, Volume, initial_state_revision,
 };
 pub use error::{ApiError, ApiErrorBody, ApiErrorCode, INVALID_API_VERSION};
 pub use id::{
@@ -58,10 +71,11 @@ pub use lending::{
     ReclaimDeviceRequest, ResidueAcknowledgement, ResidueCheck, ResolveQuarantineRequest,
 };
 pub use request::{
-    AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse, CreateVolumeRequest,
-    DeleteVolumeRequest, DetachVolumeRequest, DrainProof, ErasurePolicy, GrowVolumeRequest,
-    GrowVolumeResponse, InspectVolumeResponse, ListVolumesResponse, MoveVolumeBackingRequest,
-    MoveVolumeBackingResponse, PROVIDER_API_VERSION,
+    ATTACHMENT_REPORT_DETAIL_MAX_BYTES, AccessModeRequest, AdoptVolumeRequest, AdoptVolumeResponse,
+    AttachmentView, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest, DrainProof,
+    ErasurePolicy, GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse,
+    ListVolumesResponse, MoveVolumeBackingRequest, MoveVolumeBackingResponse, PROVIDER_API_VERSION,
+    ReportAttachmentStateRequest, ReportAttachmentStateResponse,
 };
 pub use state::{GuestNotificationStatus, MigrationState, MoveVolumeBackingState, VolumeLifecycle};
 

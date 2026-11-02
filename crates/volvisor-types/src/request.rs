@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::authority::{AuthoritySummary, PromotionClassification, SafeCurrentEvidence};
 use crate::domain::{
-    EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning, VolumeClass,
+    AttachmentEvidence, AttachmentState, EffectiveProtection, EvidenceStatus, FailureDomain,
+    Frontend, Health, Provisioning, VolumeClass,
 };
 use crate::error::ApiError;
 use crate::id::{AttachmentId, HostId, OperationId, ProjectId, VolumeId};
@@ -314,6 +315,173 @@ impl DetachVolumeRequest {
     }
 }
 
+/// Maximum length, in bytes, of a report's free-form `detail`.
+pub const ATTACHMENT_REPORT_DETAIL_MAX_BYTES: usize = 1024;
+
+/// ReportAttachmentState request (contract section 3).
+///
+/// A consumer (any VMM integration — Cloud Hypervisor, QEMU/KVM, Proxmox
+/// VE, ...) reports an observed attachment state. The same
+/// `expected_attachment_generation` precondition as detach fences the
+/// report against a stale attachment instance, but a report **never**
+/// advances `attachment_generation`: that token stays reserved for detach
+/// fencing. Evidence advances monotonically (`prepared < advertised <
+/// active`); a repeated or lower report is an idempotent no-op.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportAttachmentStateRequest {
+    /// Must equal `volvisor.volume.v2`.
+    pub api_version: String,
+    /// Idempotency key.
+    pub operation_id: OperationId,
+    /// The attachment instance making the report.
+    pub attachment_id: AttachmentId,
+    /// Expected current attachment generation (the instance fence).
+    pub expected_attachment_generation: u64,
+    /// The observed state; only `advertised` and `active` are reportable
+    /// (a consumer never reports the provider-recorded `prepared`).
+    pub state: crate::domain::AttachmentState,
+    /// The evidence basis of the report.
+    pub evidence: crate::domain::AttachmentEvidence,
+    /// Optional untrusted reporter label (never authentication).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    /// Optional diagnostic detail; bounded by
+    /// [`ATTACHMENT_REPORT_DETAIL_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ReportAttachmentStateRequest {
+    /// Validate the envelope and the state/evidence pairing.
+    ///
+    /// # Errors
+    /// `INVALID_REQUEST` for a bad api version, a `prepared` target, an
+    /// evidence basis that does not support the claimed state, an empty
+    /// reporter or over-long detail.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        crate::validate_api_version(&self.api_version)?;
+        match self.state {
+            AttachmentState::Prepared => {
+                return Err(ApiError::invalid_request(
+                    "state must be advertised or active; prepared is provider-recorded",
+                ));
+            }
+            AttachmentState::Advertised => {
+                // Either basis honestly supports "configured in a VMM".
+                if !matches!(
+                    self.evidence,
+                    AttachmentEvidence::VmmConfigured | AttachmentEvidence::GuestConfirmed
+                ) {
+                    return Err(ApiError::invalid_request(
+                        "advertised requires vmm_configured or guest_confirmed evidence",
+                    ));
+                }
+            }
+            AttachmentState::Active => {
+                // Only a positive guest-side observation may claim active.
+                if self.evidence != AttachmentEvidence::GuestConfirmed {
+                    return Err(ApiError::invalid_request(
+                        "active requires guest_confirmed evidence",
+                    ));
+                }
+            }
+        }
+        if self.reporter.as_deref() == Some("") {
+            return Err(ApiError::invalid_request(
+                "reporter must not be empty when present",
+            ));
+        }
+        if let Some(detail) = &self.detail {
+            if detail.len() > ATTACHMENT_REPORT_DETAIL_MAX_BYTES {
+                return Err(ApiError::invalid_request(format!(
+                    "detail must be at most {ATTACHMENT_REPORT_DETAIL_MAX_BYTES} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical request hash for idempotency: the target attachment is
+    /// folded in by the API layer, exactly as for detach.
+    #[must_use]
+    pub fn request_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"volvisor.volume.v2:attachment-state:");
+        hasher.update(self.attachment_id.as_str().as_bytes());
+        hasher.update(b":");
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        hasher.update(&body);
+        hasher.finalize().into()
+    }
+}
+
+/// ReportAttachmentState response (contract section 3): the current
+/// projection, whether or not this call advanced it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportAttachmentStateResponse {
+    /// The reported attachment instance.
+    pub attachment_id: AttachmentId,
+    /// The current (post-call) evidence state.
+    pub state: crate::domain::AttachmentState,
+    /// The current evidence revision (advances only on an applied
+    /// transition).
+    pub state_revision: u64,
+    /// Evidence basis of the current state; absent for `prepared`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::domain::AttachmentEvidence>,
+    /// Reporter label of the current state, when a consumer reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    /// Server-assigned receipt time of the current state, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<u64>,
+    /// The detach-fencing generation (unchanged by every report).
+    pub attachment_generation: u64,
+    /// Whether this call advanced the state. `false` is an idempotent
+    /// no-op (equal or lower evidence): the response still carries the
+    /// current projection.
+    pub applied: bool,
+}
+
+/// A full per-attachment view inside an inspect response (contract
+/// section 2). It is the hypervisor-neutral projection a consumer (Cloud
+/// Hypervisor, Proxmox VE, ...) reconciles against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentView {
+    /// Attachment identity.
+    pub attachment_id: AttachmentId,
+    /// Consuming VM.
+    pub vm_id: String,
+    /// Host the attachment is scoped to.
+    pub host_id: HostId,
+    /// Granted access mode.
+    pub access_mode: crate::domain::AccessMode,
+    /// The detach-fencing generation.
+    pub attachment_generation: u64,
+    /// The frontend the consumer should consume.
+    pub frontend: Frontend,
+    /// VMM-side disk id recorded at attach, when the consumer supplied
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm_disk_id: Option<String>,
+    /// Current evidence state.
+    pub state: crate::domain::AttachmentState,
+    /// Monotonic evidence revision.
+    pub state_revision: u64,
+    /// Evidence basis of the current state; absent for `prepared`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::domain::AttachmentEvidence>,
+    /// Reporter label of the current state, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    /// Server-assigned receipt time of the current state, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<u64>,
+}
+
 /// GrowVolume request (contract section 4A: grow-only by default).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -559,6 +727,11 @@ pub struct InspectVolumeResponse {
     pub health: Health,
     /// Attachment identities.
     pub attachment_ids: Vec<AttachmentId>,
+    /// Full per-attachment projection (contract section 2): state,
+    /// evidence, generation and the frontend to reconcile. Additive —
+    /// pre-report payloads decode with an empty list.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentView>,
     /// Current writer attachment, if any.
     pub current_writer: Option<AttachmentId>,
     /// Backend health; `unknown` when unproven.
@@ -842,5 +1015,106 @@ mod tests {
             serde_json::to_value(&response).expect("serializes")["state"],
             "COPYING"
         );
+    }
+
+    fn report_req(state: &str, evidence: &str) -> ReportAttachmentStateRequest {
+        serde_json::from_value(serde_json::json!({
+            "api_version": "volvisor.volume.v2",
+            "operation_id": "op-report-1",
+            "attachment_id": "att-1",
+            "expected_attachment_generation": 1,
+            "state": state,
+            "evidence": evidence
+        }))
+        .expect("valid report request")
+    }
+
+    #[test]
+    fn report_state_requires_truthful_evidence() {
+        // advertised is honest with either basis.
+        assert!(
+            report_req("advertised", "vmm_configured")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            report_req("advertised", "guest_confirmed")
+                .validate()
+                .is_ok()
+        );
+        // active requires a positive guest-side observation.
+        assert!(report_req("active", "guest_confirmed").validate().is_ok());
+        assert_eq!(
+            report_req("active", "vmm_configured")
+                .validate()
+                .unwrap_err()
+                .code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+        // A consumer never reports the provider-recorded prepared state.
+        assert_eq!(
+            report_req("prepared", "vmm_configured")
+                .validate()
+                .unwrap_err()
+                .code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn report_bounds_detail_and_reporter() {
+        let mut req = report_req("advertised", "vmm_configured");
+        req.detail = Some("x".repeat(ATTACHMENT_REPORT_DETAIL_MAX_BYTES + 1));
+        assert_eq!(
+            req.validate().unwrap_err().code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+        req.detail = Some("x".repeat(ATTACHMENT_REPORT_DETAIL_MAX_BYTES));
+        assert!(req.validate().is_ok());
+        req.reporter = Some(String::new());
+        assert_eq!(
+            req.validate().unwrap_err().code,
+            crate::error::ApiErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn report_hash_is_payload_sensitive() {
+        let a = report_req("advertised", "vmm_configured");
+        assert_eq!(
+            a.request_hash(),
+            report_req("advertised", "vmm_configured").request_hash()
+        );
+        assert_ne!(
+            a.request_hash(),
+            report_req("advertised", "guest_confirmed").request_hash()
+        );
+        assert_ne!(
+            a.request_hash(),
+            report_req("active", "guest_confirmed").request_hash()
+        );
+    }
+
+    #[test]
+    fn inspect_decodes_pre_report_payloads_without_attachments() {
+        let payload = serde_json::json!({
+            "volume_id": "vol-1",
+            "backend_class": "native-local",
+            "project_id": "tenant-a",
+            "generation": 1,
+            "state": "Ready",
+            "provisioned_bytes": 1024,
+            "allocated_bytes": 1024,
+            "effective_protection": { "local": "none", "remote": "none" },
+            "failure_domain": "host",
+            "health": "Unknown",
+            "attachment_ids": [],
+            "current_writer": null,
+            "backend_health": "Unknown",
+            "evidence_status": "prototype_only"
+        });
+        let inspected: InspectVolumeResponse =
+            serde_json::from_value(payload).expect("old payloads decode");
+        assert_eq!(inspected.attachments, [] as [AttachmentView; 0]);
     }
 }

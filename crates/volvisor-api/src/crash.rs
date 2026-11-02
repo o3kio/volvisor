@@ -212,6 +212,7 @@ mod tests {
                 "create_volume",
                 "attach_volume",
                 "detach_volume",
+                "report_attachment_state",
                 "grow_volume",
                 "delete_volume",
                 "move_volume_backing",
