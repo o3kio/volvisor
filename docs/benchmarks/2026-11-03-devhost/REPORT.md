@@ -105,6 +105,12 @@ the run's 606 MiB daemon log is stored as `raw/daemon.daemon.log.gz` because
 forges reject individual files above 100 MiB. The bundle is a copy of the
 run directory plus this authored report; no measurement file was edited.
 
+The pull request head is `1a2402b`. Every commit after `e3aa365` is
+documentation or the publish-time size guard in `scripts/bench/publish.sh`;
+none changes the measured binary, the load generator, or the summarizer. The
+run-time source is therefore exactly `e3aa365`, and this report does not
+claim measurements from `1a2402b`.
+
 ## 4. Capacity table: 1/8/32/128 mixed in-flight
 
 Exact values from [summary/concurrency.csv](summary/concurrency.csv). The
@@ -290,6 +296,10 @@ eviction path exists). The log is append-only with per-record `sync_all`
 (`journal.rs:466-496`); there is no rotation/compaction/truncation beyond a
 torn-tail repair. Restart replay of the resulting 259 MiB journal took
 2.669–2.813 s in §7, so the disk growth also raises future restart time.
+The RSS and journal co-growth is consistent with this retention path, but no
+heap or allocation profile was taken: the split between retained operation
+state and other allocations is not proven, and +607.1 MiB is an observed
+delta, not a measured attribution.
 
 ### B3 — Retired attachment ids accumulate without bound in provider state — [#63](https://github.com/o3kio/volvisor/issues/63)
 
