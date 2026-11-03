@@ -1,0 +1,11 @@
+{
+  "protocol_version": 2,
+  "operation_id": "op-d3-register",
+  "content": {
+    "lineage_uuids": ["0000000000000004", "0000000000000005"],
+    "endpoints": [
+      {"host_id": "host-a", "backing": "vg-near/vol-d3-00000004", "volvisor_created": true},
+      {"host_id": "host-b", "backing": "vg-near/vol-d3-00000004", "volvisor_created": false}
+    ]
+  }
+}

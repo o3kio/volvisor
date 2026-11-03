@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-03T11:23:43.706132Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:36715","provider":"Lvm"}}
+{"timestamp":"2026-11-03T11:23:43.799172Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:36715","tls":false}}
+{"timestamp":"2026-11-03T11:23:43.832155Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"GET","route":"/v2/volumes/{volume_id}","status":404,"outcome":"failure","operation_id":""}}
+{"timestamp":"2026-11-03T11:23:43.889398Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"GET","route":"/v2/volumes/{volume_id}","status":200,"outcome":"success","operation_id":""}}
+{"timestamp":"2026-11-03T11:23:43.909050Z","level":"INFO","fields":{"message":"accepting create_volume","kind":"create_volume","operation_id":"op-d5-lvm-recovered","volume_id":"vol-d5-lvm-recovered"}}
+{"timestamp":"2026-11-03T11:23:44.042790Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"POST","route":"/v2/volumes","status":200,"outcome":"success","operation_id":"op-d5-lvm-recovered"}}

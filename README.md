@@ -97,6 +97,28 @@ topology, runner labels, least-privilege credentials, secret handling,
 artifact retention and failure triage. This is prototype software: no
 production-support claim is made or implied (AGENTS rule 12).
 
+## Day-2 operations
+
+Day-2 recovery procedures and their drill results are in the
+[day-2 runbook index](docs/runbooks/day-2/README.md). The executable drills and
+raw records are in the
+[2026-11-03 single-host evidence bundle](docs/evidence/day2/2026-11-03-devhost/).
+
+| Area | Recorded verdict |
+|---|---|
+| Control-plane backup/restore with attachment state, revision and tombstones | **DRILLED** |
+| Schema compatibility, upgrade-on-write and future-version refusal | **PARTIAL** — live old-binary → new-binary upgrade/rollback not run |
+| Lost/unreachable witness service | **PARTIAL** — storage-side DRBD fencing not run |
+| Torn journal tail and corrupt state file | **DRILLED** |
+| ENOSPC on journal/state writes | **DRILLED**, with an open state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) |
+| Crash loop and single-writer lock contention | **DRILLED** |
+| Credential and certificate rotation | **DRILLED** — restart-based, no hot reload |
+| Total host loss and re-admission | **NOT RUN — REQUIRES** a real multi-host DRBD/Ceph lab, a third failure domain and BMC/fencing |
+
+The drills are single-host dev-lab evidence, not production or multi-host
+evidence. They do not change the support posture in
+[SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
+
 ## Historical draft v1 (superseded proposals)
 
 [ADR-0001](docs/adr/0001-volvisor-storage-cell-architecture.md), [ADR-0002](docs/adr/0002-replicated-async-local-endpoint-and-migration.md), [SPEC-0001](docs/specs/SPEC-0001-storage-cell-v0.md), [provider v1](contracts/volvisor-provider-v1.md), [storage classes v1](contracts/storage-class-semantics-v1.md), [replication v1](contracts/replicated-async-v1.md), [engineering design](docs/design.md), [replication research](docs/research/replicated-async-rnd.md), and [prior review](docs/reviews/storage-cell-v0-review.md).

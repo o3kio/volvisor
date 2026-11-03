@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:41.994396Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:58433","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: failed to parse provider state /tmp/opencode/d2-46-final/lab-d4-lvm/journal/lvm-state.json: EOF while parsing a value at line 1 column 45")

@@ -21,6 +21,21 @@ release) and the `package-*` jobs in `.github/workflows/ci.yaml`
 | `/etc/volvisor/volvisor.env` | the operator's `EnvironmentFile` (optional; the units spell it with `-`, absent is fine) — never shipped |
 | `/var/lib/volvisor/`, `/var/lib/volvisor-witness/` | created by the units' `StateDirectory=` at start, not by the package |
 
+### Day-2 runbooks are repository documentation, not package payload
+
+The [day-2 runbooks](../docs/runbooks/day-2/README.md) and their
+[single-host drill evidence](../docs/evidence/day2/2026-11-03-devhost/) are
+**not installed** by the deb/rpm. The package carries only
+`configuration.md` and this file under `/usr/share/doc/volvisor/`. An operator
+who needs backup/restore, upgrade/rollback, lost-witness, corruption, ENOSPC,
+crash-loop, credential rotation or host-loss procedures must read them from
+the repository at the exact commit they deployed.
+
+The recorded verdicts are honest and mixed: most areas are drilled on one
+host; live binary upgrade/rollback, storage-side witness fencing and total
+host loss are **not run**. They do not change the package's verification
+boundary below or the support matrix.
+
 ### The config-file policy: annotated examples as real configs, conffiles
 
 The example configs ship **as the real config paths the units

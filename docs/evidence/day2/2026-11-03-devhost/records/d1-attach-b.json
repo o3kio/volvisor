@@ -1,0 +1,1 @@
+{"api_version":"volvisor.volume.v2","operation_id":"op-d1-attach-b","vm_id":"vm-d1-b","host_id":"host-d1","attachment_id":"att-d1-b","expected_volume_generation":1,"access_mode":"single_writer","requested_frontend":"virtio-blk","vmm_disk_id":"disk1"}

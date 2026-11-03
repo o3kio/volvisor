@@ -1,0 +1,57 @@
+Day-2 drill environment
+=======================
+Run window: 2026-11-03T11:23:29Z .. 2026-11-03T11:23:49Z
+Host: dev (single physical development host; not a multi-host lab)
+Runner: uid=0(root) gid=0(root) groups=0(root)
+
+Run-time source identity
+------------------------
+source_sha:      e551d26af7cdedb468797ff8049e0b91b9ab416d
+worktree_dirty: no
+Every raw drill log records these two values in its header. The evidence
+bundle itself was created after the run at that commit; the bundle commit is
+docs-only and is recorded in the top-level bundle README and REPORT.
+
+Operating system and toolchain
+------------------------------
+uname:   Linux dev 6.8.0-142-generic #142-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:24:27 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+rustc:   rustc 1.99.0 (b940084d7 2026-09-28)
+cargo:   cargo 1.99.0 (5f94df478 2026-08-27)
+lvm:     LVM version: 2.03.16(2) (2022-05-18); Library 1.02.185; Driver 4.48.0
+openssl: OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)
+jq:      jq-1.7
+python3: Python 3.12.3
+curl:    curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13
+tar:     tar (GNU tar) 1.35
+flock:   flock from util-linux 2.39.3
+losetup: losetup from util-linux 2.39.3
+CPUs:    16
+Memory:  31 GiB
+
+Absent capabilities (these are the blockers, not silent skips)
+---------------------------------------------------------------
+drbdadm:        not found
+drbd kernel:    not loaded (no /dev/drbd* device present)
+rbd:            not found
+ceph:           not found
+Second host:    none. Every daemon, witness, client and the evidence
+                recorder ran on 127.0.0.1 on this one host.
+BMC/fencing:    none.
+Older binary:   no tag or second Volvisor binary exists, so no live
+                old-binary -> new-binary upgrade or cross-version rollback
+                was performed.
+
+Lab construction notes
+----------------------
+- LVM labs use loop-backed volume groups created with pvcreate/vgcreate.
+  The LVM provider deliberately skips loop devices during discovery, so the
+  harness seeds an operator-provisioned device claim (`role: native_pool`)
+  into lvm-state.json pointing at the loop device. This is a lab scaffold,
+  not a production device-claim procedure.
+- ENOSPC labs use 256 KiB tmpfs mounts for the journal directory or the
+  provider state directory. The journal was padded with real volume creates
+  until the last-page slack was small enough that the next appended record
+  encountered ENOSPC. See the D5 section of REPORT.md.
+- All tokens, curl configs and private keys were created under the run's
+  working directory outside the repository. They are not part of this
+  bundle. Only raw command output and non-secret records were copied.

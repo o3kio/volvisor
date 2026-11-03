@@ -1,0 +1,21 @@
+Binaries used for every drill
+=============================
+Built at source_sha e551d26af7cdedb468797ff8049e0b91b9ab416d
+from the clean worktree recorded in the raw drill headers.
+
+SHA256
+------
+75710c05ae637c66035d1abc2f99cb4c35af2f858f974cfec13b57ea3c79491f  target/debug/volvisord
+745869ea0b36b472fd64bfceef311da942b49429cc8ef585820ccac5629e9436  target/debug/volvisor-witnessd
+
+Version stamps
+--------------
+volvisord e551d26
+volvisor-witnessd e551d26
+
+Notes
+-----
+- These are debug-profile binaries from `cargo build` at the recorded commit.
+- The build stamp is the repository `git describe --tags --always` value
+  (`e551d26`); no release tag exists at this commit.
+- The same two binaries served all drills. No binary was rebuilt mid-run.

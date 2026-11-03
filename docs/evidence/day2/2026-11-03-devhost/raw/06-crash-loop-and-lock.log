@@ -1,0 +1,188 @@
+# drill: 06-crash-loop-and-lock
+# start: 2026-11-03T11:23:44Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d6lvm" successfully created
+lab setup tag=d6-lvm loop=/dev/loop0 vg=vg-d6lvm state=/tmp/opencode/d2-46-final/lab-d6-lvm/journal/lvm-state.json
+daemon d6-daemon healthy pid=1636810 port=46763
+
+### 2026-11-03T11:23:44Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl POST http://127.0.0.1:46763/v2/volumes /tmp/opencode/d2-46-final/records/d6-create-base.json 200 /tmp/opencode/d2-46-final/records/d6-create-base.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes
+exit=0
+
+### 2026-11-03T11:23:44Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attach /tmp/opencode/d2-46-final/records/d6-attach-base.json 200 /tmp/opencode/d2-46-final/records/d6-attach-base.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attach
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attach
+exit=0
+
+### 2026-11-03T11:23:44Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attachment-state /tmp/opencode/d2-46-final/records/d6-report-base.json 200 /tmp/opencode/d2-46-final/records/d6-report-base.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attachment-state
+HTTP 200 (want 200) POST http://127.0.0.1:46763/v2/volumes/vol-d6-base/attachment-state
+exit=0
+
+### 2026-11-03T11:23:44Z host=dev
+$ jq \{state:\ .volumes\[\"vol-d6-base\"\].runtime.state\,\ attachment:\ .volumes\[\"vol-d6-base\"\].runtime.attachment\ \|\ \{id\,state\,state_revision\,evidence\}\} /tmp/opencode/d2-46-final/lab-d6-lvm/journal/lvm-state.json
+{
+  "state": "Attached",
+  "attachment": {
+    "id": "att-d6-base",
+    "state": "active",
+    "state_revision": 2,
+    "evidence": "guest_confirmed"
+  }
+}
+exit=0
+
+### 2026-11-03T11:23:44Z host=dev
+iteration=1 killed_pid=1636810 in_flight_curl_exit=52 status=000 stderr=curl: (52) Empty reply from server 
+daemon d6-daemon healthy pid=1637028 port=46763
+
+### 2026-11-03T11:23:45Z host=dev
+$ frames_ok /tmp/opencode/d2-46-final/lab-d6-lvm/journal/journal.log
+valid_frames=7 valid_prefix=3503 file_size=3503
+exit=0
+
+### 2026-11-03T11:23:45Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-1.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+ASSERT PASS: attachment state after crash 1 == active
+ASSERT PASS: attachment state_revision after crash 1 == 2
+ASSERT PASS: attachment evidence after crash 1 == guest_confirmed
+
+### 2026-11-03T11:23:45Z host=dev
+iteration=2 killed_pid=1637028 in_flight_curl_exit=52 status=000 stderr=curl: (52) Empty reply from server 
+daemon d6-daemon healthy pid=1637138 port=46763
+
+### 2026-11-03T11:23:45Z host=dev
+$ frames_ok /tmp/opencode/d2-46-final/lab-d6-lvm/journal/journal.log
+valid_frames=8 valid_prefix=4084 file_size=4084
+exit=0
+
+### 2026-11-03T11:23:45Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-2.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+ASSERT PASS: attachment state after crash 2 == active
+ASSERT PASS: attachment state_revision after crash 2 == 2
+ASSERT PASS: attachment evidence after crash 2 == guest_confirmed
+
+### 2026-11-03T11:23:45Z host=dev
+iteration=3 killed_pid=1637138 in_flight_curl_exit=52 status=000 stderr=curl: (52) Empty reply from server 
+daemon d6-daemon healthy pid=1637219 port=46763
+
+### 2026-11-03T11:23:45Z host=dev
+$ frames_ok /tmp/opencode/d2-46-final/lab-d6-lvm/journal/journal.log
+valid_frames=9 valid_prefix=4666 file_size=4666
+exit=0
+
+### 2026-11-03T11:23:45Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-3.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+ASSERT PASS: attachment state after crash 3 == active
+ASSERT PASS: attachment state_revision after crash 3 == 2
+ASSERT PASS: attachment evidence after crash 3 == guest_confirmed
+
+### 2026-11-03T11:23:46Z host=dev
+iteration=4 killed_pid=1637219 in_flight_curl_exit=52 status=000 stderr=curl: (52) Empty reply from server 
+daemon d6-daemon healthy pid=1637300 port=46763
+
+### 2026-11-03T11:23:46Z host=dev
+$ frames_ok /tmp/opencode/d2-46-final/lab-d6-lvm/journal/journal.log
+valid_frames=10 valid_prefix=5248 file_size=5248
+exit=0
+
+### 2026-11-03T11:23:46Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-4.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+ASSERT PASS: attachment state after crash 4 == active
+ASSERT PASS: attachment state_revision after crash 4 == 2
+ASSERT PASS: attachment evidence after crash 4 == guest_confirmed
+
+### 2026-11-03T11:23:46Z host=dev
+iteration=5 killed_pid=1637300 in_flight_curl_exit=52 status=000 stderr=curl: (52) Empty reply from server 
+daemon d6-daemon healthy pid=1637499 port=46763
+
+### 2026-11-03T11:23:46Z host=dev
+$ frames_ok /tmp/opencode/d2-46-final/lab-d6-lvm/journal/journal.log
+valid_frames=11 valid_prefix=5826 file_size=5826
+exit=0
+
+### 2026-11-03T11:23:46Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-5.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+ASSERT PASS: attachment state after crash 5 == active
+ASSERT PASS: attachment state_revision after crash 5 == 2
+ASSERT PASS: attachment evidence after crash 5 == guest_confirmed
+
+### 2026-11-03T11:23:46Z host=dev
+$ jq .volumes\[\"vol-d6-base\"\].runtime.attachment\ \|\ \{id\,state\,state_revision\,evidence\} /tmp/opencode/d2-46-final/lab-d6-lvm/journal/lvm-state.json
+{
+  "id": "att-d6-base",
+  "state": "active",
+  "state_revision": 2,
+  "evidence": "guest_confirmed"
+}
+exit=0
+
+### 2026-11-03T11:23:46Z host=dev
+second-daemon startup exit=1
+
+### 2026-11-03T11:23:46Z host=dev
+$ cat /tmp/opencode/d2-46-final/raw/d6-second.daemon.log
+{"timestamp":"2026-11-03T11:23:46.878536Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:55471","provider":"Lvm"}}
+Error: Config("open journal: INTERNAL: journal directory /tmp/opencode/d2-46-final/lab-d6-lvm/journal is already locked by another writer (single-writer enforcement): Resource temporarily unavailable (os error 11)")
+exit=0
+ASSERT PASS: second daemon startup exit == 1
+ASSERT PASS: typed journal lock refusal contains already\ locked\ by\ another\ writer
+
+### 2026-11-03T11:23:46Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d6.curl GET http://127.0.0.1:46763/v2/volumes/vol-d6-base '' 200 /tmp/opencode/d2-46-final/records/d6-base-after-lock.json
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+HTTP 200 (want 200) GET http://127.0.0.1:46763/v2/volumes/vol-d6-base
+exit=0
+
+### 2026-11-03T11:23:46Z host=dev
+
+### 2026-11-03T11:23:46Z host=dev
+$ curl -fsS http://127.0.0.1:49215/healthz
+okexit=0
+second-witness startup exit=1
+
+### 2026-11-03T11:23:46Z host=dev
+$ cat /tmp/opencode/d2-46-final/raw/d6-witness-second.log
+{"timestamp":"2026-11-03T11:23:46.982614Z","level":"INFO","fields":{"message":"volvisor-witnessd starting (prototype; not production supported)","listen":"127.0.0.1:56197","lease_ttl_secs":60}}
+Error: Config("witness journal open failed: INTERNAL: journal directory /tmp/opencode/d2-46-final/lab-d6/witness-state is already locked by another writer (single-writer enforcement): Resource temporarily unavailable (os error 11)")
+exit=0
+ASSERT PASS: second witness startup exit == 1
+ASSERT PASS: typed witness lock refusal contains already\ locked\ by\ another\ writer
+
+### 2026-11-03T11:23:46Z host=dev
+$ curl -fsS http://127.0.0.1:49215/healthz
+okexit=0
+stopped d6-witness pid=1637628 sig=TERM
+stopped d6-daemon pid=1637499 sig=TERM
+
+# end: 2026-11-03T11:23:47Z
+ASSERT SUMMARY: 0 failures
+  Logical volume "vol-vol-d6-base-cf9c8b58" successfully removed.
+  Volume group "vg-d6lvm" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d6-lvm loop=/dev/loop0 vg=vg-d6lvm

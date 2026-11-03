@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:41.830356Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:52641","provider":"Fake"}}
+Error: Config("open journal: INTERNAL: unsupported durable-state schema version: journal record state /tmp/opencode/d2-46-final/lab-d4/journal/journal.log declares schema_version 2, but this build supports at most 1; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")

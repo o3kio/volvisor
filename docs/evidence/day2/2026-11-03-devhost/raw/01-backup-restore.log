@@ -1,0 +1,171 @@
+# drill: 01-backup-restore
+# start: 2026-11-03T11:23:29Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d246a" successfully created
+lab setup tag=d1 loop=/dev/loop0 vg=vg-d246a state=/tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+
+### 2026-11-03T11:23:29Z host=dev
+$ /root/git/volvisor-wt/w2-46/target/debug/volvisord --config /tmp/opencode/d2-46-final/configs/d1.toml --check-config
+{"timestamp":"2026-11-03T11:23:29.765966Z","level":"INFO","fields":{"message":"volvisord configuration check passed","summary":"config ok: listen 127.0.0.1:47257, provider lvm, journal_dir /tmp/opencode/d2-46-final/lab-d1/journal, transport plain-http loopback, read-auth open (legacy), no witness, migration disabled"}}
+exit=0
+daemon d1-daemon healthy pid=1630521 port=47257
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes/vol-d1-a/attach
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes/vol-d1-b/attach
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes/vol-d1-a/attachment-state
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes/vol-d1-b/detach
+
+### 2026-11-03T11:23:30Z host=dev
+{"allocated_bytes":67108864,"attachment_ids":["att-d1-a"],"attachments":[{"access_mode":"single_writer","attachment_generation":1,"attachment_id":"att-d1-a","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-d246a/vol-vol-d1-a-cbf6b154"}},"host_id":"host-d1","recorded_at_ms":1793705010335,"reporter":"day2-drill-guest","state":"active","state_revision":2,"vm_id":"vm-d1-a","vmm_disk_id":"disk0"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-d1-a","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":2,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Attached","volume_id":"vol-d1-a"}
+### 2026-11-03T11:23:30Z host=dev
+{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":3,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-b"}ASSERT PASS: pre-backup attachment state == active
+ASSERT PASS: pre-backup attachment state_revision == 2
+
+### 2026-11-03T11:23:30Z host=dev
+stopped d1-daemon pid=1630521 sig=TERM
+
+### 2026-11-03T11:23:30Z host=dev
+$ flock -n /tmp/opencode/d2-46-final/lab-d1/journal/journal.lock -c true
+exit=0
+
+### 2026-11-03T11:23:30Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d1/journal/journal.log /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+c38d161dfe6f1a6446e34f62c40125ac111b5e231b2ea02ee72687a89860dec1  /tmp/opencode/d2-46-final/lab-d1/journal/journal.log
+b1202f6723935251c27357e46862cea526548e59012dea201ba541c65f583386  /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+exit=0
+
+### 2026-11-03T11:23:30Z host=dev
+$ jq \{a:\ .volumes\[\"vol-d1-a\"\].runtime.attachment\,\ b_retired:\ .volumes\[\"vol-d1-b\"\].runtime.retired_attachment_ids\} /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+{
+  "a": {
+    "id": "att-d1-a",
+    "vm_id": "vm-d1-a",
+    "host_id": "host-d1",
+    "generation": 1,
+    "access_mode": "single_writer",
+    "vmm_disk_id": "disk0",
+    "state": "active",
+    "state_revision": 2,
+    "evidence": "guest_confirmed",
+    "reporter": "day2-drill-guest",
+    "recorded_at_ms": 1793705010335
+  },
+  "b_retired": [
+    "att-d1-b"
+  ]
+}
+exit=0
+
+### 2026-11-03T11:23:30Z host=dev
+$ tar --xattrs --acls -C /tmp/opencode/d2-46-final/lab-d1 -cpf /tmp/opencode/d2-46-final/lab-d1/backup/state.tar journal
+exit=0
+
+### 2026-11-03T11:23:30Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d1/backup/state.tar
+eebc53f97af22a5657c775283259e01cd5197672243d81dab21184ebb89f6700  /tmp/opencode/d2-46-final/lab-d1/backup/state.tar
+exit=0
+backup_duration_secs=0.028
+
+### 2026-11-03T11:23:30Z host=dev
+daemon d1-daemon healthy pid=1631325 port=47257
+HTTP 200 (want 200) POST http://127.0.0.1:47257/v2/volumes
+
+### 2026-11-03T11:23:30Z host=dev
+$ curl --fail-with-body --silent --show-error --config /tmp/opencode/d2-46-final/configs/d1.curl http://127.0.0.1:47257/v2/volumes/vol-d1-c
+{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":1,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-c"}exit=0
+stopped d1-daemon pid=1631325 sig=TERM
+
+### 2026-11-03T11:23:31Z host=dev
+$ jq -r .volumes\ \|\ keys\[\] /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+vol-d1-a
+vol-d1-b
+vol-d1-c
+exit=0
+
+### 2026-11-03T11:23:31Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d246a
+  vol-vol-d1-a-cbf6b154 vg-d246a 64.00m
+  vol-vol-d1-b-9f35eafc vg-d246a 64.00m
+  vol-vol-d1-c-a5c297c9 vg-d246a 64.00m
+exit=0
+
+### 2026-11-03T11:23:31Z host=dev
+
+### 2026-11-03T11:23:31Z host=dev
+$ mv /tmp/opencode/d2-46-final/lab-d1/journal /tmp/opencode/d2-46-final/lab-d1/journal.drifted
+exit=0
+
+### 2026-11-03T11:23:31Z host=dev
+$ tar --xattrs --acls -C /tmp/opencode/d2-46-final/lab-d1 -xpf /tmp/opencode/d2-46-final/lab-d1/backup/state.tar
+exit=0
+
+### 2026-11-03T11:23:31Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d1/journal/journal.log /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+c38d161dfe6f1a6446e34f62c40125ac111b5e231b2ea02ee72687a89860dec1  /tmp/opencode/d2-46-final/lab-d1/journal/journal.log
+b1202f6723935251c27357e46862cea526548e59012dea201ba541c65f583386  /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+exit=0
+
+### 2026-11-03T11:23:31Z host=dev
+$ jq \{a:\ .volumes\[\"vol-d1-a\"\].runtime.attachment\,\ b_retired:\ .volumes\[\"vol-d1-b\"\].runtime.retired_attachment_ids\} /tmp/opencode/d2-46-final/lab-d1/journal/lvm-state.json
+{
+  "a": {
+    "id": "att-d1-a",
+    "vm_id": "vm-d1-a",
+    "host_id": "host-d1",
+    "generation": 1,
+    "access_mode": "single_writer",
+    "vmm_disk_id": "disk0",
+    "state": "active",
+    "state_revision": 2,
+    "evidence": "guest_confirmed",
+    "reporter": "day2-drill-guest",
+    "recorded_at_ms": 1793705010335
+  },
+  "b_retired": [
+    "att-d1-b"
+  ]
+}
+exit=0
+daemon d1-daemon healthy pid=1632226 port=47257
+restore_to_health_duration_secs=0.194
+
+### 2026-11-03T11:23:31Z host=dev
+{"allocated_bytes":67108864,"attachment_ids":["att-d1-a"],"attachments":[{"access_mode":"single_writer","attachment_generation":1,"attachment_id":"att-d1-a","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-d246a/vol-vol-d1-a-cbf6b154"}},"host_id":"host-d1","recorded_at_ms":1793705010335,"reporter":"day2-drill-guest","state":"active","state_revision":2,"vm_id":"vm-d1-a","vmm_disk_id":"disk0"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-d1-a","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":2,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Attached","volume_id":"vol-d1-a"}{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":3,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-b"}ASSERT PASS: post-restore attachment state == active
+ASSERT PASS: post-restore attachment state_revision == 2
+ASSERT PASS: post-restore attachment evidence == guest_confirmed
+ASSERT PASS: post-restore tombstone == att-d1-b
+
+### 2026-11-03T11:23:31Z host=dev
+{"code":"IDEMPOTENCY_CONFLICT","message":"attachment_id att-d1-b is already bound to a different attachment instance or was consumed earlier in this volume's lifetime"}HTTP 409 for retired-attachment reattach
+ASSERT PASS: retired attachment id refusal status == 409
+ASSERT PASS: retired attachment refusal code contains IDEMPOTENCY_CONFLICT
+
+### 2026-11-03T11:23:31Z host=dev
+{"code":"NOT_FOUND","message":"volume vol-d1-c not found"}HTTP 404 for post-backup volume after restore
+ASSERT PASS: post-backup volume absent after restore == 404
+
+### 2026-11-03T11:23:31Z host=dev
+
+### 2026-11-03T11:23:31Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d246a
+  vol-vol-d1-a-cbf6b154 vg-d246a 64.00m
+  vol-vol-d1-b-9f35eafc vg-d246a 64.00m
+  vol-vol-d1-c-a5c297c9 vg-d246a 64.00m
+exit=0
+stopped d1-daemon pid=1632226 sig=TERM
+
+# end: 2026-11-03T11:23:31Z
+ASSERT SUMMARY: 0 failures
+  Logical volume "vol-vol-d1-a-cbf6b154" successfully removed.
+  Logical volume "vol-vol-d1-b-9f35eafc" successfully removed.
+  Logical volume "vol-vol-d1-c-a5c297c9" successfully removed.
+  Volume group "vg-d246a" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d1 loop=/dev/loop0 vg=vg-d246a

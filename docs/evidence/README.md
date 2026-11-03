@@ -23,6 +23,15 @@ working directory. Read this page before adding a bundle or citing one.
   scoped exactly as its READMEs state: real Cloud Hypervisor processes at
   recorded versions, with the storage below the VMM seam simulated. It is not
   real-media or multi-host nearline evidence.
+- **Day-2 drill evidence exists** under
+  [`docs/evidence/day2/2026-11-03-devhost/`](day2/2026-11-03-devhost/). It is a
+  **single-host development-lab** run at clean commit `e551d26`: stopped-state
+  control-plane backup/restore, schema policy, witness service restart, torn
+  journal/corrupt state, ENOSPC, SIGKILL crash loop/lock contention, and
+  restart-based credential/certificate rotation. It is not multi-host, not
+  storage-side DRBD fencing, not a live binary upgrade, and not a data-plane
+  backup. Total host loss/re-admission is **NOT RUN**. Procedures:
+  [day-2 runbooks](../runbooks/day-2/README.md).
 - **Transport/TLS evidence exists** under
   [`docs/evidence/transport-tls/`](transport-tls/2026-11-02-devhost-netns/).
   It is a **same-host** netns/veth run: a real rustls listener, private-CA

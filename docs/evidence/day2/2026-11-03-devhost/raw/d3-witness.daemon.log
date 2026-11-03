@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:35.528367Z","level":"INFO","fields":{"message":"volvisor-witnessd starting (prototype; not production supported)","listen":"127.0.0.1:58549","lease_ttl_secs":120}}
+{"timestamp":"2026-11-03T11:23:35.529146Z","level":"INFO","fields":{"message":"volvisor-witnessd serving (protocol v2; prototype; not production supported)","listen":"127.0.0.1:58549","tls":false,"host_credentials":2}}

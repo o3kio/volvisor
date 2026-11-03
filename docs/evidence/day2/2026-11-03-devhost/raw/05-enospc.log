@@ -1,0 +1,220 @@
+# drill: 05-enospc
+# start: 2026-11-03T11:23:42Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+
+### 2026-11-03T11:23:42Z host=dev
+daemon d5-daemon healthy pid=1636143 port=35339
+
+### 2026-11-03T11:23:42Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-journal.curl POST http://127.0.0.1:35339/v2/volumes /tmp/opencode/d2-46-final/records/d5-create-baseline.json 200 /tmp/opencode/d2-46-final/records/d5-create-baseline.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+exit=0
+
+### 2026-11-03T11:23:42Z host=dev
+$ df -k /tmp/opencode/d2-46-final/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256     4       252   2% /tmp/opencode/d2-46-final/lab-d5/journalfs
+exit=0
+journal size=1124 last-page slack=2972 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=2217 last-page slack=1879 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=3308 last-page slack=788 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=4398 last-page slack=3794 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=5487 last-page slack=2705 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=6586 last-page slack=1606 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=7682 last-page slack=510 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=8782 last-page slack=3506 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=9875 last-page slack=2413 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=10963 last-page slack=1325 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+journal size=12060 last-page slack=228 bytes
+
+### 2026-11-03T11:23:42Z host=dev
+$ fill_fs /tmp/opencode/d2-46-final/lab-d5/journalfs filler.bin
+filled=249856 stop=No space left on device
+exit=0
+
+### 2026-11-03T11:23:42Z host=dev
+$ df -k /tmp/opencode/d2-46-final/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256   256         0 100% /tmp/opencode/d2-46-final/lab-d5/journalfs
+exit=0
+journal before the failed append: size=12060 sha=41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172
+
+### 2026-11-03T11:23:42Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-journal.curl POST http://127.0.0.1:35339/v2/volumes /tmp/opencode/d2-46-final/records/d5-create-full.json 500 /tmp/opencode/d2-46-final/records/d5-create-full.resp.json
+HTTP 500 (want 500) POST http://127.0.0.1:35339/v2/volumes
+HTTP 500 (want 500) POST http://127.0.0.1:35339/v2/volumes
+exit=0
+{"code":"INTERNAL","message":"failed to write journal record: No space left on device (os error 28)"}ASSERT PASS: journal ENOSPC detail contains No\ space\ left\ on\ device
+
+### 2026-11-03T11:23:42Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-journal.curl GET http://127.0.0.1:35339/v2/volumes/vol-d5-full '' 404 /tmp/opencode/d2-46-final/records/d5-full-absent.json
+HTTP 404 (want 404) GET http://127.0.0.1:35339/v2/volumes/vol-d5-full
+HTTP 404 (want 404) GET http://127.0.0.1:35339/v2/volumes/vol-d5-full
+exit=0
+journal size immediately after the failed append: 12288
+
+### 2026-11-03T11:23:42Z host=dev
+stopped d5-daemon pid=1636143 sig=TERM
+
+### 2026-11-03T11:23:42Z host=dev
+$ rm -f /tmp/opencode/d2-46-final/lab-d5/journalfs/filler.bin
+exit=0
+
+### 2026-11-03T11:23:42Z host=dev
+$ df -k /tmp/opencode/d2-46-final/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256    12       244   5% /tmp/opencode/d2-46-final/lab-d5/journalfs
+exit=0
+daemon d5-daemon healthy pid=1636352 port=35339
+ASSERT PASS: torn append truncated back to the valid prefix == 12060
+ASSERT PASS: valid journal prefix unchanged after ENOSPC recovery == 41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172
+
+### 2026-11-03T11:23:42Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-journal.curl POST http://127.0.0.1:35339/v2/volumes /tmp/opencode/d2-46-final/records/d5-create-full.json 200 /tmp/opencode/d2-46-final/records/d5-create-full.retry.json
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:35339/v2/volumes
+exit=0
+ASSERT PASS: retried volume id == vol-d5-full
+stopped d5-daemon pid=1636352 sig=TERM
+
+### 2026-11-03T11:23:42Z host=dev
+$ python3 - /tmp/opencode/d2-46-final/lab-d5/journalfs/journal/journal.log
+valid_frames=24 valid_prefix=13166 file_size=13166
+exit=0
+
+### 2026-11-03T11:23:42Z host=dev
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d5lvm" successfully created
+lab setup tag=d5-lvm loop=/dev/loop0 vg=vg-d5lvm state=/tmp/opencode/d2-46-final/lab-d5/statefs/lvm-state.json
+daemon d5-lvm-daemon healthy pid=1636442 port=36715
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl POST http://127.0.0.1:36715/v2/volumes /tmp/opencode/d2-46-final/records/d5-lvm-baseline.json 200 /tmp/opencode/d2-46-final/records/d5-lvm-baseline.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:36715/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:36715/v2/volumes
+exit=0
+state before the failed save: size=1023 sha=687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2
+
+### 2026-11-03T11:23:43Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ fill_fs /tmp/opencode/d2-46-final/lab-d5/statefs filler.bin
+filled=258048 stop=No space left on device
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ df -k /tmp/opencode/d2-46-final/lab-d5/statefs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256   256         0 100% /tmp/opencode/d2-46-final/lab-d5/statefs
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl POST http://127.0.0.1:36715/v2/volumes /tmp/opencode/d2-46-final/records/d5-lvm-full.json 500 /tmp/opencode/d2-46-final/records/d5-lvm-full.resp.json
+HTTP 500 (want 500) POST http://127.0.0.1:36715/v2/volumes
+HTTP 500 (want 500) POST http://127.0.0.1:36715/v2/volumes
+exit=0
+{"code":"INTERNAL","message":"failed to write /tmp/opencode/d2-46-final/lab-d5/statefs/lvm-state.json.tmp: No space left on device (os error 28)"}
+### 2026-11-03T11:23:43Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d5/statefs/lvm-state.json
+687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2  /tmp/opencode/d2-46-final/lab-d5/statefs/lvm-state.json
+exit=0
+ASSERT PASS: durable state file unchanged by the failed save == 687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2
+ASSERT PASS: durable state file size unchanged by the failed save == 1023
+
+### 2026-11-03T11:23:43Z host=dev
+$ ls -la /tmp/opencode/d2-46-final/lab-d5/statefs
+total 260
+drwxrwxrwt 2 root root     80 Nov  3 11:23 .
+drwxr-xr-x 5 root root   4096 Nov  3 11:23 ..
+-rw------- 1 root root 258048 Nov  3 11:23 filler.bin
+-rw------- 1 root root   1023 Nov  3 11:23 lvm-state.json
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+  vol-vol-d5-lvm-full-58c0134e     vg-d5lvm 64.00m
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full '' 200 /tmp/opencode/d2-46-final/records/d5-lvm-full-inmem.json
+HTTP 200 (want 200) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full
+HTTP 200 (want 200) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full
+exit=0
+{
+  "volume_id": "vol-d5-lvm-full",
+  "state": "Ready",
+  "provisioned_bytes": 67108864
+}
+
+### 2026-11-03T11:23:43Z host=dev
+stopped d5-lvm-daemon pid=1636442 sig=TERM
+
+### 2026-11-03T11:23:43Z host=dev
+$ df -k /tmp/opencode/d2-46-final/lab-d5/statefs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256     4       252   2% /tmp/opencode/d2-46-final/lab-d5/statefs
+exit=0
+daemon d5-lvm-daemon healthy pid=1636631 port=36715
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full '' 404 /tmp/opencode/d2-46-final/records/d5-lvm-full-after.json
+HTTP 404 (want 404) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full
+HTTP 404 (want 404) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-full
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+  vol-vol-d5-lvm-full-58c0134e     vg-d5lvm 64.00m
+exit=0
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-baseline '' 200 /tmp/opencode/d2-46-final/records/d5-lvm-baseline-after.json
+HTTP 200 (want 200) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-baseline
+HTTP 200 (want 200) GET http://127.0.0.1:36715/v2/volumes/vol-d5-lvm-baseline
+exit=0
+{
+  "volume_id": "vol-d5-lvm-baseline",
+  "state": "Ready",
+  "provisioned_bytes": 67108864
+}
+
+### 2026-11-03T11:23:43Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d5-lvm.curl POST http://127.0.0.1:36715/v2/volumes /tmp/opencode/d2-46-final/records/d5-lvm-recovered.json 200 /tmp/opencode/d2-46-final/records/d5-lvm-recovered.retry.json
+HTTP 200 (want 200) POST http://127.0.0.1:36715/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:36715/v2/volumes
+exit=0
+{
+  "volume_id": "vol-d5-lvm-recovered",
+  "state": "Ready"
+}
+stopped d5-lvm-daemon pid=1636631 sig=TERM
+
+# end: 2026-11-03T11:23:44Z
+ASSERT SUMMARY: 0 failures
+  Logical volume "vol-vol-d5-lvm-baseline-3498a2bf" successfully removed.
+  Logical volume "vol-vol-d5-lvm-full-58c0134e" successfully removed.
+  Logical volume "vol-vol-d5-lvm-recovered-47c2ed53" successfully removed.
+  Volume group "vg-d5lvm" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d5-lvm loop=/dev/loop0 vg=vg-d5lvm
