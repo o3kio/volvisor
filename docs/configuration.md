@@ -66,7 +66,24 @@ typo'd key is a startup refusal, never a silently ignored setting.
 | `credentials` | tables, below | empty | Named admin / operator / read-only bearers. When any entry exists, read routes also require authentication. |
 | `tls` | table, below | disabled | Native TLS listener identity and outbound trust/mTLS. |
 | `allow_insecure` | boolean | `false` | Explicit opt-in to plain HTTP on a non-loopback listener and to plain-HTTP witness/peer URLs. Emits a startup warning. Never a silent fallback. |
-| `max_body_bytes` | integer (bytes) | 1048576 (1 MiB) | Maximum accepted request body size. |
+| `max_body_bytes` | integer (bytes) | 1048576 (1 MiB) | Maximum accepted request body size, enforced for sized and streamed bodies. |
+| `admission` | table, below | defaults | HTTP admission control: read timeout, concurrency cap, per-principal rate limit and pagination maximum. |
+
+### Admission control (`[admission]`)
+
+The long-operation model and operator guidance are documented in
+[admission control](admission-control.md). Read timeouts bound **read-only**
+routes only; journaled mutations are never silently aborted by a wall-clock
+timeout.
+
+| Field | Type | Default | Controls |
+|---|---|---|---|
+| `admission.read_timeout_secs` | integer (seconds) | `30` | Bound on a read-only provider call; expiry is `504 REQUEST_TIMEOUT`. |
+| `admission.queue_timeout_secs` | integer (seconds) | `5` | Maximum wait for a global concurrency permit; expiry is `503 OVERLOADED` with `Retry-After`. |
+| `admission.max_concurrent_requests` | integer | `256` | Global in-flight request cap. `/healthz`, `/v2/healthz` and `/metrics` bypass it. |
+| `admission.rate_limit_per_second` | integer | `100` | Per-principal token refill rate; `0` disables rate limiting. |
+| `admission.rate_limit_burst` | integer | `200` | Per-principal burst; must be at least one when the rate is non-zero. |
+| `admission.max_list_limit` | integer | `1000` | Maximum accepted `GET /v2/volumes?limit=` (1..=1000; never above the contract maximum). |
 
 ### TLS and transport fields
 

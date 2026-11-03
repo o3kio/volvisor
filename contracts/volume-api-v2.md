@@ -56,6 +56,25 @@ failure_domain, health, attachment_ids, attachments[], current_writer,
 backend_health, evidence_status
 ```
 
+`ListVolumes` is `GET /v2/volumes` with optional query parameters:
+
+```text
+project_id=<project>          existing project filter
+limit=<1..=1000>              optional page size
+cursor=<opaque next_cursor>   continuation token from the previous page
+```
+
+Ordering is stable: `volume_id` ascending. The response keeps `volumes` and
+adds `next_cursor` (present only while more entries follow; opaque, never
+parsed by clients). A request **without** `limit` preserves the legacy
+unlimited listing and carries no cursor, so an existing client never
+silently loses volumes; new clients should send `limit` to obtain a bounded
+response. `limit` outside `1..=1000` and an invalid cursor are
+`INVALID_REQUEST`. The cursor is a resume point, not a snapshot: entries
+created or deleted between pages may affect later pages. The server-side
+maximum is 1000; an operator may configure a smaller `max_list_limit`, never
+a larger one.
+
 Each entry in `attachments[]` is the full, hypervisor-neutral per-attachment
 projection a consumer reconciles against:
 
@@ -304,7 +323,7 @@ Common errors:
 `STALE_GENERATION`, `WRITER_ALREADY_ACTIVE`, `UNKNOWN_FENCING_AUTHORITY`,
 `REPLICA_NOT_DURABLE`, `MIGRATION_UNSUPPORTED_LOCAL_STORAGE`,
 `MOVE_UNSUPPORTED_SCOPE`, `VMM_HANDOFF_UNSUPPORTED`, `OPERATION_IN_DOUBT`,
-`UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`.
+`UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`, `RATE_LIMITED`, `OVERLOADED`, `REQUEST_TIMEOUT`, `PAYLOAD_TOO_LARGE`.
 
 Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID. Operation ids and attachment ids carrying the reserved `derived:` prefix are refused typed before any journal write: the prefix is the engine's derived-identity namespace, unreachable from the consumer surface. The refusal is enforced at the routes whose surfaces key on these ids (operation ids on every mutating route; attachment ids on the attach route, whose provider keys attach idempotency by attachment id); other acceptors of an attachment id (the detach route's lookup key) fail closed at the provider.
 
@@ -430,3 +449,39 @@ procedure are specified by
 [schema compatibility](../docs/schema-compatibility.md) and enforced by the
 workspace test job. This policy is implementation-facing; it does not add a
 tenant API error code.
+
+## 12. Admission control, timeouts, body limits and pagination
+
+Admission refusals use the common error shape and are **not journaled**:
+they occur before the handler reaches the journal, so they are safe to
+retry.
+
+- `429 RATE_LIMITED` — the caller's per-principal rate limit was exceeded.
+  Carries `Retry-After` (seconds). The key space is the configured principal
+  set (never bearer tokens), bounded by configuration and a defensive
+  ceiling.
+- `503 OVERLOADED` — the global in-flight concurrency cap stayed exhausted
+  for the admission wait window. Carries `Retry-After` (seconds).
+- `504 REQUEST_TIMEOUT` — a **read-only** route exceeded its bounded
+  timeout. Journaled mutations are deliberately not wrapped in this timeout.
+- `413 PAYLOAD_TOO_LARGE` — the request body exceeded `max_body_bytes`.
+  Enforced while reading, so a streamed/chunked body without
+  `Content-Length` is bounded too; rejected before parsing and before any
+  journal write.
+
+`/healthz`, `/v2/healthz` and `/metrics` bypass the concurrency cap and the
+rate limiter so liveness and monitoring remain available while load is shed.
+
+### Long-operation model
+
+This revision has **no asynchronous operation handle and no long-poll
+surface**. A journaled mutation is synchronous: validate, journal intent,
+run the provider act, journal and return the outcome. The daemon applies a
+wall-clock timeout only to read-only routes; it never drops a journaled
+mutation's future after the intent, because that would abandon an act whose
+outcome is not recorded. A client retry uses the **same `operation_id`** and
+byte-identical body: the journal replays a recorded outcome or answers
+`OPERATION_IN_DOUBT`. A client-side timeout or disconnect does not create
+server-side resumability. A resumable operation handle remains explicitly
+unimplemented; this section records the synchronous model instead of
+pretending otherwise.
