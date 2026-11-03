@@ -81,7 +81,7 @@ Build and test: `cargo build`, `cargo test --workspace`,
 one-command gates with typed, loud failures when their rig is missing:
 
 ```sh
-sudo ./scripts/test-lvm.sh          # locally runnable (root + lvm2 + loop)
+sudo ./scripts/test-lvm.sh          # locally runnable (root + lvm2 + loop + tmpfs mount)
 sudo -E ./scripts/test-ceph.sh      # external cluster; self-hosted runner
 sudo -E ./scripts/test-drbd.sh      # DRBD 9 peer; self-hosted runner
 ```

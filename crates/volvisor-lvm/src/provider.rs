@@ -12,10 +12,13 @@
 //!
 //! Create is fail-closed: if the state save fails, the just-created LV is
 //! removed with a checked `lvremove` and the in-memory entry is dropped (a
-//! failing cleanup names the exact manual `lvremove`), except when the
-//! failed save's rename already landed — then the durable record, the
-//! in-memory entry and the LV are all kept and a same-payload retry
-//! returns the volume.
+//! failing cleanup names the exact manual `lvremove` and leaves the LV
+//! visible in `lvs` but absent from provider state), except when the failed
+//! save's rename already landed — then the durable record, the in-memory
+//! entry and the LV are all kept. In that last case the API serves the
+//! volume; a retry with a new `operation_id` and the same payload is
+//! idempotent, while reusing the failed `operation_id` replays the recorded
+//! error.
 //!
 //! Thick LVM rounds logical-volume sizes **up** to whole physical extents
 //! (4 MiB by default). The provider therefore treats
@@ -542,7 +545,9 @@ impl LvmProvider {
     /// failing cleanup is never swallowed) and the memory entry is dropped:
     /// memory, durable state and LVM all agree the volume does not exist.
     /// The original save error is preserved; when the cleanup itself fails
-    /// the exact manual remediation is appended.
+    /// the exact manual remediation is appended and the LV is described as
+    /// what an operator can verify: still present in `lvs`, absent from
+    /// provider state.
     ///
     /// Carve-out: if the atomic save's rename already landed and only a
     /// later step (the directory fsync) failed, the durable file contains
@@ -566,7 +571,9 @@ impl LvmProvider {
                 format!(
                     "{}; the volume record nonetheless reached the state file (the save's \
                      rename landed before a later step failed), so volume {volume_id} and its \
-                     LV {vg_name}/{lv_name} were kept; a same-payload retry returns the volume",
+                     LV {vg_name}/{lv_name} were kept; the API serves the volume, and a retry \
+                     with a new operation_id and the same payload returns it (reusing the failed \
+                     operation_id replays this recorded error)",
                     save_error.detail
                 ),
             );
@@ -586,7 +593,9 @@ impl LvmProvider {
             detail.push_str(vg_name);
             detail.push('/');
             detail.push_str(lv_name);
-            detail.push_str(" required (startup reconciliation reports it as a foreign LV)");
+            detail.push_str(
+                " required (the LV remains visible in lvs and is absent from provider state)",
+            );
         }
         ApiError::new(save_error.code, detail)
     }

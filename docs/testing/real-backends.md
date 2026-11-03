@@ -114,7 +114,9 @@ not run.
 ### LVM rig (locally runnable)
 
 - One Linux host, root (or passwordless sudo).
-- `lvm2`, `util-linux` (`losetup`), device-mapper, loop device support.
+- `lvm2`, `util-linux` (`losetup`, `mount`, `umount`), device-mapper, loop
+  device support, and permission to mount a tmpfs (the ENOSPC regression test
+  mounts a 256 KiB tmpfs over the provider state directory).
 - At least 1 GiB free under the evidence/output directory.
 - The suite creates a private 256 MiB backing file, a loop device and a
   temporary VG, then removes them. It does not touch an operator VG.

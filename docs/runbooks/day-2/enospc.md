@@ -1,17 +1,27 @@
 # Disk full / ENOSPC during a journal or state write — day-2 runbook
 
-**Status: DRILLED, with a filed finding.**
+**Status: DRILLED on `e551d26`; the provider-state gap found by the drill
+([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code
+([PR #69](https://github.com/o3kio/volvisor/pull/69)). The post-fix path is
+covered by a real-LVM ENOSPC regression test, but the full D5 drill has not
+been re-run at the merged revision.**
 
 - **Journal ENOSPC:** fail-closed. HTTP 500, no volume, torn append
   truncated on restart, retry succeeds after space is freed.
-- **Provider-state ENOSPC:** HTTP 500 and the old durable state is intact,
-  **but** the create's LV is leaked and the running process serves the volume
-  from memory until restart. Filed as
-  [#58](https://github.com/o3kio/volvisor/issues/58). This is a real
-  behavior gap, not a drill artifact.
+- **Provider-state ENOSPC:** HTTP 500; for an uncommitted save the old
+  durable state is intact. After the #58 fix, an uncommitted save compensates
+  the just-created LV and
+  removes the in-memory entry (GET is 404, no phantom volume); if the
+  compensating `lvremove` fails, the LV remains as an operator-visible orphan
+  and the error names the manual remediation. In the rare case where the
+  save's rename landed before a later step failed, the durable record, memory
+  and LV keep the volume and GET returns it.
 
-Evidence: [D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
+Historical evidence (pre-fix D5):
+[D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
 [Report D5](../../evidence/day2/2026-11-03-devhost/REPORT.md#d5--enospc-on-journal-and-provider-state-writes).
+Post-fix coverage: `lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
+in `crates/volvisor-lvm/tests/integration_lvm.rs`.
 
 ## Scope and non-goals
 
@@ -30,11 +40,12 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
 - **Journal ENOSPC:** the failed create is not visible (404); no acknowledged
   state is lost; the torn append is removed on restart. **RTO:** free space,
   restart, retry; seconds in the lab.
-- **State ENOSPC:** the failed create is not durable, but its LV exists and
-  the running process may serve a phantom volume. **RPO:** the failed create
-  (the API returned 500, so it was never acknowledged as durable).
-  **RTO:** free space + restart + orphan-LV reconciliation. The capacity leak
-  persists until the operator removes the LV.
+- **State ENOSPC:** the failed create is not acknowledged as durable.
+  **RPO:** the failed create. Post-fix, the just-created LV is compensated
+  and the in-memory entry is rolled back; only a failing compensating
+  `lvremove` leaves an orphan that needs manual cleanup. **RTO:** free space +
+  restart + retry; add one manual `lvremove` for the cleanup-failure tail.
+  The post-fix path has not been re-drilled end-to-end at the merged revision.
 
 ## Preconditions
 
@@ -140,11 +151,22 @@ curl -fsS --config ~/.volvisor-admin.curl \
 lvs --noheadings -o lv_name,vg_name,lv_size
 ```
 
-## C. Provider-state filesystem ENOSPC (known gap)
+## C. Provider-state filesystem ENOSPC
 
-The failed save is atomic: the old `lvm-state.json` is preserved and the
-`.tmp` is removed. But `lvcreate` already ran, the new volume was inserted
-into the in-memory state, and the error path does not roll either back.
+The save is atomic up to the rename: a failure before it preserves the old
+`lvm-state.json` and removes the `.tmp`. `lvcreate` has already run. After the
+#58 fix, an uncommitted save is compensated with a checked `lvremove` and the
+in-memory entry is rolled back. Three outcomes are possible, so still inspect
+before assuming anything:
+
+- **Uncommitted save (normal):** 500, old state byte-identical, GET 404, no
+  LV for the failed volume id.
+- **Carve-out (the save's rename landed, a later step failed):** 500, GET
+  200, the durable record/LV/memory all hold the volume. Do not compensate
+  it; the volume is served, but its crash durability was not confirmed.
+- **Cleanup failure:** 500, GET 404, the LV remains, and the error detail
+  names `manual lvremove <vg>/<lv>`. The in-memory entry is gone, so the LV
+  is absent from provider state.
 
 **Do not assume "HTTP 500" means "nothing happened."**
 
@@ -160,7 +182,16 @@ curl -sS -o /tmp/after-500.json -w '%{http_code}\n' \
 cat /tmp/after-500.json
 ```
 
-D5 observed, immediately after the 500:
+Expected post-fix:
+
+- **normal:** the state hash and size are unchanged, `GET` returns 404, and
+  no LV named for `$VOLUME_ID` is present;
+- **carve-out:** `GET` returns 200, the LV is present, and the durable state
+  contains the volume;
+- **cleanup failure:** `GET` returns 404 but the LV is present, and the 500
+  detail names `manual lvremove <vg>/<lv>`.
+
+Historical D5 observation (pre-fix, `e551d26`):
 
 - old state hash `687daef0...e15a4b2`, size 1023, unchanged;
 - the new LV `vol-vol-d5-lvm-full-58c0134e` present in `lvs`;
@@ -176,12 +207,21 @@ systemctl start volvisord.service
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-3. Re-check the volume and LV. Expect 404 for the failed create (it was never
-   durable) and the LV still present. If the volume unexpectedly exists, stop
-   and investigate before serving.
+3. Re-check the volume and LV against the three outcomes above:
 
-4. Reconcile the orphan LV **only after** confirming it is absent from the
-   durable state and no consumer uses it:
+   - **normal:** `GET` is still 404 and no LV for the failed volume id exists;
+   - **cleanup failure:** `GET` is 404 and the LV is still present — go to
+     step 4;
+   - **carve-out:** `GET` is 200, the LV is present, and the durable state
+     contains the volume. Do not remove it; confirm it appears exactly once
+     in `GET /v2/volumes`, then resume at step 5's carve-out bullet.
+
+   Anything else is a state/LVM disagreement: stop and investigate before
+   serving.
+
+4. Reconcile an orphan LV **only after** confirming it is absent from the
+   durable state and no consumer uses it. This is the cleanup-failure tail;
+   never do it for the carve-out (whose state record and LV must stay):
 
 ```sh
 # Read-only checks first.
@@ -195,13 +235,19 @@ lvremove --yes vg-example/vol-vol-example-<hash>
 If you are unsure, keep the LV and escalate. Deleting an LV whose state
 record is missing from a stale backup is data loss.
 
-5. Retry the create with the same operation id after space is restored, and
-   verify one durable volume. D5 observed a subsequent create succeed (HTTP
-   200) with the daemon not wedged.
+5. Retry only after space is restored:
 
-**Until [#58](https://github.com/o3kio/volvisor/issues/58) is fixed, treat
-every state-save 500 as "LV may exist, API may lie until restart."** The old
-durable state is safe; the capacity and the temporary identity are not.
+   - **normal or cleanup failure:** use a **new `operation_id`** with the
+     same payload. Reusing the failed `operation_id` replays the recorded
+     500 verbatim; the failed create is terminal in the journal.
+   - **carve-out:** `GET` already returns the volume; a new `operation_id`
+     with the same payload returns the same volume idempotently.
+
+   Verify exactly one durable volume and one LV.
+
+The old durable state is safe. The two states that need operator attention
+are the carve-out (served but not crash-durable-confirmed) and the
+cleanup-failure orphan (visible in `lvs`, absent from provider state).
 
 ## D. Prevention
 
@@ -220,20 +266,31 @@ durable state is safe; the capacity and the temporary identity are not.
 
 - Journal ENOSPC: 500, failed volume 404, torn append truncated to the valid
   prefix on restart, retry creates exactly one volume, no phantom state.
-- State ENOSPC: 500, old state file byte-identical, **and** the operator
-  records the in-memory/LV divergence, restarts (volume 404), reconciles the
-  orphan LV, and verifies a later create.
+- State ENOSPC, normal: 500, old state file byte-identical, GET 404, no
+  orphan LV, restart 404, and a retry with a new `operation_id` creates
+  exactly one volume.
+- State ENOSPC, cleanup failure: 500 names `manual lvremove`, GET 404, the
+  LV is present and absent from provider state; the operator removes it and
+  a retry with a new `operation_id` succeeds.
+- State ENOSPC, carve-out: 500, GET 200, durable state/LV/memory agree; a
+  new `operation_id` with the same payload returns the same volume.
 - No hand-edited state file, no truncated complete journal frame.
 
 ## What was drilled
 
 D5 part A: 12060-byte journal with 228 bytes of slack, tmpfs filled, create
 500, volume 404, restart truncated 12288→12060 with the same prefix hash,
-retry 200. Part B: 1023-byte state, tmpfs filled, create 500, old state
-unchanged, in-memory GET 200, LV present, restart GET 404, LV still present,
-new create 200. Raw:
+retry 200. Part B (historical, pre-fix): 1023-byte state, tmpfs filled,
+create 500, old state unchanged, in-memory GET 200, LV present, restart GET
+404, LV still present, new create 200. Raw:
 [raw/05-enospc.log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log).
+
+The post-fix state path is exercised by
+`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
+in the real-LVM suite (256 KiB tmpfs, real ENOSPC, real `lvremove`, restart
+and retry). That is a code-level regression test, not a full re-run of D5.
 
 **Limits:** filesystem ENOSPC only (not inode/thin-pool/metadata); fake
 provider for the journal; loop LVM for state; single host; no concurrent
-writer; the state-save gap is a code finding, not a passing behavior.
+writer; the D5 part B observations describe the pre-fix code and must not be
+used as the post-fix expected behavior.

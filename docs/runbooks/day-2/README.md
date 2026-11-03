@@ -23,7 +23,7 @@ undrilled part, both are named; the overall verdict is the weaker one.
 | Upgrade and rollback across schema versions | **PARTIAL** — schema policy drilled; live binary upgrade/rollback **NOT RUN** | [upgrade-and-rollback.md](upgrade-and-rollback.md) | [D2](../../evidence/day2/2026-11-03-devhost/raw/02-schema-upgrade.log) |
 | Lost or unreachable witness | **PARTIAL** — witness service drilled; storage-side fencing **NOT RUN** | [lost-witness.md](lost-witness.md) | [D3](../../evidence/day2/2026-11-03-devhost/raw/03-lost-witness.log) |
 | Torn/corrupt journal tail and corrupt state file | **DRILLED** | [journal-and-state-corruption.md](journal-and-state-corruption.md) | [D4](../../evidence/day2/2026-11-03-devhost/raw/04-torn-journal-and-corrupt-state.log) |
-| Disk full / ENOSPC during journal or state write | **DRILLED**, with a state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) | [enospc.md](enospc.md) | [D5](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log) |
+| Disk full / ENOSPC during journal or state write | **DRILLED**; the state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code ([PR #69](https://github.com/o3kio/volvisor/pull/69)), post-fix path covered by a regression test | [enospc.md](enospc.md) | [D5](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log) |
 | Daemon crash loop and single-writer lock contention | **DRILLED** | [crash-loop-and-lock.md](crash-loop-and-lock.md) | [D6](../../evidence/day2/2026-11-03-devhost/raw/06-crash-loop-and-lock.log) |
 | Credential and certificate rotation | **DRILLED** — restart-based; no hot reload | [credential-and-cert-rotation.md](credential-and-cert-rotation.md) | [D7](../../evidence/day2/2026-11-03-devhost/raw/07-credential-and-cert-rotation.log) |
 | Total loss of one host and re-admission | **NOT RUN — REQUIRES** a real multi-host lab, a third failure domain and BMC/fencing | [host-loss-and-rejoin.md](host-loss-and-rejoin.md) | none |
@@ -43,7 +43,7 @@ exactly that; it is not zero.
 | Torn journal tail | Only the incomplete last record; acknowledged prior records survived | Restart to health | D4 |
 | Corrupt state file | Backup point; the daemon refuses to guess | Restore + reconciliation; not measured | D4 |
 | Journal ENOSPC | No acknowledged state lost; the failed create is absent | Free space + restart; measured in seconds in the lab | D5 part A |
-| Provider-state ENOSPC | The failed create is not durable; its LV **is** leaked | Free space + restart + orphan-LV reconciliation | D5 part B, [#58](https://github.com/o3kio/volvisor/issues/58) |
+| Provider-state ENOSPC | The failed create is not durable; the LV is compensated, and only a failing cleanup leaves an operator-visible orphan | Free space + restart + retry; manual `lvremove` for the cleanup-failure tail; post-fix path covered by a regression test | D5 part B (historical), [#58](https://github.com/o3kio/volvisor/issues/58) fix |
 | Crash loop with in-flight requests | The in-flight request may fail; prior durable state survived every SIGKILL | Restart/replay to health; not separately measured | D6 |
 | Token/certificate rotation | No control-plane state loss | Two controlled restarts (overlap + removal), plus client rollout | D7 |
 | Total host loss | **Unknown**; async replication can lose its tail | **Unknown** | D8 NOT RUN |

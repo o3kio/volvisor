@@ -474,8 +474,8 @@ async fn lvm_non_aligned_create_rounds_up_and_absent_lv_delete_succeeds() -> Res
     Ok(())
 }
 
-/// Assert that LVM's own report lists exactly `lv_name` under `vg_name`.
-fn assert_only_lv(pool: &LoopPool, vg_name: &str, lv_name: &str) -> Result<(), ApiError> {
+/// Assert that LVM's own report lists `lv_name` under `vg_name`.
+fn assert_lv_exists(pool: &LoopPool, vg_name: &str, lv_name: &str) -> Result<(), ApiError> {
     let lvs = pool.runner.run(
         "lvs",
         &[
@@ -495,7 +495,7 @@ fn assert_only_lv(pool: &LoopPool, vg_name: &str, lv_name: &str) -> Result<(), A
     let volumes = value["report"][0]["lv"]
         .as_array()
         .ok_or_else(|| internal("missing lv array in lvs report"))?;
-    assert_eq!(volumes.len(), 1, "exactly the retried LV: {volumes:?}");
+    assert_eq!(volumes.len(), 1, "the retried LV exists: {volumes:?}");
     assert_eq!(volumes[0]["lv_name"].as_str(), Some(lv_name));
     Ok(())
 }
@@ -540,6 +540,17 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
         "integration-token".to_owned(),
     )?;
     let id = VolumeId::new("itest-enospc").expect("valid volume id");
+    let failed_lv_name = lv_name_for(&id);
+
+    // A durable volume that is NOT the one under test: compensation must
+    // check this volume's record, not merely "the state file is non-empty".
+    let unrelated = provider
+        .create_volume(&fixture_create_request(
+            "itest-enospc-unrelated",
+            VOLUME_BYTES,
+        ))
+        .await?;
+    let unrelated_id = unrelated.volume_id.clone();
     let snapshot = fs::read(&state_path).map_err(|e| internal(format!("snapshot state: {e}")))?;
 
     fill_tmpfs(&statefs.join("fill"))?;
@@ -551,6 +562,8 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
         .await
         .expect_err("create whose state save hits ENOSPC");
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    // The detail proves this is the save failure, not an lvcreate failure
+    // (the string is coupled to state.rs's save-error format by design).
     assert!(
         err.detail.contains("state.json"),
         "the save failure names the state file: {err}"
@@ -561,10 +574,9 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
         .await
         .expect_err("the failed create must not be visible");
     assert_eq!(inspected.code, ApiErrorCode::NotFound);
-    assert_eq!(
-        provider.list_volumes(None).await.expect("list volumes"),
-        Vec::<InspectVolumeResponse>::new()
-    );
+    let listed = provider.list_volumes(None).await.expect("list volumes");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].volume_id, unrelated_id);
 
     // The compensating `lvremove` really ran: no orphan LV remains.
     let lvs = pool.runner.run(
@@ -573,8 +585,8 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     )?;
     assert!(lvs.success, "lvs query: {}", lvs.stderr_excerpt());
     assert!(
-        !lvs.stdout.contains("itest-enospc"),
-        "the compensating lvremove removed the LV: {}",
+        !lvs.stdout.contains(&failed_lv_name),
+        "the compensating lvremove removed the failed LV {failed_lv_name}: {}",
         lvs.stdout
     );
 
@@ -610,7 +622,7 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
         .expect("retry after compensation");
     assert_eq!(created.volume_id, id);
     assert_eq!(created.state, VolumeLifecycle::Ready);
-    assert_only_lv(&pool, "volvisorit-enospc", &lv_name_for(&id))?;
+    assert_lv_exists(&pool, "volvisorit-enospc", &lv_name_for(&id))?;
 
     Ok(())
 }
