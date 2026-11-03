@@ -18,11 +18,12 @@ pub const DEFAULT_ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 /// Default per-principal token-bucket refill rate. Zero disables the
-/// limiter; [`ApiConfig::default`] keeps it disabled for the legacy
-/// library callers, while the daemon's `[admission]` table enables it.
+/// limiter. Both [`ApiConfig::default`] and the daemon's `[admission]` table
+/// default to disabled, so rate limiting is opt-in and legacy client
+/// behavior is preserved until an operator sets a non-zero rate.
 pub const DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 0;
 
-/// Default per-principal token-bucket burst size.
+/// Default per-principal token-bucket burst size (disabled limiter).
 pub const DEFAULT_RATE_LIMIT_BURST: u32 = 0;
 
 /// Default maximum page size accepted by `GET /v2/volumes?limit=`.

@@ -46,10 +46,12 @@ surface. Issue #45's long-operation checkbox that asks for such a handle
 stays unchecked; this document records the synchronous model instead of
 claiming a capability the daemon does not have.
 
-## Read route timeout
+## Read-route timeout
 
-`admission.read_timeout_secs` (default `30`) bounds a read-only provider
-call. On expiry the daemon answers:
+A **single** configurable value, `admission.read_timeout_secs` (default
+`30`), bounds every read-only provider call. There are no distinct per-route
+timeout values; the same wall-clock bound applies uniformly to each route
+listed below. On expiry the daemon answers:
 
 ```http
 HTTP/1.1 504 Gateway Timeout
@@ -58,7 +60,7 @@ Content-Type: application/json
 {"code":"REQUEST_TIMEOUT","message":"read-only route ... exceeded its 30s timeout"}
 ```
 
-The bound covers `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
+The bound applies to `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
 `GET /v2/capabilities`, `GET /v2/migrations/{migration_id}`,
 `POST /v2/vms/{vm_id}/check-mobility` and the read-only peer health route.
 `/healthz`, `/v2/healthz` and `/metrics` are local and unbounded. Mutations
@@ -84,13 +86,28 @@ of permits; it cannot create unbounded tasks or connections. `/healthz`,
 `/v2/healthz` and `/metrics` bypass the cap so liveness and monitoring stay
 available during overload.
 
-## Per-principal rate limits
+## Per-principal rate limits (opt-in)
 
-`admission.rate_limit_per_second` (default `100`) and
-`admission.rate_limit_burst` (default `200`) form a per-principal token
-bucket. The key is the authenticated principal id from the scoped credential
-(`AuthContext`), or one of the fixed `admin_token`/`anonymous`/`peer`
-identities. **Bearer tokens are never used as keys and never logged.**
+Per-principal rate limiting is **disabled by default**: both
+`admission.rate_limit_per_second` and `admission.rate_limit_burst` default
+to `0`. This preserves legacy client behavior; the concurrency cap, read
+timeout and body limit stay on by default because they shed overload without
+changing the success path for well-behaved clients. Rate limiting is a
+behavioral change, so an operator must opt in explicitly.
+
+When enabled, `rate_limit_per_second` and `rate_limit_burst` form a
+per-principal token bucket. The key is the authenticated principal id from
+the scoped credential (`AuthContext`), or one of the fixed
+`admin_token`/`anonymous`/`peer` identities. **Bearer tokens are never used
+as keys and never logged.**
+
+Enable it in the daemon config:
+
+```toml
+[admission]
+rate_limit_per_second = 100
+rate_limit_burst = 200
+```
 
 - A refused request is answered `429 Too Many Requests` with `Retry-After`
   and `{"code":"RATE_LIMITED", ...}`.
@@ -98,10 +115,11 @@ identities. **Bearer tokens are never used as keys and never logged.**
 - The bucket map is bounded by the configured principal set plus a hard
   defensive ceiling; excess keys share one overflow bucket, so a hostile
   label cannot grow memory without bound.
-- Setting `rate_limit_per_second = 0` disables the limiter.
+- Setting `rate_limit_per_second = 0` (the default) disables the limiter and
+  `rate_limit_burst` is ignored.
 - The legacy read-only posture (no scoped credentials) shares the single
   `anonymous` bucket, because there is no stronger identity to key on. Use
-  scoped credentials on any shared network.
+  scoped credentials **and** enable rate limiting on any shared network.
 
 ## Pagination for `GET /v2/volumes`
 
@@ -163,9 +181,9 @@ not reach the provider.
 | Knob | Default | Meaning |
 |---|---|---|
 | `max_body_bytes` | `1048576` | Request body ceiling (sized and streamed). |
-| `admission.read_timeout_secs` | `30` | Read-only route timeout (`504 REQUEST_TIMEOUT`). |
+| `admission.read_timeout_secs` | `30` | Single read-only timeout applied to every read route (`504 REQUEST_TIMEOUT`). |
 | `admission.queue_timeout_secs` | `5` | Concurrency-permit wait (`503 OVERLOADED`). |
 | `admission.max_concurrent_requests` | `256` | Global in-flight cap (probes/metrics exempt). |
-| `admission.rate_limit_per_second` | `100` | Per-principal refill rate; `0` disables. |
-| `admission.rate_limit_burst` | `200` | Per-principal burst. |
+| `admission.rate_limit_per_second` | `0` (disabled) | Per-principal refill rate; opt-in, `0` keeps legacy behavior. |
+| `admission.rate_limit_burst` | `0` (disabled) | Per-principal burst; ignored while the rate is `0`. |
 | `admission.max_list_limit` | `1000` | Maximum accepted `GET /v2/volumes?limit=`. |

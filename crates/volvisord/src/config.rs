@@ -70,11 +70,13 @@ pub struct AdmissionConfig {
     /// Global cap on in-flight requests (liveness and metrics exempt).
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
-    /// Per-principal token refill rate; `0` disables rate limiting.
+    /// Per-principal token refill rate. Rate limiting is **opt-in**: `0`
+    /// (the default) disables it and preserves legacy client behavior.
     #[serde(default = "default_rate_limit_per_second")]
     pub rate_limit_per_second: u32,
     /// Per-principal token-bucket burst; must be at least one when the rate
-    /// is non-zero.
+    /// is non-zero. Defaults to `0` because the limiter is disabled by
+    /// default.
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
     /// Maximum accepted `GET /v2/volumes?limit=`.
@@ -421,10 +423,10 @@ fn default_max_concurrent_requests() -> usize {
     256
 }
 fn default_rate_limit_per_second() -> u32 {
-    100
+    0
 }
 fn default_rate_limit_burst() -> u32 {
-    200
+    0
 }
 fn default_max_list_limit() -> usize {
     1000
@@ -1429,10 +1431,33 @@ device_claim_token = \"scoped-destructive-auth\"
         assert_eq!(cfg.max_body_bytes, 1 << 20);
         assert_eq!(cfg.admission.read_timeout_secs, 30);
         assert_eq!(cfg.admission.max_concurrent_requests, 256);
-        assert_eq!(cfg.admission.rate_limit_per_second, 100);
+        assert_eq!(cfg.admission.rate_limit_per_second, 0);
+        assert_eq!(cfg.admission.rate_limit_burst, 0);
         let api = cfg.api_config();
         assert_eq!(api.max_body_bytes, 1 << 20);
         assert_eq!(api.read_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(api.rate_limit_per_second, 0);
+        assert_eq!(api.rate_limit_burst, 0);
+    }
+
+    #[test]
+    fn rate_limiting_is_opt_in() {
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        assert!(
+            cfg.validate().is_ok(),
+            "0/0 must be a valid disabled limiter"
+        );
+        assert_eq!(cfg.api_config().rate_limit_per_second, 0);
+        assert_eq!(cfg.api_config().rate_limit_burst, 0);
+
+        let raw = format!(
+            "{}\n[admission]\nrate_limit_per_second = 100\nrate_limit_burst = 200\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.api_config().rate_limit_per_second, 100);
+        assert_eq!(cfg.api_config().rate_limit_burst, 200);
     }
 
     #[test]

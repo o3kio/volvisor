@@ -67,7 +67,7 @@ typo'd key is a startup refusal, never a silently ignored setting.
 | `tls` | table, below | disabled | Native TLS listener identity and outbound trust/mTLS. |
 | `allow_insecure` | boolean | `false` | Explicit opt-in to plain HTTP on a non-loopback listener and to plain-HTTP witness/peer URLs. Emits a startup warning. Never a silent fallback. |
 | `max_body_bytes` | integer (bytes) | 1048576 (1 MiB) | Maximum accepted request body size, enforced for sized and streamed bodies. |
-| `admission` | table, below | defaults | HTTP admission control: read timeout, concurrency cap, per-principal rate limit and pagination maximum. |
+| `admission` | table, below | defaults | HTTP admission control: read timeout, concurrency cap, opt-in per-principal rate limit and pagination maximum. |
 
 ### Admission control (`[admission]`)
 
@@ -78,12 +78,28 @@ timeout.
 
 | Field | Type | Default | Controls |
 |---|---|---|---|
-| `admission.read_timeout_secs` | integer (seconds) | `30` | Bound on a read-only provider call; expiry is `504 REQUEST_TIMEOUT`. |
+| `admission.read_timeout_secs` | integer (seconds) | `30` | Single bound applied to every read-only provider call; expiry is `504 REQUEST_TIMEOUT`. |
 | `admission.queue_timeout_secs` | integer (seconds) | `5` | Maximum wait for a global concurrency permit; expiry is `503 OVERLOADED` with `Retry-After`. |
 | `admission.max_concurrent_requests` | integer | `256` | Global in-flight request cap. `/healthz`, `/v2/healthz` and `/metrics` bypass it. |
-| `admission.rate_limit_per_second` | integer | `100` | Per-principal token refill rate; `0` disables rate limiting. |
-| `admission.rate_limit_burst` | integer | `200` | Per-principal burst; must be at least one when the rate is non-zero. |
+| `admission.rate_limit_per_second` | integer | `0` (disabled) | Per-principal token refill rate; opt-in, `0` preserves legacy behavior. |
+| `admission.rate_limit_burst` | integer | `0` (disabled) | Per-principal burst; ignored while the rate is `0`, must be at least one when the rate is non-zero. |
 | `admission.max_list_limit` | integer | `1000` | Maximum accepted `GET /v2/volumes?limit=` (1..=1000; never above the contract maximum). |
+
+Per-principal rate limiting is **opt-in and disabled by default** (`0`/`0`)
+so unmodified deployments keep their existing client behavior. Enable it
+explicitly when you want admission-level fairness:
+
+```toml
+[admission]
+rate_limit_per_second = 100
+rate_limit_burst = 200
+```
+
+On any shared network, configure scoped `[credentials]` **and** enable rate
+limiting together: without scoped credentials every legacy caller shares the
+single `anonymous` bucket. The concurrency cap, read timeout and body limit
+remain on by default because they shed overload without changing the success
+path for well-behaved clients.
 
 ### TLS and transport fields
 

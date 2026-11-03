@@ -456,14 +456,23 @@ Admission refusals use the common error shape and are **not journaled**:
 they occur before the handler reaches the journal, so they are safe to
 retry.
 
+The global concurrency cap, the single read timeout and the body limit are
+enabled by default. Per-principal rate limiting is **opt-in and disabled by
+default**, so an unmodified deployment's success path is unchanged; an
+operator enables it explicitly with a non-zero
+`admission.rate_limit_per_second` and burst.
+
 - `429 RATE_LIMITED` — the caller's per-principal rate limit was exceeded.
   Carries `Retry-After` (seconds). The key space is the configured principal
   set (never bearer tokens), bounded by configuration and a defensive
-  ceiling.
+  ceiling. This refusal only occurs when rate limiting is enabled (non-zero
+  configured rate).
 - `503 OVERLOADED` — the global in-flight concurrency cap stayed exhausted
   for the admission wait window. Carries `Retry-After` (seconds).
 - `504 REQUEST_TIMEOUT` — a **read-only** route exceeded its bounded
-  timeout. Journaled mutations are deliberately not wrapped in this timeout.
+  timeout. One configurable `read_timeout_secs` applies uniformly to every
+  read-only route; there are no distinct per-route timeout values. Journaled
+  mutations are deliberately not wrapped in this timeout.
 - `413 PAYLOAD_TOO_LARGE` — the request body exceeded `max_body_bytes`.
   Enforced while reading, so a streamed/chunked body without
   `Content-Length` is bounded too; rejected before parsing and before any
