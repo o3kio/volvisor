@@ -17,29 +17,85 @@ source "$(dirname "$0")/lib.sh"
 
 TAG="d5"
 begin_drill "05-enospc"
-trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || true; stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || true; umount "$RUN/lab-$TAG/journalfs" 2>/dev/null || true; umount "$RUN/lab-$TAG/statefs" 2>/dev/null || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
+trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-daemon" KILL >/dev/null 2>&1 || true; stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-lvm-daemon" KILL >/dev/null 2>&1 || true; umount "$RUN/lab-$TAG/journalfs" 2>/dev/null || umount -l "$RUN/lab-$TAG/journalfs" 2>/dev/null || true; umount "$RUN/lab-$TAG/statefs" 2>/dev/null || umount -l "$RUN/lab-$TAG/statefs" 2>/dev/null || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
 
 # fill_fs <dir> <name>: write chunks (shrinking from 4 KiB to 1 byte)
-# until the filesystem refuses, leaving effectively zero free bytes.
+# until the filesystem refuses, leaving effectively zero free bytes. The
+# byte cap is a safety rail: the tmpfs mount is verified first, so this
+# cannot trigger on a 256 KiB filesystem, but if that check is ever
+# bypassed the helper fails instead of filling the host filesystem.
 fill_fs() {
-  local dir="$1" name="$2"
-  python3 - "$dir/$name" <<'PY'
+  local dir="$1" name="$2" limit=524288
+  python3 - "$dir/$name" "$limit" <<'PY'
 import sys
 path = sys.argv[1]
+limit = int(sys.argv[2])
 written = 0
 chunk = 4096
 with open(path, "wb", buffering=0) as f:
     while chunk:
+        if written + chunk > limit:
+            print(f"fill cap {limit} reached at {written} bytes; refusing to continue")
+            sys.exit(1)
         try:
-            f.write(b"\0" * chunk)
+            n = f.write(b"\0" * chunk)
         except OSError as err:
             if chunk == 1:
                 print(f"filled={written} stop={err.strerror}")
                 break
             chunk //= 2
         else:
-            written += chunk
+            written += n
 PY
+}
+
+# mount_tmpfs_256k <dir>: mount a size-capped tmpfs and prove the mount
+# actually took effect. Without the fstype check a failed mount would make
+# fill_fs write into the host filesystem instead of a disposable tmpfs.
+mount_tmpfs_256k() {
+  local dir="$1" fstype
+  mkdir -p "$dir"
+  if ! mount -t tmpfs -o size=256k tmpfs "$dir" >>"$LOG" 2>&1; then
+    printf 'FAIL: could not mount a 256 KiB tmpfs on %s; refusing to fill it\n' "$dir" | tee -a "$LOG"
+    return 1
+  fi
+  fstype="$(stat -f -c %T "$dir")"
+  if [[ "$fstype" != "tmpfs" ]]; then
+    printf 'FAIL: %s is %s, not tmpfs; refusing to fill it\n' "$dir" "$fstype" | tee -a "$LOG"
+    umount "$dir" 2>/dev/null || true
+    return 1
+  fi
+  printf 'mounted tmpfs size=256k on %s\n' "$dir" | tee -a "$LOG"
+}
+
+# stop_daemon <name>: stop a drill daemon and fail the drill if TERM does
+# not take effect. A still-live daemon would make the pre-restart snapshot
+# and the restart evidence meaningless. Escalate to KILL so a TERM-ignoring
+# daemon cannot keep the tmpfs busy and leak the lab on the failure path.
+stop_daemon() {
+  local name="$1"
+  if ! stop_pidfile "$name" TERM; then
+    printf 'WARNING: %s ignored TERM; escalating to KILL to release the lab\n' "$name" | tee -a "$LOG"
+    stop_pidfile "$name" KILL || true
+    printf 'FAIL: %s did not stop on TERM\n' "$name" | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    end_drill || true
+    exit 1
+  fi
+}
+
+# fail_drill <message>: record a setup failure that is not a `cap` command,
+# close the drill with the assertion summary and exit nonzero.
+fail_drill() {
+  printf 'FAIL: %s\n' "$1" | tee -a "$LOG"
+  ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  end_drill || true
+  exit 1
+}
+
+# free_kib <dir>: available KiB on the filesystem holding <dir>.
+free_kib() {
+  df -k "$1" | awk 'NR==2 {print $4}'
 }
 
 # assert_not_contains <haystack> <needle> <what>: inverse of assert_contains,
@@ -83,7 +139,7 @@ say "A: journal filesystem ENOSPC (fake provider)"
 JFS="$RUN/lab-$TAG/journalfs"
 JOURNAL="$JFS/journal"
 mkdir -p "$JFS" "$JOURNAL"
-mount -t tmpfs -o size=256k tmpfs "$JFS"
+mount_tmpfs_256k "$JFS" || fail_drill "journal tmpfs is not usable"
 cp /etc/mtab "$RUN/records/$TAG-journalfs.mtab"
 PORT="$(pick_port)"
 TOKEN="d5-disposable-journal-admin-$TAG"
@@ -105,7 +161,7 @@ cat >"$RUN/records/$TAG-create-full.json" <<'EOF'
 {"api_version":"volvisor.volume.v2","operation_id":"op-d5-create-full","project_id":"day2","volume_id":"vol-d5-full","class":"native-local","size_bytes":67108864}
 EOF
 
-start_volvisord "$TAG-daemon" "$CFG" "$PORT" || exit 1
+start_volvisord "$TAG-daemon" "$CFG" "$PORT" || fail_drill "$TAG-daemon did not become healthy"
 cap "create the baseline volume before filling the journal filesystem" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-baseline.json" 200 "$RUN/records/$TAG-create-baseline.resp.json"
 cap "filesystem usage before the fill" df -k "$JFS"
@@ -122,8 +178,7 @@ while :; do
   if [[ "$SLACK" -lt 500 ]]; then break; fi
   PAD=$((PAD + 1))
   if [[ "$PAD" -gt 24 ]]; then
-    printf 'could not reach a small last-page slack after %s padding creates\n' "$PAD" | tee -a "$LOG"
-    exit 1
+    fail_drill "could not reach a small last-page slack after $PAD padding creates"
   fi
   cat >"$RUN/records/$TAG-pad-$PAD.json" <<EOF
 {"api_version":"volvisor.volume.v2","operation_id":"op-d5-pad-$PAD","project_id":"day2","volume_id":"vol-d5-pad-$PAD","class":"native-local","size_bytes":67108864}
@@ -133,6 +188,7 @@ done
 
 cap "fill the 256 KiB journal filesystem to ENOSPC" fill_fs "$JFS" filler.bin
 cap "filesystem usage at ENOSPC" df -k "$JFS"
+assert_eq "$(free_kib "$JFS")" "0" "journal filesystem has zero KiB available at ENOSPC"
 JOURNAL_SHA_BEFORE="$(sha256sum "$JOURNAL/journal.log" | cut -d' ' -f1)"
 JOURNAL_SIZE_BEFORE="$(stat -c %s "$JOURNAL/journal.log")"
 printf 'journal before the failed append: size=%s sha=%s\n' "$JOURNAL_SIZE_BEFORE" "$JOURNAL_SHA_BEFORE" | tee -a "$LOG"
@@ -140,23 +196,37 @@ printf 'journal before the failed append: size=%s sha=%s\n' "$JOURNAL_SIZE_BEFOR
 cap "a create whose intent append hits ENOSPC is refused" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-full.json" 500 "$RUN/records/$TAG-create-full.resp.json"
 cat "$RUN/records/$TAG-create-full.resp.json" | tee -a "$LOG"
+printf '\n' | tee -a "$LOG"
+assert_eq "$(jq -r '.code' "$RUN/records/$TAG-create-full.resp.json")" "INTERNAL" "journal ENOSPC code"
 assert_contains "$(cat "$RUN/records/$TAG-create-full.resp.json")" "No space left on device" "journal ENOSPC detail"
 cap "the refused volume is absent (journal-before-mutate held)" \
   api_expect "$CURL" GET "$BASE/v2/volumes/vol-d5-full" "" 404 "$RUN/records/$TAG-full-absent.json"
 AFTER_FAIL_SIZE="$(stat -c %s "$JOURNAL/journal.log")"
 printf 'journal size immediately after the failed append: %s\n' "$AFTER_FAIL_SIZE" | tee -a "$LOG"
+# Prove the failed append actually reached the filesystem before ENOSPC.
+# Without this, the later truncate-back check would pass vacuously if the
+# journal layer ever refused before writing any bytes.
+if [[ -n "$JOURNAL_SIZE_BEFORE" ]] && (( AFTER_FAIL_SIZE > JOURNAL_SIZE_BEFORE )); then
+  printf 'ASSERT PASS: the failed append grew the journal past the valid prefix before ENOSPC\n' | tee -a "$LOG"
+else
+  printf 'ASSERT FAIL: the failed append did not grow the journal (before=%s after=%s)\n' "$JOURNAL_SIZE_BEFORE" "$AFTER_FAIL_SIZE" | tee -a "$LOG"
+  ASSERT_FAILS=$((ASSERT_FAILS + 1))
+fi
 
 say "stop while the journal filesystem is full, free the filler, restart"
-stop_pidfile "$TAG-daemon" TERM
+stop_daemon "$TAG-daemon"
+# The harness opens each daemon log with `>`; snapshot this incarnation's
+# log before the restart truncates it.
+cap "snapshot the first daemon log before restart" cp "$RUN/raw/$TAG-daemon.daemon.log" "$RUN/raw/$TAG-daemon.pre-restart.log"
 cap "free the filler" rm -f "$JFS/filler.bin"
 cap "filesystem usage after freeing the filler" df -k "$JFS"
-start_volvisord "$TAG-daemon" "$CFG" "$PORT" || exit 1
+start_volvisord "$TAG-daemon" "$CFG" "$PORT" || fail_drill "$TAG-daemon did not become healthy"
 assert_eq "$(stat -c %s "$JOURNAL/journal.log")" "$JOURNAL_SIZE_BEFORE" "torn append truncated back to the valid prefix"
 assert_eq "$(sha256sum "$JOURNAL/journal.log" | cut -d' ' -f1)" "$JOURNAL_SHA_BEFORE" "valid journal prefix unchanged after ENOSPC recovery"
 cap "the retried create succeeds once space is available" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-full.json" 200 "$RUN/records/$TAG-create-full.retry.json"
 assert_eq "$(jq -r '.volume_id' "$RUN/records/$TAG-create-full.retry.json")" "vol-d5-full" "retried volume id"
-stop_pidfile "$TAG-daemon" TERM
+stop_daemon "$TAG-daemon"
 cap "journal frame map after ENOSPC recovery" python3 - "$JOURNAL/journal.log" <<'PY'
 import struct, sys, zlib
 data = open(sys.argv[1], "rb").read()
@@ -174,20 +244,20 @@ while len(data) - off >= 20:
     seq += 1
     frames += 1
 print(f"valid_frames={frames} valid_prefix={off} file_size={len(data)}")
+if off != len(data):
+    print(f"ERROR: {len(data) - off} trailing byte(s) after the valid prefix", file=sys.stderr)
+    sys.exit(1)
 PY
 
 # ---------------------------------------------------------------- part B
 say "B: LVM provider state filesystem ENOSPC (journal on ordinary storage)"
 SFS="$RUN/lab-$TAG/statefs"
 mkdir -p "$SFS"
-mount -t tmpfs -o size=256k tmpfs "$SFS"
+mount_tmpfs_256k "$SFS" || fail_drill "state tmpfs is not usable"
 LSTATE="$SFS/lvm-state.json"
 LCFG="$RUN/configs/$TAG-lvm.toml"
 LJOURNAL="$RUN/lab-$TAG/lvm-journal"
-lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d5lvm" || {
-  printf 'lab setup failed\n' | tee -a "$LOG"
-  exit 1
-}
+lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d5lvm" || fail_drill "lvm lab setup failed"
 LPORT="$(pick_port)"
 LTOKEN="d5-disposable-lvm-admin-$TAG"
 write_header_config "$RUN/configs/$TAG-lvm.curl" "$LTOKEN"
@@ -213,7 +283,7 @@ cat >"$RUN/records/$TAG-lvm-full-newop.json" <<'EOF'
 {"api_version":"volvisor.volume.v2","operation_id":"op-d5-lvm-full-newop","project_id":"day2","volume_id":"vol-d5-lvm-full","class":"native-local","size_bytes":67108864}
 EOF
 
-start_volvisord "$TAG-lvm-daemon" "$LCFG" "$LPORT" || exit 1
+start_volvisord "$TAG-lvm-daemon" "$LCFG" "$LPORT" || fail_drill "$TAG-lvm-daemon did not become healthy"
 cap "create the LVM baseline volume" \
   api_expect "$LCURL" POST "$LBASE/v2/volumes" "$RUN/records/$TAG-lvm-baseline.json" 200 "$RUN/records/$TAG-lvm-baseline.resp.json"
 cap "snapshot the durable state before the failure" cp "$LSTATE" "$RUN/records/$TAG-lvm-state-baseline.json"
@@ -228,6 +298,7 @@ cap "LVM baseline LV exists" lvs --noheadings -o lv_name,vg_name,lv_size "vg-d5l
 cap "state filesystem usage before the fill" df -k "$SFS"
 cap "fill the state filesystem to ENOSPC" fill_fs "$SFS" filler.bin
 cap "state filesystem usage at ENOSPC" df -k "$SFS"
+assert_eq "$(free_kib "$SFS")" "0" "state filesystem has zero KiB available at ENOSPC"
 
 FAIL_RESP="$RUN/records/$TAG-lvm-full.resp.json"
 cap "a create whose provider state save hits ENOSPC returns 500 INTERNAL" \
@@ -239,6 +310,7 @@ assert_eq "$FAIL_CODE" "INTERNAL" "state save ENOSPC error code"
 assert_contains "$FAIL_MSG" "No space left on device" "state save ENOSPC message names the OS error"
 assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the exact state tmp path"
 assert_not_contains "$FAIL_MSG" "manual lvremove" "compensating lvremove succeeded (no manual remediation named)"
+assert_not_contains "$FAIL_MSG" "were kept" "failure is the uncommitted-save compensation, not the post-rename carve-out"
 
 cap "the state file after the failed save" sha256sum "$LSTATE"
 assert_eq "$(sha256sum "$LSTATE" | cut -d' ' -f1)" "$STATE_SHA_BEFORE" "durable state file unchanged by the failed save"
@@ -264,16 +336,21 @@ assert_eq "$(jq -r '.volumes | length' "$RUN/records/$TAG-lvm-list-now.json")" "
 assert_eq "$(jq -r '[.volumes[].volume_id] | join(",")' "$RUN/records/$TAG-lvm-list-now.json")" "vol-d5-lvm-baseline" "same-process list volume ids"
 
 say "stop the daemon while the state filesystem is still full, free the filler, restart"
-stop_pidfile "$TAG-lvm-daemon" TERM
+stop_daemon "$TAG-lvm-daemon"
+# Preserve the first incarnation's log (failed save + the 500/404 audit
+# trail; the compensation itself is shown by the `lvs` checks above) before
+# start_volvisord truncates it.
+cap "snapshot the first LVM daemon log before restart" cp "$RUN/raw/$TAG-lvm-daemon.daemon.log" "$RUN/raw/$TAG-lvm-daemon.pre-restart.log"
 cap "free the filler" rm -f "$SFS/filler.bin"
 cap "state filesystem usage after freeing the filler" df -k "$SFS"
-start_volvisord "$TAG-lvm-daemon" "$LCFG" "$LPORT" || exit 1
+start_volvisord "$TAG-lvm-daemon" "$LCFG" "$LPORT" || fail_drill "$TAG-lvm-daemon did not become healthy"
 cap "after restart the failed volume is still 404" \
   api_expect "$LCURL" GET "$LBASE/v2/volumes/vol-d5-lvm-full" "" 404 "$RUN/records/$TAG-lvm-full-after.json"
 cap "after restart the durable baseline volume is still served" \
   api_expect "$LCURL" GET "$LBASE/v2/volumes/vol-d5-lvm-baseline" "" 200 "$RUN/records/$TAG-lvm-baseline-after.json"
 jq '{volume_id,state,provisioned_bytes}' "$RUN/records/$TAG-lvm-baseline-after.json" | tee -a "$LOG"
 assert_eq "$(jq -r '.volume_id' "$RUN/records/$TAG-lvm-baseline-after.json")" "vol-d5-lvm-baseline" "baseline volume id after restart"
+assert_eq "$(jq -r '.state' "$RUN/records/$TAG-lvm-baseline-after.json")" "Ready" "baseline volume state after restart"
 cap "LVs after restart (only the baseline remains)" lvs --noheadings -o lv_name,vg_name,lv_size "vg-d5lvm"
 assert_contains "$(lv_names "vg-d5lvm")" "$BASELINE_LV" "baseline LV still present after restart"
 assert_eq "$(lv_count "vg-d5lvm")" "1" "only the baseline LV present after restart"
@@ -295,7 +372,8 @@ cap "replay the same operation_id after space is free (terminal failure replay)"
 cap "the same-operation_id replay error body" cat "$REPLAY_RESP"
 assert_eq "$(jq -r '.code' "$REPLAY_RESP")" "INTERNAL" "same operation_id terminal replay keeps INTERNAL"
 assert_eq "$(jq -r '.message' "$REPLAY_RESP")" "$FAIL_MSG" "same operation_id terminal replay serves the recorded message"
-assert_eq "$(cat "$REPLAY_RESP")" "$(cat "$FAIL_RESP")" "same operation_id terminal replay is byte-identical to the first response"
+assert_eq "$(cmp -s "$REPLAY_RESP" "$FAIL_RESP" && printf identical || printf different)" "identical" "same operation_id terminal replay body is byte-identical (cmp)"
+assert_contains "$(cat "$RUN/raw/$TAG-lvm-daemon.daemon.log")" "replaying recorded outcome without executing" "daemon log records the replay path without execution"
 assert_eq "$(jq -r '.volumes | length' "$LSTATE")" "1" "terminal replay added no durable volume"
 assert_eq "$(jq -r '.volumes | has("vol-d5-lvm-full")' "$LSTATE")" "false" "terminal replay added no failed-volume record"
 cap "LVs after the terminal replay (only the baseline remains)" lvs --noheadings -o lv_name,vg_name,lv_size "vg-d5lvm"
@@ -307,6 +385,7 @@ cap "a new operation_id with the same payload succeeds" \
 jq '{volume_id,state,provisioned_bytes}' "$NEWOP_RESP" | tee -a "$LOG"
 assert_eq "$(jq -r '.volume_id' "$NEWOP_RESP")" "vol-d5-lvm-full" "new-operation volume id"
 assert_eq "$(jq -r '.state' "$NEWOP_RESP")" "Ready" "new-operation volume state"
+assert_eq "$(jq -r '.provisioned_bytes' "$NEWOP_RESP")" "67108864" "new-operation provisioned bytes"
 
 cap "snapshot the durable state after the successful create" cp "$LSTATE" "$RUN/records/$TAG-lvm-state-final.json"
 cap "durable state checksum after the successful create" sha256sum "$LSTATE"
@@ -316,7 +395,7 @@ assert_eq "$DURABLE_LV" "$FAILED_LV" "durable record uses the derived failed-vol
 cap "LVs after the successful create (baseline plus new volume)" lvs --noheadings -o lv_name,vg_name,lv_size "vg-d5lvm"
 NEW_VOLUME_LV_COUNT="$(lv_names "vg-d5lvm" | awk -v wanted="$FAILED_LV" '$0 == wanted { n++ } END { print n + 0 }')"
 assert_eq "$(lv_count "vg-d5lvm")" "2" "baseline plus new-volume LV (total 2)"
-assert_eq "$NEW_VOLUME_LV_COUNT" "1" "exactly one LV for the new volume"
+assert_eq "$NEW_VOLUME_LV_COUNT" "1" "the new volume's derived LV name appears exactly once"
 assert_contains "$(lv_names "vg-d5lvm")" "$BASELINE_LV" "baseline LV still present after the new create"
 assert_eq "$(jq -r '.volumes | length' "$LSTATE")" "2" "durable state holds exactly two volume records"
 assert_eq "$(jq -r '.volumes["vol-d5-lvm-full"] != null' "$LSTATE")" "true" "durable state holds the new volume record"
@@ -326,7 +405,7 @@ cap "state filesystem contents after the successful create" ls -la "$SFS"
 TMP_AFTER_SUCCESS="$(find "$SFS" -maxdepth 1 -name '*.tmp' -print)"
 printf '.tmp residue after the successful create: %s\n' "${TMP_AFTER_SUCCESS:-<none>}" | tee -a "$LOG"
 assert_eq "$TMP_AFTER_SUCCESS" "" "no .tmp residue after the successful create"
-stop_pidfile "$TAG-lvm-daemon" TERM
+stop_daemon "$TAG-lvm-daemon"
 
 if end_drill; then
   printf 'D5 COMPLETE\n'
