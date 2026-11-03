@@ -320,6 +320,9 @@ Versioned provider capabilities:
 advertised by the providers that qualify it (the native-local LVM provider and
 the conformance fake); a provider without it answers the route's typed
 `NOT_FOUND` (the default trait behavior), never a silent accept.
+See the [provider authoring guide](../docs/provider-authoring.md) for the shared
+semantics core, capability rules, and the conformance/parity suites a provider
+must pass.
 `managed_ceph_osd` includes the separately gated, disabled-by-default
 experimental `rook-cell-experimental` deployment mode ([ADR-0008](../docs/adr/0008-rook-only-hyperconverged-cells.md)); it is not a fourth volume class.
 

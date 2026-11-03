@@ -29,9 +29,14 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use volvisor_provider::VolumeProvider;
+use volvisor_provider::semantics::{
+    AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
+    ensure_attachment_id_not_retired, ensure_expected_attachment_generation,
+    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+};
 use volvisor_types::domain::{
-    AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health, Provisioning,
-    VolumeClass,
+    AccessMode, AttachmentEvidence, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend,
+    Health, Provisioning, VolumeClass,
 };
 
 use volvisor_types::crash::StoreCrashHooks;
@@ -44,7 +49,7 @@ use volvisor_types::request::{
 };
 use volvisor_types::{
     ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, DeviceId,
-    MoveVolumeBackingState, ProjectId, VolumeId, VolumeLifecycle, unix_ms_now,
+    HostId, MoveVolumeBackingState, ProjectId, VolumeId, VolumeLifecycle, unix_ms_now,
     validate_api_version,
 };
 
@@ -708,18 +713,12 @@ impl LvmProvider {
         // recorded replays the recorded response (even if the volume
         // generation has since moved) and never fabricates a second
         // attachment; the same id with a different payload conflicts.
+        let identity = AttachmentIdentity::from_request(volume_id, req, mode);
         for (recorded_volume, stored) in state.volumes() {
             if let Some(record) = stored.runtime.attachment.as_ref() {
                 if record.id == req.attachment_id {
-                    if *recorded_volume == *volume_id
-                        && record.vm_id == req.vm_id
-                        && record.host_id == req.host_id
-                        && record.access_mode == mode
-                        && record.vmm_disk_id == req.vmm_disk_id
-                    {
-                        return Ok(attach_response(record, &stored.entry));
-                    }
-                    return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+                    resolve_attachment_replay(recorded_volume, record, &identity)?;
+                    return Ok(attach_response(record, &stored.entry));
                 }
             }
         }
@@ -727,25 +726,15 @@ impl LvmProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
-        if stored
-            .runtime
-            .retired_attachment_ids
-            .contains(&req.attachment_id)
-        {
-            return Err(ApiError::attachment_id_conflict(&req.attachment_id));
-        }
-        if req.expected_volume_generation != stored.entry.generation {
-            return Err(ApiError::stale_generation(
-                req.expected_volume_generation,
-                stored.entry.generation,
-            ));
-        }
-        if stored.runtime.attachment.is_some() {
-            return Err(ApiError::new(
-                ApiErrorCode::WriterAlreadyActive,
-                format!("volume {volume_id} already has an active attachment"),
-            ));
-        }
+        ensure_attachment_id_not_retired(
+            stored
+                .runtime
+                .retired_attachment_ids
+                .contains(&req.attachment_id),
+            &req.attachment_id,
+        )?;
+        ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
+        ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
         match stored.runtime.state {
             VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
             other => {
@@ -798,12 +787,10 @@ impl LvmProvider {
                 "attachment {attachment_id} is not attached to volume {volume_id}"
             )));
         }
-        if req.expected_attachment_generation != record.generation {
-            return Err(ApiError::stale_generation(
-                req.expected_attachment_generation,
-                record.generation,
-            ));
-        }
+        ensure_expected_attachment_generation(
+            req.expected_attachment_generation,
+            record.generation,
+        )?;
         // The drain proof (`vm_stopped_or_io_drained_proof`) is a
         // type-mandatory attestation: authority is never released without
         // one, though the provider cannot verify the claim itself
@@ -842,7 +829,6 @@ impl LvmProvider {
             )));
         }
         let mut state = self.lock_state()?;
-        let applied;
         let response = {
             let stored = state
                 .volume_mut(volume_id)
@@ -858,33 +844,9 @@ impl LvmProvider {
                     req.attachment_id
                 )));
             }
-            // The generation is the detach fence: validate it, never advance it.
-            if req.expected_attachment_generation != record.generation {
-                return Err(ApiError::stale_generation(
-                    req.expected_attachment_generation,
-                    record.generation,
-                ));
-            }
-            applied = req.state > record.state;
-            if applied {
-                record.state = req.state;
-                record.state_revision += 1;
-                record.evidence = Some(req.evidence);
-                record.reporter.clone_from(&req.reporter);
-                record.recorded_at_ms = Some(unix_ms_now());
-            }
-            ReportAttachmentStateResponse {
-                attachment_id: record.id.clone(),
-                state: record.state,
-                state_revision: record.state_revision,
-                evidence: record.evidence,
-                reporter: record.reporter.clone(),
-                recorded_at_ms: record.recorded_at_ms,
-                attachment_generation: record.generation,
-                applied,
-            }
+            apply_attachment_report(record, req, unix_ms_now())?
         };
-        if applied {
+        if response.applied {
             self.persist(&mut state)?;
         }
         Ok(response)
@@ -2533,5 +2495,67 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
         // A fresh record is provider-recorded Prepared; a replay answers
         // the recorded evidence, exactly as the conformance fake does.
         state: record.state,
+    }
+}
+
+impl AttachmentRecordView for AttachmentRecord {
+    fn attachment_id(&self) -> &AttachmentId {
+        &self.id
+    }
+
+    fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    fn host_id(&self) -> &HostId {
+        &self.host_id
+    }
+
+    fn access_mode(&self) -> AccessMode {
+        self.access_mode
+    }
+
+    fn vmm_disk_id(&self) -> Option<&str> {
+        self.vmm_disk_id.as_deref()
+    }
+
+    fn attachment_generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl AttachmentStateRecord for AttachmentRecord {
+    fn attachment_state(&self) -> AttachmentState {
+        self.state
+    }
+
+    fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+
+    fn evidence(&self) -> Option<AttachmentEvidence> {
+        self.evidence
+    }
+
+    fn reporter(&self) -> Option<&str> {
+        self.reporter.as_deref()
+    }
+
+    fn recorded_at_ms(&self) -> Option<u64> {
+        self.recorded_at_ms
+    }
+
+    fn record_reported_state(
+        &mut self,
+        state: AttachmentState,
+        evidence: AttachmentEvidence,
+        reporter: Option<String>,
+        recorded_at_ms: u64,
+    ) {
+        self.state = state;
+        self.state_revision += 1;
+        self.evidence = Some(evidence);
+        self.reporter = reporter;
+        self.recorded_at_ms = Some(recorded_at_ms);
     }
 }

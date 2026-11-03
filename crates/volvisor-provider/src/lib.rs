@@ -56,6 +56,7 @@ pub mod handoff;
 pub mod lending;
 pub mod provider;
 pub mod runner;
+pub mod semantics;
 pub mod vmm;
 pub mod vmm_http;
 pub mod vmm_version;
@@ -75,6 +76,12 @@ pub use lending::{
 };
 pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
+pub use semantics::{
+    AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
+    attachment_payload_matches, ensure_attachment_id_not_retired,
+    ensure_expected_attachment_generation, ensure_expected_generation, ensure_no_active_attachment,
+    resolve_attachment_replay,
+};
 pub use vmm::{
     ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeResizeCall, FakeVmm,
     PauseProof, VmState, VmmController,
