@@ -20,7 +20,8 @@ been re-run at the merged revision.**
   survived; it attempts the checked `lvremove` and leaves the file for the
   operator (if the removal also fails, the 500 names `manual lvremove`). A
   surviving record shows the volume `Failed` with a missing LV after
-  restart. Do not auto-delete in that case.
+  restart when the removal succeeded; if the LV remains alongside the
+  record, it loads as a served volume. Do not auto-delete in that case.
 
 Historical evidence (pre-fix D5):
 [D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
@@ -42,15 +43,20 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
 
 ## RPO / RTO
 
-- **Journal ENOSPC:** the failed create is not visible (404); no acknowledged
-  state is lost; the torn append is removed on restart. **RTO:** free space,
-  restart, retry; seconds in the lab.
+- **Journal ENOSPC:** a failed attempt is never acknowledged as durable; no
+  acknowledged state is lost; the torn append is removed on restart. The
+  failed create is 404 when nothing executed (intent append failed, or the
+  provider call failed); if `GET` is 200, the volume is real and served.
+  **RTO:** free space, restart, verify, retry with a new `operation_id`;
+  seconds in the lab.
 - **State ENOSPC:** the failed create is not acknowledged as durable.
-  **RPO:** the failed create. Post-fix, the just-created LV is compensated
-  and the in-memory entry is rolled back; only a failing compensating
-  `lvremove` leaves an orphan that needs manual cleanup. **RTO:** free space +
-  restart + retry; add one manual `lvremove` for the cleanup-failure tail.
-  The post-fix path has not been re-drilled end-to-end at the merged revision.
+  **RPO:** the failed create (except the carve-out, where the record did
+  become durable and the volume is served). Post-fix, the just-created LV is
+  compensated and the in-memory entry is rolled back; only a failing
+  compensating `lvremove` leaves an orphan that needs manual cleanup.
+  **RTO:** free space + restart + retry; add one manual `lvremove` for the
+  cleanup-failure tail. The post-fix path has not been re-drilled
+  end-to-end at the merged revision.
 
 ## Preconditions
 
@@ -90,7 +96,10 @@ Typical 500 bodies (observed):
 ```
 
 The detail distinguishes the two paths: `failed to write journal record` vs
-`failed to write .../lvm-state.json.tmp`.
+`failed to write .../lvm-state.json.tmp`. A delayed-allocation filesystem can
+instead report `failed to fsync journal record` after the bytes were written;
+treat it as "the frame may already be durable on disk", not as "nothing
+happened".
 
 ## B. Journal filesystem ENOSPC
 
@@ -102,8 +111,8 @@ du -sh /var/lib/volvisor/journal
 df -h /var/lib/volvisor/journal
 ```
 
-2. Confirm the failed volume is absent, then stop the daemon. The stop is what
-   lets replay truncate the torn append.
+2. Check the failed volume's state (below), then stop the daemon. The stop is
+   what lets replay truncate the torn append.
 
 ```sh
 curl -sS -o /dev/null -w '%{http_code}\n' \
@@ -111,10 +120,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:8080/v2/volumes/$VOLUME_ID
 ```
 
-Expected for the failed create: `404`, unless the ENOSPC hit the **outcome**
-append after the create landed. Then `GET` is `200` with a real volume: the
-volume exists and is served; verify it, do not re-create it, and expect the
-same `operation_id` to fail closed as `OPERATION_IN_DOUBT`.
+Expected for the failed create: `404`. If `GET` is `200`, the volume is real
+and served (for example a section C carve-out): verify it, do not re-create
+it, and do not reuse the failed `operation_id`.
 
 ```sh
 systemctl stop volvisord.service
@@ -142,12 +150,15 @@ prefix. D5 observed 12060 before the failed append, 12288 immediately after
    was the intent-append error (`failed to write journal record`). Then
    nothing was executed and the retry must create one volume, not two.
    If the 500 body names the LVM provider instead, the intent **was**
-   journaled and the provider call failed; a same-`operation_id` retry
-   fails closed as `OPERATION_IN_DOUBT`. If step 2 observed a `200`, the
-   outcome append failed after the create landed: verify the volume and LV,
-   do not re-create, and expect `OPERATION_IN_DOUBT` for the same
-   `operation_id`. Either way, the conflict is closed by using a **new
-   `operation_id`** with the same payload after inspecting journal/state.
+   journaled and the provider call failed; a same-`operation_id` retry does
+   not re-execute — it replays the recorded 500 when the failure outcome
+   fit in the journal, and fails closed as `OPERATION_IN_DOUBT` when it did
+   not. The same applies to `failed to fsync journal record` (the frame may
+   already be on disk; treat the retry as non-executing). If step 2 observed
+   a `200`, the volume exists: verify the volume and LV, do not re-create,
+   and expect the same id not to re-execute. In every case, close the
+   operation with a **new `operation_id`** and the same payload after
+   inspecting journal/state.
 
 ```sh
 # send the same create request that failed
@@ -191,9 +202,10 @@ before assuming anything:
   record survived. It attempts the same checked `lvremove`; if that also
   fails, the 500 names `manual lvremove`. Either way, treat the combined
   case as indeterminate: a surviving valid record appears as `Failed` with
-  a missing LV after restart; a corrupt file needs the corruption runbook.
-  Do not remove the LV until the state file is readable and proves the
-  record absent.
+  a missing LV after restart when the removal succeeded, or loads as a
+  served volume if the LV remains; a corrupt file needs the corruption
+  runbook. Do not remove the LV until the state file is readable and proves
+  the record absent.
 
 **Do not assume "HTTP 500" means "nothing happened."**
 
@@ -220,7 +232,8 @@ Expected post-fix:
 - **indeterminate:** `GET` returns 404 and the durable file could not be
   read; no LV exists, or the LV remains if the compensating `lvremove` also
   failed. Compare a backup before acting; a valid surviving record will load
-  as a `Failed` volume with a missing LV.
+  as a `Failed` volume with a missing LV, or as a served volume if the LV
+  remains.
 
 Historical D5 observation (pre-fix, `e551d26`):
 
@@ -290,7 +303,7 @@ Outside the indeterminate case the old durable state is safe. The states
 that need operator attention are the carve-out (served but not
 crash-durable-confirmed), the cleanup-failure orphan (visible in `lvs`,
 absent from provider state), and the indeterminate case (unreadable durable
-file, no LV).
+file, with or without the LV).
 
 ## D. Prevention
 
@@ -307,13 +320,13 @@ file, no LV).
 
 ## Pass condition
 
-- Journal ENOSPC: 500, failed volume 404, torn append truncated to the valid
-  prefix on restart, same-`operation_id` retry creates exactly one volume
-  when the 500 was the intent-append error, no phantom state. If the 500
-  named the provider (intent durable, call failed), the same id fails closed
-  as `OPERATION_IN_DOUBT`. If the failure was the **outcome** append (GET
-  200), the volume exists; it is verified, not re-created, and the same
-  `operation_id` fails closed as `OPERATION_IN_DOUBT`.
+- Journal ENOSPC: 500, no acknowledged volume lost, torn append truncated to
+  the valid prefix on restart, no phantom state. A same-`operation_id` retry
+  creates exactly one volume only for an intent-append 500 with GET 404.
+  When the 500 named the provider (intent durable, call failed) or `GET` was
+  200, the volume is verified rather than re-created and the same id does
+  not re-execute (verbatim replay or `OPERATION_IN_DOUBT`); the operation is
+  closed with a new `operation_id`.
 - State ENOSPC, normal: 500, old state file byte-identical, GET 404, no
   orphan LV, restart 404, and a retry with a new `operation_id` creates
   exactly one volume.
