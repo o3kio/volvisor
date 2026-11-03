@@ -11,6 +11,8 @@
 
 mod common;
 
+use std::fs;
+
 use common::{fixture, unclaimed_fixture};
 use volvisor_lvm::provider::lv_name_for;
 use volvisor_lvm::state::LvmState;
@@ -218,6 +220,244 @@ async fn create_verifies_the_lv_against_lvs_and_fails_honestly() {
     // Nothing was persisted.
     let listed = fixture.provider.list_volumes(None).await.expect("list");
     assert_eq!(listed, []);
+}
+
+#[tokio::test]
+async fn create_save_failure_rolls_back_lv_and_memory_and_converges_across_restart() {
+    let fixture = fixture();
+    let id = volume_id("savefail-vol");
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
+
+    // Remove the state file's directory (not the file): the next save
+    // fails before its rename, so the old durable file is still intact.
+    let parent = fixture
+        .state_path
+        .parent()
+        .expect("state path has a parent")
+        .to_path_buf();
+    let parked = common::leak_tempdir().join("parked");
+    fs::rename(&parent, &parked).expect("park the state directory");
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("savefail-vol", GIB))
+        .await
+        .expect_err("create whose state save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    // The original save failure is surfaced, not replaced by a generic one.
+    assert!(err.detail.contains("failed to create"), "{err}");
+
+    // No 200-until-restart: the in-memory entry was rolled back too.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the failed create must not be visible");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    assert_eq!(fixture.provider.list_volumes(None).await.expect("list"), []);
+
+    // The compensating lvremove actually ran and removed the LV.
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    let invocations = fixture.runner.invocations();
+    let create_at = invocations
+        .iter()
+        .position(|invocation| invocation.program == "lvcreate")
+        .expect("lvcreate ran");
+    let remove_at = invocations
+        .iter()
+        .position(|invocation| invocation.program == "lvremove")
+        .expect("the compensation lvremove ran");
+    assert!(remove_at > create_at, "lvremove must follow lvcreate");
+    assert!(
+        invocations[remove_at]
+            .args
+            .iter()
+            .any(|arg| arg == &lv_path),
+        "the compensation names {lv_path}: {:?}",
+        invocations[remove_at].args
+    );
+
+    // The old durable file survived byte-for-byte: no volume, same claim.
+    fs::rename(&parked, &parent).expect("restore the state directory");
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("state after restore"),
+        snapshot
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("load durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(
+        durable
+            .device(&DeviceId::new(common::CLAIMED_DEVICE).expect("device id"))
+            .is_some(),
+        "the claim is untouched"
+    );
+
+    // Restart converges: no missing volume and no orphan foreign LV.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("the rolled-back create must not reappear");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    assert_eq!(restarted.list_volumes(None).await.expect("list"), []);
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+    assert!(report.foreign_lvs.is_empty(), "{report:?}");
+
+    // The same create retries cleanly on the restarted provider: no
+    // orphan name collision and no wedged state.
+    let created = restarted
+        .create_volume(&fixture_create_request("savefail-vol", GIB))
+        .await
+        .expect("retry after compensation");
+    assert_eq!(created.volume_id, id);
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    assert!(
+        LvmState::load(&fixture.state_path)
+            .expect("state after retry")
+            .volume(&id)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn create_save_failure_with_a_failing_lvremove_surfaces_the_orphan() {
+    let fixture = fixture();
+    let id = volume_id("savefail-orphan");
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    fixture.world.lock().expect("world").fail_lvremove_for = vec![lv_path.clone()];
+    let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
+
+    let parent = fixture
+        .state_path
+        .parent()
+        .expect("state path has a parent")
+        .to_path_buf();
+    let parked = common::leak_tempdir().join("parked");
+    fs::rename(&parent, &parked).expect("park the state directory");
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("savefail-orphan", GIB))
+        .await
+        .expect_err("create whose save and cleanup fail");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    // The cleanup failure is never masked: the exact remediation is named.
+    assert!(err.detail.contains("manual lvremove"), "{err}");
+    assert!(err.detail.contains(&lv_path), "{err}");
+
+    // Memory is rolled back even though the LV could not be removed.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the failed create must not be visible");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+
+    // The durable file is unchanged: no volume was recorded.
+    fs::rename(&parked, &parent).expect("restore the state directory");
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("state after restore"),
+        snapshot
+    );
+    assert!(
+        LvmState::load(&fixture.state_path)
+            .expect("load durable state")
+            .volume(&id)
+            .is_none()
+    );
+
+    // Restart reports the orphan as foreign; nothing is missing from state.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("the orphan is not adopted");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.foreign_lvs.contains(&lv_path), "{report:?}");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn create_save_failure_after_rename_is_honored_not_compensated() {
+    let fixture = fixture();
+    let id = volume_id("saverename-vol");
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    // Seed the durable file with the volume while the provider's
+    // in-memory state still predates it (the fixture was built first).
+    common::seed_volume(
+        &fixture.state_path,
+        "saverename-vol",
+        common::CLAIMED_VG,
+        GIB,
+    );
+
+    // Force the next save to fail before its rename while the durable
+    // file stays present: a directory at the sibling temp path makes
+    // create_owner_only fail with EISDIR.
+    let mut tmp_name = fixture.state_path.clone().into_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
+    fs::create_dir(&tmp_path).expect("blocking temp directory");
+
+    let invocations_before = fixture.runner.invocations().len();
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request("saverename-vol", GIB))
+        .await
+        .expect_err("create whose save fails after the durable record exists");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("nonetheless reached"), "{err}");
+
+    // The durable file already contained the volume: keep the LV, do not
+    // compensate, and keep serving the in-memory entry.
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvremove"),
+        "a committed record must not be compensated"
+    );
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the in-memory entry is kept");
+    assert_eq!(inspected.volume_id, id);
+
+    fs::remove_dir(&tmp_path).expect("clean up the blocking temp directory");
 }
 
 #[tokio::test]

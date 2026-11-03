@@ -10,6 +10,13 @@
 //! are always verified against `lvs` output — a successful exit status
 //! alone is never trusted as evidence (honest reporting).
 //!
+//! Create is fail-closed: if the state save fails, the just-created LV is
+//! removed with a checked `lvremove` and the in-memory entry is dropped (a
+//! failing cleanup names the exact manual `lvremove`), except when the
+//! failed save's rename already landed — then the durable record, the
+//! in-memory entry and the LV are all kept and a same-payload retry
+//! returns the volume.
+//!
 //! Thick LVM rounds logical-volume sizes **up** to whole physical extents
 //! (4 MiB by default). The provider therefore treats
 //! `actual_lvm_size >= requested_size` as success, persists and reports
@@ -527,6 +534,63 @@ impl LvmProvider {
         );
     }
 
+    /// Reconcile a create whose state save failed (issue #58).
+    ///
+    /// The in-memory entry has already been inserted. Normally the old
+    /// durable file is still intact, so the just-created LV is removed with
+    /// a **checked** `lvremove` (unlike [`Self::remove_lv_best_effort`], a
+    /// failing cleanup is never swallowed) and the memory entry is dropped:
+    /// memory, durable state and LVM all agree the volume does not exist.
+    /// The original save error is preserved; when the cleanup itself fails
+    /// the exact manual remediation is appended.
+    ///
+    /// Carve-out: if the atomic save's rename already landed and only a
+    /// later step (the directory fsync) failed, the durable file contains
+    /// the volume. All three sources then agree it exists, so the memory
+    /// entry and the LV are kept and the error says the record nonetheless
+    /// reached the state file. The durable file is re-read to decide; a
+    /// load error is treated as *not* committed (the fail-closed direction).
+    fn compensate_unpersisted_create(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        save_error: ApiError,
+    ) -> ApiError {
+        let committed = LvmState::load(&self.state_path)
+            .is_ok_and(|durable| durable.volume(volume_id).is_some());
+        if committed {
+            return ApiError::new(
+                save_error.code,
+                format!(
+                    "{}; the volume record nonetheless reached the state file (the save's \
+                     rename landed before a later step failed), so volume {volume_id} and its \
+                     LV {vg_name}/{lv_name} were kept; a same-payload retry returns the volume",
+                    save_error.detail
+                ),
+            );
+        }
+
+        let removed = self
+            .runner
+            .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])
+            .is_ok_and(|output| output.success);
+        state.remove_volume(volume_id);
+        let mut detail = save_error.detail;
+        if !removed {
+            detail.push_str(
+                "; in-memory state was rolled back but the LV could not be removed: manual \
+                 lvremove ",
+            );
+            detail.push_str(vg_name);
+            detail.push('/');
+            detail.push_str(lv_name);
+            detail.push_str(" required (startup reconciliation reports it as a foreign LV)");
+        }
+        ApiError::new(save_error.code, detail)
+    }
+
     /// Pick the first claimed native-pool volume group with enough free
     /// space for the **extent-rounded** demand (headroom included);
     /// `NO_SAFE_CAPACITY` when none qualifies.
@@ -672,8 +736,8 @@ impl LvmProvider {
 
         let stored = StoredVolume {
             entry: VolumeEntry {
-                vg_name,
-                lv_name,
+                vg_name: vg_name.clone(),
+                lv_name: lv_name.clone(),
                 size_bytes: effective,
                 requested_size_bytes: req.size_bytes,
                 generation: 1,
@@ -689,7 +753,15 @@ impl LvmProvider {
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
-        self.persist(&mut state)?;
+        if let Err(save_error) = self.persist(&mut state) {
+            return Err(self.compensate_unpersisted_create(
+                &mut state,
+                &req.volume_id,
+                &vg_name,
+                &lv_name,
+                save_error,
+            ));
+        }
         Ok(inspect_response(&req.volume_id, &stored))
     }
 
