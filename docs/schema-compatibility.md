@@ -17,7 +17,7 @@ file is never allowed (AGENTS rule 8's fail-closed reading).
 | Store | File(s) | Version carrier | Current version |
 |---|---|---|---|
 | Intent journal | `<journal_dir>/journal.log` (binary frames) | `record_version` inside each frame payload | `RECORD_VERSION = 1` |
-| LVM provider state | `lvm_state_path`, default `<journal_dir>/lvm-state.json` | `schema_version` | `LVM_STATE_SCHEMA_VERSION = 1` |
+| LVM provider state | `lvm_state_path`, default `<journal_dir>/lvm-state.json` | `schema_version` | `LVM_STATE_SCHEMA_VERSION = 2` |
 | Ceph provider state | `ceph_state_path`, default `<journal_dir>/ceph-state.json` | `schema_version` | `CEPH_STATE_SCHEMA_VERSION = 1` |
 | DRBD provider state | `drbd_state_path`, default `<journal_dir>/drbd-state.json` | `schema_version` | `DRBD_STATE_SCHEMA_VERSION = 1` |
 | Migration records | `<journal_dir>/migrations/<migration_id>.json` | `schema_version` | `MIGRATION_RECORD_SCHEMA_VERSION = 1` |
@@ -84,6 +84,15 @@ decoder backfills `requested_size_bytes` from `size_bytes` — the only size
 that file recorded — rather than defaulting to zero or guessing a different
 value.
 
+The first additive change made under this policy is issue
+[#70](https://github.com/o3kio/volvisor/issues/70): the durable LVM intent
+maps `pending_creates`, `pending_grows` and `pending_deletes` are schema v2,
+not a silent v1 additive change. `lvm-state-v2-n1.json` is the last released
+v1 shape; v1 files load with the maps defaulted empty and are upgraded to v2
+by the first successful save. An older binary sees `schema_version: 2` and
+refuses the file with the typed unsupported-version error (never a generic
+parse failure on an unknown field).
+
 ## Unknown, future and older versions
 
 Every covered store probes the version **before** the strict decode. The
@@ -149,6 +158,7 @@ current struct.
 | `tests/fixtures/schema/lvm-state-v1-n1.json` | LVM | `a8c0254` (consumer reporting, before retired ids) | attachment state/revision/generation, `vmm_disk_id`, evidence, move record |
 | `tests/fixtures/schema/lvm-state-v1-n2.json` | LVM N-2 | `fafb62e` (initial P1 format) | absent `requested_size_bytes` backfills from `size_bytes`; pre-P6 fields default |
 | `tests/fixtures/schema/lvm-state-v1-tombstones.json` | LVM | `c00bc3e` (tombstones, before version field) | `retired_attachment_ids` preserved |
+| `tests/fixtures/schema/lvm-state-v2-n1.json` | LVM v1 (N-1 for v2) | last released v1 shape, written by the pre-#70 binary at `ee739bc` from the `a8c0254` fixture | v1 attachment state/revision/evidence, move record, and empty intent maps; upgrade-on-write stamps v2 |
 | `tests/fixtures/schema/ceph-state-v1-n1.json` | Ceph N-1 | `ab9cedd` (before `vmm_disk_id`) | attachment mapping, absent disk id is `None` |
 | `tests/fixtures/schema/drbd-state-v1-n1.json` | DRBD N-1 | `f686531` (before `vmm_disk_id`) | authority block, migration-cut marker, counters |
 | `tests/fixtures/schema/drbd-state-v1-n2.json` | DRBD N-2 | `97e6841` (initial P3 format) | defaulted authority/fence/migration/disk id |

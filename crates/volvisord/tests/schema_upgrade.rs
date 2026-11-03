@@ -174,7 +174,7 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     assert!(
         fs::read_to_string(&lvm_path)
             .expect("read lvm")
-            .contains("\"schema_version\": 1")
+            .contains("\"schema_version\": 2")
     );
     assert_eq!(LvmState::load(&lvm_path).expect("lvm reload"), lvm);
 
@@ -316,7 +316,7 @@ fn each_covered_store_refuses_a_newer_schema_on_open() {
     // version refusal must win (partial decode is forbidden).
     let future_lvm = fixture_text("lvm-state-v1-n1.json").replacen(
         '{',
-        "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+        "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
         1,
     );
     let path = write(root, "lvm-state.json", future_lvm.as_bytes());
