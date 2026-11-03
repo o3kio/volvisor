@@ -32,7 +32,7 @@ groups:
 
       - alert: VolvisorReconcileStale
         expr: |
-          max by (scope) (
+          max by (scope, instance) (
             reconcile_age_seconds{job="volvisor", scope=~"grow|move"}
           ) > 300
         for: 5m

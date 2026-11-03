@@ -20,13 +20,21 @@ production evidence, **not** a data-path benchmark, **not** an SLA, and
 - **Binary:** release build `volvisord e3aa365`, SHA256
   `670c21259a7474fba0450f779f61967401871fbc2cb47d21da9ab40b0db8a58b`,
   built with `cargo build --release --locked -p volvisord` and
-  `CARGO_BUILD_JOBS=4`.
+  `CARGO_BUILD_JOBS=4`. `raw/00-orchestration.log` instead shows the stale
+  pre-build hash `04c06df8…`, because that header was stamped before the
+  build; the executed binary is the `670c2125…` value recorded in
+  [ENVIRONMENT.txt](ENVIRONMENT.txt). See [SCRIPTS.txt](SCRIPTS.txt).
 - **Environment and absent capabilities:** [ENVIRONMENT.txt](ENVIRONMENT.txt).
   `drbdadm`, `rbd`, `ceph`, `fio` and a second physical host were absent.
+- **Provenance record:** [SCRIPTS.txt](SCRIPTS.txt) — harness hashes at
+  `e3aa365` and the reason the raw orchestration log carries a stale
+  pre-build binary hash.
 
 The measurement harness (`run-all.sh`, `bench.py`, `summarize.py`) is
 committed under [`scripts/bench/`](../../../scripts/bench/) at the recorded
-source SHA `e3aa365`. This bundle is a copy of the run directory; the
+source SHA `e3aa365`; [SCRIPTS.txt](SCRIPTS.txt) records the SHA256 of each
+script at that revision and the raw-log hash discrepancy. This bundle is a
+copy of the run directory; the
 unmodified raw records are under `json/`, `csv/` and `raw/`. The run's
 daemon log is 606 MiB uncompressed, above forge file-size limits, so
 `publish.sh` stores it as `raw/daemon.daemon.log.gz` (gzip, timestamp

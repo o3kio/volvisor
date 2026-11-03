@@ -41,9 +41,9 @@ longer exists. The consistency step below is mandatory.
 - **RPO:** every control-plane mutation after the stopped backup is lost. D1
   demonstrated this: a volume created after the backup returned 404 after
   restore.
-- **RTO:** 0.194 s from extract to a healthy API on the lab host, plus the
-  time to reconcile backend LVs and validate the data path. The 0.194 s is
-  not a production SLA.
+- **RTO:** 0.194 s from the start of the restore procedure to a healthy API
+  on the lab host, plus the time to reconcile backend LVs and validate the
+  data path. The 0.194 s is not a production SLA.
 
 ## Preconditions
 

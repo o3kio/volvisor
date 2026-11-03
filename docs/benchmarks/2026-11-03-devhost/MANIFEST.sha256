@@ -1,6 +1,7 @@
 55cbd8595ca1f6946dc087c0f77ff657edb9416a2c539ecca2adb04a354ebaf0  ./ENVIRONMENT.txt
-c4266b22357824bd9bd8f9fd5cadebd367a67c897eceadd28fe621730e8c7b12  ./README.md
-47fd885ccf2384bbd35ea1ebb3cb112452854a8105735ff9e5c9604abf3b58ba  ./REPORT.md
+b765dc3d86741e45ce54c70dab73ccacac7abb4be6d8261cedd7cb3936a5f94e  ./README.md
+9c5084bf360418d2942a3b47bbd84e77ea28900caa110285872485eec6b14640  ./REPORT.md
+61831a5794b1ac68aff7cf16fa3f0c6df5ab4a6d897855be7266cfc61a511195  ./SCRIPTS.txt
 27accbeee6fafeccf636bdd886b7929470b3a49cc6e84f2d5252b0a30a37c89f  ./configs/volvisord-cap32.toml
 160c96276a6a441f7ca1266964f3d3940548f08e3c90b1bed275bb1e2c605833  ./configs/volvisord-rate50.toml
 8cf481794fc014fb6fceeca60049172b978cea717442b5e158dbbc0895781eaf  ./configs/volvisord.toml

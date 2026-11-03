@@ -542,9 +542,25 @@ where
     // Reaching this point after an in-flight resolution means the
     // inspection proved the act had not landed — the act's own first
     // step re-verifies (never a blind re-execution).
+    // The `provider` field names the surface actually driven. Migration and
+    // peer operations do not run through the volume provider's `name()`, so
+    // labeling them with it would misattribute the trace.
+    let surface = if matches!(
+        op_kind,
+        OP_MIGRATION_PREPARE | OP_MIGRATION_TRANSFER | OP_MIGRATION_ABORT
+    ) {
+        "migration"
+    } else if matches!(
+        op_kind,
+        OP_PEER_PREPARE | OP_PEER_GRANT | OP_PEER_RESTORE_VM | OP_PEER_DISCARD
+    ) {
+        "peer"
+    } else {
+        state.provider.name()
+    };
     let provider_span = tracing::info_span!(
         "provider_call",
-        provider = %state.provider.name(),
+        provider = %surface,
         kind = op_kind,
         operation_id = %operation_id,
     );

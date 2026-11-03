@@ -18,6 +18,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use volvisor_handoff::{MobilityRequest, migration_not_enabled};
 use volvisor_types::domain::VolumeClass;
 use volvisor_types::request::{
@@ -35,8 +36,28 @@ use crate::admission::ListLimit;
 use crate::config::DEFAULT_MAX_LIST_LIMIT;
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
 use crate::extract::{RequireAdmin, RequireOperator, RequireRead, ValidJson};
+use crate::metrics::JournalSnapshot;
 use crate::ops;
 use crate::state::SharedState;
+
+/// Sample the journal on the blocking pool.
+///
+/// The journal lock and `stat` are synchronous filesystem work. Running them
+/// on the blocking pool keeps a stalled fsync from parking a Tokio runtime
+/// worker, so `/healthz` and other requests still run while `/readyz` waits
+/// for the sample. A join failure is reported as a closed journal, never as
+/// a fabricated zero.
+async fn journal_snapshot_off_worker(state: &SharedState) -> JournalSnapshot {
+    let state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || state.journal_snapshot()).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => JournalSnapshot {
+            records: None,
+            log_bytes: None,
+            open: false,
+        },
+    }
+}
 
 /// `POST /v2/volumes` — CreateVolume.
 pub(crate) async fn create_volume(
@@ -73,9 +94,11 @@ pub(crate) async fn create_volume(
 /// preserve the legacy unlimited listing (the compatibility choice: an old
 /// client must never silently lose volumes) and carry no `next_cursor`;
 /// requests with `limit` are bounded by `1..=max_list_limit` and return an
-/// opaque `next_cursor` while more entries follow. Unknown query parameters
-/// are ignored (a `serde_urlencoded` limitation); an invalid `project_id`,
-/// `limit` or `cursor` value is rejected with `INVALID_REQUEST`.
+/// opaque `next_cursor` while more entries follow. A `cursor` without
+/// `limit` is rejected (a continuation token only resumes a bounded page).
+/// Unknown query parameters are ignored (a `serde_urlencoded` limitation);
+/// an invalid `project_id`, `limit` or `cursor` value is rejected with
+/// `INVALID_REQUEST`.
 pub(crate) async fn list_volumes(
     State(state): State<SharedState>,
     _read: RequireRead,
@@ -122,6 +145,15 @@ fn paginate(
                 "limit must be between 1 and {max_limit}"
             )));
         }
+    }
+    if cursor.is_some() && limit.is_none() {
+        // A continuation token resumes a bounded page. Without `limit` the
+        // legacy contract is an unlimited listing; accepting the cursor
+        // would return a silent suffix with no `next_cursor`, which looks
+        // like a complete result to a client that ignored `limit`.
+        return Err(ApiError::invalid_request(
+            "cursor requires limit; request a bounded page with both parameters",
+        ));
     }
     if let Some(cursor) = cursor {
         let after = decode_cursor(cursor)?;
@@ -1033,9 +1065,9 @@ pub(crate) async fn healthz() -> Response {
 /// succeed. With no probe target the body reports `witness: "not_probed"` and
 /// readiness does **not** fail on that unknown. It never claims volume health.
 pub(crate) async fn readyz(State(state): State<SharedState>) -> Response {
-    let witness = state.probe_witness().await;
+    let (witness, journal) =
+        tokio::join!(state.probe_witness(), journal_snapshot_off_worker(&state));
     let startup_complete = state.startup_complete();
-    let journal = state.journal_snapshot();
     let witness_status = match witness {
         Some(true) => "reachable",
         Some(false) => "unreachable",
@@ -1066,8 +1098,7 @@ pub(crate) async fn readyz(State(state): State<SharedState>) -> Response {
 /// `witness_reachable` gauge with the same bounded transport probe `/readyz`
 /// uses.
 pub(crate) async fn metrics(State(state): State<SharedState>, _read: RequireRead) -> Response {
-    let _ = state.probe_witness().await;
-    let journal = state.journal_snapshot();
+    let (_, journal) = tokio::join!(state.probe_witness(), journal_snapshot_off_worker(&state));
     text_response(
         StatusCode::OK,
         state.metrics.render_with_journal(Some(journal)),

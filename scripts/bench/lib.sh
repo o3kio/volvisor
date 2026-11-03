@@ -86,14 +86,33 @@ cap() {
     "$@"
     rc=$?
     printf 'exit=%s\n' "$rc"
+    # The group is the left side of a pipeline (a subshell), so `rc` does
+    # not survive in this shell. Exit the subshell with the command's status;
+    # PIPESTATUS[0] then carries it back.
+    exit "$rc"
   } 2>&1 | tee -a "$LOG"
   return "${PIPESTATUS[0]}"
+}
+
+# restamp_binary <path>: replace the pre-build binary hash in the log header
+# with the hash of the binary the run actually executed.
+restamp_binary() {
+  local log="$1"
+  local hash
+  hash="$(sha256sum "$BIN/volvisord" | awk '{print $1}')"
+  sed -i "s|^# binary_sha256: .*|# binary_sha256: $hash|" "$log"
 }
 
 new_token() {
   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 }
 
+# Pick a currently free loopback port.
+#
+# The bind is inherently racy: the daemon binds the port later. If another
+# process wins the race the daemon fails to bind and the run dies at startup;
+# there is no silent fallback to a different port, so no evidence is recorded
+# against an unintended listener.
 pick_port() {
   python3 - <<'PY'
 import socket
@@ -137,11 +156,29 @@ start_daemon() {
   printf '%s\n' "$pid"
 }
 
+# pid_is_volvisord <pid>: true only when /proc/<pid>/cmdline is this run's
+# volvisord binary. Guards against signalling an unrelated process after PID
+# reuse.
+pid_is_volvisord() {
+  local pid="$1" cmd
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  cmd="$(tr '\0' '\n' <"/proc/$pid/cmdline" | head -n 1)"
+  # Exact path only: a basename match would signal another run's daemon after
+  # PID reuse.
+  [[ "$cmd" == "$BIN/volvisord" ]]
+}
+
 stop_pidfile() {
   local name="$1" sig="${2:-TERM}" pidfile="$RUN/records/$1.pid"
   [[ -f "$pidfile" ]] || return 0
   local pid
   pid="$(cat "$pidfile")"
+  if ! pid_is_volvisord "$pid"; then
+    printf 'WARNING: %s pid %s is not this run'"'"'s volvisord (stale pidfile); not signalling\n' \
+      "$name" "$pid" | tee -a "$LOG"
+    rm -f "$pidfile"
+    return 0
+  fi
   if kill -0 "$pid" 2>/dev/null; then
     kill "-$sig" "$pid" 2>/dev/null || true
   fi
@@ -183,6 +220,16 @@ lvm_lab_setup() {
     printf '$ vgcreate --yes %s %s\n' "$vg" "$loop"
     vgcreate --yes "$vg" "$loop"
   } >>"$LOG" 2>&1 || {
+    # The loop device exists now even though setup failed. Remove any VG/PV
+    # residue and detach it before dying so the EXIT trap (which only knows
+    # LAB_READY) cannot leak it.
+    if vgs "$vg" >/dev/null 2>&1; then
+      vgremove --yes --force "$vg" >>"$LOG" 2>&1 || true
+    fi
+    pvremove --yes "$loop" >>"$LOG" 2>&1 || true
+    losetup -d "$loop" >>"$LOG" 2>&1 || \
+      printf 'bench: WARNING: failed to detach %s after setup failure\n' "$loop" >&2
+    rm -f "$RUN/records/$tag.loop" "$RUN/records/$tag.vg"
     die "loop-backed LVM setup failed; see $LOG"
   }
 
@@ -207,18 +254,34 @@ EOF
 }
 
 # lvm_lab_teardown <tag>: remove only the VG/loop recorded by setup.
+# Returns non-zero and leaves the directory in place if any removal step
+# fails, so a live loop/VG is never hidden by `rm -rf`.
 lvm_lab_teardown() {
   local tag="$1"
   local dir="$RUN/lab/$tag"
-  local loop="" vg=""
+  local loop="" vg="" failed=0
   [[ -f "$RUN/records/$tag.loop" ]] && loop="$(cat "$RUN/records/$tag.loop")"
   [[ -f "$RUN/records/$tag.vg" ]] && vg="$(cat "$RUN/records/$tag.vg")"
   if [[ -n "$vg" ]] && vgs "$vg" >/dev/null 2>&1; then
-    vgremove --yes "$vg" >>"$LOG" 2>&1 || true
+    if ! vgremove --yes "$vg" >>"$LOG" 2>&1; then
+      printf 'bench: ERROR: vgremove %s failed; leaving lab state\n' "$vg" | tee -a "$LOG"
+      failed=1
+    fi
   fi
   if [[ -n "$loop" ]] && losetup "$loop" >/dev/null 2>&1; then
-    pvremove --yes "$loop" >>"$LOG" 2>&1 || true
-    losetup -d "$loop" >>"$LOG" 2>&1 || true
+    if ! pvremove --yes "$loop" >>"$LOG" 2>&1; then
+      printf 'bench: ERROR: pvremove %s failed; leaving loop attached\n' "$loop" | tee -a "$LOG"
+      failed=1
+    fi
+    if ! losetup -d "$loop" >>"$LOG" 2>&1; then
+      printf 'bench: ERROR: losetup -d %s failed; leaving loop attached\n' "$loop" | tee -a "$LOG"
+      failed=1
+    fi
+  fi
+  if [[ "$failed" -ne 0 ]]; then
+    printf 'bench: lab teardown incomplete tag=%s loop=%s vg=%s dir=%s\n' \
+      "$tag" "$loop" "$vg" "$dir" | tee -a "$LOG"
+    return 1
   fi
   rm -rf "$dir"
   printf 'lab teardown tag=%s loop=%s vg=%s\n' "$tag" "$loop" "$vg" | tee -a "$LOG"

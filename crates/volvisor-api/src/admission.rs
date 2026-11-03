@@ -68,6 +68,14 @@ struct AdmissionInner {
 }
 
 impl Admission {
+    /// Build the admission state.
+    ///
+    /// Library callers that enable rate limiting with
+    /// `rate_limit_burst = 0` are normalized to a burst of one, because a
+    /// zero-capacity bucket could never admit a request. The daemon's config
+    /// validation refuses that same input instead (see
+    /// `validate_admission_fields`), so an operator never silently gets the
+    /// coercion.
     pub(crate) fn new(config: ApiConfig) -> Self {
         let burst = if config.rate_limit_per_second > 0 {
             config.rate_limit_burst.max(1)
@@ -81,6 +89,16 @@ impl Admission {
                 rate_limiter: RateLimiter::new(config.rate_limit_per_second, burst),
             }),
         }
+    }
+
+    /// Consume one rate-limit token for `principal`.
+    ///
+    /// Exposed to the authentication middleware so a credential-rejected
+    /// request is charged to the anonymous bucket rather than bypassing the
+    /// limiter entirely (the post-authentication limiter only runs for
+    /// admitted requests).
+    pub(crate) fn check_rate(&self, principal: &str) -> Result<(), Duration> {
+        self.inner.rate_limiter.check(principal)
     }
 }
 
@@ -99,7 +117,10 @@ fn read_timeout(config: &ApiConfig, route: &str, method: &Method) -> Option<Dura
     if is_exempt(route) {
         return None;
     }
-    if *method == Method::GET || route == "/v2/vms/{vm_id}/check-mobility" {
+    if *method == Method::GET
+        || *method == Method::HEAD
+        || route == "/v2/vms/{vm_id}/check-mobility"
+    {
         Some(config.read_timeout)
     } else {
         None
@@ -147,15 +168,16 @@ pub(crate) async fn guard(
     request
         .extensions_mut()
         .insert(ListLimit(admission.inner.config.max_list_limit));
+    // The authentication middleware runs inside this layer and charges the
+    // anonymous bucket on a denial. It reaches the same limiter through this
+    // extension instead of duplicating the admission state.
+    request.extensions_mut().insert(admission.clone());
     let body = match read_timeout(&admission.inner.config, &route, &method) {
         Some(limit) => match tokio::time::timeout(limit, next.run(request)).await {
             Ok(response) => response,
             Err(_elapsed) => error_response(&ApiError::new(
                 ApiErrorCode::RequestTimeout,
-                format!(
-                    "read-only route {route} exceeded its {}s timeout",
-                    limit.as_secs()
-                ),
+                format!("read-only route {route} exceeded its {limit:?} timeout"),
             )),
         },
         None => next.run(request).await,
@@ -175,10 +197,18 @@ pub(crate) async fn rate_limit(
     if is_exempt(&route) {
         return next.run(request).await;
     }
-    let principal = request
+    let principal = if request
         .extensions()
-        .get::<AuthContext>()
-        .map_or("anonymous", |context| context.principal.as_str());
+        .get::<crate::auth::PeerRateLimitPrincipal>()
+        .is_some()
+    {
+        "peer"
+    } else {
+        request
+            .extensions()
+            .get::<AuthContext>()
+            .map_or("anonymous", |context| context.principal.as_str())
+    };
     if let Err(retry_after) = admission.inner.rate_limiter.check(principal) {
         return error_response_with_retry_after(
             &ApiError::new(
@@ -230,10 +260,15 @@ impl RateLimiter {
     /// Consume one token for `key`, or return the delay before a token is
     /// available. A disabled limiter (`per_second == 0`) always admits.
     fn check(&self, key: &str) -> Result<(), Duration> {
+        self.check_at(key, Instant::now())
+    }
+
+    /// [`Self::check`] with an injected instant, so refill and Retry-After
+    /// arithmetic can be tested without sleeping.
+    fn check_at(&self, key: &str, now: Instant) -> Result<(), Duration> {
         if self.per_second == 0 {
             return Ok(());
         }
-        let now = Instant::now();
         let mut buckets = self
             .buckets
             .lock()
@@ -265,8 +300,13 @@ impl RateLimiter {
             bucket.tokens -= 1.0;
             Ok(())
         } else {
+            // Retry-After is whole seconds (RFC 9110 delay-seconds). The
+            // refill rate is >= 1 token/s and the deficit is < 1 token, so
+            // the true wait is at most one second; `ceil` reports that wait
+            // and the one-second floor keeps a sub-second deficit from
+            // rounding to zero.
             let seconds = (1.0 - bucket.tokens) / f64::from(self.per_second);
-            Err(Duration::from_secs_f64(seconds.max(1.0).ceil()))
+            Err(Duration::from_secs_f64(seconds.max(0.0).ceil().max(1.0)))
         }
     }
 }
@@ -300,6 +340,46 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(buckets.len() <= MAX_RATE_LIMIT_BUCKETS + 1);
+    }
+
+    #[test]
+    fn retry_after_is_one_second_and_the_bucket_refills() {
+        let limiter = RateLimiter::new(1, 1);
+        let t0 = Instant::now();
+        assert!(limiter.check_at("a", t0).is_ok());
+        assert_eq!(
+            limiter.check_at("a", t0),
+            Err(Duration::from_secs(1)),
+            "an exhausted bucket reports the one-second floor"
+        );
+        assert!(
+            limiter
+                .check_at("a", t0 + Duration::from_millis(500))
+                .is_err(),
+            "half a second does not refill a whole token at 1/s"
+        );
+        assert!(
+            limiter.check_at("a", t0 + Duration::from_secs(1)).is_ok(),
+            "one refill period admits the next request"
+        );
+    }
+
+    #[test]
+    fn faster_refill_still_reports_the_one_second_floor() {
+        let limiter = RateLimiter::new(100, 1);
+        let t0 = Instant::now();
+        assert!(limiter.check_at("a", t0).is_ok());
+        assert_eq!(
+            limiter.check_at("a", t0),
+            Err(Duration::from_secs(1)),
+            "a sub-second deficit still emits a whole second"
+        );
+        assert!(
+            limiter
+                .check_at("a", t0 + Duration::from_millis(10))
+                .is_ok(),
+            "100/s refills a token in 10 ms"
+        );
     }
 
     #[test]

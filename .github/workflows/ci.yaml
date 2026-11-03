@@ -38,10 +38,12 @@ jobs:
       - name: Validate the real-backend shell scripts
         run: |
           bash -n scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
-            scripts/lib/real-backends-common.sh
+            scripts/lib/real-backends-common.sh \
+            scripts/bench/lib.sh scripts/bench/run-all.sh scripts/bench/publish.sh
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -x scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
-            scripts/lib/real-backends-common.sh
+            scripts/lib/real-backends-common.sh \
+            scripts/bench/lib.sh scripts/bench/run-all.sh scripts/bench/publish.sh
       - name: Validate the release scope
         run: python3 scripts/release-scope.py check
       - name: Validate the release gate graph

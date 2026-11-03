@@ -42,7 +42,10 @@ PY
 STATE="$RUN/lab-$TAG-lvm/journal/lvm-state.json"
 JOURNAL="$RUN/lab-$TAG-lvm/journal"
 CFG="$RUN/configs/$TAG.toml"
-lvm_lab_setup "$TAG-lvm" 2G "$STATE" "vg-d6lvm"
+lvm_lab_setup "$TAG-lvm" 2G "$STATE" "vg-d6lvm" || {
+  printf 'lab setup failed\n' | tee -a "$LOG"
+  exit 1
+}
 PORT="$(pick_port)"
 TOKEN="d6-disposable-admin-$TAG"
 write_header_config "$RUN/configs/$TAG.curl" "$TOKEN"

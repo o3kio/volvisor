@@ -144,7 +144,10 @@ mount -t tmpfs -o size=256k tmpfs "$SFS"
 LSTATE="$SFS/lvm-state.json"
 LCFG="$RUN/configs/$TAG-lvm.toml"
 LJOURNAL="$RUN/lab-$TAG/lvm-journal"
-lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d5lvm"
+lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d5lvm" || {
+  printf 'lab setup failed\n' | tee -a "$LOG"
+  exit 1
+}
 LPORT="$(pick_port)"
 LTOKEN="d5-disposable-lvm-admin-$TAG"
 write_header_config "$RUN/configs/$TAG-lvm.curl" "$LTOKEN"

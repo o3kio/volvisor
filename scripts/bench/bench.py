@@ -780,6 +780,13 @@ def run_micro(client: HttpClient, recorder: Recorder, ids: Ids, args: argparse.N
     for _ in range(args.capabilities_iterations):
         recorder.record("capabilities", "read", capabilities(client))
 
+    # Capture the file sizes before cleanup: cleanup's detach/delete are
+    # durability mutations too, but they are not part of the recorded
+    # mutation count. Including them in the numerator would overstate the
+    # derived bytes-per-mutation.
+    setup["journal_before_cleanup_bytes"] = file_size(args.journal)
+    setup["state_before_cleanup_bytes"] = file_size(args.state)
+
     # Cleanup (not part of the recorded timings).
     for volume_id in (cycle_id, grow_id):
         inspected = inspect_volume(client, volume_id)
@@ -1104,7 +1111,22 @@ def wait_healthy(host: str, port: int, timeout: float) -> float:
 CHILDREN: dict[int, subprocess.Popen] = {}
 
 
-def stop_daemon(pid: int, timeout: float = 30.0) -> float:
+def pid_is_volvisord(pid: int, binary: str) -> bool:
+    """True only when /proc/<pid>/cmdline is this run's volvisord binary."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    argv = [part for part in raw.split(b"\0") if part]
+    if not argv:
+        return False
+    try:
+        return Path(argv[0].decode("utf-8", "replace")).resolve() == Path(binary).resolve()
+    except OSError:
+        return False
+
+
+def stop_daemon(pid: int, binary: str, timeout: float = 30.0) -> float:
     start = time.monotonic()
     child = CHILDREN.pop(pid, None)
     if child is not None:
@@ -1115,6 +1137,10 @@ def stop_daemon(pid: int, timeout: float = 30.0) -> float:
             child.kill()
             child.wait(timeout=5)
         return time.monotonic() - start
+    if not pid_is_volvisord(pid, binary):
+        # A stale pidfile after PID reuse must never signal an unrelated
+        # process.
+        return 0.0
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -1140,6 +1166,8 @@ def start_daemon(binary: str, config: str, log_path: str) -> tuple[int, float]:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    # The child holds its own duplicate of the descriptor.
+    handle.close()
     CHILDREN[process.pid] = process
     return process.pid, time.monotonic()
 
@@ -1284,7 +1312,7 @@ def run_soak(client: HttpClient, args: argparse.Namespace, out_dir: Path) -> dic
             time.sleep(0.2)
         pid = read_pid(args.pidfile)
         restart_started = now_utc()
-        stop_seconds = stop_daemon(pid) if pid else None
+        stop_seconds = stop_daemon(pid, args.binary) if pid else None
         new_pid, _ = start_daemon(args.binary, args.config, args.daemon_log)
         Path(args.pidfile).write_text(f"{new_pid}\n", encoding="ascii")
         healthy_seconds = wait_healthy(args.host, args.port, 120.0)
@@ -1348,7 +1376,7 @@ def run_restart(client: HttpClient, args: argparse.Namespace) -> dict:
             "state_bytes": file_size(args.state),
             "pid": pid,
         }
-        stop_seconds = stop_daemon(pid) if pid else None
+        stop_seconds = stop_daemon(pid, args.binary) if pid else None
         new_pid, _ = start_daemon(args.binary, args.config, args.daemon_log)
         Path(args.pidfile).write_text(f"{new_pid}\n", encoding="ascii")
         healthy_seconds = wait_healthy(args.host, args.port, 120.0)
@@ -1449,8 +1477,8 @@ def main(argv: list[str] | None = None) -> int:
         setup = run_micro(client, recorder, ids, args)
         recorder.write_csv()
         summary = recorder.summary()
-        journal_end = file_size(args.journal)
-        state_end = file_size(args.state)
+        journal_end = setup.get("journal_before_cleanup_bytes")
+        state_end = setup.get("state_before_cleanup_bytes")
         mutations = summary["writes"]
         setup["journal"] = {
             "start_bytes": setup["journal_start_bytes"],

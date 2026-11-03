@@ -182,7 +182,7 @@ start_volvisord_tls() {
   local i
   for ((i = 0; i < 300; i++)); do
     if curl -fsS --max-time 1 --cacert "$CA" "https://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
-      printf 'daemon %s healthy pid=%s port=%s tls=true\n' "$(cat "$RUN/records/$name.pid")" "$port" | tee -a "$LOG"
+      printf 'daemon %s healthy pid=%s port=%s tls=true\n' "$name" "$(cat "$RUN/records/$name.pid")" "$port" | tee -a "$LOG"
       return 0
     fi
     sleep 0.1

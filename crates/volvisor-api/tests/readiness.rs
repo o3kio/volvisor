@@ -87,8 +87,12 @@ async fn readiness_flips_on_startup_and_real_witness_loss() {
     assert_eq!(ready["checks"]["witness"], serde_json::json!("reachable"));
 
     // Dependency loss: closing the real listener makes the bounded transport
-    // probe fail, and readiness must follow while liveness does not.
+    // probe fail, and readiness must follow while liveness does not. The
+    // probe result is deliberately cached for one second to bound public
+    // `/readyz` traffic, so wait past that window before asserting the
+    // dependency loss is observed.
     drop(listener);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let (status, ready, body) = send(&app, request(Method::GET, "/readyz")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "readyz: {body}");
     assert_eq!(ready["status"], serde_json::json!("not_ready"));

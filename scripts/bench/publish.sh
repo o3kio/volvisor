@@ -27,6 +27,9 @@ done
 [[ -n "$SOURCE" && -d "$SOURCE" ]] || die "--run-dir must name an existing run directory"
 [[ -n "$DEST" ]] || die "--dest is required"
 [[ -f "$SOURCE/configs/token" ]] || die "run has no configs/token; refusing an unverifiable bundle"
+if [[ -d "$DEST" ]] && [[ -n "$(find "$DEST" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  die "--dest $DEST is not empty; remove the stale bundle before publishing"
+fi
 
 TOKEN="$(cat "$SOURCE/configs/token")"
 [[ -n "$TOKEN" ]] || die "empty token file; refusing"
@@ -68,6 +71,12 @@ done
 if grep -rIl -- "$TOKEN" "$DEST" >/dev/null 2>&1; then
   grep -rIl -- "$TOKEN" "$DEST" >&2
   die "run token found in the published bundle; refusing to publish secrets"
+fi
+# `grep -I` skips files it classifies as binary; an embedded token in a
+# compressed/binary artifact must still fail the publish.
+if grep -rl -- "$TOKEN" "$DEST" >/dev/null 2>&1; then
+  grep -rl -- "$TOKEN" "$DEST" >&2
+  die "run token found in a binary artifact; refusing to publish secrets"
 fi
 
 # Forge hosting rejects individual files above 100 MiB. Raw daemon logs are

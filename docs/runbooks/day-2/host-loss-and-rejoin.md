@@ -37,7 +37,7 @@ It does not cover:
 
 For the contract and topology, read
 [ADR-0007](../../adr/0007-drbd9-nearline-replication-provider.md),
-[nearline replication contract v2../../../contracts/nearline-replication-v2.md),
+[nearline replication contract v2](../../../contracts/nearline-replication-v2.md),
 and [N1/N2/N3/N10 in the nearline campaign](../nearline-multihost-campaign.md).
 
 ## Required topology
@@ -171,7 +171,7 @@ cat > adopt.json <<EOF
 EOF
 curl -fsS --config ~/.volvisor-host-b.curl -H 'content-type: application/json' \
   --data-binary @adopt.json \
-  "http://$HOST_B:8080/v2/admin/nearline/$VOL/adopt" | tee adopt.json
+  "http://$HOST_B:8080/v2/admin/nearline/$VOL/adopt" | tee adopt-response.json
 ```
 
 3. Record the classification. Without a recorded last-acknowledged barrier,
@@ -253,7 +253,7 @@ stays **NOT RUN — REQUIRES** the listed hardware/authority. A single-host
 ## References
 
 - [Nearline multi-host campaign (N1/N2/N3/N10)](../nearline-multihost-campaign.md)
-- [Nearline replication contract v2../../../contracts/nearline-replication-v2.md)
+- [Nearline replication contract v2](../../../contracts/nearline-replication-v2.md)
 - [ADR-0007 — DRBD 9 nearline provider](../../adr/0007-drbd9-nearline-replication-provider.md)
 - [Evidence standards](../../evidence/README.md)
 - [Lost-witness runbook](lost-witness.md) — the service half that *was* drilled

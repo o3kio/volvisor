@@ -213,7 +213,9 @@ false sense of safety.
 - The daemon is healthy and the expected volumes/attachments are served with
   the same state/revision/evidence.
 - The in-flight operation is retried idempotently; backend orphans are
-  reconciled.
+  reconciled. **NOT DRILLED:** D6 did not re-issue the killed operations and
+  does not observe backend-orphan reconciliation. Treat this item as
+  procedure-only until a drill performs the same-`operation_id` retry.
 - A second daemon/witness on the same directory exits 1 with
   `already locked by another writer`, and the first stays healthy.
 
@@ -229,4 +231,6 @@ exited 1 with the typed lock refusal; the first services stayed healthy. Raw:
 
 **Limits:** same-host `SIGKILL`, no power cut; local filesystem `flock`, not a
 distributed lock; loop-device LVM; no concurrent multi-host writer; the
-in-flight request is allowed to fail and is not an exactly-once claim.
+in-flight request is allowed to fail and is not an exactly-once claim. The
+in-flight create was not retried with the same `operation_id` (that
+pass-condition item is marked NOT DRILLED above).

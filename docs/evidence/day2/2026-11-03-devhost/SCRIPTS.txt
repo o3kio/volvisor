@@ -1,0 +1,40 @@
+Day-2 harness scripts: provenance record
+========================================
+
+The drills ran at source_sha e551d26af7cdedb468797ff8049e0b91b9ab416d.
+The harness scripts were NOT tracked in that commit. Their first tracked
+revision is d5af71fcd5dc4e69c7537c91f85b463b63b15900 ("docs: add day-2
+operations runbooks and drill evidence (#46)"), committed at
+2026-11-03T11:31:13Z, after the run window ended at 2026-11-03T11:23:49Z.
+
+The raw drill headers derive `worktree_dirty` from
+`git -C "$REPO" status --porcelain`, which reports tracked modifications and
+also untracked, non-ignored files. `.gitignore` at e551d26 contains no entry
+that would hide the harness scripts. A recorded `no` therefore means the
+run's recorded `$REPO` worktree was clean including untracked files. The
+scripts are absent from e551d26's tree and would have appeared as `??` if
+they had been in that worktree, so the executed harness was not located
+there; the raw logs record neither its location nor its bytes. There is no
+byte-level capture proving that the script bytes below are exactly the bytes
+that executed. They are the first tracked form and the closest auditable
+record.
+
+SHA256 of each script at d5af71f
+--------------------------------
+95e4c6584935f6dd1aab73080e3ed69b4e5e7a6799eacd4b1f8299c26f83a388  lib.sh
+a4f0cffcf78a5e93bd724401c668b421422b9e5410d66b818e2008d77a68455c  d1.sh
+d61f78fff9fc92453760048c726312bf9b775542addf3f442e2a2486b2590b8b  d2.sh
+0e8aef2245726346bc3810228a78c98e8e763be4c0215d1eb2e3841b1eb3b27c  d3.sh
+4510918c05f5fd9e36a3be9f18e77c83af6600fce87d104c409be77cb0f2a420  d4.sh
+de1f93ea343cd06307bb7b300d28214a8f2849c0a559af538d1e5d45c5116f65  d5.sh
+8ac18003fb712a235653c7704deb9aa54cd93d4159cdf30a494fa1e44111ed31  d6.sh
+dae309d04941dfb29cb945e2e2b94ae44d73401a7787a6fe3b90c6bdf78b988c  d7.sh
+566fc32bbc1c17766ff7ec095d6cc226aaf96258a9a2e98d746d4426039d938b  run-all.sh
+
+The scripts currently in docs/runbooks/day-2/scripts/ include review fixes and
+differ from these hashes. They were not used to produce this bundle and this
+bundle does not claim the fixed scripts reproduce it byte-for-byte.
+
+Extract the exact first-tracked blobs with:
+  git show d5af71f:docs/runbooks/day-2/scripts/lib.sh | sha256sum
+  (repeat for each script)

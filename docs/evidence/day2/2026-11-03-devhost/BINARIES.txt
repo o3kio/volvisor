@@ -19,3 +19,9 @@ Notes
 - The build stamp is the repository `git describe --tags --always` value
   (`e551d26`); no release tag exists at this commit.
 - The same two binaries served all drills. No binary was rebuilt mid-run.
+- Provenance limit: the raw drill headers record only `source_sha` and
+  `worktree_dirty`. They do not record these SHA256 digests or the
+  `--version` stamps. This file is an authored record collected outside the
+  raw captures; it does not cryptographically bind the files that executed.
+  The `--version` stamp is a repository description, not a content hash.
+- The harness scripts are absent from `e551d26`'s tree; see SCRIPTS.txt.

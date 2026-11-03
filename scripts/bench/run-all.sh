@@ -26,9 +26,15 @@ LAB_READY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --run-dir) RUN_DIR="$2"; shift 2 ;;
-    --soak-minutes) SOAK_MINUTES="$2"; shift 2 ;;
-    --sweep-seconds) SWEEP_SECONDS="$2"; shift 2 ;;
+    --run-dir|--soak-minutes|--sweep-seconds)
+      [[ $# -ge 2 ]] || die "missing value for $1"
+      case "$1" in
+        --run-dir) RUN_DIR="$2" ;;
+        --soak-minutes) SOAK_MINUTES="$2" ;;
+        --sweep-seconds) SWEEP_SECONDS="$2" ;;
+      esac
+      shift 2
+      ;;
     --skip-soak) SKIP_SOAK=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --keep-lab) KEEP_LAB=1; shift ;;
@@ -52,6 +58,9 @@ cleanup() {
     lvm_lab_teardown "main" || true
   fi
   end_log
+  # Seal the manifest after `end_log`, so the run's own orchestration log is
+  # covered by the checksum it ships with.
+  write_checksums "$RUN" || printf 'bench: WARNING: manifest generation failed\n' >&2
   exit "$rc"
 }
 trap cleanup EXIT
@@ -72,6 +81,7 @@ if [[ "$SKIP_BUILD" -eq 0 || ! -x "$BIN/volvisord" ]]; then
     cd "$REPO" || exit 1
     CARGO_BUILD_JOBS=4 cargo build --release --locked -p volvisord
   ) >>"$LOG" 2>&1 || die "release build failed; see $LOG"
+  restamp_binary "$LOG"
 fi
 
 write_environment "$RUN/ENVIRONMENT.txt"
@@ -244,13 +254,12 @@ say "recording post-run volume groups"
 vgs --noheadings -o vg_name,vg_size,pv_count >"$RUN/records/vgs-after.txt" 2>&1 || true
 
 say "lab teardown"
-lvm_lab_teardown "main"
+lvm_lab_teardown "main" || die "lab teardown failed; the loop device/VG was left for inspection"
 LAB_READY=0
 
 say "summarizing raw results"
 python3 "$HERE/summarize.py" --run-dir "$RUN" >>"$LOG" 2>&1 \
   || die "summary generation failed"
 
-write_checksums "$RUN"
 say "done: $RUN"
 say "raw JSON, CSV, environment and MANIFEST.sha256 are in the run directory"

@@ -148,11 +148,15 @@ pub const EXTENT: u64 = 4 << 20;
 /// The operator-declared DRBD minor range.
 pub const MINOR_MIN: u32 = 10;
 /// See [`MINOR_MIN`].
-pub const MINOR_MAX: u32 = 20;
+///
+/// Sized for the shared-instance conformance run: the kit creates one
+/// volume per check and only some checks delete theirs, so the range must
+/// cover the whole suite's live set, not one test in isolation.
+pub const MINOR_MAX: u32 = 40;
 /// The operator-declared local replication port range.
 pub const PORT_MIN: u16 = 7900;
 /// See [`PORT_MIN`].
-pub const PORT_MAX: u16 = 7910;
+pub const PORT_MAX: u16 = 7930;
 /// Minor/port used by [`seed_volume`] fixtures.
 pub const SEED_MINOR: u32 = 11;
 /// See [`SEED_MINOR`].

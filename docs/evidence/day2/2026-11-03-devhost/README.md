@@ -7,9 +7,22 @@ and not a data-plane durability proof.
 
 - **Exact source:** `e551d26af7cdedb468797ff8049e0b91b9ab416d`
   (`git describe --tags --always` = `e551d26`).
-- **Worktree at run time:** clean (`worktree_dirty: no` in every raw drill
-  header). The bundle commit itself is docs-only and was created after the
-  run; see [REPORT.md](REPORT.md) for both identities.
+- **Worktree at run time:** the raw headers record `worktree_dirty: no`,
+  derived from `git status --porcelain` (tracked changes **and** untracked,
+  non-ignored files). **The harness scripts are absent from `e551d26`'s
+  tree**; had they been present untracked in the recorded worktree, the flag
+  would have read `yes`. The raw logs therefore place the harness outside the
+  recorded worktree and do not bind its bytes. Its first tracked revision is
+  `d5af71f`, committed eight minutes after the run window closed.
+  [SCRIPTS.txt](SCRIPTS.txt) records the SHA256 of every script at that first
+  tracked revision and states the limit explicitly. The bundle commit itself
+  is docs-only and was created after the run; see [REPORT.md](REPORT.md) for
+  both identities.
+- **Binary identity limit:** the raw drill headers record only `source_sha`
+  and `worktree_dirty`; they do **not** record either binary's SHA256 or
+  `--version` stamp. [BINARIES.txt](BINARIES.txt) is an authored record
+  collected outside the raw captures, so it is corroborating metadata, not a
+  byte-level proof anchored in the raw logs.
 - **Run window:** 2026-11-03T11:23:29Z .. 2026-11-03T11:23:49Z.
 - **Host:** one physical development host (`dev`, Ubuntu kernel
   `6.8.0-142-generic`), every daemon/client on `127.0.0.1`.
@@ -65,6 +78,7 @@ README.md          this file
 REPORT.md          per-drill pass conditions, observations, verdicts, blockers
 ENVIRONMENT.txt    host/toolchain identity and absent capabilities
 BINARIES.txt       binary SHA256 digests and --version stamps
+SCRIPTS.txt        harness provenance and first-tracked-revision SHA256 values
 MANIFEST.sha256    SHA256 over every other file in this bundle
 raw/               unmodified captured command stdout/stderr and daemon logs
 records/           request/response JSON, status files, frame/state fixtures
@@ -103,9 +117,12 @@ sudo RUN=/tmp/opencode/volvisor-day2-$(date -u +%Y%m%dT%H%M%SZ) \
 ```
 
 The harness records `source_sha` and `worktree_dirty` at the start of every
-drill. A dirty run cannot support the clean-SHA claim this bundle makes. The
-harness is a lab harness: it starts daemons directly (no systemd) and creates
-disposable loop-backed volume groups.
+drill. A dirty worktree (including untracked, non-ignored files) cannot
+support the clean-SHA claim this bundle makes. This bundle additionally
+discloses that the harness was not present in the recorded worktree at
+`e551d26`; see [SCRIPTS.txt](SCRIPTS.txt). The harness is a lab harness: it
+starts daemons directly (no systemd) and creates disposable loop-backed
+volume groups.
 
 Do **not** run these scripts on a host with production volume groups. Always
 set a disposable `RUN` directory and inspect `lvm_lab_setup` before use.

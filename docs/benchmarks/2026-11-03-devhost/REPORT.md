@@ -15,7 +15,11 @@ the caveats in §9 before using any number.
 - **Binary:** `target/release/volvisord`, SHA256
   `670c21259a7474fba0450f779f61967401871fbc2cb47d21da9ab40b0db8a58b`,
   built with `cargo build --release --locked -p volvisord` and
-  `CARGO_BUILD_JOBS=4`.
+  `CARGO_BUILD_JOBS=4`. **Raw-log discrepancy:** the orchestration header was
+  stamped before the build and shows the stale pre-build hash `04c06df8…`.
+  The raw log is kept unmodified; the executed binary is the `670c2125…`
+  value in [ENVIRONMENT.txt](ENVIRONMENT.txt). The harness now re-stamps the
+  header after building. See [SCRIPTS.txt](SCRIPTS.txt).
 - **Environment:** [ENVIRONMENT.txt](ENVIRONMENT.txt). `drbdadm`, `rbd`,
   `ceph`, `fio`, a second physical host and physical-disk LVM were absent.
 - **Evidence:** [README.md](README.md), [summary/TABLES.md](summary/TABLES.md),
@@ -53,8 +57,9 @@ capacity claim:
   pass measures end-to-end create latency and the state/journal file sizes;
   it does **not** isolate the state-save syscall.
 - **Mixed sweep.** 1, 8, 32 and 128 in-flight clients for 30 s each, 70 %
-  reads / 30 % writes by target ratio. Actual ratios are recorded in
-  `summary/concurrency.csv`. Each worker owns one volume, so the live-volume
+  reads / 30 % writes by target ratio. The achieved ratio is the
+  `read_ratio_actual` field in `json/mixed-*.json` (the summary CSV does not
+  repeat it). Each worker owns one volume, so the live-volume
   set grows with the tier (1, 8, 32, 128 volumes); this is a deliberate
   load shape, not a fixed-dataset sweep.
 - **Admission cap probe (diagnostic).** 128 in-flight, daemon
@@ -84,7 +89,9 @@ capacity claim:
 From the recorded source SHA, with root and `lvm2`/loop support:
 
 ```bash
-cd /root/git/volvisor-wt/w2-43
+git clone https://github.com/o3kio/volvisor.git
+cd volvisor
+git checkout e3aa365
 sudo scripts/bench/run-all.sh \
   --run-dir /tmp/opencode/volvisor-bench-20261103T125250Z
 ```
@@ -100,7 +107,8 @@ sha256sum -c MANIFEST.sha256
 ```
 
 The measurement harness (`run-all.sh`, `bench.py`, `summarize.py`) and the
-run use the same SHA (`e3aa365`). `publish.sh` gained a post-run size guard:
+run use the same SHA (`e3aa365`); [SCRIPTS.txt](SCRIPTS.txt) records their
+SHA256 at that revision. `publish.sh` gained a post-run size guard:
 the run's 606 MiB daemon log is stored as `raw/daemon.daemon.log.gz` because
 forges reject individual files above 100 MiB. The bundle is a copy of the
 run directory plus this authored report; no measurement file was edited.
@@ -145,9 +153,9 @@ Derived observations (from the exact values above):
   writes are in flight. This is consistent with a single provider-state lock
   and whole-state fsync serializing both classes.
 
-This is a control-plane ceiling, not a CPU ceiling: 16 vCPUs were available
-and the process was not CPU-saturated; throughput **fell** as in-flight work
-rose, which points at serialized durable writes and lock wait.
+This is a control-plane ceiling, not a measured CPU ceiling: 16 vCPUs were
+available, but no CPU-saturation metric was sampled. Throughput **fell** as
+in-flight work rose, which points at serialized durable writes and lock wait.
 
 ## 5. Micro (concurrency 1)
 
@@ -180,7 +188,12 @@ Exact values from [summary/journal-state.csv](summary/journal-state.csv):
 
 The journal is append-only and fsynced per acknowledged mutation; the
 derived **901.998 bytes per mutation** is file growth divided by recorded
-mutations, not an isolated append syscall measurement. The state file is
+mutations, not an isolated append syscall measurement. The numerator was
+captured after two unrecorded cleanup mutations (detach/delete of the micro
+volumes), while the denominator counts only recorded writes, so the figure
+overstates per-mutation growth by roughly 0.3 %. The harness now captures
+the journal size before cleanup; this bundle keeps the original measurement
+and its caveat. The state file is
 rewritten and fsynced per mutation; its end size returns to the empty-state
 size because the cleanup deleted the micro volumes.
 
@@ -194,10 +207,12 @@ Exact values from [summary/state-scale.csv](summary/state-scale.csv):
 | 8 | 11708 | 514445 | 144.251 |
 | 32 | 29678 | 541634 | 164.455 |
 
-From 1 to 32 live volumes the create p50 rose from 123.904 ms to 164.455 ms
-(+40.551 ms, derived +32.7 %) while the state file grew from 6,486 B to
-29,678 B. This is a small dataset by production standards; the point is the
-direction and the whole-file rewrite, not a fitted curve.
+From 1 to 32 live volumes the *last* create at each sample rose from
+123.904 ms to 164.455 ms (+40.551 ms, derived +32.7 %) while the state file
+grew from 6,486 B to 29,678 B. These are single `last_create_ms` samples, not
+the create p50 (which is 144.016 ms over the whole micro run). This is a
+small dataset by production standards; the point is the direction and the
+whole-file rewrite, not a fitted curve.
 
 ## 6. Shortened soak (25 minutes, not 24 hours)
 
@@ -212,7 +227,7 @@ Exact values from [summary/soak.csv](summary/soak.csv) and
 | error rate | 0.000148 |
 | p50 / p95 / p99 ms | 2.262 / 16.804 / 26.25 |
 | RSS first / last / max KiB | 128896.0 / 750612.0 / 750612.0 |
-| RSS slope KiB/s | 412.9999 |
+| RSS slope KiB/s (whole run, across restart) | 412.9999 |
 | fds first / last / max / min | 19.0 / 18.0 / 19.0 / 9.0 |
 | journal first / last / delta B | 45959969.0 / 271399822.0 / 225439853.0 |
 | state first / last / delta B | 5911.0 / 2522793.0 / 2516882.0 |
@@ -225,11 +240,21 @@ was deliberately stopped for the restart and the client observed the gap.
 The 25.0-minute run is a shortened soak, so this is not a leak proof for
 24 hours.
 
-Derived growth (from the exact bytes above; one run, one host):
+Derived growth (from the exact bytes above; one run, one host). The RSS
+series spans two daemon incarnations separated by the mid-run restart, so
+the endpoint delta blends them; the per-incarnation slopes are the honest
+leak signal:
 
-- **RSS:** +621,716 KiB = **607.1 MiB** over 25.0 min, slope
-  **412.9999 KiB/s ≈ 24.29 MiB/min**. This is not flat. At the observed
-  slope it is ≈1.42 GiB/h (derived). Filed as finding B2.
+- **RSS, first incarnation (0–720 s):** 128,896 → 484,808 KiB
+  (+355,912 KiB = 347.6 MiB), linear slope **526.08 KiB/s ≈ 30.83
+  MiB/min**.
+- **RSS, second incarnation (721–1500 s):** 404,456 → 750,612 KiB
+  (+346,156 KiB = 338.0 MiB), linear slope **351.27 KiB/s ≈ 20.58
+  MiB/min**.
+- **RSS, whole-run endpoint delta:** +621,716 KiB = **607.1 MiB**, and the
+  cross-restart fitted slope is 412.9999 KiB/s ≈ **24.20 MiB/min**. This
+  end-to-end figure is not one process's growth; both incarnations grew,
+  so it is not evidence that a single process leaked at that rate.
 - **Journal:** +225,439,853 B = **215.0 MiB** over 25.0 min,
   **150,291.33 B/s ≈ 8.6 MiB/min**; at the observed rate ≈12.1 GiB/day
   (derived). The journal has no rotation or compaction in this build.
@@ -320,10 +345,10 @@ defects:
 
 - **Cap 32, 128 in-flight, 1 s queue timeout:** 3626 ops, 238.045 ops/s,
   p50 447.461 ms, p95 1317.53 ms, p99 1886.251 ms, 0 × 503, 0 errors.
-  The cap queued rather than shed because measured queue wait stayed under
-  the 1 s timeout. The run does **not** claim that cap 32 sheds; it shows
-  the default-cap sweep and this cap probe both pay the same serialization
-  cost.
+  The absence of 503s implies no request waited out the 1 s queue timeout;
+  server-side queue wait itself was not sampled. The run does **not** claim
+  that cap 32 sheds; it shows the default-cap sweep and this cap probe both
+  pay the same serialization cost.
 - **Rate limit 50/s, 64 in-flight:** 50.781 accepted ops/s, 946 × 429,
   error rate 0.539031, accepted p95 197.172 ms, all-attempt p95 194.304 ms,
   p99 388.736 ms, 0 network errors. This is real admission shedding. The
@@ -365,8 +390,14 @@ defects:
   soak cleanup deleted the live volumes; the mid-soak restart (§6/§7) is the
   non-empty replay check.
 - **Cap probe.** Cap 32 with a 1 s queue timeout did not produce 503s in
-  this run; queue wait stayed under 1 s. Shedding is demonstrated by the
-  50 req/s rate-limit probe, not by the cap probe.
+  this run. That implies no request waited out the timeout, but server-side
+  queue wait was not sampled. Shedding is demonstrated by the 50 req/s
+  rate-limit probe, not by the cap probe.
+- **Raw log provenance.** The raw orchestration log is unmodified: its
+  `binary_sha256` is the stale pre-build value `04c06df8…`. The executed
+  binary is `670c2125…` (ENVIRONMENT.txt). The harness was tracked at
+  `e3aa365`, but the bundled publish step and the current harness include
+  later review fixes; see [SCRIPTS.txt](SCRIPTS.txt).
 
 ## 10. Artifact map
 
