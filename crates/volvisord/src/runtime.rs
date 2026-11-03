@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use volvisor_api::peer::PeerRouteContext;
-use volvisor_api::{AppState, SharedState, router};
+use volvisor_api::{AppState, SharedState, router_with_config};
 use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
 use volvisor_drbd::{AuthorityContext, DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
@@ -830,7 +830,7 @@ pub async fn serve(config: Config) -> Result<(), DaemonError> {
         );
     }
     let state = build_state(&config)?;
-    let app = router(state, config.max_body_bytes);
+    let app = router_with_config(state, &config.api_config());
     let listener = std::net::TcpListener::bind(config.listen)
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
     listener
@@ -960,7 +960,7 @@ fn journal_err(context: &'static str) -> impl Fn(ApiError) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MigrationConfig, VmmConfig};
+    use crate::config::{AdmissionConfig, MigrationConfig, VmmConfig};
 
     fn fake_config(listen: &str, admin_token: Option<&str>) -> Config {
         Config {
@@ -1000,6 +1000,7 @@ mod tests {
             credentials: crate::config::CredentialsConfig::default(),
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
+            admission: AdmissionConfig::default(),
         }
     }
 
@@ -1044,6 +1045,7 @@ mod tests {
             credentials: crate::config::CredentialsConfig::default(),
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
+            admission: AdmissionConfig::default(),
         }
     }
 
@@ -1198,6 +1200,7 @@ mod tests {
             credentials: crate::config::CredentialsConfig::default(),
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
+            admission: AdmissionConfig::default(),
         }
     }
 

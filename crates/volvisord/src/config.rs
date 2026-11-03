@@ -51,6 +51,50 @@ impl ProviderKind {
 /// reads or logs credential material.
 pub const DEFAULT_CEPH_USER: &str = "client.volvisor";
 
+/// HTTP admission-control knobs (issue #45).
+///
+/// The long-operation model is documented in `docs/admission-control.md`:
+/// `read_timeout_secs` bounds read-only routes only, never a journaled
+/// mutation.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionConfig {
+    /// Bound on a read-only provider call (list/inspect/capabilities and
+    /// mobility observation).
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+    /// Bound on waiting for a global concurrency permit before answering
+    /// `503 OVERLOADED`.
+    #[serde(default = "default_admission_wait_timeout_secs")]
+    pub queue_timeout_secs: u64,
+    /// Global cap on in-flight requests (liveness and metrics exempt).
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    /// Per-principal token refill rate; `0` disables rate limiting.
+    #[serde(default = "default_rate_limit_per_second")]
+    pub rate_limit_per_second: u32,
+    /// Per-principal token-bucket burst; must be at least one when the rate
+    /// is non-zero.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    /// Maximum accepted `GET /v2/volumes?limit=`.
+    #[serde(default = "default_max_list_limit")]
+    pub max_list_limit: usize,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            read_timeout_secs: default_read_timeout_secs(),
+            queue_timeout_secs: default_admission_wait_timeout_secs(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            rate_limit_per_second: default_rate_limit_per_second(),
+            rate_limit_burst: default_rate_limit_burst(),
+            max_list_limit: default_max_list_limit(),
+        }
+    }
+}
+
 /// Daemon configuration (TOML file at `--config`).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,6 +208,10 @@ pub struct Config {
     /// Maximum request body size in bytes.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// HTTP admission-control knobs (timeouts, concurrency cap, rate limit,
+    /// pagination maximum). See `docs/admission-control.md`.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
     /// Base URL of the writer-authority witness (drbd provider only,
     /// e.g. `https://10.0.0.3:9101`). When set, the provider is
     /// witness-managed: every promotion acquires a lease first, a
@@ -363,6 +411,24 @@ impl CredentialsConfig {
 fn default_max_body_bytes() -> usize {
     1 << 20
 }
+fn default_read_timeout_secs() -> u64 {
+    30
+}
+fn default_admission_wait_timeout_secs() -> u64 {
+    5
+}
+fn default_max_concurrent_requests() -> usize {
+    256
+}
+fn default_rate_limit_per_second() -> u32 {
+    100
+}
+fn default_rate_limit_burst() -> u32 {
+    200
+}
+fn default_max_list_limit() -> usize {
+    1000
+}
 fn default_drbd_port_min() -> u16 {
     7100
 }
@@ -500,6 +566,22 @@ impl Config {
             || !self.credentials.admin.is_empty()
             || !self.credentials.operator.is_empty()
             || !self.credentials.read_only.is_empty()
+    }
+
+    /// Build the API layer's admission configuration from the daemon knobs.
+    #[must_use]
+    pub fn api_config(&self) -> volvisor_api::ApiConfig {
+        volvisor_api::ApiConfig {
+            max_body_bytes: self.max_body_bytes,
+            read_timeout: std::time::Duration::from_secs(self.admission.read_timeout_secs),
+            admission_wait_timeout: std::time::Duration::from_secs(
+                self.admission.queue_timeout_secs,
+            ),
+            max_concurrent_requests: self.admission.max_concurrent_requests,
+            rate_limit_per_second: self.admission.rate_limit_per_second,
+            rate_limit_burst: self.admission.rate_limit_burst,
+            max_list_limit: self.admission.max_list_limit,
+        }
     }
 
     /// Render the concise `--check-config` summary (P7-A, ADR-0009):
@@ -1004,6 +1086,7 @@ impl Config {
                 ));
             }
         }
+        self.validate_admission_fields()?;
         self.validate_drbd_field_shapes()?;
         // An explicitly empty token is a configuration mistake: unset means
         // "fail closed, loopback only", while "" would authenticate an empty
@@ -1037,6 +1120,45 @@ impl Config {
                      metadata)"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Admission-control knob bounds (issue #45). The defaults are safe;
+    /// these checks refuse a configuration that would disable the cap
+    /// silently or make the rate limiter ill-defined.
+    fn validate_admission_fields(&self) -> Result<(), DaemonError> {
+        let admission = &self.admission;
+        if !(1..=3600).contains(&admission.read_timeout_secs) {
+            return Err(DaemonError::Config(
+                "admission.read_timeout_secs must be between 1 and 3600".to_owned(),
+            ));
+        }
+        if !(1..=300).contains(&admission.queue_timeout_secs) {
+            return Err(DaemonError::Config(
+                "admission.queue_timeout_secs must be between 1 and 300".to_owned(),
+            ));
+        }
+        if !(1..=65_536).contains(&admission.max_concurrent_requests) {
+            return Err(DaemonError::Config(
+                "admission.max_concurrent_requests must be between 1 and 65536".to_owned(),
+            ));
+        }
+        if admission.rate_limit_per_second > 0 && admission.rate_limit_burst == 0 {
+            return Err(DaemonError::Config(
+                "admission.rate_limit_burst must be at least 1 when rate_limit_per_second is non-zero"
+                    .to_owned(),
+            ));
+        }
+        if admission.rate_limit_burst > 1_000_000 {
+            return Err(DaemonError::Config(
+                "admission.rate_limit_burst must not exceed 1000000".to_owned(),
+            ));
+        }
+        if !(1..=1000).contains(&admission.max_list_limit) {
+            return Err(DaemonError::Config(
+                "admission.max_list_limit must be between 1 and 1000".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1305,6 +1427,40 @@ device_claim_token = \"scoped-destructive-auth\"
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.provider, ProviderKind::Lvm);
         assert_eq!(cfg.max_body_bytes, 1 << 20);
+        assert_eq!(cfg.admission.read_timeout_secs, 30);
+        assert_eq!(cfg.admission.max_concurrent_requests, 256);
+        assert_eq!(cfg.admission.rate_limit_per_second, 100);
+        let api = cfg.api_config();
+        assert_eq!(api.max_body_bytes, 1 << 20);
+        assert_eq!(api.read_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn admission_knobs_are_validated() {
+        let raw = format!(
+            "{}\n[admission]\nrate_limit_per_second = 0\nrate_limit_burst = 0\nmax_list_limit = 50\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.api_config().max_list_limit, 50);
+
+        let raw = format!(
+            "{}\n[admission]\nrate_limit_per_second = 10\nrate_limit_burst = 0\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "a non-zero rate with a zero burst must be refused"
+        );
+
+        let raw = format!(
+            "{}\n[admission]\nmax_concurrent_requests = 0\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
