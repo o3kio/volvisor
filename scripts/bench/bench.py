@@ -1024,6 +1024,7 @@ def run_mixed(client: HttpClient, args: argparse.Namespace, out_dir: Path) -> di
     for state in states:
         cleanup_failures.extend(cleanup_volume(client, state.volume_id, ids))
 
+    recorder.write_csv()
     summary = recorder.summary()
     summary.update(
         {
@@ -1311,6 +1312,7 @@ def run_soak(client: HttpClient, args: argparse.Namespace, out_dir: Path) -> dic
         # Detach any surviving attachment before deleting.
         cleanup_failures.extend(cleanup_volume(client, volume_id, ids))
 
+    recorder.write_csv()
     summary = recorder.summary()
     summary.update(
         {
@@ -1445,6 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
         recorder = Recorder(out_dir, "micro")
         ids = Ids("micro")
         setup = run_micro(client, recorder, ids, args)
+        recorder.write_csv()
         summary = recorder.summary()
         journal_end = file_size(args.journal)
         state_end = file_size(args.state)
