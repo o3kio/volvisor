@@ -70,6 +70,14 @@ if grep -rIl -- "$TOKEN" "$DEST" >/dev/null 2>&1; then
   die "run token found in the published bundle; refusing to publish secrets"
 fi
 
+# Forge hosting rejects individual files above 100 MiB. Raw daemon logs are
+# the only unbounded artifact (the 25-minute soak produced a 606 MiB one), so
+# compress oversized raw logs in place after the plaintext token check.
+# `gzip -n` omits the timestamp so the committed bytes are reproducible.
+while IFS= read -r -d '' path; do
+  gzip -9 -n -f "$path"
+done < <(find "$DEST/raw" -type f -size +50M -print0)
+
 # An authored report must exist before the manifest is sealed.
 if [[ ! -f "$DEST/REPORT.md" ]]; then
   printf 'WARNING: %s/REPORT.md is missing; the bundle is evidence, not a report\n' "$DEST" >&2
