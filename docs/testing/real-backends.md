@@ -383,6 +383,12 @@ and versions, never key bytes, keyring contents, or the shared secret.
 | `FAILED [drbd.node-name-mismatch]` | runner hostname vs variable | CI/infra owner | `preflight.log` |
 | `FAILED [drbd.peer-unresolvable]` | peer DNS/address, replication network | DRBD infrastructure owner | `preflight.log` |
 | `FAILED [drbd.tests-failed]` | peer backing LV, `drbdadm status`, kernel log | Volvisor maintainer + DRBD owner | `run.log`, `junit.xml` |
+| `FAILED [lvm.missing-tool.*]` | `losetup`, `lvm2`, `mount`/`umount` installed | LVM infrastructure owner | `preflight.log`, `environment.txt` |
+| `FAILED [lvm.no-loop-control]` / `no-free-loop` | loop module loaded, free loop device, stale `losetup -a` entries | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.no-device-mapper]` | device-mapper (`dm_mod`) available | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.no-tmpfs-mount]` / `no-tmpfs-umount` | root with `CAP_SYS_ADMIN` (or container equivalent) can mount a tmpfs; no stale mount at the probe path | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.low-disk]` | ≥1 GiB free under the evidence/output directory | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.tests-failed]` / `suite-skipped` | test assertion, rig state, `VOLVISOR_TEST_LVM` passed through | Volvisor maintainer + LVM owner | `run.log`, `junit.xml` |
 | `FAILED [*.suite-skipped]` | env not passed through `sudo -E` | CI/infra owner | `run.log`, `preflight.log` |
 | `real-backends-gate` failed | matrix result in the job summary | Volvisor release manager | run URL, `real-backends-evidence` |
 

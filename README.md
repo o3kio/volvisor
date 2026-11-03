@@ -111,7 +111,7 @@ raw records are in the
 | Schema compatibility, upgrade-on-write and future-version refusal | **PARTIAL** — live old-binary → new-binary upgrade/rollback not run |
 | Lost/unreachable witness service | **PARTIAL** — storage-side DRBD fencing not run |
 | Torn journal tail and corrupt state file | **DRILLED** |
-| ENOSPC on journal/state writes | **DRILLED**, with an open state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) |
+| ENOSPC on journal/state writes | **DRILLED**; the state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code ([PR #69](https://github.com/o3kio/volvisor/pull/69)), post-fix path covered by a regression test |
 | Crash loop and single-writer lock contention | **DRILLED** |
 | Credential and certificate rotation | **DRILLED** — restart-based, no hot reload |
 | Total host loss and re-admission | **NOT RUN — REQUIRES** a real multi-host DRBD/Ceph lab, a third failure domain and BMC/fencing |

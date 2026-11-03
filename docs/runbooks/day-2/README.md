@@ -43,7 +43,7 @@ exactly that; it is not zero.
 | Torn journal tail | Only the incomplete last record; acknowledged prior records survived | Restart to health | D4 |
 | Corrupt state file | Backup point; the daemon refuses to guess | Restore + reconciliation; not measured | D4 |
 | Journal ENOSPC | No acknowledged state lost; the failed create is absent | Free space + restart; measured in seconds in the lab | D5 part A |
-| Provider-state ENOSPC | The failed create is not durable; the LV is compensated, and only a failing cleanup leaves an operator-visible orphan | Free space + restart + retry; manual `lvremove` for the cleanup-failure tail; post-fix path covered by a regression test | D5 part B (historical), [#58](https://github.com/o3kio/volvisor/issues/58) fix |
+| Provider-state ENOSPC | For an uncommitted save the failed create is not durable; the LV is compensated, and only a failing cleanup leaves an operator-visible orphan. In the rare post-rename carve-out the record **is** durable and the volume is served | Free space + restart + retry for the uncommitted cases; manual `lvremove` for the cleanup-failure tail; in the carve-out a new `operation_id` returns the volume idempotently. Post-fix path covered by a regression test | D5 part B (historical), [#58](https://github.com/o3kio/volvisor/issues/58) fix |
 | Crash loop with in-flight requests | The in-flight request may fail; prior durable state survived every SIGKILL | Restart/replay to health; not separately measured | D6 |
 | Token/certificate rotation | No control-plane state loss | Two controlled restarts (overlap + removal), plus client rollout | D7 |
 | Total host loss | **Unknown**; async replication can lose its tail | **Unknown** | D8 NOT RUN |
@@ -131,8 +131,11 @@ It does not touch pre-existing VGs. Do not run it on a production host.
 
 ## Known gaps filed as issues
 
-- [#58](https://github.com/o3kio/volvisor/issues/58) — LVM create returns 500
-  on state-save ENOSPC but leaves the LV and serves it from memory.
+- [#58](https://github.com/o3kio/volvisor/issues/58) — LVM create returned 500
+  on state-save ENOSPC and left the LV, serving it from memory. Fixed in code
+  by [PR #69](https://github.com/o3kio/volvisor/pull/69); the post-fix path is
+  covered by a regression test, but D5 has not been re-run at the merged
+  revision.
 - [#37](https://github.com/o3kio/volvisor/issues/37) — three-physical-host
   nearline campaign, the prerequisite for real host-loss evidence.
 - [#38](https://github.com/o3kio/volvisor/issues/38) — three-host Rook-cell

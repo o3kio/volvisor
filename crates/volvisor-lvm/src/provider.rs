@@ -13,12 +13,12 @@
 //! Create is fail-closed: if the state save fails, the just-created LV is
 //! removed with a checked `lvremove` and the in-memory entry is dropped (a
 //! failing cleanup names the exact manual `lvremove` and leaves the LV
-//! visible in `lvs` but absent from provider state), except when the failed
-//! save's rename already landed — then the durable record, the in-memory
-//! entry and the LV are all kept. In that last case the API serves the
-//! volume; a retry with a new `operation_id` and the same payload is
-//! idempotent, while reusing the failed `operation_id` replays the recorded
-//! error.
+//! visible in `lvs` but absent from provider state), except when the durable
+//! state already contains this volume's record — then the durable record,
+//! the in-memory entry and the LV are all kept. In that last case the API
+//! serves the volume; a retry with a new `operation_id` and the same payload
+//! is idempotent, while reusing the failed `operation_id` replays the
+//! failure or fails closed as in-doubt.
 //!
 //! Thick LVM rounds logical-volume sizes **up** to whole physical extents
 //! (4 MiB by default). The provider therefore treats
@@ -555,6 +555,9 @@ impl LvmProvider {
     /// entry and the LV are kept and the error says the record nonetheless
     /// reached the state file. The durable file is re-read to decide; a
     /// load error is treated as *not* committed (the fail-closed direction).
+    /// The decision is presence-based: a record for this volume left by an
+    /// earlier failed mutation takes the same keep branch, which is still
+    /// the safe direction (all sources say the volume exists).
     fn compensate_unpersisted_create(
         &self,
         state: &mut LvmState,
@@ -569,11 +572,11 @@ impl LvmProvider {
             return ApiError::new(
                 save_error.code,
                 format!(
-                    "{}; the volume record nonetheless reached the state file (the save's \
-                     rename landed before a later step failed), so volume {volume_id} and its \
-                     LV {vg_name}/{lv_name} were kept; the API serves the volume, and a retry \
-                     with a new operation_id and the same payload returns it (reusing the failed \
-                     operation_id replays this recorded error)",
+                    "{}; the durable state already contains this volume's record, so volume \
+                     {volume_id} and its LV {vg_name}/{lv_name} were kept; the API serves the \
+                     volume, and a retry with a new operation_id and the same payload returns it \
+                     (reusing the failed operation_id replays the failure, or fails closed as \
+                     in-doubt when the journal could not record the outcome)",
                     save_error.detail
                 ),
             );

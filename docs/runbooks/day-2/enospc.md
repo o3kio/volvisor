@@ -10,12 +10,15 @@ been re-run at the merged revision.**
   truncated on restart, retry succeeds after space is freed.
 - **Provider-state ENOSPC:** HTTP 500; for an uncommitted save the old
   durable state is intact. After the #58 fix, an uncommitted save compensates
-  the just-created LV and
-  removes the in-memory entry (GET is 404, no phantom volume); if the
-  compensating `lvremove` fails, the LV remains as an operator-visible orphan
-  and the error names the manual remediation. In the rare case where the
-  save's rename landed before a later step failed, the durable record, memory
-  and LV keep the volume and GET returns it.
+  the just-created LV and removes the in-memory entry (GET is 404, no phantom
+  volume); if the compensating `lvremove` fails, the LV remains as an
+  operator-visible orphan and the error names the manual remediation. In the
+  rare case where the save's rename landed before a later step failed, the
+  durable record, memory and LV keep the volume and GET returns it. If the
+  durable re-read itself failed, the provider cannot say whether a record
+  survived; it removes the LV and leaves the file for the operator. A
+  surviving record shows the volume `Failed` with a missing LV after
+  restart. Do not auto-delete in that case.
 
 Historical evidence (pre-fix D5):
 [D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
@@ -106,7 +109,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:8080/v2/volumes/$VOLUME_ID
 ```
 
-Expected for the failed create: `404`.
+Expected for the failed create: `404`, unless the ENOSPC hit the **outcome**
+append after the create landed. Then `GET` is `200` with a real volume: the
+volume exists and is served; verify it, do not re-create it, and expect the
+same `operation_id` to fail closed as `OPERATION_IN_DOUBT`.
 
 ```sh
 systemctl stop volvisord.service
@@ -129,8 +135,9 @@ prefix. D5 observed 12060 before the failed append, 12288 immediately after
 (the torn append), and 12060 after restart, with the prefix SHA256 unchanged
 (`41bcc95a...`).
 
-5. Retry the original operation **with the same `operation_id`**. The retry
-   must create one volume, not two.
+5. Retry the original operation **with the same `operation_id`** only when
+   step 2 observed a `404` (the intent append failed, so nothing was
+   executed). The retry must create one volume, not two.
 
 ```sh
 # send the same create request that failed
@@ -140,7 +147,10 @@ curl -fsS --config ~/.volvisor-admin.curl \
 ```
 
 Expected: HTTP 200 for the retry; D5 observed `vol-d5-full` durable with 24
-valid frames and no second copy. If the retry returns a conflict, inspect the
+valid frames and no second copy. If step 2 observed a `200` (the outcome
+append failed after the create landed), do **not** retry: verify the volume
+and LV, and expect the same `operation_id` to fail closed as
+`OPERATION_IN_DOUBT`. If the retry returns a conflict, inspect the
 journal/state before trying another id.
 
 6. Verify the failed volume id is now present exactly once and its LV exists.
@@ -156,17 +166,22 @@ lvs --noheadings -o lv_name,vg_name,lv_size
 The save is atomic up to the rename: a failure before it preserves the old
 `lvm-state.json` and removes the `.tmp`. `lvcreate` has already run. After the
 #58 fix, an uncommitted save is compensated with a checked `lvremove` and the
-in-memory entry is rolled back. Three outcomes are possible, so still inspect
+in-memory entry is rolled back. Four outcomes are possible, so still inspect
 before assuming anything:
 
 - **Uncommitted save (normal):** 500, old state byte-identical, GET 404, no
   LV for the failed volume id.
-- **Carve-out (the save's rename landed, a later step failed):** 500, GET
-  200, the durable record/LV/memory all hold the volume. Do not compensate
-  it; the volume is served, but its crash durability was not confirmed.
 - **Cleanup failure:** 500, GET 404, the LV remains, and the error detail
   names `manual lvremove <vg>/<lv>`. The in-memory entry is gone, so the LV
   is absent from provider state.
+- **Carve-out (the save's rename landed, a later step failed):** 500, GET
+  200, the durable record/LV/memory all hold the volume. Do not compensate
+  it; the volume is served, but its crash durability was not confirmed.
+- **Indeterminate (the durable re-read failed):** 500, GET 404, the LV was
+  removed, and the provider could not read the durable file, so it cannot
+  say whether a record survived. A surviving valid record appears as
+  `Failed` with a missing LV after restart; a corrupt file needs the
+  corruption runbook. Stop and investigate; do not auto-delete anything.
 
 **Do not assume "HTTP 500" means "nothing happened."**
 
@@ -189,7 +204,10 @@ Expected post-fix:
 - **carve-out:** `GET` returns 200, the LV is present, and the durable state
   contains the volume;
 - **cleanup failure:** `GET` returns 404 but the LV is present, and the 500
-  detail names `manual lvremove <vg>/<lv>`.
+  detail names `manual lvremove <vg>/<lv>`;
+- **indeterminate:** `GET` returns 404, no LV exists, and the durable file
+  could not be read. Compare a backup before acting; a valid surviving record
+  will load as a `Failed` volume with a missing LV.
 
 Historical D5 observation (pre-fix, `e551d26`):
 
@@ -207,14 +225,17 @@ systemctl start volvisord.service
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-3. Re-check the volume and LV against the three outcomes above:
+3. Re-check the volume and LV against the four outcomes above:
 
    - **normal:** `GET` is still 404 and no LV for the failed volume id exists;
    - **cleanup failure:** `GET` is 404 and the LV is still present — go to
      step 4;
    - **carve-out:** `GET` is 200, the LV is present, and the durable state
      contains the volume. Do not remove it; confirm it appears exactly once
-     in `GET /v2/volumes`, then resume at step 5's carve-out bullet.
+     in `GET /v2/volumes`, then resume at step 5's carve-out bullet;
+   - **indeterminate:** `GET` is 404 and no LV exists, but the durable file
+     could not be read. Do not retry or delete anything; compare a backup and
+     escalate with the state and LVM output.
 
    Anything else is a state/LVM disagreement: stop and investigate before
    serving.
@@ -238,16 +259,24 @@ record is missing from a stale backup is data loss.
 5. Retry only after space is restored:
 
    - **normal or cleanup failure:** use a **new `operation_id`** with the
-     same payload. Reusing the failed `operation_id` replays the recorded
-     500 verbatim; the failed create is terminal in the journal.
+     same payload. Reusing the failed `operation_id` does not re-execute:
+     it replays the recorded failure when the journal had space to record
+     the outcome (the separated layout), and fails closed as
+     `OPERATION_IN_DOUBT` when the journal shares the full filesystem and
+     could not record it. The new-`operation_id` retry is correct either
+     way.
    - **carve-out:** `GET` already returns the volume; a new `operation_id`
      with the same payload returns the same volume idempotently.
+   - **indeterminate:** do not retry; investigate the unreadable durable
+     file and compare a backup first.
 
    Verify exactly one durable volume and one LV.
 
-The old durable state is safe. The two states that need operator attention
-are the carve-out (served but not crash-durable-confirmed) and the
-cleanup-failure orphan (visible in `lvs`, absent from provider state).
+Outside the indeterminate case the old durable state is safe. The states
+that need operator attention are the carve-out (served but not
+crash-durable-confirmed), the cleanup-failure orphan (visible in `lvs`,
+absent from provider state), and the indeterminate case (unreadable durable
+file, no LV).
 
 ## D. Prevention
 
@@ -265,7 +294,10 @@ cleanup-failure orphan (visible in `lvs`, absent from provider state).
 ## Pass condition
 
 - Journal ENOSPC: 500, failed volume 404, torn append truncated to the valid
-  prefix on restart, retry creates exactly one volume, no phantom state.
+  prefix on restart, retry with the same `operation_id` creates exactly one
+  volume, no phantom state. If the failure was the **outcome** append (GET
+  200), the volume exists; it is verified, not re-created, and the same
+  `operation_id` fails closed as `OPERATION_IN_DOUBT`.
 - State ENOSPC, normal: 500, old state file byte-identical, GET 404, no
   orphan LV, restart 404, and a retry with a new `operation_id` creates
   exactly one volume.
@@ -274,6 +306,9 @@ cleanup-failure orphan (visible in `lvs`, absent from provider state).
   a retry with a new `operation_id` succeeds.
 - State ENOSPC, carve-out: 500, GET 200, durable state/LV/memory agree; a
   new `operation_id` with the same payload returns the same volume.
+- State ENOSPC, indeterminate: 500, GET 404, no LV, and the durable file
+  could not be read. This is a stop-and-investigate outcome, not a pass; it
+  must be recorded and escalated.
 - No hand-edited state file, no truncated complete journal frame.
 
 ## What was drilled

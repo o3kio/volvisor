@@ -456,7 +456,10 @@ async fn create_save_failure_after_rename_is_honored_not_compensated() {
         .await
         .expect_err("create whose save fails after the durable record exists");
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
-    assert!(err.detail.contains("nonetheless reached"), "{err}");
+    assert!(
+        err.detail.contains("durable state already contains"),
+        "{err}"
+    );
 
     // The durable file already contained the volume: keep the LV, do not
     // compensate, and keep serving the in-memory entry.
@@ -538,6 +541,15 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
             .expect("world")
             .lvs
             .contains_key(&lv_path)
+    );
+
+    // Neither the failed save nor the compensation may rewrite or delete the
+    // unreadable durable file: doing so would silently drop the device claim
+    // and make the restart assertions below pass vacuously.
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("durable file survived untouched"),
+        b"{ not valid provider state".to_vec(),
+        "the unreadable durable file must be left for the operator"
     );
 
     fs::remove_dir(&tmp_path).expect("unblock the next save");
