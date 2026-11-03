@@ -272,7 +272,10 @@ lvm_lab_teardown() {
   [[ -f "$RUN/records/$tag.loop" ]] && loop="$(cat "$RUN/records/$tag.loop")"
   [[ -f "$RUN/records/$tag.vg" ]] && vg="$(cat "$RUN/records/$tag.vg")"
   if [[ -n "$vg" ]] && vgs "$vg" >/dev/null 2>&1; then
-    owners="$(pvs --noheadings -o pv_name "$vg" 2>/dev/null | xargs)"
+    # `pvs` positional arguments are *PV* names, not VG names: `pvs "$vg"`
+    # prints nothing and the ownership guard would refuse every teardown.
+    # Ask the VG which PVs back it instead.
+    owners="$(vgs --noheadings -o pv_name "$vg" 2>/dev/null | xargs)"
     if [[ -z "$loop" || "$owners" != "$loop" ]]; then
       printf 'REFUSING to remove VG %s: its PVs (%s) are not this drill'"'"'s loop (%s)\n' \
         "$vg" "${owners:-unknown}" "${loop:-unknown}" | tee -a "$LOG"
