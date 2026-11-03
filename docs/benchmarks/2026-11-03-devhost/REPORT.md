@@ -266,7 +266,7 @@ lab observation, not a production RTO.
 These are measured behaviors, not tuning changes. No production behavior was
 changed to improve any number.
 
-### B1 — Global provider-state lock + whole-state fsync serializes control-plane work — [issue link pending]
+### B1 — Global provider-state lock + whole-state fsync serializes control-plane work — [#62](https://github.com/o3kio/volvisor/issues/62)
 
 Evidence: §4 (throughput falls 1665.787 → 2293.7 → 899.759 → 241.716 ops/s
 as in-flight rises 1 → 8 → 32 → 128; p95 1.77 → 6.454 → 191.244 →
@@ -279,7 +279,7 @@ directory `sync_all`). The read path also takes `lock_state`
 (e.g. `provider.rs:363`), so reads wait behind a writer holding the lock
 across the fsync.
 
-### B2 — Journal retention grows without bound in memory and on disk — [issue link pending]
+### B2 — Journal retention grows without bound in memory and on disk — [#64](https://github.com/o3kio/volvisor/issues/64)
 
 Evidence: §6 RSS +621,716 KiB in 25.0 min (412.9999 KiB/s) and journal
 +225,439,853 B in 25.0 min, with flat fds (19 → 18). Source:
@@ -291,7 +291,7 @@ eviction path exists). The log is append-only with per-record `sync_all`
 torn-tail repair. Restart replay of the resulting 259 MiB journal took
 2.669–2.813 s in §7, so the disk growth also raises future restart time.
 
-### B3 — Retired attachment ids accumulate without bound in provider state — [issue link pending]
+### B3 — Retired attachment ids accumulate without bound in provider state — [#63](https://github.com/o3kio/volvisor/issues/63)
 
 Evidence: §6 state 5,911 → 2,522,793 B (2.4 MiB) with only four live soak
 volumes; §4 state max is not a function of live volume count. Source:
