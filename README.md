@@ -7,7 +7,8 @@ Volvisor is the **volume virtualization and orchestration layer** for O3K and Ce
 > [support matrix](SUPPORT_MATRIX.md). The v0.1.0 release is being
 > prepared; **no tag or GitHub release exists yet**, and the distribution
 > tag is blocked in this workstream by the missing signing key. The separate
-> pre-production exit gate is tracked in the
+> pre-production exit gate remains unmet; see the
+> [readiness report](docs/releases/pre-production-readiness.md) and
 > [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md).
 
 | v2 volume class | What it means | Live migration |

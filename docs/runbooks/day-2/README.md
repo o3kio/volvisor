@@ -1,6 +1,6 @@
 # Day-2 operations runbooks
 
-Status: **seven areas drilled on one host; total host loss NOT RUN.** Read the
+Status: **five areas fully drilled and two partially drilled on one host; total host loss NOT RUN.** Read the
 verdict on each page before using it. A runbook is a procedure; only the
 evidence bundle is a result.
 

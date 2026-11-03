@@ -1,9 +1,10 @@
 # Volvisor support matrix (v0.1.0 preparation)
 
 Status: **implemented prototype; no production support**
-Date: 2026-11-02
-Basis: `main` at `ad9efb0` (includes #37/#38 preflight, #39 gate, #41 schema, #47 docs and #40 transport/auth), plus the `docs/40-security-reconciliation` branch
+Date: 2026-11-03
+Basis: `main` at `575acfc` (Wave 2 merged: #41 schema, #40 transport/auth, #42 provider core, #45 admission control, #46 day-2 runbooks, #44 observability, #43 benchmarks)
 Intended release: `v0.1.0` — **not tagged, not published**
+Gate record: [pre-production readiness report](docs/releases/pre-production-readiness.md)
 Normative context: [SPEC-0002 §11](docs/specs/SPEC-0002-volvisor-volume-virtualization.md#11-real-host-acceptance-matrix),
 [ADR-0003](docs/adr/0003-tiered-volume-virtualization.md),
 [ADR-0004](docs/adr/0004-nearline-replication-and-mobility.md),
@@ -77,7 +78,8 @@ copy:
   part of the real-host campaigns and the exit review.
 - **No tag or GitHub release exists.** The v0.1.0 distribution tag is
   blocked in this workstream by the missing signing key; the separate
-  pre-production exit gate is recorded in the
+  pre-production exit gate remains unmet and is recorded in the
+  [readiness report](docs/releases/pre-production-readiness.md) and
   [checklist](docs/releases/v0.1.0-checklist.md).
 
 ## Evidence index
@@ -91,7 +93,9 @@ copy:
 | [ADR-0010](docs/adr/0010-tier-v-real-vmm-verification.md) | The exact Tier V claim vocabulary: "verified against a real VMM process at recorded versions". | Production support or real-media evidence. |
 | [POC design and GO/NO-GO](docs/poc/rook-cells/README.md) | The pre-registered C01–C14 criteria for a future run. | Any executed Rook/Ceph result; no GO exists. |
 | [release-scope.toml](release-scope.toml) and [real-backends gate](docs/testing/real-backends.md) | Which providers this release claims, and that a missing, skipped, or failed suite for a `supported` provider blocks publish. | A suite result, or any Ceph/DRBD evidence. `ceph-rbd` and `nearline-replicated` are `not-run` non-claims. |
-| [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md) | The distribution-tag gate, the separate pre-production exit gate, and the local build/smoke commands and results. | That the tag is allowed; the distribution tag is blocked in this workstream by the missing signing key, and the exit gate remains unmet. |
+| [Day-2 drill bundle, 2026-11-03](docs/evidence/day2/2026-11-03-devhost/REPORT.md) | Single-host backup/restore, journal/state corruption, ENOSPC, crash-loop/lock and restart-based credential rotation drills, with recorded output and honest RPO/RTO. | Multi-host host loss (D8), live binary upgrade/rollback, storage-side DRBD fencing, or any production recovery guarantee. The bundle predates #42/#45/#44 and does not certify them. |
+| [Control-plane benchmark bundle, 2026-11-03](docs/benchmarks/2026-11-03-devhost/REPORT.md) | Single-host loop-backed LVM control-plane throughput/latency at 1/8/32/128 in-flight, admission/rate-limit probes, a 25-minute soak, and restart replay. | Data-path performance, real Ceph/DRBD/NVMe numbers, a 24-hour soak, production capacity, or any SLA. RSS and journal growth in the soak are open findings (#64). |
+| [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md) and [readiness report](docs/releases/pre-production-readiness.md) | The distribution-tag gate, the separate pre-production exit gate, the gate-to-evidence mapping, and the local build/smoke commands and results. | That the tag is allowed; the distribution tag is blocked in this workstream by the missing signing key, and the exit gate remains unmet. |
 
 ## Claim rules for reviewers
 
