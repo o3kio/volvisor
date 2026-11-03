@@ -339,6 +339,7 @@ impl HttpPeerClient {
     }
 
     /// Issue one request and decode the typed result.
+    #[tracing::instrument(name = "peer_call", skip(self, body), fields(path = path))]
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -461,6 +462,7 @@ fn safe_path_segment(vm_id: &str) -> bool {
 /// Run one synchronous VMM operation on the blocking thread pool (the
 /// `VmmController` seam is synchronous; calling it inline would pin an
 /// async worker for the command's full duration).
+#[tracing::instrument(name = "vmm_call", skip(vmm, operation))]
 async fn vmm_call<T, F>(vmm: &Arc<dyn VmmController>, operation: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
@@ -667,6 +669,7 @@ impl DaemonHandoffDriver {
     }
 
     /// This host's witness view of one volume.
+    #[tracing::instrument(name = "witness_inspect", skip(self), fields(volume_id = %volume_id))]
     async fn view(&self, volume_id: &VolumeId) -> Result<AuthorityView, ApiError> {
         self.witness
             .inspect(volume_id)
@@ -675,6 +678,7 @@ impl DaemonHandoffDriver {
     }
 
     /// The observed local state of one VM.
+    #[tracing::instrument(name = "vmm_state", skip(self), fields(vm_id = %vm_id))]
     async fn local_state(&self, vm_id: &str) -> Result<VmState, ApiError> {
         let vm_id = vm_id.to_owned();
         vmm_call(&self.vmm, move |vmm| vmm.state(&vm_id)).await
@@ -684,6 +688,7 @@ impl DaemonHandoffDriver {
     /// promote/restore acts re-call `grant` first: the route is
     /// idempotent and its outcomes carry the promoted device paths the
     /// restore's disk mappings need).
+    #[tracing::instrument(name = "peer_grant", skip(self), fields(migration_id = %migration_id))]
     async fn peer_grants(
         &self,
         migration_id: &MigrationId,

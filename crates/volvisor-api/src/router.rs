@@ -15,6 +15,9 @@
 //! monitoring stay available while load is shed; reads are open only in the
 //! documented legacy/tokenless posture (see [`crate::auth`]).
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::middleware::{self, Next};
@@ -25,6 +28,7 @@ use crate::ApiConfig;
 use crate::admission::{self, Admission};
 use crate::auth;
 use crate::handlers;
+use crate::metrics::Metrics;
 use crate::peer;
 use crate::state::SharedState;
 
@@ -170,6 +174,12 @@ pub fn router_with_config(state: SharedState, config: &ApiConfig) -> Router {
         // spellings serve the same liveness-only response.
         .route("/healthz", get(handlers::healthz))
         .route("/v2/healthz", get(handlers::healthz))
+        // Readiness is distinct from liveness: it requires journal replay,
+        // provider reconcile and startup completion, and (when a real probe
+        // is configured) witness reachability. Both probe endpoints bypass
+        // admission control exactly like `/healthz`.
+        .route("/readyz", get(handlers::readyz))
+        .route("/v2/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
         .fallback(handlers::not_found)
         // Authentication/authorization/audit runs inside the metrics layer so
@@ -195,22 +205,40 @@ pub fn router_with_config(state: SharedState, config: &ApiConfig) -> Router {
         .with_state(state)
 }
 
-/// Middleware counting served requests in `http_requests_total{route,code}`.
+/// Decrements the in-flight gauge when the request future completes or is
+/// dropped, so a cancellation cannot leave the gauge permanently elevated.
+struct InFlightGuard(Arc<Metrics>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.request_finished();
+    }
+}
+
+/// Middleware recording `http_requests_total{route,code}` and
+/// `http_request_duration_seconds{route,class}` and maintaining
+/// `http_requests_in_flight`.
 ///
-/// The label is the matched route *pattern* (e.g. `/v2/volumes/{volume_id}`)
-/// when routing resolved one, falling back to the raw path.
+/// The route label is the matched route *pattern* (e.g.
+/// `/v2/volumes/{volume_id}`) when routing resolved one. Unmatched requests
+/// (the fallback) are recorded under the fixed `<unmatched>` label: the raw
+/// path may contain consumer ids and must never become an unbounded label.
 async fn record_http_request(
     State(state): State<SharedState>,
     req: Request,
     next: Next,
 ) -> Response {
+    const UNMATCHED_ROUTE: &str = "<unmatched>";
     let route = req.extensions().get::<MatchedPath>().map_or_else(
-        || req.uri().path().to_owned(),
+        || UNMATCHED_ROUTE.to_owned(),
         |matched| matched.as_str().to_owned(),
     );
+    state.metrics.request_started();
+    let _guard = InFlightGuard(Arc::clone(&state.metrics));
+    let started = Instant::now();
     let response = next.run(req).await;
     state
         .metrics
-        .record_http(&route, response.status().as_u16());
+        .record_http(&route, response.status().as_u16(), started.elapsed());
     response
 }

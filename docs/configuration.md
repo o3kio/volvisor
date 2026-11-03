@@ -80,7 +80,7 @@ timeout.
 |---|---|---|---|
 | `admission.read_timeout_secs` | integer (seconds) | `30` | Single bound applied to every read-only provider call; expiry is `504 REQUEST_TIMEOUT`. |
 | `admission.queue_timeout_secs` | integer (seconds) | `5` | Maximum wait for a global concurrency permit; expiry is `503 OVERLOADED` with `Retry-After`. |
-| `admission.max_concurrent_requests` | integer | `256` | Global in-flight request cap. `/healthz`, `/v2/healthz` and `/metrics` bypass it. |
+| `admission.max_concurrent_requests` | integer | `256` | Global in-flight request cap. `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass it. |
 | `admission.rate_limit_per_second` | integer | `0` (disabled) | Per-principal token refill rate; opt-in, `0` preserves legacy behavior. |
 | `admission.rate_limit_burst` | integer | `0` (disabled) | Per-principal burst; ignored while the rate is `0`, must be at least one when the rate is non-zero. |
 | `admission.max_list_limit` | integer | `1000` | Maximum accepted `GET /v2/volumes?limit=` (1..=1000; never above the contract maximum). |
@@ -147,7 +147,8 @@ Tokens are compared in constant time.
 
 When **any** `[credentials]` entry is configured, read routes require at least
 the read-only role: volume listing/inspection, capabilities, migration
-observation and `/metrics`. `/healthz` and `/v2/healthz` stay open for probes.
+observation and `/metrics`. `/healthz`, `/v2/healthz`, `/readyz` and
+`/v2/readyz` stay open for probes.
 Without scoped credentials, the legacy behavior is preserved: `admin_token` (or
 a tokenless loopback dev instance) leaves reads open while mutations and
 `/v2/admin/*` remain token-guarded. The full matrix and threat model are in the
@@ -157,7 +158,7 @@ Role summary:
 
 | Surface | Required role |
 |---|---|
-| `GET /healthz`, `GET /v2/healthz` | public |
+| `GET /healthz`, `GET /v2/healthz`, `GET /readyz`, `GET /v2/readyz` | public |
 | `GET /v2/volumes`, `GET /v2/volumes/{id}`, `GET /v2/capabilities`, `GET /metrics`, `GET /v2/migrations/{id}` | read-only (when scoped credentials are configured) |
 | Volume create/delete/attach/detach/attachment-state/grow/move-backing, migration prepare/transfer/abort | operator |
 | `/v2/admin/*` (device/admin inventory included) and `POST /v2/vms/{id}/check-mobility` | admin |

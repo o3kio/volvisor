@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use volvisor_api::peer::PeerRouteContext;
-use volvisor_api::{AppState, SharedState, router_with_config};
+use volvisor_api::{AppState, Metrics, SharedState, router_with_config};
 use volvisor_ceph::{CephProviderConfig, CephRbdProvider};
 use volvisor_drbd::{AuthorityContext, DrbdProvider, DrbdProviderConfig};
 use volvisor_journal::Journal;
@@ -74,6 +74,14 @@ const GROW_RETRY_TICK: Duration = Duration::from_secs(5);
 /// provider cannot be constructed or reconciled.
 pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
     let journal = Journal::open(&config.journal_dir).map_err(journal_err("open journal"))?;
+    // The witness probe target is resolved at startup so `/readyz` and the
+    // `witness_reachable` gauge can use the same real transport probe the
+    // migration driver uses. No witness URL means `not_probed`.
+    let witness_probe = config
+        .witness_url
+        .as_deref()
+        .map(migration_witness_probe)
+        .transpose()?;
     let state = match config.provider {
         ProviderKind::Fake => {
             let provider = Arc::new(volvisor_provider::FakeProvider::new());
@@ -103,12 +111,13 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             let move_reconciler = provider.clone();
             let state = AppState::new(provider, Some(admin), journal, config.admin_token.clone())
                 .with_grow_notifier(grow.clone());
-            // Detached by design (the renewal-task pattern): the task
-            // owns the notification reconcile for the daemon's
-            // lifetime and never fails the startup that spawned it —
-            // every outcome is a structured event.
-            let _detached = spawn_grow_retry_task(grow);
-            let _detached = spawn_move_retry_task(move_reconciler);
+            // Detached by design (the renewal-task pattern): the tasks
+            // own the reconcile for the daemon's lifetime and never fail
+            // the startup that spawned them — every outcome is a
+            // structured event, and each successful pass records the
+            // `reconcile_age_seconds{scope}` sample.
+            let _detached = spawn_grow_retry_task(grow, state.metrics_handle());
+            let _detached = spawn_move_retry_task(move_reconciler, state.metrics_handle());
             state
         }
         ProviderKind::Ceph => {
@@ -161,6 +170,10 @@ pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
             }
             state
         }
+    };
+    let state = match witness_probe {
+        Some(address) => state.with_witness_probe(address),
+        None => state,
     };
     Ok(Arc::new(
         state.with_credentials(config.credentials.to_credentials()),
@@ -265,7 +278,10 @@ fn wire_grow_notification(
 /// `spawn_migration_retry_task` pattern): the task owns the
 /// reconcile for the daemon's lifetime and never fails the startup
 /// that spawned it.
-fn spawn_grow_retry_task(engine: Arc<GrowNotificationEngine>) -> tokio::task::JoinHandle<()> {
+fn spawn_grow_retry_task(
+    engine: Arc<GrowNotificationEngine>,
+    metrics: Arc<Metrics>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // The pass runs on the blocking pool, never on a runtime
         // worker: the engine's pass is synchronous and bounded per
@@ -276,6 +292,9 @@ fn spawn_grow_retry_task(engine: Arc<GrowNotificationEngine>) -> tokio::task::Jo
         loop {
             let engine = Arc::clone(&engine);
             let pass = tokio::task::spawn_blocking(move || engine.retry_pass()).await;
+            if matches!(&pass, Ok(Ok(_))) {
+                metrics.record_reconcile_complete("grow");
+            }
             log_grow_pass(pass);
             tokio::time::sleep(GROW_RETRY_TICK).await;
         }
@@ -340,13 +359,19 @@ const MOVE_RETRY_TICK: Duration = Duration::from_secs(5);
 /// the `lvs` observation) and logs every outcome as a structured
 /// event. Detached by design — a failed pass never fails the
 /// daemon; it is retried on the next tick.
-fn spawn_move_retry_task(provider: Arc<volvisor_lvm::LvmProvider>) -> tokio::task::JoinHandle<()> {
+fn spawn_move_retry_task(
+    provider: Arc<volvisor_lvm::LvmProvider>,
+    metrics: Arc<Metrics>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Non-overlap is preserved by construction — the task awaits
         // each pass before sleeping the next tick.
         loop {
             let provider = Arc::clone(&provider);
             let pass = tokio::task::spawn_blocking(move || provider.move_reconcile_pass()).await;
+            if matches!(&pass, Ok(Ok(_))) {
+                metrics.record_reconcile_complete("move");
+            }
             log_move_pass(pass);
             tokio::time::sleep(MOVE_RETRY_TICK).await;
         }
@@ -830,12 +855,17 @@ pub async fn serve(config: Config) -> Result<(), DaemonError> {
         );
     }
     let state = build_state(&config)?;
-    let app = router_with_config(state, &config.api_config());
+    let app = router_with_config(Arc::clone(&state), &config.api_config());
     let listener = std::net::TcpListener::bind(config.listen)
         .map_err(|e| DaemonError::Http(format!("bind {}: {e}", config.listen)))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| DaemonError::Http(format!("set_nonblocking {}: {e}", config.listen)))?;
+    // `/readyz` flips only after journal replay, provider reconcile and the
+    // listener bind have all completed above. It is marked before the
+    // service-manager notification so a probe that races the notify sees the
+    // same truthful state.
+    state.mark_ready();
     tracing::info!(listen = %config.listen, tls = config.tls.enabled, "volvisor API serving");
     // P7-B (ADR-0009's service model): READY=1 only now — startup
     // reconciliation completed above (`build_state`: journal lock +

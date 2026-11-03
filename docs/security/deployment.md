@@ -70,7 +70,7 @@ read-only < operator < admin.
 
 | Surface | Required role |
 |---|---|
-| `GET /healthz`, `GET /v2/healthz` | public |
+| `GET /healthz`, `GET /v2/healthz`, `GET /readyz`, `GET /v2/readyz` | public |
 | `GET /v2/capabilities`, `GET /metrics` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
 | `GET /v2/volumes`, `GET /v2/volumes/{volume_id}` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
 | `GET /v2/migrations/{migration_id}` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
@@ -279,8 +279,9 @@ carries:
 - `status` and `outcome` (`success`, `denied` or `failure`);
 - `operation_id` when the journal pipeline attached one to the response.
 
-Successful `/healthz` and `/v2/healthz` probes are not audited, to avoid
-unbounded probe noise. Failed probes are audited. Denied requests are audited
+Successful `/healthz`, `/v2/healthz`, `/readyz` and `/v2/readyz` probes are
+not audited, to avoid unbounded probe noise. Failed probes are audited.
+Denied requests are audited
 with `outcome = "denied"` before the handler runs. No audit event contains a
 bearer token, client private key or TLS key material.
 

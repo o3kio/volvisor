@@ -1025,9 +1025,53 @@ pub(crate) async fn healthz() -> Response {
     json_response(StatusCode::OK, &serde_json::json!({ "status": "ok" }))
 }
 
+/// `GET /readyz` — readiness, distinct from liveness.
+///
+/// Ready requires the journal to be open, startup to have completed
+/// (provider constructed/reconciled and the listener bound), and — when a
+/// witness probe target is configured — the bounded transport probe to
+/// succeed. With no probe target the body reports `witness: "not_probed"` and
+/// readiness does **not** fail on that unknown. It never claims volume health.
+pub(crate) async fn readyz(State(state): State<SharedState>) -> Response {
+    let witness = state.probe_witness().await;
+    let startup_complete = state.startup_complete();
+    let journal = state.journal_snapshot();
+    let witness_status = match witness {
+        Some(true) => "reachable",
+        Some(false) => "unreachable",
+        None => "not_probed",
+    };
+    let ready = journal.open && startup_complete && witness != Some(false);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = serde_json::json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "startup_complete": startup_complete,
+        "checks": {
+            "journal": if journal.open { "open" } else { "closed" },
+            "provider": if startup_complete { "reconciled" } else { "pending_startup" },
+            "witness": witness_status,
+        },
+    });
+    json_response(status, &body)
+}
+
 /// `GET /metrics` — Prometheus text exposition.
+///
+/// The journal gauges are sampled under the journal lock for this scrape;
+/// when a witness probe is configured, the scrape refreshes the
+/// `witness_reachable` gauge with the same bounded transport probe `/readyz`
+/// uses.
 pub(crate) async fn metrics(State(state): State<SharedState>, _read: RequireRead) -> Response {
-    text_response(StatusCode::OK, state.metrics.render())
+    let _ = state.probe_witness().await;
+    let journal = state.journal_snapshot();
+    text_response(
+        StatusCode::OK,
+        state.metrics.render_with_journal(Some(journal)),
+    )
 }
 
 /// Fallback for unmatched routes: the contract error shape with `NOT_FOUND`.

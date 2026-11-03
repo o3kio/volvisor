@@ -63,8 +63,8 @@ Content-Type: application/json
 The bound applies to `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
 `GET /v2/capabilities`, `GET /v2/migrations/{migration_id}`,
 `POST /v2/vms/{vm_id}/check-mobility` and the read-only peer health route.
-`/healthz`, `/v2/healthz` and `/metrics` are local and unbounded. Mutations
-are never bounded by this value (see above).
+`/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` are local
+and unbounded. Mutations are never bounded by this value (see above).
 
 ## Global concurrency cap
 
@@ -83,8 +83,8 @@ Retry-After: 5
 The permit is held for the whole request, including a journaled mutation's
 provider call. A slow or hung provider therefore consumes a bounded number
 of permits; it cannot create unbounded tasks or connections. `/healthz`,
-`/v2/healthz` and `/metrics` bypass the cap so liveness and monitoring stay
-available during overload.
+`/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass the cap so
+liveness, readiness and monitoring stay available during overload.
 
 ## Per-principal rate limits (opt-in)
 

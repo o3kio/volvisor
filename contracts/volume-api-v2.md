@@ -481,8 +481,36 @@ operator enables it explicitly with a non-zero
   `Content-Length` is bounded too; rejected before parsing and before any
   journal write.
 
-`/healthz`, `/v2/healthz` and `/metrics` bypass the concurrency cap and the
-rate limiter so liveness and monitoring remain available while load is shed.
+`/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass the
+concurrency cap and the rate limiter so probes and monitoring remain
+available while load is shed. The four probe endpoints are public; `/metrics`
+requires read access when scoped credentials are configured (and stays open
+in the legacy/tokenless posture, like every read).
+
+### Readiness and metric exposition
+
+`/healthz` and `/v2/healthz` are **liveness only**: a `200` means the process
+is serving, not that its durable dependencies are usable. `/readyz` and
+`/v2/readyz` are readiness: they answer `200` only when the journal is open
+and startup has completed (journal replay, provider construction/reconcile
+and listener bind), and `503` otherwise. The JSON body names each check:
+
+```json
+{"status":"ready","startup_complete":true,
+ "checks":{"journal":"open","provider":"reconciled","witness":"reachable"}}
+```
+
+`checks.witness` is `reachable`, `unreachable`, or `not_probed`. With no
+witness URL configured the daemon reports `not_probed` and does **not** fail
+readiness on that unknown; a configured witness whose bounded transport probe
+fails makes readiness `503` while liveness stays `200`. This probe is
+transport reachability of the witness endpoint, not a claim about authority,
+quorum or data safety.
+
+`/metrics` is Prometheus text exposition. Metric names, fixed label sets,
+cardinality bounds, refreshes and omitted measurements are documented in
+[observability](../docs/operations/observability.md); labels never carry
+volume/attachment/VM ids, principals, tokens, URLs or error strings.
 
 ### Long-operation model
 

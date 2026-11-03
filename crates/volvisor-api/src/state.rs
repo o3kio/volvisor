@@ -1,6 +1,9 @@
 //! Shared API server state.
 
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use volvisor_handoff::MigrationSurface;
 use volvisor_journal::Journal;
@@ -9,8 +12,25 @@ use volvisor_provider::{
 };
 
 use crate::auth::AuthPolicy;
-use crate::metrics::Metrics;
+use crate::metrics::{JournalSnapshot, Metrics};
 use crate::peer::PeerRouteContext;
+
+/// Bound on the readiness witness transport probe.
+const WITNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Process-local readiness state.
+///
+/// `startup_complete` is set by [`AppState::mark_ready`] only after the
+/// daemon has opened/replayed the journal, constructed and reconciled the
+/// provider, and bound its listener. The witness probe target is present only
+/// when the daemon was configured with a witness URL; absent means
+/// `not_probed`, which is reported honestly rather than treated as either
+/// reachable or unreachable.
+#[derive(Debug, Default)]
+struct Readiness {
+    startup_complete: AtomicBool,
+    witness_probe: Option<SocketAddr>,
+}
 
 /// Cheaply cloneable handle to the API server state.
 pub type SharedState = Arc<AppState>;
@@ -67,8 +87,10 @@ pub struct AppState {
     pub(crate) peer_token: Option<String>,
     /// Durable intent journal (idempotency registry + journal-before-mutate).
     pub(crate) journal: std::sync::Mutex<Journal>,
-    /// Prometheus-format counters served on `/metrics`.
+    /// Prometheus-format metrics served on `/metrics`.
     pub(crate) metrics: Arc<Metrics>,
+    /// Startup/readiness state and the optional witness probe target.
+    readiness: Readiness,
     /// Scoped credential policy guarding the API surface. Built from the
     /// legacy `admin_token` and/or the named `[credentials]` entries; an
     /// empty policy fails closed for mutations/admin (the tokenless mode is
@@ -94,6 +116,13 @@ impl AppState {
         journal: Journal,
         admin_token: Option<String>,
     ) -> Self {
+        let metrics = Arc::new(Metrics::new());
+        // `AppState::new` is reached only after the caller opened/replayed the
+        // journal and constructed the provider (whose constructor performs
+        // its startup reconcile). Record that real boundary as the startup
+        // reconcile sample; `mark_ready` still gates readiness on the daemon
+        // reaching the serving path.
+        metrics.record_reconcile_complete("startup");
         Self {
             provider,
             admin,
@@ -105,9 +134,74 @@ impl AppState {
             peer_ctx: None,
             peer_token: None,
             journal: std::sync::Mutex::new(journal),
-            metrics: Arc::new(Metrics::new()),
+            metrics,
+            readiness: Readiness::default(),
             auth: AuthPolicy::new(admin_token),
             crash: None,
+        }
+    }
+
+    /// Attach the real witness transport-probe target used by `/readyz` and
+    /// the `witness_reachable` gauge. `None` leaves witness reachability
+    /// `not_probed` rather than inventing a value.
+    #[must_use]
+    pub fn with_witness_probe(mut self, address: SocketAddr) -> Self {
+        self.readiness.witness_probe = Some(address);
+        self
+    }
+
+    /// A cheap handle to the in-process metrics, for background tasks that
+    /// record real reconcile passes.
+    #[must_use]
+    pub fn metrics_handle(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Mark startup complete: journal open/replayed, provider
+    /// constructed/reconciled, listener bound. `/readyz` answers not-ready
+    /// until this is called.
+    pub fn mark_ready(&self) {
+        self.readiness
+            .startup_complete
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether the daemon has reached its serving path.
+    #[must_use]
+    pub fn startup_complete(&self) -> bool {
+        self.readiness.startup_complete.load(Ordering::Acquire)
+    }
+
+    /// Probe the configured witness by TCP transport reachability, bounded.
+    /// `None` means no probe is configured (`not_probed`); `Some(false)` is a
+    /// failed probe. The gauge is updated with the same observation.
+    pub(crate) async fn probe_witness(&self) -> Option<bool> {
+        let address = self.readiness.witness_probe?;
+        let reachable = tokio::task::spawn_blocking(move || {
+            TcpStream::connect_timeout(&address, WITNESS_PROBE_TIMEOUT).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        self.metrics.set_witness_reachable(Some(reachable));
+        Some(reachable)
+    }
+
+    /// A live journal sample for `/metrics`; a poisoned mutex is reported as
+    /// a closed journal rather than a fabricated record count.
+    pub(crate) fn journal_snapshot(&self) -> JournalSnapshot {
+        match self.journal.lock() {
+            Ok(journal) => JournalSnapshot {
+                records: Some(journal.record_count()),
+                log_bytes: std::fs::metadata(journal.log_path())
+                    .ok()
+                    .map(|metadata| metadata.len()),
+                open: true,
+            },
+            Err(_) => JournalSnapshot {
+                records: None,
+                log_bytes: None,
+                open: false,
+            },
         }
     }
 

@@ -21,10 +21,11 @@
 //! ## Read authorization
 //!
 //! When any scoped credential is configured, volume metadata, capabilities
-//! and `/metrics` require at least read-only. `/healthz` stays open for
-//! probes. When no scoped credential exists (loopback dev/test, or the legacy
-//! admin-token-only mode) reads remain open; `docs/security/deployment.md`
-//! states the threat model for that compatibility posture.
+//! and `/metrics` require at least read-only. `/healthz`, `/v2/healthz`,
+//! `/readyz` and `/v2/readyz` stay open for probes. When no scoped credential
+//! exists (loopback dev/test, or the legacy admin-token-only mode) reads
+//! remain open; `docs/security/deployment.md` states the threat model for
+//! that compatibility posture.
 //!
 //! ## Audit
 //!
@@ -172,10 +173,16 @@ enum Access {
     Peer,
 }
 
+/// Liveness/readiness probes are public and high-frequency; they carry no
+/// caller identity and are not audited on success.
+fn is_probe_route(route: &str) -> bool {
+    matches!(route, "/healthz" | "/v2/healthz" | "/readyz" | "/v2/readyz")
+}
+
 /// Map a matched route pattern and method onto its required access.
 fn required_access(route: &str, method: &axum::http::Method) -> Access {
     use axum::http::Method;
-    if route == "/healthz" || route == "/v2/healthz" {
+    if is_probe_route(route) {
         return Access::Public;
     }
     if route.starts_with("/v2/internal/peer") {
@@ -256,7 +263,7 @@ pub(crate) async fn authorize_and_audit(
     // Liveness probes are deliberately not audited on success: they are
     // high-frequency and carry no caller identity. A failed probe is still
     // an auditable event.
-    if !(route == "/healthz" || route == "/v2/healthz") || !response.status().is_success() {
+    if !is_probe_route(&route) || !response.status().is_success() {
         audit(
             &principal,
             &role,
@@ -459,6 +466,8 @@ mod tests {
         for (route, method, expected) in [
             ("/healthz", Method::GET, Access::Public),
             ("/v2/healthz", Method::GET, Access::Public),
+            ("/readyz", Method::GET, Access::Public),
+            ("/v2/readyz", Method::GET, Access::Public),
             ("/metrics", Method::GET, Access::Read),
             ("/v2/capabilities", Method::GET, Access::Read),
             ("/v2/volumes", Method::GET, Access::Read),
