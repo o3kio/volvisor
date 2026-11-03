@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use volvisor_lvm::provider::{LvmProvider, MoveTiming, lv_name_for};
 use volvisor_lvm::state::{DeviceEntry, LvmState, MoveRecord};
 use volvisor_lvm::{CommandRunner, RealRunner};
@@ -1043,7 +1043,34 @@ async fn lvm_move_aborted_mid_supervision_parks_without_freeing() -> Result<(), 
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Synchronise on the observed world, not a wall-clock sleep. On a
+    // fast page-cache-backed loop device the 2 GiB pvmove can finish
+    // inside a fixed 300 ms window; `Complete` is then the honest
+    // answer and the abort never exercises the mid-supervision park.
+    // Wait until the durable record says `COPYING` *and* `lvs` reports
+    // the temporary pvmove mirror, then abort immediately.
+    let abort_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(record) = recorded_move(&pool.state_path) {
+            assert_ne!(
+                record.state,
+                MoveVolumeBackingState::Complete,
+                "the move completed before the operator could abort it mid-flight; \
+                 the test cannot exercise the mid-supervision park"
+            );
+            if record.state == MoveVolumeBackingState::Copying {
+                let devices = lv_backing_pvs(&pool)?;
+                if devices.iter().any(|device| device.contains("pvmove")) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < abort_deadline,
+            "the move never reached an observed COPYING mirror; cannot abort mid-flight"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     operator_ok(Command::new("pvmove").arg("--abort"));
 
     let response = move_task
