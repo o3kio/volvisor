@@ -151,6 +151,17 @@ pub struct FakeLvm {
     /// When true, `lvs` fails (honest-unknown injection for the move
     /// supervision: an unobservable world mid-move).
     pub fail_lvs: bool,
+    /// When true, `lvcreate` reports a non-zero exit **without**
+    /// creating the LV: a known command failure (distinct from a
+    /// runner-level error, whose outcome is unknown).
+    pub fail_lvcreate: bool,
+    /// When true, `lvextend` reports a non-zero exit **without**
+    /// resizing the LV: a known command failure.
+    pub fail_lvextend: bool,
+    /// Programs whose `CommandRunner::run` returns an error instead of
+    /// an exit status (spawn/timeout/wait failure). The command outcome
+    /// is unknown: it may have reached LVM.
+    pub fail_runner_for: Vec<String>,
 }
 
 impl Default for FakeLvm {
@@ -183,6 +194,9 @@ impl Default for FakeLvm {
             fail_vgremove: false,
             fail_vgs: false,
             fail_lvs: false,
+            fail_lvcreate: false,
+            fail_lvextend: false,
+            fail_runner_for: Vec::new(),
         }
     }
 }
@@ -465,6 +479,11 @@ fn pvs_report(world: &FakeLvm) -> CommandOutput {
 /// (e.g. a pause seam around the world lock).
 #[allow(clippy::too_many_lines)] // one arm per LVM verb — the kit's table
 pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<CommandOutput> {
+    if world.fail_runner_for.iter().any(|failed| failed == program) {
+        // A runner-level failure (spawn/timeout/wait) has no exit
+        // status: the caller must treat the command outcome as unknown.
+        return None;
+    }
     match program {
         "lvs" => {
             if world.fail_lvs {
@@ -481,6 +500,9 @@ pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<Comma
         "pvs" => Some(pvs_report(world)),
         "lsblk" => Some(CommandOutput::success(lsblk_for(world))),
         "lvcreate" => {
+            if world.fail_lvcreate {
+                return Some(CommandOutput::failure("lvcreate: simulated failure"));
+            }
             // lvcreate --yes -L <size>B -n <lv> <vg>
             let size = arg_after(args, "-L")?;
             let size: u64 = size.trim_end_matches('B').parse().ok()?;
@@ -525,6 +547,9 @@ pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<Comma
             Some(CommandOutput::success(String::new()))
         }
         "lvextend" => {
+            if world.fail_lvextend {
+                return Some(CommandOutput::failure("lvextend: simulated failure"));
+            }
             // lvextend --yes -L <size>B <vg>/<lv>
             let size = arg_after(args, "-L")?;
             let size: u64 = size.trim_end_matches('B').parse().ok()?;
