@@ -80,7 +80,7 @@ as a fabricated zero.
 | `journal_records` | gauge | — | Valid journal records (replayed plus appended), sampled from the live `Journal`. |
 | `journal_log_bytes` | gauge | — | Size of the journal log file in bytes. Omitted if it cannot be stat'ed. |
 | `reconcile_age_seconds` | gauge | `scope` | Seconds since the last completed reconcile pass: `startup`, `grow`, or `move`. |
-| `witness_reachable` | gauge | — | `1`/`0` from the last witness transport probe. Absent until a probe target exists. |
+| `witness_reachable` | gauge | — | `1`/`0` from the last witness transport probe. Absent without a configured probe target (and before the first probe). |
 
 `operations_total.outcome` is one of `success`, `failure`, `replayed`,
 `in_doubt`, `conflict`, `resolved`, `re_drive`. Operation kinds are the
@@ -206,9 +206,10 @@ cargo +1.85 check --workspace --locked --all-targets
 Results:
 
 - Workspace tests: all suites passed; `0 failed`.
-- `observability_load`: `1 passed`. It drove one real create and 250
-  requests, observed 8 parked requests in `http_requests_in_flight`, saw the
-  gauge return to the scrape-only baseline of `1`, observed the provider
+- `observability_load`: `1 passed`. It drove one real create, 200 unique-id
+  reads on a matched route and 50 unique-path fallbacks, observed 8 parked
+  requests in `http_requests_in_flight`, saw the gauge return to the
+  scrape-only baseline of `1`, observed the provider
   histogram count of 1, the HTTP `4xx` count of 208 on
   `/v2/volumes/{volume_id}` and 50 on `<unmatched>`, and read
   `journal_records = 2` / a positive `journal_log_bytes` from the real
