@@ -8,9 +8,14 @@ Run-time source identity
 ------------------------
 source_sha:      e551d26af7cdedb468797ff8049e0b91b9ab416d
 worktree_dirty: no
-Every raw drill log records these two values in its header. The evidence
-bundle itself was created after the run at that commit; the bundle commit is
-docs-only and is recorded in the top-level bundle README and REPORT.
+Every raw drill log records these two values in its header. The `dirty`
+flag comes from `git status --porcelain`, which includes untracked,
+non-ignored files. The harness scripts are absent from this commit's tree
+(first tracked at d5af71f), so the recorded `no` places them outside the
+recorded worktree rather than certifying their bytes. See SCRIPTS.txt. The
+evidence bundle itself was created after the run at that commit; the bundle
+commit is docs-only and is recorded in the top-level bundle README and
+REPORT.
 
 Operating system and toolchain
 ------------------------------

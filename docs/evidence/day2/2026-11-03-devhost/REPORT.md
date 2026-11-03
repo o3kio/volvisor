@@ -21,8 +21,17 @@ drill covers the witness service, not storage-side DRBD lease enforcement.
 
 - **Source commit:** `e551d26af7cdedb468797ff8049e0b91b9ab416d`
   (`git describe --tags --always` = `e551d26`).
-- **Worktree at run time:** clean. Every raw drill header records
-  `# worktree_dirty: no` and the same source SHA.
+- **Worktree at run time:** every raw drill header records
+  `# worktree_dirty: no` and the same source SHA. The flag comes from
+  `git status --porcelain`, which includes untracked, non-ignored files.
+  **The harness scripts are absent from `e551d26`'s tree**, and the flag
+  would have read `yes` had they been present untracked in the recorded
+  worktree. The raw logs therefore place the harness outside the recorded
+  worktree and do not bind its bytes; its first tracked revision is
+  `d5af71f`, committed after the run window. [SCRIPTS.txt](SCRIPTS.txt)
+  records the SHA256 of each script at that revision and states that no
+  byte-level capture proves those exact bytes executed. The clean-worktree
+  claim is about the recorded product worktree, not the harness.
 - **Bundle commit:** the commit that contains this directory. The source SHA
   and the bundle commit are different by design: the drills ran at
   `e551d26`; the bundle is a docs-only addition made afterwards. This bundle
@@ -34,6 +43,9 @@ drill covers the witness service, not storage-side DRBD lease enforcement.
   `volvisor-witnessd` SHA256
   `745869ea0b36b472fd64bfceef311da942b49429cc8ef585820ccac5629e9436`;
   both report `--version` = `e551d26`. See [BINARIES.txt](BINARIES.txt).
+  The raw drill headers do not record either hash or the version stamp, so
+  these values are authored corroboration, not an anchor captured inside the
+  raw logs.
 - **Harness:** [`docs/runbooks/day-2/scripts/`](../../../runbooks/day-2/scripts/),
   started by `run-all.sh`; each drill writes its own `raw/<name>.log` with
   UTC timestamps, exact argv, stdout, stderr and exit status.
@@ -321,6 +333,9 @@ same witness state directory.
 [raw/d6-witness-second.log](raw/d6-witness-second.log).
 
 **Verdict: DRILLED** for a same-host crash loop and local lock contention.
+**Not drilled:** the killed creates were not retried with the same
+`operation_id`, and backend-orphan reconciliation was not exercised; those
+remain procedure-only pass items.
 **RPO:** an in-flight request may fail; this drill makes no exactly-once
 claim, and the client must retry with its operation id. Durable prior state
 survived every kill. **RTO:** startup replay + health on this host (observed

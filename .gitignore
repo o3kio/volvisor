@@ -5,3 +5,5 @@
 Cargo.lock.bak
 *.swp
 .env
+__pycache__/
+*.pyc

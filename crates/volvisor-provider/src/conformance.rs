@@ -10,7 +10,8 @@
 //!   functions, one per check, each against a freshly constructed provider.
 //!
 //! Covered semantics: create/inspect round trip with honest defaults,
-//! idempotent create, payload-conflict detection, single-writer enforcement,
+//! idempotent create and attach (including replay response fidelity),
+//! payload-conflict detection, single-writer enforcement,
 //! generation fencing on attach/detach/grow/delete, detach drain
 //! preconditions, grow-only resize, delete preconditions, project-scoped
 //! listing, capability gating and missing-volume handling, plus the
@@ -22,7 +23,9 @@
 //! lifecycle (create/attach replay, attachment-id conflicts, single-writer
 //! admission, volume/attachment generation fencing, detach/delete finality) and
 //! compares decision classes against both the shared expected fixture and the
-//! in-memory reference provider. The report/tombstone branch is
+//! in-memory reference provider. Attach replay additionally compares the
+//! response projection (generation, frontend and state), so a fabricated
+//! replay cannot pass on class alone. The report/tombstone branch is
 //! capability-conditional: providers advertising
 //! [`Capability::AttachmentStateReport`] must implement the positive contract,
 //! and a provider without it must fail closed. `provider_conformance_tests!`
@@ -282,6 +285,61 @@ pub async fn check_idempotent_create(provider: &dyn VolumeProvider) -> Result<()
     require(
         matching == 1,
         "idempotent create replay must not create a duplicate volume",
+    )
+}
+
+/// Check: attach is idempotent per attachment identity and payload.
+///
+/// Replaying the identical attach request returns the recorded instance
+/// (same attachment generation, volume generation, frontend and state),
+/// leaves exactly one attachment on the volume, and does not advance the
+/// inspect projection. A provider that returns `Ok` with a fabricated replay
+/// projection fails here even though the decision class looks correct.
+pub async fn check_idempotent_attach(provider: &dyn VolumeProvider) -> Result<(), String> {
+    let volume_id = "cc-idempotent-attach";
+    let create = fixture_create_request(volume_id, GIB);
+    let created = provider
+        .create_volume(&create)
+        .await
+        .map_err(|e| format!("create_volume: {e}"))?;
+    let attach = fixture_attach_request(volume_id, "cc-idempotent-attach-1", created.generation);
+    let first = provider
+        .attach_volume(&create.volume_id, &attach)
+        .await
+        .map_err(|e| format!("attach_volume: {e}"))?;
+    let second = provider
+        .attach_volume(&create.volume_id, &attach)
+        .await
+        .map_err(|e| format!("idempotent attach replay: {e}"))?;
+    require(
+        second == first,
+        "replaying the identical attach request must return the recorded instance",
+    )?;
+
+    let inspected = provider
+        .inspect_volume(&create.volume_id)
+        .await
+        .map_err(|e| format!("inspect_volume: {e}"))?;
+    require(
+        inspected.attachment_ids == vec![first.attachment_id.clone()],
+        "attach replay must not fabricate or duplicate an attachment id",
+    )?;
+    let view = inspected
+        .attachments
+        .iter()
+        .find(|view| view.attachment_id == first.attachment_id)
+        .ok_or_else(|| "inspect must expose the replayed attachment".to_owned())?;
+    require(
+        view.attachment_generation == first.attachment_generation,
+        "inspect attachment_generation must match the replayed attach response",
+    )?;
+    require(
+        view.frontend == first.frontend,
+        "inspect frontend must match the replayed attach response",
+    )?;
+    require(
+        view.state == first.state,
+        "inspect attachment state must match the replayed attach response",
     )
 }
 
@@ -1082,6 +1140,9 @@ pub enum ParityOutcome {
     Created,
     /// An idempotent create or attach replay returned the recorded result.
     Replayed,
+    /// An identical attach replay returned a different projection than the
+    /// recorded instance (a replay-fidelity failure, never a valid class).
+    ReplayDiverged,
     /// Attach succeeded.
     Attached,
     /// Detach succeeded.
@@ -1233,17 +1294,21 @@ pub async fn run_universal_parity(provider: &dyn VolumeProvider) -> Vec<ParitySt
     let attachment_generation = attached
         .as_ref()
         .map_or(0, |response| response.attachment_generation);
-    steps.push(step("attach", outcome(attached, ParityOutcome::Attached)));
+    steps.push(step(
+        "attach",
+        outcome(attached.clone(), ParityOutcome::Attached),
+    ));
 
     // A replay keeps the *original* expected volume generation: replay
-    // identity wins over the (now stale) generation fence.
-    steps.push(step(
-        "attach-replay",
-        outcome(
-            provider.attach_volume(&create.volume_id, &attach).await,
-            ParityOutcome::Replayed,
-        ),
-    ));
+    // identity wins over the (now stale) generation fence. It must also
+    // return the recorded projection byte-for-byte; a class-only check would
+    // let a fabricated replay (wrong state, frontend or generation) pass.
+    let replayed = provider.attach_volume(&create.volume_id, &attach).await;
+    let replay_outcome = match (&attached, &replayed) {
+        (Ok(first), Ok(second)) if first != second => ParityOutcome::ReplayDiverged,
+        _ => outcome(replayed, ParityOutcome::Replayed),
+    };
+    steps.push(step("attach-replay", replay_outcome));
 
     let stale_after = fixture_attach_request(volume_id, "parity-stale-after", volume_generation);
     steps.push(step(
@@ -1642,6 +1707,9 @@ pub async fn run_conformance(provider: &dyn VolumeProvider) -> Vec<String> {
     if let Err(failure) = check_idempotent_create(provider).await {
         failures.push(format!("idempotent_create: {failure}"));
     }
+    if let Err(failure) = check_idempotent_attach(provider).await {
+        failures.push(format!("idempotent_attach: {failure}"));
+    }
     if let Err(failure) = check_create_payload_conflict(provider).await {
         failures.push(format!("create_payload_conflict: {failure}"));
     }
@@ -1735,6 +1803,14 @@ macro_rules! provider_conformance_tests {
                 let provider = $make_provider();
                 let provider: &dyn $crate::VolumeProvider = &*provider;
                 let outcome = $crate::conformance::check_idempotent_create(provider).await;
+                assert_eq!(outcome, Ok(()), "conformance failure");
+            }
+
+            #[tokio::test]
+            async fn idempotent_attach() {
+                let provider = $make_provider();
+                let provider: &dyn $crate::VolumeProvider = &*provider;
+                let outcome = $crate::conformance::check_idempotent_attach(provider).await;
                 assert_eq!(outcome, Ok(()), "conformance failure");
             }
 
@@ -1857,6 +1933,104 @@ mod tests {
         let provider: &dyn VolumeProvider = &provider;
         let outcome = assert_conformance(provider).await;
         assert_eq!(outcome, Ok(()));
+    }
+
+    /// A provider whose second attach call returns a fabricated projection:
+    /// the decision class is still `Ok`, so only a response-fidelity check
+    /// can catch it.
+    struct DivergingReplay {
+        inner: FakeProvider,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl VolumeProvider for DivergingReplay {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn capabilities(&self) -> CapabilitySet {
+            self.inner.capabilities()
+        }
+
+        fn supported_classes(&self) -> &[VolumeClass] {
+            self.inner.supported_classes()
+        }
+
+        async fn create_volume(
+            &self,
+            req: &CreateVolumeRequest,
+        ) -> Result<volvisor_types::request::InspectVolumeResponse, ApiError> {
+            self.inner.create_volume(req).await
+        }
+
+        async fn inspect_volume(
+            &self,
+            id: &VolumeId,
+        ) -> Result<volvisor_types::request::InspectVolumeResponse, ApiError> {
+            self.inner.inspect_volume(id).await
+        }
+
+        async fn list_volumes(
+            &self,
+            project: Option<&ProjectId>,
+        ) -> Result<Vec<volvisor_types::request::InspectVolumeResponse>, ApiError> {
+            self.inner.list_volumes(project).await
+        }
+
+        async fn attach_volume(
+            &self,
+            volume_id: &VolumeId,
+            req: &AttachVolumeRequest,
+        ) -> Result<volvisor_types::request::AttachVolumeResponse, ApiError> {
+            let mut response = self.inner.attach_volume(volume_id, req).await?;
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                response.state = AttachmentState::Active;
+            }
+            Ok(response)
+        }
+
+        async fn detach_volume(
+            &self,
+            volume_id: &VolumeId,
+            attachment_id: &AttachmentId,
+            req: &DetachVolumeRequest,
+        ) -> Result<volvisor_types::request::InspectVolumeResponse, ApiError> {
+            self.inner
+                .detach_volume(volume_id, attachment_id, req)
+                .await
+        }
+
+        async fn grow_volume(
+            &self,
+            volume_id: &VolumeId,
+            req: &GrowVolumeRequest,
+        ) -> Result<volvisor_types::request::GrowVolumeResponse, ApiError> {
+            self.inner.grow_volume(volume_id, req).await
+        }
+
+        async fn delete_volume(
+            &self,
+            volume_id: &VolumeId,
+            req: &DeleteVolumeRequest,
+        ) -> Result<(), ApiError> {
+            self.inner.delete_volume(volume_id, req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_attach_rejects_a_fabricated_replay_projection() {
+        let provider = DivergingReplay {
+            inner: FakeProvider::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let failure = check_idempotent_attach(&provider)
+            .await
+            .expect_err("a changed replay projection must fail the check");
+        assert!(
+            failure.contains("recorded instance"),
+            "failure names the replay fidelity violation: {failure}"
+        );
     }
 
     #[tokio::test]

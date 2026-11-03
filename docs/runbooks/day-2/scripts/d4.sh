@@ -161,7 +161,10 @@ cp "$RUN/records/$TAG-journal-before-future.log" "$LOGJ"
 say "B: corrupt the LVM durable state file and prove startup refuses without rewriting it"
 LSTATE="$RUN/lab-$TAG-lvm/journal/lvm-state.json"
 LCFG="$RUN/configs/$TAG-lvm.toml"
-lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d4lvm"
+lvm_lab_setup "$TAG-lvm" 2G "$LSTATE" "vg-d4lvm" || {
+  printf 'lab setup failed\n' | tee -a "$LOG"
+  exit 1
+}
 # Make the seeded file syntactically corrupt (truncated JSON, a realistic
 # partial write) and prove the daemon refuses rather than guessing.
 printf '{"schema_version":1,"volumes":{"vol-partial":' >"$LSTATE"

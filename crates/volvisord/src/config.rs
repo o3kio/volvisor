@@ -901,6 +901,12 @@ impl Config {
                         entry.id
                     )));
                 }
+                if entry.id == "__overflow__" {
+                    return Err(DaemonError::Config(format!(
+                        "credentials.{role} id \"__overflow__\" is reserved by the rate limiter; \
+                         choose a different principal id"
+                    )));
+                }
                 if entry.token.trim().is_empty() {
                     return Err(DaemonError::Config(format!(
                         "credentials.{role} id {:?} requires a non-empty token",
@@ -1685,6 +1691,15 @@ provider = \"lvm\"
         assert!(
             error.to_string().contains("duplicated"),
             "error names the duplicate id: {error}"
+        );
+
+        let reserved_id =
+            minimal_toml() + "[[credentials.admin]]\nid = \"__overflow__\"\ntoken = \"secret\"\n";
+        let cfg: Config = toml::from_str(&reserved_id).expect("parse");
+        let error = cfg.validate().expect_err("reserved rate-limit id");
+        assert!(
+            error.to_string().contains("__overflow__"),
+            "error names the reserved id: {error}"
         );
 
         let duplicate_token = minimal_toml()

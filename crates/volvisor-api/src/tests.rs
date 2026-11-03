@@ -31,7 +31,7 @@ use volvisor_provider::fake::FakeProvider;
 use volvisor_types::{ApiError, ApiErrorBody, ApiErrorCode, AttachmentEvidence, AttachmentState};
 
 use crate::auth::{Credential, Role};
-use crate::{ApiConfig, AppState, SharedState, ops, router};
+use crate::{ApiConfig, AppState, SharedState, ops, router, router_with_config};
 
 /// Fixture size used throughout (1 GiB, 512-aligned).
 const GIB: u64 = 1 << 30;
@@ -4474,6 +4474,58 @@ fn setup_peer() -> PeerKit {
 /// A peer request with the peer credential.
 fn peer_request(method: Method, uri: &str, body: &Value) -> Request<Body> {
     with_bearer(json_request_without_auth(method, uri, body), PEER_TOKEN)
+}
+
+#[tokio::test]
+async fn peer_and_anonymous_traffic_have_separate_rate_limit_buckets() {
+    // The internal peer routes are authorized by `RequirePeer`, not an
+    // `AuthContext`. Without the peer-principal marker, peer traffic would
+    // share the anonymous bucket with unauthenticated callers and an
+    // attacker could drain the source daemon's migration calls.
+    let kit = setup_peer();
+    let config = ApiConfig {
+        rate_limit_per_second: 1,
+        rate_limit_burst: 1,
+        ..ApiConfig::default()
+    };
+    let app = router_with_config(kit.state.clone(), &config);
+    let uri = "/v2/internal/peer/health";
+
+    let (ok, body) = send_json(&app, peer_request(Method::GET, uri, &json!({}))).await;
+    assert_eq!(ok, StatusCode::OK, "{body}");
+    let (limited, limited_body) = send_json(&app, peer_request(Method::GET, uri, &json!({}))).await;
+    assert_eq!(limited, StatusCode::TOO_MANY_REQUESTS, "{limited_body}");
+    assert_eq!(limited_body["code"], json!("RATE_LIMITED"));
+
+    // An unauthenticated peer call is charged to its own anonymous bucket,
+    // not to the peer bucket: the first is a 401 from `RequirePeer`, the
+    // second is shed before the handler.
+    let bad_peer = |token: &str| {
+        with_bearer(
+            json_request_without_auth(Method::GET, uri, &json!({})),
+            token,
+        )
+    };
+    let (unauthorized, unauthorized_body) = send_json(&app, bad_peer("wrong-peer-token")).await;
+    assert_eq!(
+        unauthorized,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    let (shed, shed_body) = send_json(&app, bad_peer("wrong-peer-token")).await;
+    assert_eq!(shed, StatusCode::TOO_MANY_REQUESTS, "{shed_body}");
+    assert_eq!(shed_body["code"], json!("RATE_LIMITED"));
+
+    // The legacy admin identity still has an independent bucket.
+    let (admin, admin_body) = send_json(
+        &app,
+        with_bearer(
+            json_request_without_auth(Method::GET, "/v2/volumes", &json!({})),
+            TEST_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(admin, StatusCode::OK, "{admin_body}");
 }
 
 fn peer_prepare_body(migration: &str, vm: &str, volumes: &[(&str, u64)]) -> Value {

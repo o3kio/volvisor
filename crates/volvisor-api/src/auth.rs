@@ -39,9 +39,10 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::error::json_response;
+use crate::error::{error_response_with_retry_after, json_response};
 pub(crate) use crate::extract::{bearer_token, fixed_time_eq};
 use crate::state::SharedState;
+use volvisor_types::{ApiError, ApiErrorCode};
 
 /// A scoped role. Ordering is privilege ordering: `ReadOnly < Operator <
 /// Admin`.
@@ -87,6 +88,14 @@ pub struct AuthContext {
     /// The resolved role.
     pub role: Role,
 }
+
+/// The peer credential resolved to the fixed `peer` rate-limit identity.
+///
+/// Internal peer routes are authorized by `peer::RequirePeer`, not by a
+/// scoped [`AuthContext`], so this marker carries the already-verified
+/// identity to the rate limiter. It deliberately grants no role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerRateLimitPrincipal;
 
 /// The credential set and the read-protection posture derived from it.
 #[derive(Clone, Debug, Default)]
@@ -239,21 +248,30 @@ pub(crate) async fn authorize_and_audit(
     let access = required_access(&route, &method);
     let presented = bearer_token(request.headers());
     let context = state.auth.authenticate(presented);
+    let peer_authenticated = access == Access::Peer && peer_token_matches(&state, presented);
 
     let (principal, role) = match (&context, access) {
         (Some(context), _) => (context.principal.clone(), context.role.as_str().to_owned()),
-        (None, Access::Peer) => resolve_peer_principal(&state, presented),
+        (None, Access::Peer) if peer_authenticated => ("peer".to_owned(), "peer".to_owned()),
         (None, _) => ("anonymous".to_owned(), "none".to_owned()),
     };
 
     let denial = authorize(&state, access, context.as_ref());
     if let Some(response) = denial {
+        // A rejected credential is still offered load: charge the shared
+        // anonymous bucket here, because the post-authentication limiter is
+        // never reached on this path. This turns a brute-force flood into
+        // 429s instead of an unthrottled stream of 401/403s.
+        let response = charge_auth_denial(&request, response);
         audit(&principal, &role, &method, &route, &response, None);
         return response;
     }
 
     if let Some(context) = context {
         request.extensions_mut().insert(context);
+    }
+    if peer_authenticated {
+        request.extensions_mut().insert(PeerRateLimitPrincipal);
     }
     let response = next.run(request).await;
     let operation_id = response
@@ -276,18 +294,34 @@ pub(crate) async fn authorize_and_audit(
     response
 }
 
-/// Resolve the peer principal for the audit trail without performing the
-/// peer authorization itself (`peer::RequirePeer` owns that boundary).
-fn resolve_peer_principal(state: &SharedState, presented: Option<&str>) -> (String, String) {
-    let authenticated = state
+/// Whether the presented bearer token is the daemon's peer credential.
+///
+/// The peer authorization itself remains `peer::RequirePeer`'s boundary;
+/// this only resolves the audit and rate-limit identity.
+fn peer_token_matches(state: &SharedState, presented: Option<&str>) -> bool {
+    state
         .peer_token
         .as_deref()
-        .is_some_and(|expected| presented.is_some_and(|token| fixed_time_eq(token, expected)));
-    if authenticated {
-        ("peer".to_owned(), "peer".to_owned())
-    } else {
-        ("anonymous".to_owned(), "none".to_owned())
-    }
+        .is_some_and(|expected| presented.is_some_and(|token| fixed_time_eq(token, expected)))
+}
+
+/// Charge a rejected request to the anonymous rate-limit bucket and replace
+/// the denial with `429 RATE_LIMITED` when that bucket is exhausted.
+fn charge_auth_denial(request: &Request, denial: Response) -> Response {
+    let Some(admission) = request.extensions().get::<crate::admission::Admission>() else {
+        return denial;
+    };
+    let Err(retry_after) = admission.check_rate("anonymous") else {
+        return denial;
+    };
+    error_response_with_retry_after(
+        &ApiError::new(
+            ApiErrorCode::RateLimited,
+            "authentication attempts exceeded the anonymous request rate; retry after the \
+             Retry-After delay",
+        ),
+        retry_after,
+    )
 }
 
 /// Apply the route's access rule. `None` means allowed.

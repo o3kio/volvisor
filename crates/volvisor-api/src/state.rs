@@ -3,7 +3,7 @@
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use volvisor_handoff::MigrationSurface;
 use volvisor_journal::Journal;
@@ -18,6 +18,12 @@ use crate::peer::PeerRouteContext;
 /// Bound on the readiness witness transport probe.
 const WITNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a witness probe result is reused before another TCP connect.
+///
+/// `/readyz` is public and `/metrics` is scraped frequently; without this
+/// cache every call would open a fresh outbound connection to the witness.
+const WITNESS_PROBE_CACHE: Duration = Duration::from_secs(1);
+
 /// Process-local readiness state.
 ///
 /// `startup_complete` is set by [`AppState::mark_ready`] only after the
@@ -26,10 +32,28 @@ const WITNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// when the daemon was configured with a witness URL; absent means
 /// `not_probed`, which is reported honestly rather than treated as either
 /// reachable or unreachable.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Readiness {
     startup_complete: AtomicBool,
+    /// Resolved once at startup; a DNS change after start is not re-resolved
+    /// by the readiness probe (see [`AppState::with_witness_probe`]).
     witness_probe: Option<SocketAddr>,
+    /// Serializes witness probes so a burst of `/readyz` calls opens at most
+    /// one outbound connection at a time.
+    probe_gate: tokio::sync::Mutex<()>,
+    /// Last probe result and when it was observed.
+    probe_cache: std::sync::Mutex<Option<(Instant, bool)>>,
+}
+
+impl Default for Readiness {
+    fn default() -> Self {
+        Self {
+            startup_complete: AtomicBool::new(false),
+            witness_probe: None,
+            probe_gate: tokio::sync::Mutex::const_new(()),
+            probe_cache: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 /// Cheaply cloneable handle to the API server state.
@@ -144,6 +168,11 @@ impl AppState {
     /// Attach the real witness transport-probe target used by `/readyz` and
     /// the `witness_reachable` gauge. `None` leaves witness reachability
     /// `not_probed` rather than inventing a value.
+    ///
+    /// The address is the one resolved from the configured witness URL at
+    /// startup and is not re-resolved by the probe. A DNS change after start
+    /// therefore requires a daemon restart before readiness reflects it; the
+    /// driver's own connections re-resolve per connect.
     #[must_use]
     pub fn with_witness_probe(mut self, address: SocketAddr) -> Self {
         self.readiness.witness_probe = Some(address);
@@ -172,16 +201,39 @@ impl AppState {
         self.readiness.startup_complete.load(Ordering::Acquire)
     }
 
-    /// Probe the configured witness by TCP transport reachability, bounded.
-    /// `None` means no probe is configured (`not_probed`); `Some(false)` is a
-    /// failed probe. The gauge is updated with the same observation.
+    /// Probe the configured witness by TCP transport reachability, bounded
+    /// and single-flight. `None` means no probe is configured (`not_probed`);
+    /// `Some(false)` is a failed probe. Results are reused for one second so
+    /// a public `/readyz` flood cannot open one outbound connection per
+    /// request. The gauge is updated with the same observation.
     pub(crate) async fn probe_witness(&self) -> Option<bool> {
         let address = self.readiness.witness_probe?;
+
+        // Serialize probes. Callers that waited re-check the cache below, so
+        // a concurrent burst resolves to one connection and one observation.
+        let _gate = self.readiness.probe_gate.lock().await;
+        if let Some((observed_at, reachable)) = *self
+            .readiness
+            .probe_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            if observed_at.elapsed() < WITNESS_PROBE_CACHE {
+                self.metrics.set_witness_reachable(Some(reachable));
+                return Some(reachable);
+            }
+        }
+
         let reachable = tokio::task::spawn_blocking(move || {
             TcpStream::connect_timeout(&address, WITNESS_PROBE_TIMEOUT).is_ok()
         })
         .await
         .unwrap_or(false);
+        *self
+            .readiness
+            .probe_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), reachable));
         self.metrics.set_witness_reachable(Some(reachable));
         Some(reachable)
     }
@@ -297,5 +349,56 @@ impl AppState {
         self.peer_token = token;
         self.peer_ctx = Some(context);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use volvisor_provider::fake::FakeProvider;
+
+    fn state_with_probe(address: SocketAddr) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temporary journal directory");
+        let journal = Journal::open(dir.path()).expect("journal open");
+        let provider: Arc<dyn VolumeProvider> = Arc::new(FakeProvider::new());
+        let state = AppState::new(provider, None, journal, None).with_witness_probe(address);
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn witness_probe_result_is_cached_for_one_second() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe target");
+        let address = listener.local_addr().expect("probe address");
+        let (state, _dir) = state_with_probe(address);
+
+        assert_eq!(state.probe_witness().await, Some(true));
+        // The cache must answer without a second outbound connect, so it
+        // stays `true` even after the listener is gone.
+        drop(listener);
+        assert_eq!(
+            state.probe_witness().await,
+            Some(true),
+            "a probe within the cache window must reuse the observation"
+        );
+
+        tokio::time::sleep(WITNESS_PROBE_CACHE + Duration::from_millis(50)).await;
+        assert_eq!(
+            state.probe_witness().await,
+            Some(false),
+            "an expired cache must perform a fresh probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_configured_probe_is_not_probed() {
+        let dir = tempfile::tempdir().expect("temporary journal directory");
+        let journal = Journal::open(dir.path()).expect("journal open");
+        let provider: Arc<dyn VolumeProvider> = Arc::new(FakeProvider::new());
+        let state = AppState::new(provider, None, journal, None);
+        assert_eq!(
+            state.probe_witness().await,
+            None,
+            "no configured target must report not_probed"
+        );
     }
 }

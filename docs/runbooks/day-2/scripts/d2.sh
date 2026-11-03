@@ -17,8 +17,12 @@ cap "cargo test schema_upgrade" cargo test --manifest-path "$REPO/Cargo.toml" --
 STATE="$RUN/lab-$TAG/journal/lvm-state.json"
 JOURNAL="$RUN/lab-$TAG/journal"
 CFG="$RUN/configs/$TAG.toml"
+VG="vg-d2lab"
 mkdir -p "$JOURNAL"
-lvm_lab_setup "$TAG" 4G "$STATE" "vg-volvisor"
+lvm_lab_setup "$TAG" 4G "$STATE" "$VG" || {
+  printf 'lab setup failed\n' | tee -a "$LOG"
+  exit 1
+}
 
 # Replace the lab-seeded state with a real pre-versioning shape assembled
 # from the golden fixtures: the N-1 attachment record plus the tombstone
@@ -29,11 +33,11 @@ TOMB="$REPO/tests/fixtures/schema/lvm-state-v1-tombstones.json"
 LOOP="$(cat "$RUN/records/$TAG.loop")"
 jq --arg loop "$LOOP" \
    --slurpfile tomb "$TOMB" \
-   '.moves = {} | .devices = {"dev-d2b01": {"stable_identity":"day2-lab-d2","path":$loop,"vg_name":"vg-volvisor","role":"native_pool","owner_generation":1}} | .volumes += $tomb[0].volumes | del(.schema_version)' \
+   '.moves = {} | .devices = {"dev-d2b01": {"stable_identity":"day2-lab-d2","path":$loop,"vg_name":"vg-d2lab","role":"native_pool","owner_generation":1}} | .volumes += $tomb[0].volumes | del(.schema_version)' \
    "$N1" >"$STATE"
 cap "record the pre-versioning state (no schema_version; attachment + tombstones)" cat "$STATE"
-cap "create the fixture LVs so the pre-versioning records reconcile" lvcreate --yes -n vol-vol-upgrade-n1-abcd1234 -L 2G vg-volvisor
-cap "create the fixture LV for the tombstone volume" lvcreate --yes -n vol-vol-upgrade-tombstone-abcd1234 -L 1G vg-volvisor
+cap "create the fixture LVs so the pre-versioning records reconcile" lvcreate --yes -n vol-vol-upgrade-n1-abcd1234 -L 2G vg-d2lab
+cap "create the fixture LV for the tombstone volume" lvcreate --yes -n vol-vol-upgrade-tombstone-abcd1234 -L 1G vg-d2lab
 cap "state has no schema_version before startup" jq 'has("schema_version")' "$STATE"
 cap "pre-upgrade state checksum" sha256sum "$STATE"
 
@@ -44,7 +48,7 @@ cat >"$CFG" <<EOF
 listen = "127.0.0.1:$PORT"
 journal_dir = "$JOURNAL"
 provider = "lvm"
-lvm_vg_prefix = "vg-volvisor"
+lvm_vg_prefix = "vg-d2lab"
 device_claim_token = "d2-disposable-claim-$TAG"
 lvm_state_path = "$STATE"
 admin_token = "$TOKEN"

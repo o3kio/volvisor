@@ -148,7 +148,7 @@ impl Histogram {
 }
 
 /// Prometheus counters, histograms and gauges for one API server instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     /// `http_requests_total` labels: (route pattern, status code).
     http_requests: Mutex<BTreeMap<(String, u16), AtomicU64>>,
@@ -394,8 +394,8 @@ impl Metrics {
             return;
         }
         out.push_str(
-            "# HELP reconcile_age_seconds Seconds since the last completed reconcile pass, \
-             by fixed scope.\n",
+            "# HELP reconcile_age_seconds Seconds since the last completed reconcile pass for a \
+             scope, or since its task started if no pass has completed.\n",
         );
         out.push_str("# TYPE reconcile_age_seconds gauge\n");
         for (scope, completed_at) in passes {
@@ -458,6 +458,12 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Render the live journal gauges, omitting unavailable samples rather than
 /// fabricating zeroes.
 fn render_journal(out: &mut String, journal: JournalSnapshot) {
@@ -483,6 +489,9 @@ fn status_class(code: u16) -> &'static str {
         200..=299 => "2xx",
         300..=399 => "3xx",
         400..=499 => "4xx",
+        // 500..=599, plus anything else `http::StatusCode` can construct
+        // (100..=999): out-of-class codes group with the server-error class
+        // rather than being silently dropped.
         _ => "5xx",
     }
 }
@@ -512,7 +521,10 @@ fn write_sample(
 
 /// Escape a label value for the Prometheus text format.
 fn escape_label_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Current Unix time in seconds (`0` before the epoch).

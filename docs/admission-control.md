@@ -62,9 +62,14 @@ Content-Type: application/json
 
 The bound applies to `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
 `GET /v2/capabilities`, `GET /v2/migrations/{migration_id}`,
+`GET /v2/admin/devices`, `GET /v2/admin/devices/{device_id}/ownership`,
 `POST /v2/vms/{vm_id}/check-mobility` and the read-only peer health route.
 `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` are local
 and unbounded. Mutations are never bounded by this value (see above).
+
+`HEAD` requests are bounded exactly like `GET` (axum routes `HEAD` to the
+`GET` handler), so a hung provider cannot pin a `HEAD` request past the
+timeout.
 
 ## Global concurrency cap
 
@@ -97,9 +102,15 @@ behavioral change, so an operator must opt in explicitly.
 
 When enabled, `rate_limit_per_second` and `rate_limit_burst` form a
 per-principal token bucket. The key is the authenticated principal id from
-the scoped credential (`AuthContext`), or one of the fixed
-`admin_token`/`anonymous`/`peer` identities. **Bearer tokens are never used
-as keys and never logged.**
+the scoped credential (`AuthContext`), the fixed `admin_token` identity, or
+the fixed `peer` identity for traffic authenticated by the daemon-to-daemon
+peer token. Requests with no valid identity share the fixed `anonymous`
+bucket. **Bearer tokens are never used as keys and never logged.**
+
+A request rejected by authentication or authorization is charged to the
+`anonymous` bucket before its `401`/`403` is returned, so a credential
+brute-force flood is rate-limited rather than bypassing the limiter. When
+the anonymous bucket is exhausted the rejection becomes `429 RATE_LIMITED`.
 
 Enable it in the daemon config:
 
@@ -110,7 +121,10 @@ rate_limit_burst = 200
 ```
 
 - A refused request is answered `429 Too Many Requests` with `Retry-After`
-  and `{"code":"RATE_LIMITED", ...}`.
+  and `{"code":"RATE_LIMITED", ...}`. `Retry-After` is whole seconds. The
+  refill rate is at least 1 token/s and the deficit is below one token, so
+  the computed wait is at most one second; it is rounded up with a
+  one-second floor, so the emitted value is always `1`.
 - Different principals have independent buckets.
 - The bucket map is bounded by the configured principal set plus a hard
   defensive ceiling; excess keys share one overflow bucket, so a hostile
@@ -127,7 +141,9 @@ rate_limit_burst = 200
   maximum `1000`). Out-of-range values are `400 INVALID_REQUEST`.
 - `cursor` — opaque continuation token from the previous page's
   `next_cursor`. Clients echo it back and never parse it. An invalid cursor
-  is `400 INVALID_REQUEST`.
+  is `400 INVALID_REQUEST`. A cursor is only valid with `limit`; a cursor
+  without `limit` is also `400 INVALID_REQUEST`, rather than a silently
+  truncated unlimited listing.
 - Ordering is stable: `volume_id` ascending, independent of the provider's
   iteration order.
 - The response keeps `volumes` and adds `next_cursor` only while more entries

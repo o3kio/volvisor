@@ -9,7 +9,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -271,6 +271,53 @@ async fn read_route_timeout_is_typed_and_does_not_pin_the_connection() {
 }
 
 #[tokio::test]
+async fn head_request_is_bounded_like_get() {
+    // axum routes HEAD to the GET handler; the timeout selector must include
+    // it or a hung provider pins a HEAD request indefinitely.
+    let provider = Arc::new(ControlledProvider::with_list_delay(Duration::from_millis(
+        250,
+    )));
+    let (state, _dir) = setup(provider);
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(40),
+        ..base_config(1 << 20)
+    };
+    let app = router_with_config(state, &config);
+
+    let (status, _headers, _body) =
+        send(&app, request(Method::HEAD, "/v2/volumes", ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn a_timed_out_read_releases_its_concurrency_permit() {
+    // The read timeout drops the handler future; the permit guard must drop
+    // with it, or the default cap would leak one slot per timeout until every
+    // later request is shed with 503.
+    let provider = Arc::new(ControlledProvider::with_list_delay(Duration::from_millis(
+        250,
+    )));
+    let (state, _dir) = setup(provider);
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(30),
+        max_concurrent_requests: 1,
+        ..base_config(1 << 20)
+    };
+    let app = router_with_config(state, &config);
+
+    for attempt in 0..3 {
+        let (status, _headers, body) =
+            send(&app, request(Method::GET, "/v2/volumes", ADMIN_TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "attempt {attempt} must reach the timeout, not 503: {body}"
+        );
+        assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
+    }
+}
+
+#[tokio::test]
 async fn journaled_mutation_is_not_aborted_by_the_read_timeout() {
     // The read timeout is far shorter than the provider's create delay. A
     // journaled mutation must still complete and record its outcome: the
@@ -310,6 +357,49 @@ async fn journaled_mutation_is_not_aborted_by_the_read_timeout() {
     assert_eq!(replay_status, StatusCode::OK);
     assert_eq!(replay_body, body);
     assert_eq!(journal_record_count(&state), records_after_first);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn readyz_snapshot_runs_off_the_runtime_worker() {
+    // A stalled journal lock must not park the only runtime worker: while
+    // `/readyz` waits for its blocking snapshot, `/healthz` must still run.
+    let (state, _dir) = setup(Arc::new(ControlledProvider::new()));
+    let app = router_with_config(state.clone(), &base_config(1 << 20));
+
+    let held = Arc::clone(&state);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = held.journal.lock().expect("journal lock");
+        locked_tx.send(()).expect("signal lock");
+        std::thread::sleep(Duration::from_millis(400));
+    });
+    locked_rx.recv().expect("journal lock acquired");
+
+    let ready_app = app.clone();
+    let ready = tokio::spawn(async move {
+        send(&ready_app, request(Method::GET, "/readyz", ADMIN_TOKEN)).await
+    });
+    // Give the readyz task a chance to reach the (blocking) snapshot wait.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let started = Instant::now();
+    let (health, _headers, body) = send(&app, request(Method::GET, "/healthz", ADMIN_TOKEN)).await;
+    assert_eq!(health, StatusCode::OK, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "healthz waited {:?} behind the journal lock; the snapshot must run off-worker",
+        started.elapsed()
+    );
+
+    let (ready_status, _headers, _body) = ready.await.expect("readyz task");
+    assert!(
+        matches!(
+            ready_status,
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "readyz must answer, not hang: {ready_status}"
+    );
+    holder.join().expect("journal holder");
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +489,37 @@ async fn per_principal_rate_limit_is_isolated_and_typed() {
     assert_eq!(health, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn credential_denials_are_charged_to_the_anonymous_bucket() {
+    // Authentication runs before the rate-limit layer, so a denied credential
+    // never reaches it. Without charging the denial here, brute force would
+    // receive an unthrottled stream of 401s.
+    let provider = Arc::new(ControlledProvider::new());
+    let (state, _dir) = setup_scoped(provider);
+    let config = ApiConfig {
+        rate_limit_per_second: 1,
+        rate_limit_burst: 1,
+        ..base_config(1 << 20)
+    };
+    let app = router_with_config(state, &config);
+
+    let (first, _headers, first_body) =
+        send(&app, request(Method::GET, "/v2/volumes", "wrong-token")).await;
+    assert_eq!(first, StatusCode::UNAUTHORIZED, "{first_body}");
+
+    let (second, headers, second_body) =
+        send(&app, request(Method::GET, "/v2/volumes", "wrong-token")).await;
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS, "{second_body}");
+    assert_eq!(second_body["code"], json!("RATE_LIMITED"));
+    assert_eq!(retry_after(&headers), "1");
+
+    // A valid principal has an independent bucket, so the brute-force
+    // attempt did not lock out legitimate traffic.
+    let (legit, _headers, _body) =
+        send(&app, request(Method::GET, "/v2/volumes", READER_A_TOKEN)).await;
+    assert_eq!(legit, StatusCode::OK);
+}
+
 // ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
@@ -419,7 +540,7 @@ async fn list_volumes_paginates_with_a_stable_opaque_cursor_and_legacy_default()
     let dir = tempfile::tempdir().expect("temporary journal directory");
     let journal = Journal::open(dir.path()).expect("journal open");
     let state = Arc::new(AppState::new(
-        provider,
+        provider.clone(),
         None,
         journal,
         Some(ADMIN_TOKEN.to_owned()),
@@ -470,6 +591,44 @@ async fn list_volumes_paginates_with_a_stable_opaque_cursor_and_legacy_default()
         .collect();
     assert_eq!(second_ids, ["vol-c"]);
     assert!(second.get("next_cursor").is_none());
+
+    // The cursor is a resume point, not a snapshot: adding an identity after
+    // the cursor makes it visible on the next page, while one inserted before
+    // the cursor is not re-served. No served identity is duplicated.
+    seed_volumes(&provider, &["vol-0-before", "vol-d-after"]).await;
+    let (status, _headers, mutated) = send(&app, request(Method::GET, &uri, ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mutated_ids: Vec<&str> = mutated["volumes"]
+        .as_array()
+        .expect("volumes")
+        .iter()
+        .map(|volume| volume["volume_id"].as_str().expect("volume id"))
+        .collect();
+    assert_eq!(mutated_ids, ["vol-c", "vol-d-after"]);
+    assert!(mutated.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn cursor_without_limit_is_rejected() {
+    let provider = Arc::new(FakeProvider::new());
+    seed_volumes(&provider, &["vol-a", "vol-b"]).await;
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let state = Arc::new(AppState::new(
+        provider,
+        None,
+        journal,
+        Some(ADMIN_TOKEN.to_owned()),
+    ));
+    let app = router_with_config(state, &base_config(1 << 20));
+
+    let (status, _headers, body) = send(
+        &app,
+        request(Method::GET, "/v2/volumes?cursor=v1.766f6c2d61", ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], json!("INVALID_REQUEST"));
 }
 
 #[tokio::test]

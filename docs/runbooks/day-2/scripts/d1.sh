@@ -12,7 +12,10 @@ CFG="$RUN/configs/$TAG.toml"
 JOURNAL="$RUN/lab-$TAG/journal"
 BACKUP="$RUN/lab-$TAG/backup"
 mkdir -p "$JOURNAL" "$BACKUP"
-lvm_lab_setup "$TAG" 768M "$STATE" "vg-d246a"
+lvm_lab_setup "$TAG" 768M "$STATE" "vg-d246a" || {
+  printf 'lab setup failed\n' | tee -a "$LOG"
+  exit 1
+}
 
 PORT="$(pick_port)"
 TOKEN="d2-disposable-admin-$TAG"

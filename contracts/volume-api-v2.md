@@ -69,8 +69,9 @@ adds `next_cursor` (present only while more entries follow; opaque, never
 parsed by clients). A request **without** `limit` preserves the legacy
 unlimited listing and carries no cursor, so an existing client never
 silently loses volumes; new clients should send `limit` to obtain a bounded
-response. `limit` outside `1..=1000` and an invalid cursor are
-`INVALID_REQUEST`. The cursor is a resume point, not a snapshot: entries
+response. A `cursor` without `limit` is `INVALID_REQUEST` (a continuation
+token only resumes a bounded page). `limit` outside `1..=1000` and an
+invalid cursor are `INVALID_REQUEST`. The cursor is a resume point, not a snapshot: entries
 created or deleted between pages may affect later pages. The server-side
 maximum is 1000; an operator may configure a smaller `max_list_limit`, never
 a larger one.

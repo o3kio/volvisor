@@ -283,6 +283,11 @@ fn spawn_grow_retry_task(
     metrics: Arc<Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Stamp the scope at task spawn so a daemon whose every pass fails
+        // still exposes an age that grows into the stale alert; the first
+        // successful pass overwrites this sample. Without it the series would
+        // be absent forever and `VolvisorReconcileStale` could never fire.
+        metrics.record_reconcile_complete("grow");
         // The pass runs on the blocking pool, never on a runtime
         // worker: the engine's pass is synchronous and bounded per
         // volume by the resize-disk timeout, and the handle is
@@ -364,6 +369,9 @@ fn spawn_move_retry_task(
     metrics: Arc<Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Stamp at task spawn (see the grow task): a daemon whose every move
+        // pass fails still exposes a growing age for the stale alert.
+        metrics.record_reconcile_complete("move");
         // Non-overlap is preserved by construction — the task awaits
         // each pass before sleeping the next tick.
         loop {

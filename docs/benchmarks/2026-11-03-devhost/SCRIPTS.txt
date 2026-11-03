@@ -1,0 +1,37 @@
+Benchmark harness scripts: provenance record
+============================================
+
+The measurement ran at source_sha
+e3aa365ea65b865c8310a42ea6b459b038f0ab24. Unlike the day-2 harness, the
+benchmark scripts were already tracked at that commit:
+1f79679 ("bench: add reproducible single-host control-plane harness (#43)")
+introduced scripts/bench/.
+
+SHA256 of each script at e3aa365
+--------------------------------
+718bb2ef6d7461d1699c320680198f536e9706b1e198b6d1783a63873f3eb57e  lib.sh
+1ecdf167781a5cbf88e2ec833965284377a9b11e2b24eaa3d86f716f001909b3  run-all.sh
+86d8047b868f44da3f1d24a27831a7708345649ef723118c4d33950f2ad4b987  bench.py
+eea4e14ab8dd81864c9b69d69d79094699af852b50124d6abc7d0e5ba4b99153  summarize.py
+e75fa09325b2bdda4bbb107ed69f4ee1bef71d7dc16278774f5a54027a197dd1  publish.sh
+
+The scripts currently in scripts/bench/ include review fixes and differ from
+these hashes. They were not used to produce this bundle and this bundle does
+not claim the fixed scripts reproduce it byte-for-byte.
+
+Bundled publish step
+--------------------
+The bundle was copied and compressed after the run with a later publish.sh
+(a post-run size guard for the 606 MiB daemon log). That does not change the
+measured binary, load generator or summarizer.
+
+Binary hash discrepancy in the raw orchestration log
+----------------------------------------------------
+raw/00-orchestration.log records
+`binary_sha256: 04c06df8d0fe288127b634b8616845f35033ba6ef2d3011647824315745b472c`.
+That line was written before `cargo build` ran, so it describes a stale
+pre-build artifact. The binary that actually executed the run is
+670c21259a7474fba0450f779f61967401871fbc2cb47d21da9ab40b0db8a58b, as
+recorded in ENVIRONMENT.txt and SECTION 3 of REPORT.md. The harness now
+re-stamps the header after the build; this bundle keeps the original raw log
+unmodified and discloses the discrepancy instead of rewriting it.

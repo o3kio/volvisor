@@ -454,6 +454,13 @@ struct MoveLoopGuard {
 
 impl Drop for MoveLoopGuard {
     fn drop(&mut self) {
+        // A test failure can fire while the spawned pvmove is still live.
+        // vgremove/pvremove then fail against the active mirror and leak
+        // both loop devices. `pvmove --abort` is host-wide in LVM 2.03.16,
+        // but this guard only runs while the test's host lock is held.
+        if let Err(e) = self.runner.run("pvmove", &["--abort"]) {
+            eprintln!("cleanup: best-effort pvmove --abort failed: {e}");
+        }
         if let Err(e) = self
             .runner
             .run("vgremove", &["--yes", "--force", &self.vg_name])
@@ -1050,33 +1057,53 @@ async fn lvm_move_aborted_mid_supervision_parks_without_freeing() -> Result<(), 
     // Wait until the durable record says `COPYING` *and* `lvs` reports
     // the temporary pvmove mirror, then abort immediately.
     let abort_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_copying = false;
+    let mut completed_before_abort = false;
     loop {
         if let Some(record) = recorded_move(&pool.state_path) {
-            assert_ne!(
-                record.state,
-                MoveVolumeBackingState::Complete,
-                "the move completed before the operator could abort it mid-flight; \
-                 the test cannot exercise the mid-supervision park"
-            );
+            if record.state == MoveVolumeBackingState::Complete {
+                completed_before_abort = true;
+                break;
+            }
             if record.state == MoveVolumeBackingState::Copying {
+                saw_copying = true;
                 let devices = lv_backing_pvs(&pool)?;
-                if devices.iter().any(|device| device.contains("pvmove")) {
+                if devices.iter().any(|device| {
+                    device
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|segment| segment.starts_with("pvmove"))
+                }) {
                     break;
                 }
             }
         }
         assert!(
             Instant::now() < abort_deadline,
-            "the move never reached an observed COPYING mirror; cannot abort mid-flight"
+            "{}",
+            if saw_copying {
+                "the move left COPYING before the temporary pvmove mirror was observed; \
+                 cannot abort mid-flight on this host"
+            } else {
+                "the move never reached COPYING; cannot abort mid-flight on this host"
+            }
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    operator_ok(Command::new("pvmove").arg("--abort"));
+    if !completed_before_abort {
+        operator_ok(Command::new("pvmove").arg("--abort"));
+    }
 
     let response = move_task
         .await
         .expect("the move task joins")
         .expect("the drive answers with a park, not a failure");
+    if completed_before_abort || response.state == MoveVolumeBackingState::Complete {
+        panic!(
+            "the move completed before `pvmove --abort` could park it; this host cannot \
+             exercise the mid-supervision park (the abort raced a fast page-cache pvmove)"
+        );
+    }
     assert_eq!(
         response.state,
         MoveVolumeBackingState::InDoubt,

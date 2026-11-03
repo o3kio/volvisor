@@ -46,7 +46,12 @@ Readiness body (the field names are stable):
   fail on that unknown. A configured witness that fails the bounded probe
   makes readiness `503`.
 
-The witness probe is a TCP connect with a 2-second bound. It establishes
+The witness probe is a TCP connect with a 2-second bound. The target address
+is resolved once at startup; a DNS change after start requires a daemon
+restart before readiness reflects it (the witness driver itself re-resolves
+per connect). `/readyz` and `/metrics` share a one-second probe cache and a
+single-flight gate, so a burst of public `/readyz` calls opens at most one
+outbound connection and reuses the same observation. The probe establishes
 transport reachability only: it does not authenticate, inspect authority,
 prove quorum, or claim data safety. A listener on the target port that is not
 the witness would still read as `reachable`; use the witness's own health and
@@ -79,11 +84,16 @@ as a fabricated zero.
 | `journal_open` | gauge | — | `1` while the daemon holds the journal open, `0` if the journal mutex is unusable. |
 | `journal_records` | gauge | — | Valid journal records (replayed plus appended), sampled from the live `Journal`. |
 | `journal_log_bytes` | gauge | — | Size of the journal log file in bytes. Omitted if it cannot be stat'ed. |
-| `reconcile_age_seconds` | gauge | `scope` | Seconds since the last completed reconcile pass: `startup`, `grow`, or `move`. |
+| `reconcile_age_seconds` | gauge | `scope` | Seconds since the last completed reconcile pass, or since the `grow`/`move` task started if no pass has completed: `startup`, `grow`, or `move`. |
 | `witness_reachable` | gauge | — | `1`/`0` from the last witness transport probe. Absent without a configured probe target (and before the first probe). |
 
 `operations_total.outcome` is one of `success`, `failure`, `replayed`,
-`in_doubt`, `conflict`, `resolved`, `re_drive`. Operation kinds are the
+`in_doubt`, `conflict`, `resolved`, `re_drive`. `resolved` is a terminal
+recovery outcome: a retry proved by inspection that the act had landed, so
+the operation returns the recorded result without a second provider call.
+`re_drive` is not terminal: a retry proved the act had **not** landed and is
+re-executing, so the same operation later records its `success`/`failure`.
+Operation kinds are the
 compile-time constants in `volvisor-api/src/ops.rs` (`create_volume`,
 `attach_volume`, `detach_volume`, `report_attachment_state`, `grow_volume`,
 `delete_volume`, `move_volume_backing`, `claim_device`, `release_device`,
@@ -103,17 +113,21 @@ request, including probes, errors and unmatched routes.
 
 ### Time-series refreshes
 
-- `/metrics` samples the journal under the journal lock for that scrape, so
-  `journal_records` and `journal_log_bytes` are real current values, not
-  cached counters.
+- `/metrics` and `/readyz` sample the journal on the blocking pool, so a
+  stalled fsync cannot park a Tokio runtime worker; the readiness response
+  itself still waits on that blocking sample (bounded by the fsync, which is
+  not timeout-cancelled), while `/healthz` and other requests keep running.
+  The sample is the real journal state, not a cached counter. A failed
+  blocking join is rendered as a closed journal, never as a fabricated zero.
 - If a witness probe target is configured, `/metrics` refreshes
-  `witness_reachable` with the same bounded TCP probe that `/readyz` uses.
-  Without a target the gauge is absent.
+  `witness_reachable` with the same bounded, cached TCP probe that `/readyz`
+  uses. Without a target the gauge is absent.
 - `reconcile_age_seconds{scope="startup"}` is stamped when the serving state
   is constructed (after journal replay and provider construction/reconcile).
-  `grow` and `move` are stamped only after a successful background pass on a
-  daemon that runs those tasks. A failing pass does not refresh the sample,
-  so the age grows and an alert can fire.
+- `reconcile_age_seconds{scope="grow"|"move"}` is stamped when the background
+  task starts, not only after its first success. A daemon whose every pass
+  fails from boot still exposes a growing age, so `VolvisorReconcileStale`
+  can fire; the first successful pass overwrites the sample.
 
 ## Cardinality bounds
 

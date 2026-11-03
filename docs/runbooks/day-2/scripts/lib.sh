@@ -56,6 +56,9 @@ cap() {
     "$@"
     rc=$?
     printf 'exit=%s\n' "$rc"
+    # Left side of a pipeline runs in a subshell; exit it with the command's
+    # status so PIPESTATUS[0] actually carries the failure.
+    exit "$rc"
   } 2>&1 | tee -a "$LOG"
   return "${PIPESTATUS[0]}"
 }
@@ -72,6 +75,7 @@ cap_stdin() {
     "$@" <"$input"
     rc=$?
     printf 'exit=%s\n' "$rc"
+    exit "$rc"
   } 2>&1 | tee -a "$LOG"
   return "${PIPESTATUS[0]}"
 }
@@ -105,6 +109,11 @@ assert_contains() {
   fi
 }
 
+# Pick a currently free loopback port.
+#
+# The bind is inherently racy: the daemon binds the port later. If another
+# process wins the race the daemon fails to bind and the drill fails at
+# startup; there is no silent fallback to a different port.
 pick_port() {
   python3 - <<'PY'
 import socket
@@ -138,10 +147,25 @@ start_volvisord() {
   printf 'daemon %s healthy pid=%s port=%s\n' "$name" "$(cat "$RUN/records/$name.pid")" "$port" | tee -a "$LOG"
 }
 
+pid_is_drill_daemon() {
+  local pid="$1" cmd
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  cmd="$(tr '\0' '\n' <"/proc/$pid/cmdline" | head -n 1)"
+  # Exact path only: a basename match would signal another drill's daemon
+  # after PID reuse. Both daemons this harness starts are accepted.
+  [[ "$cmd" == "$BIN/volvisord" || "$cmd" == "$BIN/volvisor-witnessd" ]]
+}
+
 stop_pidfile() {
   local name="$1" sig="${2:-TERM}" pidfile="$RUN/records/$1.pid"
   [[ -f "$pidfile" ]] || return 0
   local pid; pid="$(cat "$pidfile")"
+  if ! pid_is_drill_daemon "$pid"; then
+    printf 'WARNING: %s pid %s is not this drill'"'"'s daemon (stale pidfile); not signalling\n' \
+      "$name" "$pid" | tee -a "$LOG"
+    rm -f "$pidfile"
+    return 0
+  fi
   if kill -0 "$pid" 2>/dev/null; then
     kill "-$sig" "$pid" 2>/dev/null || true
   fi
@@ -207,9 +231,16 @@ checksum() { sha256sum "$1"; }
 # operator-provisioned claim record instead of using /v2/admin claim.
 lvm_lab_setup() {
   local tag="$1" size="$2" state_path="$3" vg="${4:-$1}" dir="$RUN/lab-$1"
+  if vgs "$vg" >/dev/null 2>&1; then
+    printf 'REFUSING to reuse existing VG %s; choose a lab-unique name\n' "$vg" >&2
+    return 1
+  fi
   mkdir -p "$dir"
   truncate -s "$size" "$dir/disk.img"
-  local loop; loop="$(losetup -f --show "$dir/disk.img")"
+  local loop; loop="$(losetup -f --show "$dir/disk.img")" || {
+    printf 'losetup failed for %s\n' "$dir/disk.img" >&2
+    return 1
+  }
   printf '%s' "$loop" >"$RUN/records/$tag.loop"
   printf '%s' "$vg" >"$RUN/records/$tag.vg"
   pvcreate --yes "$loop" >>"$LOG" 2>&1 || return 1
@@ -237,15 +268,34 @@ EOF
 lvm_lab_teardown() {
   local tag="$1"
   local dir="$RUN/lab-$tag"
-  local loop="" vg=""
+  local loop="" vg="" failed=0 owners=""
   [[ -f "$RUN/records/$tag.loop" ]] && loop="$(cat "$RUN/records/$tag.loop")"
   [[ -f "$RUN/records/$tag.vg" ]] && vg="$(cat "$RUN/records/$tag.vg")"
   if [[ -n "$vg" ]] && vgs "$vg" >/dev/null 2>&1; then
-    vgremove --yes "$vg" >>"$LOG" 2>&1 || true
+    owners="$(pvs --noheadings -o pv_name "$vg" 2>/dev/null | xargs)"
+    if [[ -z "$loop" || "$owners" != "$loop" ]]; then
+      printf 'REFUSING to remove VG %s: its PVs (%s) are not this drill'"'"'s loop (%s)\n' \
+        "$vg" "${owners:-unknown}" "${loop:-unknown}" | tee -a "$LOG"
+      failed=1
+    elif ! vgremove --yes "$vg" >>"$LOG" 2>&1; then
+      printf 'vgremove %s failed\n' "$vg" | tee -a "$LOG"
+      failed=1
+    fi
   fi
   if [[ -n "$loop" ]] && losetup "$loop" >/dev/null 2>&1; then
-    pvremove --yes "$loop" >>"$LOG" 2>&1 || true
-    losetup -d "$loop" >>"$LOG" 2>&1 || true
+    if ! pvremove --yes "$loop" >>"$LOG" 2>&1; then
+      printf 'pvremove %s failed\n' "$loop" | tee -a "$LOG"
+      failed=1
+    fi
+    if ! losetup -d "$loop" >>"$LOG" 2>&1; then
+      printf 'losetup -d %s failed\n' "$loop" | tee -a "$LOG"
+      failed=1
+    fi
+  fi
+  if [[ "$failed" -ne 0 ]]; then
+    printf 'lab teardown INCOMPLETE tag=%s loop=%s vg=%s dir=%s\n' \
+      "$tag" "$loop" "$vg" "$dir" | tee -a "$LOG"
+    return 1
   fi
   rm -rf "$dir"
   printf 'lab teardown tag=%s loop=%s vg=%s\n' "$tag" "$loop" "$vg" | tee -a "$LOG"
