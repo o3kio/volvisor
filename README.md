@@ -119,6 +119,21 @@ The drills are single-host dev-lab evidence, not production or multi-host
 evidence. They do not change the support posture in
 [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
 
+## Benchmarks
+
+The reproducible control-plane harness is in
+[`scripts/bench/`](scripts/bench/) and its published evidence is indexed in
+[`docs/benchmarks/`](docs/benchmarks/README.md). The first bundle is the
+[2026-11-03 single-host control-plane run](docs/benchmarks/2026-11-03-devhost/REPORT.md):
+1/8/32/128 in-flight mixed latency and throughput, admission and rate-limit
+shedding probes, and a shortened 25-minute soak with restart replay.
+
+That run is **one host, loop-backed LVM, control-plane only** — no data-path
+or guest-I/O measurement, no real Ceph/DRBD, and **no production SLA**. The
+24-hour soak is **not run**; the published soak is 25 minutes. A benchmark is
+not a durability proof and does not change the support posture in
+[SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
+
 ## Historical draft v1 (superseded proposals)
 
 [ADR-0001](docs/adr/0001-volvisor-storage-cell-architecture.md), [ADR-0002](docs/adr/0002-replicated-async-local-endpoint-and-migration.md), [SPEC-0001](docs/specs/SPEC-0001-storage-cell-v0.md), [provider v1](contracts/volvisor-provider-v1.md), [storage classes v1](contracts/storage-class-semantics-v1.md), [replication v1](contracts/replicated-async-v1.md), [engineering design](docs/design.md), [replication research](docs/research/replicated-async-rnd.md), and [prior review](docs/reviews/storage-cell-v0-review.md).

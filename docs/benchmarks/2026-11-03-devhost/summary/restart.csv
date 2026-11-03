@@ -1,0 +1,7 @@
+scenario,iteration,journal_bytes_before,state_bytes_before,stop_seconds,healthy_seconds,state_bytes_after,journal_bytes_after,listed_volumes,missing_volumes
+restart-post-soak,1,271435753,269,0.763,2.813,269,271435753,0,
+restart-post-soak,2,271435753,269,0.464,2.669,269,271435753,0,
+restart-pre-soak,1,562847,269,0.02,0.103,269,562847,0,
+restart-pre-soak,2,562847,269,0.003,0.102,269,562847,0,
+restart-pre-soak,3,562847,269,0.003,0.102,269,562847,0,
+soak-restart,1,178260132,1465696,0.422,1.799,1465696,178260132,4,
