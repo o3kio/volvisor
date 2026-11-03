@@ -21,9 +21,9 @@
 //! The router installs these layers so a request traverses, outermost first:
 //!
 //! 1. metrics (`record_http_request`);
-//! 2. this module's [`guard`] — concurrency permit + read timeout;
+//! 2. this module's `guard` — concurrency permit + read timeout;
 //! 3. authentication/authorization/audit;
-//! 4. this module's [`rate_limit`] — per-principal token bucket, after the
+//! 4. this module's `rate_limit` — per-principal token bucket, after the
 //!    principal is resolved;
 //! 5. the body limit and the handler.
 //!
