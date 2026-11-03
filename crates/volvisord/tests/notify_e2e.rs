@@ -118,6 +118,7 @@ fn fake_config(journal_dir: std::path::PathBuf, listen: std::net::SocketAddr) ->
         credentials: volvisord::config::CredentialsConfig::default(),
         tls: volvisord::config::TlsConfig::default(),
         allow_insecure: false,
+        admission: volvisord::config::AdmissionConfig::default(),
     }
 }
 

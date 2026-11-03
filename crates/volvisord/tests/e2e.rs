@@ -103,6 +103,7 @@ fn e2e_config(dir: &tempfile::TempDir) -> volvisord::Config {
         credentials: volvisord::config::CredentialsConfig::default(),
         tls: volvisord::config::TlsConfig::default(),
         allow_insecure: false,
+        admission: volvisord::config::AdmissionConfig::default(),
     }
 }
 
@@ -111,7 +112,7 @@ async fn daemon_end_to_end_fake_provider() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = e2e_config(&dir);
     let state = volvisord::runtime::build_state(&config).expect("build state");
-    let app = volvisor_api::router(state, config.max_body_bytes);
+    let app = volvisor_api::router_with_config(state, &config.api_config());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -241,6 +242,7 @@ async fn daemon_journal_lock_fails_fast_for_second_instance() {
         credentials: volvisord::config::CredentialsConfig::default(),
         tls: volvisord::config::TlsConfig::default(),
         allow_insecure: false,
+        admission: volvisord::config::AdmissionConfig::default(),
     };
     // Hold one state (and thus the journal lock) ...
     let first = volvisord::runtime::build_state(&config).expect("first instance");

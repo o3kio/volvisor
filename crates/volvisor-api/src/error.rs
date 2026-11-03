@@ -6,6 +6,8 @@
 //! typed [`ApiErrorCode`]. axum's own rejection bodies (extractor defaults)
 //! never reach the client; they are converted in [`crate::extract`].
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +28,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// Used to reconstruct the HTTP status of a *replayed failure outcome*: the
 /// journal persists the error body (not the status), and a replay must be
 /// status- and byte-compatible with the first caller's response.
-const ALL_CODES: [ApiErrorCode; 21] = [
+const ALL_CODES: [ApiErrorCode; 28] = [
     ApiErrorCode::UnsupportedClassOrPolicy,
     ApiErrorCode::InsufficientFailureDomains,
     ApiErrorCode::NoSafeCapacity,
@@ -34,6 +36,9 @@ const ALL_CODES: [ApiErrorCode; 21] = [
     ApiErrorCode::ForeignDeviceState,
     ApiErrorCode::StaleGeneration,
     ApiErrorCode::WriterAlreadyActive,
+    ApiErrorCode::LeaseHeld,
+    ApiErrorCode::StaleEpoch,
+    ApiErrorCode::FencePending,
     ApiErrorCode::UnknownFencingAuthority,
     ApiErrorCode::ReplicaNotDurable,
     ApiErrorCode::MigrationUnsupportedLocalStorage,
@@ -42,6 +47,10 @@ const ALL_CODES: [ApiErrorCode; 21] = [
     ApiErrorCode::OperationInDoubt,
     ApiErrorCode::UnsafeDataLoss,
     ApiErrorCode::CephClusterUnhealthy,
+    ApiErrorCode::RateLimited,
+    ApiErrorCode::Overloaded,
+    ApiErrorCode::RequestTimeout,
+    ApiErrorCode::PayloadTooLarge,
     ApiErrorCode::InvalidRequest,
     ApiErrorCode::NotFound,
     ApiErrorCode::InvalidState,
@@ -97,6 +106,17 @@ pub(crate) fn to_json_value<T: Serialize + ?Sized>(value: &T) -> Result<Value, A
 pub(crate) fn json_response(status: StatusCode, body: &Value) -> Response {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
     build_response(status, "application/json", bytes)
+}
+
+/// Like [`error_response`], plus a `Retry-After` header (seconds) for the
+/// admission-control refusals (`429 RATE_LIMITED` / `503 OVERLOADED`).
+pub(crate) fn error_response_with_retry_after(error: &ApiError, retry_after: Duration) -> Response {
+    let mut response = error_response(error);
+    let seconds = retry_after.as_secs().max(1);
+    if let Ok(value) = header::HeaderValue::from_str(&seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// Build a plain-text response (used by `/metrics`).

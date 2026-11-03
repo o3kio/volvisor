@@ -32,6 +32,8 @@ async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 # Structured audit-event capture (JSON) in the auth tests.
 tracing-subscriber = { workspace = true }
+# Streamed request bodies in the admission-control body-limit tests.
+futures = { workspace = true }
 # Journal fault injection (`Journal::inject_append_failures_after`) for the
 # journal-before-mutate fault tests; the feature is never enabled for the
 # library itself or for downstream consumers (resolver v3 keeps dev-dep
