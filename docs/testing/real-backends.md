@@ -34,14 +34,17 @@ path here; that is not a suite result. The first genuine green run must
 be linked from issue evidence with its exact SHA, and `release-scope.toml`
 must be flipped to `supported` only after that rig exists.
 
-Local LVM evidence for this branch (2026-11-02, dev host): `./scripts/test-lvm.sh`
-exited 0 with `110` tests passing, including all six real-loop-device
-integration tests (`test result: ok. 6 passed; 0 failed`); the run's
-`target/real-backends/lvm/` evidence is a local artifact and is not
-committed. On the same host, `./scripts/test-ceph.sh` and
-`./scripts/test-drbd.sh` exited `2` at `ceph.missing-tool.ceph` and
-`drbd.missing-tool.drbdadm` respectively — loud prerequisite failures, not
-skips and not suite results.
+Local LVM evidence for this branch (2026-11-03, dev host): `./scripts/test-lvm.sh`
+exited 0 with `124` tests passing, including all seven real-loop-device
+integration tests (`test result: ok. 7 passed; 0 failed`), among them the
+#58 ENOSPC regression
+(`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`);
+the run's `target/real-backends/lvm/` evidence is a local artifact and is not
+committed. The earlier 2026-11-02 run recorded `110` passing tests and six
+integration tests before that regression existed. On the same host,
+`./scripts/test-ceph.sh` and `./scripts/test-drbd.sh` exited `2` at
+`ceph.missing-tool.ceph` and `drbd.missing-tool.drbdadm` respectively — loud
+prerequisite failures, not skips and not suite results.
 
 ## The release gate (no silent bypass)
 
