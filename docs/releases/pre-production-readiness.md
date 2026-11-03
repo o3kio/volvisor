@@ -110,9 +110,11 @@ report mapping every gate to evidence. Current status:
 5. **#43 — credible backend numbers and 24 h soak.** Single-host loop-LVM
    only; no real Ceph/DRBD/physical-disk numbers and no 24 h run.
 6. **#49 / #58 / #62 / #63 / #64 — assurance and real findings.** Fuzzing and
-   interleaving tests are not implemented; the ENOSPC state-save leak and
-   the measured lock/journal/retirement growth are open findings, not
-   resolved production issues.
+   interleaving tests are not implemented; the ENOSPC state-save leak is fixed
+   in code by [PR #69](https://github.com/o3kio/volvisor/pull/69) with a
+   real-LVM regression test (`#58`), while the measured
+   lock/journal/retirement growth remains an open finding. None is a resolved
+   production issue.
 
 ## What must not be claimed
 

@@ -19,7 +19,9 @@
 #![cfg(feature = "integration-lvm")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -84,6 +86,78 @@ impl Drop for LoopGuard {
         }
         if let Err(e) = self.runner.run("losetup", &["-d", &self.loop_device]) {
             eprintln!("cleanup: losetup -d failed: {e}");
+        }
+    }
+}
+
+/// Unmounts the provider-state tmpfs on every path, including assertion
+/// failures and panics. A busy mount falls back to a lazy unmount.
+struct MountGuard {
+    mountpoint: PathBuf,
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        let unmounted = Command::new("umount")
+            .arg(&self.mountpoint)
+            .status()
+            .is_ok_and(|status| status.success());
+        if unmounted {
+            return;
+        }
+        if let Err(e) = Command::new("umount")
+            .arg("-l")
+            .arg(&self.mountpoint)
+            .status()
+        {
+            eprintln!(
+                "cleanup: best-effort umount -l {} failed: {e}",
+                self.mountpoint.display()
+            );
+        }
+    }
+}
+
+/// Mount a 256 KiB tmpfs at `mountpoint` — the same size as the issue #58
+/// repro's provider-state filesystem.
+fn mount_state_tmpfs(mountpoint: &Path) -> Result<(), ApiError> {
+    fs::create_dir_all(mountpoint).map_err(|e| {
+        internal(format!(
+            "create tmpfs mountpoint {}: {e}",
+            mountpoint.display()
+        ))
+    })?;
+    let output = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=256k", "tmpfs"])
+        .arg(mountpoint)
+        .output()
+        .map_err(|e| internal(format!("execute mount: {e}")))?;
+    if !output.status.success() {
+        return Err(internal(format!(
+            "mount tmpfs at {} failed: {}",
+            mountpoint.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// Fill the tmpfs with a filler file until the kernel reports ENOSPC
+/// (raw errno 28) — the actual syscall path the issue #58 repro triggers.
+fn fill_tmpfs(path: &Path) -> Result<(), ApiError> {
+    let mut filler = fs::File::create(path)
+        .map_err(|e| internal(format!("create tmpfs filler {}: {e}", path.display())))?;
+    let chunk = [0_u8; 4096];
+    loop {
+        match filler.write_all(&chunk) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(28) => return Ok(()),
+            Err(e) => {
+                return Err(internal(format!(
+                    "fill tmpfs at {} failed: {e}",
+                    path.display()
+                )));
+            }
         }
     }
 }
@@ -396,6 +470,159 @@ async fn lvm_non_aligned_create_rounds_up_and_absent_lv_delete_succeeds() -> Res
         .await
         .expect_err("deleted volume is gone");
     assert_eq!(err.code, ApiErrorCode::NotFound);
+
+    Ok(())
+}
+
+/// Assert that LVM's own report lists `lv_name` under `vg_name`.
+fn assert_lv_exists(pool: &LoopPool, vg_name: &str, lv_name: &str) -> Result<(), ApiError> {
+    let lvs = pool.runner.run(
+        "lvs",
+        &[
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_name",
+            &format!("{vg_name}/{lv_name}"),
+        ],
+    )?;
+    assert!(lvs.success, "lvs query: {}", lvs.stderr_excerpt());
+    let value: serde_json::Value =
+        serde_json::from_str(&lvs.stdout).map_err(|e| internal(format!("parse lvs: {e}")))?;
+    let volumes = value["report"][0]["lv"]
+        .as_array()
+        .ok_or_else(|| internal("missing lv array in lvs report"))?;
+    assert_eq!(volumes.len(), 1, "the retried LV exists: {volumes:?}");
+    assert_eq!(volumes[0]["lv_name"].as_str(), Some(lv_name));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart()
+-> Result<(), ApiError> {
+    if !lvm_tests_enabled() {
+        eprintln!(
+            "skipping real-LVM integration test: set VOLVISOR_TEST_LVM=1 (requires root, \
+             losetup and lvm2) to run it"
+        );
+        return Ok(());
+    }
+
+    // These tests mutate the host's real LVM (and `pvmove --abort` is
+    // host-wide): they serialize on the host lock.
+    let _host = host_lock().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = setup_loop_pool(dir.path(), "volvisorit-enospc")?;
+    let statefs = dir.path().join("statefs");
+    mount_state_tmpfs(&statefs)?;
+    let _mount = MountGuard {
+        mountpoint: statefs.clone(),
+    };
+
+    // The live provider runs over a 256 KiB tmpfs holding the seeded
+    // claim record — the issue #58 repro's provider-state filesystem.
+    let state_path = statefs.join("state.json");
+    fs::copy(&pool.state_path, &state_path).map_err(|e| {
+        internal(format!(
+            "seed tmpfs state from {}: {e}",
+            pool.state_path.display()
+        ))
+    })?;
+    let provider = LvmProvider::new(
+        Arc::clone(&pool.runner),
+        state_path.clone(),
+        PathBuf::from("/"),
+        "volvisorit".to_owned(),
+        "integration-token".to_owned(),
+    )?;
+    let id = VolumeId::new("itest-enospc").expect("valid volume id");
+    let failed_lv_name = lv_name_for(&id);
+
+    // A durable volume that is NOT the one under test: compensation must
+    // check this volume's record, not merely "the state file is non-empty".
+    let unrelated = provider
+        .create_volume(&fixture_create_request(
+            "itest-enospc-unrelated",
+            VOLUME_BYTES,
+        ))
+        .await?;
+    let unrelated_id = unrelated.volume_id.clone();
+    let snapshot = fs::read(&state_path).map_err(|e| internal(format!("snapshot state: {e}")))?;
+
+    fill_tmpfs(&statefs.join("fill"))?;
+
+    // The state save hits real ENOSPC after `lvcreate` already ran: the
+    // provider must compensate the LV and never expose a phantom volume.
+    let err = provider
+        .create_volume(&fixture_create_request("itest-enospc", VOLUME_BYTES))
+        .await
+        .expect_err("create whose state save hits ENOSPC");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    // The detail proves this is the save failure, not an lvcreate failure
+    // (the string is coupled to state.rs's save-error format by design).
+    assert!(
+        err.detail.contains("state.json"),
+        "the save failure names the state file: {err}"
+    );
+
+    let inspected = provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the failed create must not be visible");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    let listed = provider.list_volumes(None).await.expect("list volumes");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].volume_id, unrelated_id);
+
+    // The compensating `lvremove` really ran: no orphan LV remains.
+    let lvs = pool.runner.run(
+        "lvs",
+        &["--reportformat", "json", "--units", "b", "--nosuffix"],
+    )?;
+    assert!(lvs.success, "lvs query: {}", lvs.stderr_excerpt());
+    assert!(
+        !lvs.stdout.contains(&failed_lv_name),
+        "the compensating lvremove removed the failed LV {failed_lv_name}: {}",
+        lvs.stdout
+    );
+
+    // Freeing the filler leaves the old durable record byte-identical:
+    // the failed save never replaced it with a phantom volume.
+    fs::remove_file(statefs.join("fill"))
+        .map_err(|e| internal(format!("remove tmpfs filler: {e}")))?;
+    let after = fs::read(&state_path).map_err(|e| internal(format!("read state: {e}")))?;
+    assert_eq!(after, snapshot, "the claim record is unchanged");
+
+    // A restart converges: the rolled-back create never reappears and
+    // no orphan is reported as foreign.
+    let restarted = LvmProvider::new(
+        Arc::clone(&pool.runner),
+        state_path.clone(),
+        PathBuf::from("/"),
+        "volvisorit".to_owned(),
+        "integration-token".to_owned(),
+    )?;
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("the rolled-back create must not reappear");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    let report = restarted.reconcile_report()?;
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+    assert!(report.foreign_lvs.is_empty(), "{report:?}");
+
+    // The same create retries cleanly on the restarted provider.
+    let created = restarted
+        .create_volume(&fixture_create_request("itest-enospc", VOLUME_BYTES))
+        .await
+        .expect("retry after compensation");
+    assert_eq!(created.volume_id, id);
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    assert_lv_exists(&pool, "volvisorit-enospc", &lv_name_for(&id))?;
 
     Ok(())
 }
@@ -1007,6 +1234,7 @@ async fn lvm_move_aborted_out_of_band_while_down_parks_in_doubt() -> Result<(), 
 /// completion claim, never a generic failure: the source extents
 /// were never declared freed, the generation never bumped, and the
 /// data is intact.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lvm_move_aborted_mid_supervision_parks_without_freeing() -> Result<(), ApiError> {
     if !lvm_tests_enabled() {
@@ -1098,12 +1326,11 @@ async fn lvm_move_aborted_mid_supervision_parks_without_freeing() -> Result<(), 
         .await
         .expect("the move task joins")
         .expect("the drive answers with a park, not a failure");
-    if completed_before_abort || response.state == MoveVolumeBackingState::Complete {
-        panic!(
-            "the move completed before `pvmove --abort` could park it; this host cannot \
-             exercise the mid-supervision park (the abort raced a fast page-cache pvmove)"
-        );
-    }
+    assert!(
+        !completed_before_abort && response.state != MoveVolumeBackingState::Complete,
+        "the move completed before `pvmove --abort` could park it; this host cannot \
+         exercise the mid-supervision park (the abort raced a fast page-cache pvmove)"
+    );
     assert_eq!(
         response.state,
         MoveVolumeBackingState::InDoubt,

@@ -34,14 +34,18 @@ path here; that is not a suite result. The first genuine green run must
 be linked from issue evidence with its exact SHA, and `release-scope.toml`
 must be flipped to `supported` only after that rig exists.
 
-Local LVM evidence for this branch (2026-11-02, dev host): `./scripts/test-lvm.sh`
-exited 0 with `110` tests passing, including all six real-loop-device
-integration tests (`test result: ok. 6 passed; 0 failed`); the run's
-`target/real-backends/lvm/` evidence is a local artifact and is not
-committed. On the same host, `./scripts/test-ceph.sh` and
-`./scripts/test-drbd.sh` exited `2` at `ceph.missing-tool.ceph` and
-`drbd.missing-tool.drbdadm` respectively — loud prerequisite failures, not
-skips and not suite results.
+Local LVM evidence for this branch (2026-11-03, dev host): `./scripts/test-lvm.sh`
+exited 0 with `124` tests passing, including all seven real-loop-device
+integration tests (`test result: ok. 7 passed; 0 failed`), among them the
+#58 ENOSPC regression
+(`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`);
+the run's evidence is a local artifact under the configured
+`VOLVISOR_TEST_OUTPUT_DIR` and is not committed. The earlier 2026-11-02 run
+recorded `110` passing tests and six integration tests before that regression
+existed. On the same host,
+`./scripts/test-ceph.sh` and `./scripts/test-drbd.sh` exited `2` at
+`ceph.missing-tool.ceph` and `drbd.missing-tool.drbdadm` respectively — loud
+prerequisite failures, not skips and not suite results.
 
 ## The release gate (no silent bypass)
 
@@ -114,7 +118,9 @@ not run.
 ### LVM rig (locally runnable)
 
 - One Linux host, root (or passwordless sudo).
-- `lvm2`, `util-linux` (`losetup`), device-mapper, loop device support.
+- `lvm2`, `util-linux` (`losetup`, `mount`, `umount`), device-mapper, loop
+  device support, and permission to mount a tmpfs (the ENOSPC regression test
+  mounts a 256 KiB tmpfs over the provider state directory).
 - At least 1 GiB free under the evidence/output directory.
 - The suite creates a private 256 MiB backing file, a loop device and a
   temporary VG, then removes them. It does not touch an operator VG.
@@ -381,6 +387,12 @@ and versions, never key bytes, keyring contents, or the shared secret.
 | `FAILED [drbd.node-name-mismatch]` | runner hostname vs variable | CI/infra owner | `preflight.log` |
 | `FAILED [drbd.peer-unresolvable]` | peer DNS/address, replication network | DRBD infrastructure owner | `preflight.log` |
 | `FAILED [drbd.tests-failed]` | peer backing LV, `drbdadm status`, kernel log | Volvisor maintainer + DRBD owner | `run.log`, `junit.xml` |
+| `FAILED [lvm.missing-tool.*]` | `losetup`, `lvm2`, `mount`/`umount` installed | LVM infrastructure owner | `preflight.log`, `environment.txt` |
+| `FAILED [lvm.no-loop-control]` / `no-free-loop` | loop module loaded, free loop device, stale `losetup -a` entries | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.no-device-mapper]` | device-mapper (`dm_mod`) available | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.no-tmpfs-mount]` / `no-tmpfs-umount` | root with `CAP_SYS_ADMIN` (or container equivalent) can mount a tmpfs; no stale mount at the probe path | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.low-disk]` | ≥1 GiB free under the evidence/output directory | LVM infrastructure owner | `preflight.log` |
+| `FAILED [lvm.tests-failed]` / `suite-skipped` | test assertion, rig state, `VOLVISOR_TEST_LVM` passed through | Volvisor maintainer + LVM owner | `run.log`, `junit.xml` |
 | `FAILED [*.suite-skipped]` | env not passed through `sudo -E` | CI/infra owner | `run.log`, `preflight.log` |
 | `real-backends-gate` failed | matrix result in the job summary | Volvisor release manager | run URL, `real-backends-evidence` |
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Real-LVM gate: runs the loop-device integration suite on this host.
 #
-# This is locally runnable (root + lvm2 + losetup + device-mapper). It is
-# also the `lvm` suite in release-scope.toml, so a release that claims
+# This is locally runnable (root + lvm2 + losetup + device-mapper +
+# tmpfs-mount capability for the ENOSPC regression test). It is also the
+# `lvm` suite in release-scope.toml, so a release that claims
 # native-local runs exactly this script and refuses to publish if it does
 # not pass.
 #
@@ -39,7 +40,7 @@ rb_write_environment
 rb_log "== real-LVM preflight =="
 
 rb_require_root lvm
-for tool in cargo rustc losetup lvm pvcreate vgcreate lvcreate lvremove vgremove pvremove lvs vgs pvs dmsetup; do
+for tool in cargo rustc losetup lvm pvcreate vgcreate lvcreate lvremove vgremove pvremove lvs vgs pvs dmsetup mount umount; do
     rb_require_tool lvm "$tool"
 done
 
@@ -59,6 +60,25 @@ if ! dmsetup version >/dev/null 2>&1; then
     rb_fail lvm.no-device-mapper \
         "'dmsetup version' failed. The device-mapper driver (dm_mod) must be available; the provider creates and grows real dm-linear LVs."
 fi
+# The ENOSPC regression test mounts a 256 KiB tmpfs over the provider
+# state directory. Probe the capability, not merely the binary, so a
+# root-but-capability-less host fails with a typed prerequisite error
+# instead of a mid-suite test failure.
+mount_probe="$RB_OUT/mount-probe"
+mkdir -p "$mount_probe"
+if ! mount -t tmpfs -o size=4k tmpfs "$mount_probe" >/dev/null 2>&1; then
+    rmdir "$mount_probe" 2>/dev/null || true
+    rb_fail lvm.no-tmpfs-mount \
+        "mounting a tmpfs at $mount_probe failed. The ENOSPC regression test needs root with CAP_SYS_ADMIN (or an equivalent container capability) to mount a 256 KiB tmpfs; enable it or run the suite on a host/VM that permits tmpfs mounts."
+fi
+if ! umount "$mount_probe" >/dev/null 2>&1; then
+    umount -l "$mount_probe" >/dev/null 2>&1 || true
+    rmdir "$mount_probe" 2>/dev/null || true
+    rb_fail lvm.no-tmpfs-umount \
+        "unmounting the tmpfs probe at $mount_probe failed. Remove the stale mount before running the suite."
+fi
+rmdir "$mount_probe" 2>/dev/null || true
+rb_record "tmpfs_mount=ok"
 
 available_kb=$(df -Pk "$RB_OUT" | awk 'NR==2 {print $4}')
 if [[ -z "$available_kb" || "$available_kb" -lt 1048576 ]]; then
@@ -70,7 +90,7 @@ rb_record "lvm_version=$(lvm version 2>/dev/null | head -n 1)"
 rb_record "losetup=$(losetup --version 2>&1 | head -n 1)"
 rb_record "free_loop=$(losetup -f 2>/dev/null || echo none)"
 rb_record "output_dir=$RB_OUT"
-rb_log "root, lvm2, loop and device-mapper prerequisites present"
+rb_log "root, lvm2, loop, device-mapper and tmpfs-mount prerequisites present"
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     rb_check_only_finish
@@ -90,6 +110,7 @@ rb_assert_no_skip_note lvm "skipping real-LVM integration test"
 for test_name in \
     lvm_lifecycle_on_loop_device \
     lvm_non_aligned_create_rounds_up_and_absent_lv_delete_succeeds \
+    lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart \
     lvm_move_evacuates_under_concurrent_io \
     lvm_move_restart_mid_move_re_attaches_and_completes \
     lvm_move_aborted_out_of_band_while_down_parks_in_doubt \
