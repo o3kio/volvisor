@@ -532,6 +532,14 @@ pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<Comma
             if !world.lvextend_silent {
                 let effective = round_up_to_extent(size, world.extent_size);
                 let previous = world.lvs.get(path).copied().unwrap_or_default();
+                // Real `lvextend -L` refuses to shrink. Model that so a
+                // provider bug passing a smaller target cannot silently
+                // shrink the fake world.
+                if effective < previous {
+                    return Some(CommandOutput::failure(format!(
+                        "lvextend: refusing to shrink {path} from {previous} to {effective} bytes"
+                    )));
+                }
                 world.lvs.insert(path.to_owned(), effective);
                 // Consume the growth from the LV's placement PV.
                 let delta = effective.saturating_sub(previous);

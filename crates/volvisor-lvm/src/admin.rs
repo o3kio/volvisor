@@ -176,7 +176,7 @@ impl LvmProvider {
                 owner_generation,
             },
         );
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
 
         Ok(Pool {
             id: pool_id_for(device_id)?,
@@ -261,7 +261,7 @@ impl LvmProvider {
         // (that would re-claim a device whose VG no longer exists); the
         // operator gets the exact manual remediation instead.
         state.remove_device(device_id);
-        state.save(&self.state_path)?;
+        self.persist(&mut state)?;
 
         let pvremove = self.runner.run("pvremove", &["--yes", &entry.path])?;
         if !pvremove.success {

@@ -295,6 +295,11 @@ impl StoreCrashHooks {
     /// passes `n` matching consults first. One shot — the firing
     /// consult consumes the entry. A consult at a different point
     /// neither consumes nor decrements the arm.
+    ///
+    /// Only the LVM provider state save consults this table today
+    /// (including the `AfterRenameBeforeDirFsync` point). Arming a
+    /// point for a store whose save does not consult it is inert, so a
+    /// rig must not treat a non-firing arm as evidence.
     pub fn arm_save_failure(&self, store: &'static str, point: StoreSavePoint, skip: usize) {
         self.lock_failures().insert(store, (point, skip));
     }
