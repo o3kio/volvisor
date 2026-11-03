@@ -1,0 +1,128 @@
+# drill: 04-torn-journal-and-corrupt-state
+# start: 2026-11-03T11:23:40Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+daemon d4-daemon healthy pid=1635538 port=52641
+
+### 2026-11-03T11:23:40Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d4.curl POST http://127.0.0.1:52641/v2/volumes /tmp/opencode/d2-46-final/records/d4-create-keep.json 200 /tmp/opencode/d2-46-final/records/d4-create-keep.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+exit=0
+
+### 2026-11-03T11:23:40Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d4.curl POST http://127.0.0.1:52641/v2/volumes /tmp/opencode/d2-46-final/records/d4-create-tail.json 200 /tmp/opencode/d2-46-final/records/d4-create-tail.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+exit=0
+stopped d4-daemon pid=1635538 sig=TERM
+
+### 2026-11-03T11:23:41Z host=dev
+$ frames /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+{"frames": [{"start": 0, "end": 588, "sequence": 1, "payload_len": 568}, {"start": 588, "end": 1110, "sequence": 2, "payload_len": 502}, {"start": 1110, "end": 1696, "sequence": 3, "payload_len": 566}, {"start": 1696, "end": 2218, "sequence": 4, "payload_len": 502}], "valid_prefix": 2218, "file_size": 2218}
+exit=0
+
+### 2026-11-03T11:23:41Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+127d817fc2478cb6269e43fe0ac8a12e6c834c8614107dc848c79fc5fcd1de12  /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+exit=0
+baseline_size=2218 baseline_sha=127d817fc2478cb6269e43fe0ac8a12e6c834c8614107dc848c79fc5fcd1de12
+
+### 2026-11-03T11:23:41Z host=dev
+
+### 2026-11-03T11:23:41Z host=dev
+$ stat -c %s\ %n /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+2282 /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+exit=0
+daemon d4-daemon healthy pid=1635624 port=52641
+
+### 2026-11-03T11:23:41Z host=dev
+$ curl -fsS http://127.0.0.1:52641/healthz
+{"status":"ok"}exit=0
+ASSERT PASS: torn garbage tail truncated back to the valid prefix == 2218
+ASSERT PASS: torn garbage tail left the valid prefix byte-identical == 127d817fc2478cb6269e43fe0ac8a12e6c834c8614107dc848c79fc5fcd1de12
+
+### 2026-11-03T11:23:41Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d4.curl POST http://127.0.0.1:52641/v2/volumes /tmp/opencode/d2-46-final/records/d4-create-keep.json 200 /tmp/opencode/d2-46-final/records/d4-create-keep.replay.json
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+exit=0
+ASSERT PASS: replayed volume id == vol-d4-keep
+stopped d4-daemon pid=1635624 sig=TERM
+
+### 2026-11-03T11:23:41Z host=dev
+last frame starts at 1696; truncating to start+8
+
+### 2026-11-03T11:23:41Z host=dev
+$ stat -c %s\ %n /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+1704 /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+exit=0
+daemon d4-daemon healthy pid=1635886 port=52641
+ASSERT PASS: half-written last frame truncated away == 1696
+ASSERT PASS: recovered prefix matches the baseline prefix == ed13557f2d5bffbb47538d5b7873f7da2b48c0d638c2c5a6c62f930ed131742c
+
+### 2026-11-03T11:23:41Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d4.curl POST http://127.0.0.1:52641/v2/volumes /tmp/opencode/d2-46-final/records/d4-create-keep.json 200 /tmp/opencode/d2-46-final/records/d4-create-keep.replay2.json
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+exit=0
+
+### 2026-11-03T11:23:41Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d4.curl POST http://127.0.0.1:52641/v2/volumes /tmp/opencode/d2-46-final/records/d4-create-new.json 200 /tmp/opencode/d2-46-final/records/d4-create-new.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:52641/v2/volumes
+exit=0
+
+### 2026-11-03T11:23:41Z host=dev
+$ frames /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+{"frames": [{"start": 0, "end": 588, "sequence": 1, "payload_len": 568}, {"start": 588, "end": 1110, "sequence": 2, "payload_len": 502}, {"start": 1110, "end": 1696, "sequence": 3, "payload_len": 566}, {"start": 1696, "end": 2283, "sequence": 4, "payload_len": 567}, {"start": 2283, "end": 2803, "sequence": 5, "payload_len": 500}], "valid_prefix": 2803, "file_size": 2803}
+exit=0
+stopped d4-daemon pid=1635886 sig=TERM
+
+### 2026-11-03T11:23:41Z host=dev
+
+### 2026-11-03T11:23:41Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+28b24cf01ef828d13bfe4fceb58483b247570fd00e50ebc0662adb9db6c928ba  /tmp/opencode/d2-46-final/lab-d4/journal/journal.log
+exit=0
+future_journal_size=2922
+future-journal startup exit=1
+
+### 2026-11-03T11:23:41Z host=dev
+$ cat /tmp/opencode/d2-46-final/raw/d4-future-journal.daemon.log
+{"timestamp":"2026-11-03T11:23:41.830356Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:52641","provider":"Fake"}}
+Error: Config("open journal: INTERNAL: unsupported durable-state schema version: journal record state /tmp/opencode/d2-46-final/lab-d4/journal/journal.log declares schema_version 2, but this build supports at most 1; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")
+exit=0
+ASSERT PASS: future journal record startup exit == 1
+ASSERT PASS: typed future journal refusal contains unsupported\ durable-state\ schema\ version
+ASSERT PASS: future frame was not truncated == 2922
+ASSERT PASS: valid prefix before the future frame is untouched == 956aec45b3741e3c4575a903a29b3461b475ff8e260d0954d8a0bd8ef5befd2f
+
+### 2026-11-03T11:23:41Z host=dev
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d4lvm" successfully created
+lab setup tag=d4-lvm loop=/dev/loop0 vg=vg-d4lvm state=/tmp/opencode/d2-46-final/lab-d4-lvm/journal/lvm-state.json
+
+### 2026-11-03T11:23:41Z host=dev
+$ cat /tmp/opencode/d2-46-final/lab-d4-lvm/journal/lvm-state.json
+{"schema_version":1,"volumes":{"vol-partial":exit=0
+corrupt-state startup exit=1
+
+### 2026-11-03T11:23:42Z host=dev
+$ cat /tmp/opencode/d2-46-final/raw/d4-corrupt-state.daemon.log
+{"timestamp":"2026-11-03T11:23:41.994396Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:58433","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: failed to parse provider state /tmp/opencode/d2-46-final/lab-d4-lvm/journal/lvm-state.json: EOF while parsing a value at line 1 column 45")
+exit=0
+ASSERT PASS: corrupt state startup exit == 1
+ASSERT PASS: typed corrupt-state refusal contains lvm\ provider\ construction\ failed
+ASSERT PASS: corrupt state file untouched (no silent rewrite) == 879d7597c3c26cb21a45c03c4bbe6306957183633def14d40e3c7c5addebd1d1
+
+# end: 2026-11-03T11:23:42Z
+ASSERT SUMMARY: 0 failures
+  Volume group "vg-d4lvm" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d4-lvm loop=/dev/loop0 vg=vg-d4lvm

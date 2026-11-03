@@ -1,0 +1,186 @@
+# drill: 03-lost-witness
+# start: 2026-11-03T11:23:35Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+
+### 2026-11-03T11:23:35Z host=dev
+$ /root/git/volvisor-wt/w2-46/target/debug/volvisor-witnessd --check-config --config /tmp/opencode/d2-46-final/lab-d3/witnessd.toml
+{"timestamp":"2026-11-03T11:23:35.272360Z","level":"INFO","fields":{"message":"volvisor-witnessd configuration check passed","summary":"config ok: listen 127.0.0.1:58549, state_dir /tmp/opencode/d2-46-final/lab-d3/witness-state, transport plain-http loopback, lease_ttl 120s, grace 2s, suspend_budget 2s, host_credentials 2"}}
+exit=0
+witness healthy pid=1634399 port=58549
+
+### 2026-11-03T11:23:35Z host=dev
+$ ''
+exit=0
+HTTP 200 (want 200) GET http://127.0.0.1:58549/healthz
+
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-host-a.curl POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/register /tmp/opencode/d2-46-final/records/d3-register.json 200 /tmp/opencode/d2-46-final/records/d3-register.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/register
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/register
+exit=0
+{"volume_id":"vol-d3-witness","current_epoch":0}
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-host-a.curl POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant /tmp/opencode/d2-46-final/records/d3-grant-a.json 200 /tmp/opencode/d2-46-final/records/d3-grant-a.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+exit=0
+{"epoch":1,"lease_id":1,"lease_ttl_secs":120,"fencing_proof":{"volume_id":"vol-d3-witness","retired_epoch":0,"commit_index":2}}
+### 2026-11-03T11:23:35Z host=dev
+$ jq \{epoch\,lease_id\,lease_ttl_secs\} /tmp/opencode/d2-46-final/records/d3-grant-a.resp.json
+{
+  "epoch": 1,
+  "lease_id": 1,
+  "lease_ttl_secs": 120
+}
+exit=0
+ASSERT PASS: initial granted epoch == 1
+
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-admin.curl GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness '' 200 /tmp/opencode/d2-46-final/records/d3-view-before.json
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+exit=0
+{
+  "volume_id": "vol-d3-witness",
+  "current_epoch": 1,
+  "holder": "host-a",
+  "lease_state": "live",
+  "lease_id": 1,
+  "commit_index": 2
+}
+
+### 2026-11-03T11:23:35Z host=dev
+stopped d3-witness pid=1634399 sig=TERM
+healthz during outage exit=7 stderr=curl: (7) Failed to connect to 127.0.0.1 port 58549 after 0 ms: Couldn't connect to server 
+
+### 2026-11-03T11:23:35Z host=dev
+$ curl -sS --max-time 3 --config /tmp/opencode/d2-46-final/configs/d3-host-b.curl --request POST --header content-type:\ application/json --data-binary @- http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant < /tmp/opencode/d2-46-final/records/d3-grant-b-early.json
+curl: (7) Failed to connect to 127.0.0.1 port 58549 after 0 ms: Couldn't connect to server
+exit=7
+grant during outage exit=7 stderr=curl: (7) Failed to connect to 127.0.0.1 port 58549 after 0 ms: Couldn't connect to server 
+ASSERT PASS: healthz connection-refused exit during outage == 7
+ASSERT PASS: grant connection-refused exit during outage == 7
+
+### 2026-11-03T11:23:35Z host=dev
+witness healthy pid=1634535 port=58549
+
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-admin.curl GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness '' 200 /tmp/opencode/d2-46-final/records/d3-view-after.json
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+exit=0
+{
+  "volume_id": "vol-d3-witness",
+  "current_epoch": 1,
+  "holder": "host-a",
+  "lease_state": "live",
+  "lease_id": 1,
+  "commit_index": 2,
+  "registration": {
+    "volume_id": "vol-d3-witness",
+    "lineage_uuids": [
+      "0000000000000004",
+      "0000000000000005"
+    ],
+    "endpoints": [
+      {
+        "host_id": "host-a",
+        "backing": "vg-near/vol-d3-00000004",
+        "volvisor_created": true
+      },
+      {
+        "host_id": "host-b",
+        "backing": "vg-near/vol-d3-00000004",
+        "volvisor_created": false
+      }
+    ],
+    "barrier": null,
+    "registered_at": 1793705015
+  }
+}
+ASSERT PASS: epoch survived witness restart == 1
+ASSERT PASS: holder survived witness restart == host-a
+ASSERT PASS: lease survived witness restart == 1
+ASSERT PASS: commit index survived witness restart == 2
+ASSERT PASS: registration endpoints survived witness restart == 2
+
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-host-b.curl POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant /tmp/opencode/d2-46-final/records/d3-grant-b-early.json 409 /tmp/opencode/d2-46-final/records/d3-grant-b-early.resp.json
+HTTP 409 (want 409) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+HTTP 409 (want 409) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+exit=0
+{
+  "code": "LEASE_HELD",
+  "message": "witness lease held; current_epoch=1"
+}
+ASSERT PASS: live-lease grant refusal code contains LEASE_HELD
+
+### 2026-11-03T11:23:35Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-host-a.curl POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/revoke /tmp/opencode/d2-46-final/records/d3-revoke-a.json 200 /tmp/opencode/d2-46-final/records/d3-revoke-a.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/revoke
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/revoke
+exit=0
+{
+  "fencing_proof": {
+    "volume_id": "vol-d3-witness",
+    "retired_epoch": 1,
+    "commit_index": 3
+  }
+}
+
+### 2026-11-03T11:23:35Z host=dev
+
+### 2026-11-03T11:23:40Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-host-b.curl POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant /tmp/opencode/d2-46-final/records/d3-grant-b.json 200 /tmp/opencode/d2-46-final/records/d3-grant-b.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+HTTP 200 (want 200) POST http://127.0.0.1:58549/v1/volumes/vol-d3-witness/grant
+exit=0
+{
+  "epoch": 2,
+  "lease_id": 2,
+  "fencing_proof": {
+    "volume_id": "vol-d3-witness",
+    "retired_epoch": 1,
+    "commit_index": 4
+  }
+}
+ASSERT PASS: successor epoch after failover == 2
+
+### 2026-11-03T11:23:40Z host=dev
+$ api_expect /tmp/opencode/d2-46-final/configs/d3-admin.curl GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness '' 200 /tmp/opencode/d2-46-final/records/d3-view-final.json
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+HTTP 200 (want 200) GET http://127.0.0.1:58549/v1/volumes/vol-d3-witness
+exit=0
+{
+  "current_epoch": 2,
+  "holder": "host-b",
+  "lease_state": "live",
+  "lease_id": 2,
+  "commit_index": 4,
+  "retirements": [
+    {
+      "epoch": 0,
+      "commit_index": 2
+    },
+    {
+      "epoch": 1,
+      "commit_index": 3
+    }
+  ]
+}
+
+### 2026-11-03T11:23:40Z host=dev
+$ ls -l /tmp/opencode/d2-46-final/lab-d3/witness-state
+total 4
+-rw------- 1 root root    0 Nov  3 11:23 journal.lock
+-rw------- 1 root root 3453 Nov  3 11:23 journal.log
+exit=0
+stopped d3-witness pid=1634535 sig=TERM
+
+# end: 2026-11-03T11:23:40Z
+ASSERT SUMMARY: 0 failures

@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:34.777198Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:53501","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: unsupported durable-state schema version: lvm state /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json declares schema_version 2, but this build supports at most 1; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")

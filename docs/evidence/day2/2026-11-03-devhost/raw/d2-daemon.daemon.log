@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-03T11:23:34.808350Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:53501","provider":"Lvm"}}
+{"timestamp":"2026-11-03T11:23:34.881444Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:53501","tls":false}}
+{"timestamp":"2026-11-03T11:23:34.882182Z","level":"WARN","fields":{"message":"grow notification outstanding; retried next pass","kind":"grow_retry","volume_id":"vol-upgrade-n1","detail":"grow-notification version gate refused: no vmm.cloud_hypervisor binary is configured; the grow-notification version gate cannot prove the VMM version"}}
+{"timestamp":"2026-11-03T11:23:34.930714Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"GET","route":"/v2/volumes/{volume_id}","status":200,"outcome":"success","operation_id":""}}

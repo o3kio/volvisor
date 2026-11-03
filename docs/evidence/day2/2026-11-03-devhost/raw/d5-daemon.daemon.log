@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-03T11:23:42.595662Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:35339","provider":"Fake"}}
+{"timestamp":"2026-11-03T11:23:42.597608Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:35339","tls":false}}
+{"timestamp":"2026-11-03T11:23:42.730102Z","level":"INFO","fields":{"message":"accepting create_volume","kind":"create_volume","operation_id":"op-d5-create-full","volume_id":"vol-d5-full"}}
+{"timestamp":"2026-11-03T11:23:42.730599Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"POST","route":"/v2/volumes","status":200,"outcome":"success","operation_id":"op-d5-create-full"}}

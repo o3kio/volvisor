@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-03T11:23:49.267264Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:47917","provider":"Fake"}}
+{"timestamp":"2026-11-03T11:23:49.268336Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:47917","tls":true}}
+{"timestamp":"2026-11-03T11:23:49.425917Z","level":"INFO","fields":{"message":"accepting create_volume","kind":"create_volume","operation_id":"op-d7-cred-a","volume_id":"vol-d7-cred-a"}}
+{"timestamp":"2026-11-03T11:23:49.427420Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"POST","route":"/v2/volumes","status":200,"outcome":"success","operation_id":"op-d7-cred-a"}}

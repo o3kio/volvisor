@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:46.982614Z","level":"INFO","fields":{"message":"volvisor-witnessd starting (prototype; not production supported)","listen":"127.0.0.1:56197","lease_ttl_secs":60}}
+Error: Config("witness journal open failed: INTERNAL: journal directory /tmp/opencode/d2-46-final/lab-d6/witness-state is already locked by another writer (single-writer enforcement): Resource temporarily unavailable (os error 11)")

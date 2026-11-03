@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-03T11:23:46.878536Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:55471","provider":"Lvm"}}
+Error: Config("open journal: INTERNAL: journal directory /tmp/opencode/d2-46-final/lab-d6-lvm/journal is already locked by another writer (single-writer enforcement): Resource temporarily unavailable (os error 11)")

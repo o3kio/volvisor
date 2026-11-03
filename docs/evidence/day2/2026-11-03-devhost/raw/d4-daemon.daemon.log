@@ -1,0 +1,7 @@
+{"timestamp":"2026-11-03T11:23:41.484036Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:52641","provider":"Fake"}}
+{"timestamp":"2026-11-03T11:23:41.485709Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:52641","tls":false}}
+{"timestamp":"2026-11-03T11:23:41.622118Z","level":"INFO","fields":{"message":"accepting create_volume","kind":"create_volume","operation_id":"op-d4-create-keep","volume_id":"vol-d4-keep"}}
+{"timestamp":"2026-11-03T11:23:41.622300Z","level":"INFO","fields":{"message":"replaying recorded outcome without executing","kind":"create_volume","operation_id":"op-d4-create-keep"}}
+{"timestamp":"2026-11-03T11:23:41.622375Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"POST","route":"/v2/volumes","status":200,"outcome":"success","operation_id":"op-d4-create-keep"}}
+{"timestamp":"2026-11-03T11:23:41.640591Z","level":"INFO","fields":{"message":"accepting create_volume","kind":"create_volume","operation_id":"op-d4-create-new","volume_id":"vol-d4-new"}}
+{"timestamp":"2026-11-03T11:23:41.641678Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"POST","route":"/v2/volumes","status":200,"outcome":"success","operation_id":"op-d4-create-new"}}

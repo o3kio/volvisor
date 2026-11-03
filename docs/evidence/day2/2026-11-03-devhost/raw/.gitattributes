@@ -1,0 +1,4 @@
+# Captured terminal output can legitimately end a line with a space (for
+# example, stderr collected with `tr '\n' ' '`). These raw logs are kept
+# byte-for-byte; do not flag trailing bytes as whitespace errors.
+*.log whitespace=-blank-at-eol

@@ -1,0 +1,175 @@
+# drill: 02-schema-upgrade
+# start: 2026-11-03T11:23:31Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: e551d26af7cdedb468797ff8049e0b91b9ab416d
+# worktree_dirty: no
+# runner: uid=0
+
+
+### 2026-11-03T11:23:31Z host=dev
+
+### 2026-11-03T11:23:31Z host=dev
+$ cargo test --manifest-path /root/git/volvisor-wt/w2-46/Cargo.toml --locked -p volvisord --test schema_upgrade -- --nocapture
+   Compiling volvisord v0.1.0 (/root/git/volvisor-wt/w2-46/crates/volvisord)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.21s
+     Running tests/schema_upgrade.rs (volvisor-wt/w2-46/target/debug/deps/schema_upgrade-03056ba63e9b7dbf)
+
+running 2 tests
+test each_covered_store_refuses_a_newer_schema_on_open ... ok
+test a_populated_pre_versioning_state_directory_upgrades_in_place ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+exit=0
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-volvisor" successfully created
+lab setup tag=d2 loop=/dev/loop0 vg=vg-volvisor state=/tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+
+### 2026-11-03T11:23:34Z host=dev
+$ cat /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+{
+  "volumes": {
+    "vol-upgrade-n1": {
+      "entry": {
+        "vg_name": "vg-volvisor",
+        "lv_name": "vol-vol-upgrade-n1-abcd1234",
+        "size_bytes": 2147483648,
+        "requested_size_bytes": 2147483648,
+        "generation": 7,
+        "data_epoch": 3,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-upgrade-n1",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 5,
+          "access_mode": "single_writer",
+          "vmm_disk_id": "disk-n1",
+          "state": "active",
+          "state_revision": 3,
+          "evidence": "guest_confirmed",
+          "reporter": "consumer-upgrade",
+          "recorded_at_ms": 1700000000123
+        }
+      }
+    },
+    "vol-upgrade-tombstone": {
+      "entry": {
+        "vg_name": "vg-volvisor",
+        "lv_name": "vol-vol-upgrade-tombstone-abcd1234",
+        "size_bytes": 1073741824,
+        "requested_size_bytes": 1073741824,
+        "generation": 9,
+        "data_epoch": 4,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null,
+        "retired_attachment_ids": [
+          "att-retired-oldest",
+          "att-retired-newer"
+        ]
+      }
+    }
+  },
+  "devices": {
+    "dev-d2b01": {
+      "stable_identity": "day2-lab-d2",
+      "path": "/dev/loop0",
+      "vg_name": "vg-volvisor",
+      "role": "native_pool",
+      "owner_generation": 1
+    }
+  },
+  "moves": {}
+}
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ lvcreate --yes -n vol-vol-upgrade-n1-abcd1234 -L 2G vg-volvisor
+  Logical volume "vol-vol-upgrade-n1-abcd1234" created.
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ lvcreate --yes -n vol-vol-upgrade-tombstone-abcd1234 -L 1G vg-volvisor
+  Logical volume "vol-vol-upgrade-tombstone-abcd1234" created.
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ jq has\(\"schema_version\"\) /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+false
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+225a71d4900d1e686a6201b589150ec0044c289b2e08f32ad5e23c2582cc2fa1  /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+exit=0
+daemon d2-daemon healthy pid=1634115 port=53501
+HTTP 200 (want 200) POST http://127.0.0.1:53501/v2/volumes
+stopped d2-daemon pid=1634115 sig=TERM
+
+### 2026-11-03T11:23:34Z host=dev
+$ jq .schema_version /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+1
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ jq .volumes\[\"vol-upgrade-n1\"\].runtime.attachment\ \|\ \{state\,state_revision\,evidence\} /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+{
+  "state": "active",
+  "state_revision": 3,
+  "evidence": "guest_confirmed"
+}
+exit=0
+
+### 2026-11-03T11:23:34Z host=dev
+$ jq .volumes\[\"vol-upgrade-tombstone\"\].runtime.retired_attachment_ids /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+[
+  "att-retired-oldest",
+  "att-retired-newer"
+]
+exit=0
+ASSERT PASS: upgraded schema_version == 1
+ASSERT PASS: upgraded attachment state == active
+ASSERT PASS: upgraded attachment state_revision == 3
+ASSERT PASS: upgraded tombstones == att-retired-oldest\,att-retired-newer
+
+### 2026-11-03T11:23:34Z host=dev
+
+### 2026-11-03T11:23:34Z host=dev
+$ sha256sum /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+0df9f3325be51018ddcb56a377b632d14ede5268176f09235539f28c43205b71  /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json
+exit=0
+future-schema startup exit=1
+
+### 2026-11-03T11:23:34Z host=dev
+$ cat /tmp/opencode/d2-46-final/raw/d2-future.daemon.log
+{"timestamp":"2026-11-03T11:23:34.777198Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:53501","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: unsupported durable-state schema version: lvm state /tmp/opencode/d2-46-final/lab-d2/journal/lvm-state.json declares schema_version 2, but this build supports at most 1; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")
+exit=0
+ASSERT PASS: future schema startup exit status == 1
+ASSERT PASS: typed future-schema refusal contains unsupported\ durable-state\ schema\ version
+ASSERT PASS: future schema file untouched == 0df9f3325be51018ddcb56a377b632d14ede5268176f09235539f28c43205b71
+
+### 2026-11-03T11:23:34Z host=dev
+daemon d2-daemon healthy pid=1634283 port=53501
+HTTP 200 (want 200) GET http://127.0.0.1:53501/v2/volumes/vol-upgrade-n1
+{"allocated_bytes":2147483648,"attachment_ids":["att-upgrade-n1"],"attachments":[{"access_mode":"single_writer","attachment_generation":5,"attachment_id":"att-upgrade-n1","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-volvisor/vol-vol-upgrade-n1-abcd1234"}},"host_id":"host-upgrade","recorded_at_ms":1700000000123,"reporter":"consumer-upgrade","state":"active","state_revision":3,"vm_id":"vm-upgrade","vmm_disk_id":"disk-n1"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-upgrade-n1","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":7,"health":"Unknown","project_id":"tenant-upgrade","provisioned_bytes":2147483648,"state":"Attached","volume_id":"vol-upgrade-n1"}stopped d2-daemon pid=1634283 sig=TERM
+
+# end: 2026-11-03T11:23:35Z
+ASSERT SUMMARY: 0 failures
+  Logical volume "vol-vol-upgrade-n1-abcd1234" successfully removed.
+  Logical volume "vol-vol-upgrade-tombstone-abcd1234" successfully removed.
+  Logical volume "vol-vol-d2-new-a05c5bf2" successfully removed.
+  Volume group "vg-volvisor" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d2 loop=/dev/loop0 vg=vg-volvisor
