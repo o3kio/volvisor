@@ -1,0 +1,14 @@
+# captured: 2026-11-03T20:22:04Z
+# orchestrator check after the drill, not a drill assertion
+
+$ vgs
+exit=0
+
+$ pvs
+exit=0
+
+$ losetup -a
+exit=0
+
+$ mount | grep -F '/tmp/opencode/volvisor-d5-redrill-20261103T202159Z'
+exit=1

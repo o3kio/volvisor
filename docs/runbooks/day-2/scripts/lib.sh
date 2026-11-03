@@ -45,8 +45,12 @@ end_drill() {
 say() { printf '\n### %s host=%s\n' "$(now)" "$(uname -n)" | tee -a "$LOG"; }
 
 # cap <tag> <command...>: run, record exact argv/stdout/stderr/exit status.
+# CAP_EXPECT_RC (default 0) is the status the command is expected to return;
+# any other status is an assertion failure. Set it for commands whose nonzero
+# status is itself the observation (D3's transport-failure capture).
 cap() {
   local tag="$1"; shift
+  local want_rc="${CAP_EXPECT_RC:-0}"
   say "$tag"
   local rc
   {
@@ -60,12 +64,22 @@ cap() {
     # status so PIPESTATUS[0] actually carries the failure.
     exit "$rc"
   } 2>&1 | tee -a "$LOG"
-  return "${PIPESTATUS[0]}"
+  rc="${PIPESTATUS[0]}"
+  # The command ran in the pipeline's subshell, so any path that increments
+  # ASSERT_FAILS there (api_expect on a status mismatch, a local assert) is
+  # lost to the parent. Count an unexpected status here instead: every `cap`
+  # command is expected to succeed unless CAP_EXPECT_RC says otherwise.
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    printf 'ASSERT FAIL: cap %q exited %s (expected %s)\n' "$tag" "$rc" "$want_rc" | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+  return "$rc"
 }
 
 # cap_stdin <tag> <file> <command...>: same, but feed <file> on stdin.
 cap_stdin() {
   local tag="$1" input="$2"; shift 2
+  local want_rc="${CAP_EXPECT_RC:-0}"
   say "$tag"
   local rc
   {
@@ -77,7 +91,12 @@ cap_stdin() {
     printf 'exit=%s\n' "$rc"
     exit "$rc"
   } 2>&1 | tee -a "$LOG"
-  return "${PIPESTATUS[0]}"
+  rc="${PIPESTATUS[0]}"
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    printf 'ASSERT FAIL: cap_stdin %q exited %s (expected %s)\n' "$tag" "$rc" "$want_rc" | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+  return "$rc"
 }
 
 # record_file <tag> <path>: copy a file's exact bytes into the raw log.
@@ -272,7 +291,10 @@ lvm_lab_teardown() {
   [[ -f "$RUN/records/$tag.loop" ]] && loop="$(cat "$RUN/records/$tag.loop")"
   [[ -f "$RUN/records/$tag.vg" ]] && vg="$(cat "$RUN/records/$tag.vg")"
   if [[ -n "$vg" ]] && vgs "$vg" >/dev/null 2>&1; then
-    owners="$(pvs --noheadings -o pv_name "$vg" 2>/dev/null | xargs)"
+    # `pvs` positional arguments are *PV* names, not VG names: `pvs "$vg"`
+    # prints nothing and the ownership guard would refuse every teardown.
+    # Ask the VG which PVs back it instead.
+    owners="$(vgs --noheadings -o pv_name "$vg" 2>/dev/null | xargs)"
     if [[ -z "$loop" || "$owners" != "$loop" ]]; then
       printf 'REFUSING to remove VG %s: its PVs (%s) are not this drill'"'"'s loop (%s)\n' \
         "$vg" "${owners:-unknown}" "${loop:-unknown}" | tee -a "$LOG"

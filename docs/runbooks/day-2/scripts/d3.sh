@@ -114,7 +114,7 @@ stop_pidfile "$TAG-witness" TERM
 curl -sS --max-time 3 "$BASE/healthz" >"$RUN/records/$TAG-down-health.out" 2>"$RUN/records/$TAG-down-health.err"
 DOWN_RC=$?
 printf 'healthz during outage exit=%s stderr=%s\n' "$DOWN_RC" "$(tr '\n' ' ' <"$RUN/records/$TAG-down-health.err")" | tee -a "$LOG"
-cap_stdin "grant while the witness is unavailable (transport failure, no authority minted)" \
+CAP_EXPECT_RC=7 cap_stdin "grant while the witness is unavailable (transport failure, no authority minted)" \
   "$RUN/records/$TAG-grant-b-early.json" \
   curl -sS --max-time 3 --config "$B_CURL" --request POST \
   --header 'content-type: application/json' --data-binary @- \

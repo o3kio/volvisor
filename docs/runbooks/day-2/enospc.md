@@ -1,10 +1,16 @@
 # Disk full / ENOSPC during a journal or state write — day-2 runbook
 
-**Status: DRILLED on `e551d26`; the provider-state gap found by the drill
-([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code
-([PR #69](https://github.com/o3kio/volvisor/pull/69)). The post-fix path is
-covered by a real-LVM ENOSPC regression test, but the full D5 drill has not
-been re-run at the merged revision.**
+**Status: DRILLED on `e551d26`; re-run post-fix at product `1863a7a` and
+harness `940722e` for the normal uncommitted-save path.** The provider-state
+gap found by the drill
+([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed and merged in
+[PR #69](https://github.com/o3kio/volvisor/pull/69). D5 was re-drilled after
+the fix on one host (both parts: the journal path and the provider-state normal
+path). The
+cleanup-failure, post-rename carve-out and unreadable-durable-reread branches
+were not fault-injected by the re-drill; they are covered by the deterministic
+tests added in #69. See the
+[post-fix re-drill bundle](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 
 - **Journal ENOSPC:** fail-closed. HTTP 500, no volume, torn append
   truncated on restart, retry succeeds after space is freed.
@@ -56,8 +62,12 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
   compensated and the in-memory entry is rolled back; only a failing
   compensating `lvremove` leaves an orphan that needs manual cleanup.
   **RTO:** free space + restart + retry; add one manual `lvremove` for the
-  cleanup-failure tail. The post-fix path has not been re-drilled
-  end-to-end at the merged revision.
+  cleanup-failure tail. The normal uncommitted-save path was re-drilled
+  post-fix at product `1863a7a` / harness `940722e`: the failed create stayed
+  non-durable, the LV was compensated, and same-process plus post-restart GET
+  returned 404. The cleanup-failure, carve-out and indeterminate branches
+  were not fault-injected in that re-drill; they remain the four-outcome
+  procedure above and are covered by tests, not by an end-to-end drill.
 
 ## Preconditions
 
@@ -305,7 +315,8 @@ record is missing from a stale backup is data loss.
    - **indeterminate:** do not retry; investigate the unreadable durable
      file and compare a backup first.
 
-   Verify exactly one durable volume and one LV.
+   Verify exactly one durable volume record for the retried volume id and one
+   LV for it; pre-existing volumes and their LVs are unchanged.
 
 Outside the indeterminate case the old durable state is safe. The states
 that need operator attention are the carve-out (served but not
@@ -356,14 +367,52 @@ D5 part A: 12060-byte journal with 228 bytes of slack, tmpfs filled, create
 retry 200. Part B (historical, pre-fix): 1023-byte state, tmpfs filled,
 create 500, old state unchanged, in-memory GET 200, LV present, restart GET
 404, LV still present, new create 200. Raw:
-[raw/05-enospc.log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log).
+[pre-fix raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log).
 
-The post-fix state path is exercised by
+**Post-fix re-drill (normal uncommitted-save path), product `1863a7a` /
+harness `940722e`:**
+
+- Part A re-confirmed: journal 12060 bytes with 228 bytes of slack, SHA256
+  `41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172`;
+  tmpfs filled (filler 249856 bytes); create 500/`INTERNAL` with
+  `failed to write journal record: No space left on device (os error 28)`;
+  volume 404; journal 12288 immediately after; restart truncated it to 12060
+  with the same SHA256; same-`operation_id` retry 200/`vol-d5-full`;
+  `valid_frames=24 valid_prefix=13166 file_size=13166`.
+- Part B: baseline state 1023 bytes, SHA256
+  `687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2`;
+  create 500/`INTERNAL` naming
+  `.../lab-d5/statefs/lvm-state.json.tmp: No space left on device (os error
+  28)` and no `manual lvremove`; old state byte-identical; no failed-volume
+  record; no `.tmp`; the failed-volume LV
+  `vol-vol-d5-lvm-full-58c0134e` removed, leaving only
+  `vol-vol-d5-lvm-baseline-3498a2bf`; same-process GET 404 and list exactly
+  the baseline; stop while full, free, restart: still 404, baseline still
+  200/`Ready`, state still 1023 bytes / same SHA256, still no record, no
+  `.tmp`, only the baseline LV; same `op-d5-lvm-full` replay 500 byte-identical
+  (asserted with `cmp`) with daemon
+  log `replaying recorded outcome without executing`; new
+  `op-d5-lvm-full-newop` 200/`vol-d5-lvm-full`/`Ready`/`provisioned_bytes=67108864`; final state 1767
+  bytes, SHA256
+  `43e090d7635dfe855a48f31d4b225c98d9f80c5ada364e0aa4730cb520557e1d`,
+  exactly 2 volume records and 2 LVs, no `.tmp`. Part A also asserted the
+  refused create was `INTERNAL` and that the failed append grew the journal
+  before ENOSPC, so the truncate-back check cannot pass vacuously. The run
+  produced 51 `ASSERT PASS` lines and `ASSERT SUMMARY: 0 failures`; the
+  separate orchestrator record shows exit status 0. Raw:
+  [post-fix raw log](../../evidence/day2/2026-11-03-d5-redrill/raw/05-enospc.log),
+  [post-fix report](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
+
+The post-fix state path is also exercised by
 `lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
 in the real-LVM suite (256 KiB tmpfs, real ENOSPC, real `lvremove`, restart
-and retry). That is a code-level regression test, not a full re-run of D5.
+and retry), plus deterministic tests for the cleanup-failure, carve-out and
+unreadable-reread branches. Those are code-level regression tests, not a
+full re-run of every branch.
 
 **Limits:** filesystem ENOSPC only (not inode/thin-pool/metadata); fake
 provider for the journal; loop LVM for state; single host; no concurrent
-writer; the D5 part B observations describe the pre-fix code and must not be
-used as the post-fix expected behavior.
+writer; the pre-fix bundle's D5 part B observations describe the old code and
+must not be used as post-fix expected behavior. The post-fix re-drill covers
+the normal uncommitted-save path only; its cleanup-failure, carve-out and
+indeterminate branches remain test-covered, not drilled.

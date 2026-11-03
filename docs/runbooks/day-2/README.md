@@ -11,6 +11,15 @@ worktree on the single development host `dev`. The committed bundle is
 [`docs/evidence/day2/2026-11-03-devhost/`](../../evidence/day2/2026-11-03-devhost/).
 The scripts that produced it are in [`scripts/`](scripts/).
 
+D5 was **re-run post-fix** (both parts) at harness
+`940722ea3322df0a47834c307e2e0081c57e0b5e` (`940722e`) with product code
+identical to merged `1863a7a` (PR #69). That re-drill covers the normal
+uncommitted-save state-ENOSPC path and re-confirms the journal path on the same
+single host; the
+cleanup-failure, carve-out and unreadable-durable-reread tails were not
+fault-injected and remain test-covered. Bundle:
+[`docs/evidence/day2/2026-11-03-d5-redrill/`](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
+
 This page is the index. Each area page states **DRILLED**, **PARTIAL** or
 **NOT RUN — REQUIRES ...** at the top. Where an area has a drilled part and an
 undrilled part, both are named; the overall verdict is the weaker one.
@@ -23,7 +32,7 @@ undrilled part, both are named; the overall verdict is the weaker one.
 | Upgrade and rollback across schema versions | **PARTIAL** — schema policy drilled; live binary upgrade/rollback **NOT RUN** | [upgrade-and-rollback.md](upgrade-and-rollback.md) | [D2](../../evidence/day2/2026-11-03-devhost/raw/02-schema-upgrade.log) |
 | Lost or unreachable witness | **PARTIAL** — witness service drilled; storage-side fencing **NOT RUN** | [lost-witness.md](lost-witness.md) | [D3](../../evidence/day2/2026-11-03-devhost/raw/03-lost-witness.log) |
 | Torn/corrupt journal tail and corrupt state file | **DRILLED** | [journal-and-state-corruption.md](journal-and-state-corruption.md) | [D4](../../evidence/day2/2026-11-03-devhost/raw/04-torn-journal-and-corrupt-state.log) |
-| Disk full / ENOSPC during journal or state write | **DRILLED**; the state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code ([PR #69](https://github.com/o3kio/volvisor/pull/69)), post-fix path covered by a regression test | [enospc.md](enospc.md) | [D5](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log) |
+| Disk full / ENOSPC during journal or state write | **DRILLED — pre-fix finding + post-fix re-drill (both parts); tails covered by tests** | [enospc.md](enospc.md) | [pre-fix D5](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log), [post-fix D5](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md) |
 | Daemon crash loop and single-writer lock contention | **DRILLED** | [crash-loop-and-lock.md](crash-loop-and-lock.md) | [D6](../../evidence/day2/2026-11-03-devhost/raw/06-crash-loop-and-lock.log) |
 | Credential and certificate rotation | **DRILLED** — restart-based; no hot reload | [credential-and-cert-rotation.md](credential-and-cert-rotation.md) | [D7](../../evidence/day2/2026-11-03-devhost/raw/07-credential-and-cert-rotation.log) |
 | Total loss of one host and re-admission | **NOT RUN — REQUIRES** a real multi-host lab, a third failure domain and BMC/fencing | [host-loss-and-rejoin.md](host-loss-and-rejoin.md) | none |
@@ -43,7 +52,7 @@ exactly that; it is not zero.
 | Torn journal tail | Only the incomplete last record; acknowledged prior records survived | Restart to health | D4 |
 | Corrupt state file | Backup point; the daemon refuses to guess | Restore + reconciliation; not measured | D4 |
 | Journal ENOSPC | No acknowledged state lost; the failed create is absent | Free space + restart; measured in seconds in the lab | D5 part A |
-| Provider-state ENOSPC | For an uncommitted save the failed create is not durable; the LV is compensated, and only a failing cleanup leaves an operator-visible orphan. In the rare post-rename carve-out the record **is** durable and the volume is served | Free space + restart + retry for the uncommitted cases; manual `lvremove` for the cleanup-failure tail; in the carve-out a new `operation_id` returns the volume idempotently. Post-fix path covered by a regression test | D5 part B (historical), [#58](https://github.com/o3kio/volvisor/issues/58) fix |
+| Provider-state ENOSPC | For an uncommitted save the failed create is not durable; the LV is compensated, and only a failing cleanup leaves an operator-visible orphan. In the rare post-rename carve-out the record **is** durable and the volume is served | Free space + restart + retry for the uncommitted cases; manual `lvremove` for the cleanup-failure tail; in the carve-out a new `operation_id` returns the volume idempotently. Normal path re-drilled post-fix; cleanup-failure, carve-out and indeterminate branches covered by tests, not fault-injected | Post-fix D5 re-drill (both parts), product `1863a7a` / harness `940722e`, plus [#69](https://github.com/o3kio/volvisor/pull/69) tests |
 | Crash loop with in-flight requests | The in-flight request may fail; prior durable state survived every SIGKILL | Restart/replay to health; not separately measured | D6 |
 | Token/certificate rotation | No control-plane state loss | Two controlled restarts (overlap + removal), plus client rollout | D7 |
 | Total host loss | **Unknown**; async replication can lose its tail | **Unknown** | D8 NOT RUN |
@@ -132,10 +141,14 @@ It does not touch pre-existing VGs. Do not run it on a production host.
 ## Known gaps filed as issues
 
 - [#58](https://github.com/o3kio/volvisor/issues/58) — LVM create returned 500
-  on state-save ENOSPC and left the LV, serving it from memory. Fixed in code
-  by [PR #69](https://github.com/o3kio/volvisor/pull/69); the post-fix path is
-  covered by a regression test, but D5 has not been re-run at the merged
-  revision.
+  on state-save ENOSPC and left the LV, serving it from memory. Fixed by
+  [PR #69](https://github.com/o3kio/volvisor/pull/69) (merged at `1863a7a`) and
+  re-drilled post-fix at harness `940722e` for the normal uncommitted-save
+  path; the cleanup-failure, carve-out and indeterminate branches are
+  test-covered, not drilled. The separate out-of-scope work (grow/delete/move
+  persist divergence, the kill-9 `lvcreate`→persist orphan window, and a real
+  post-rename directory-fsync fault seam) remains
+  [#70](https://github.com/o3kio/volvisor/issues/70).
 - [#37](https://github.com/o3kio/volvisor/issues/37) — three-physical-host
   nearline campaign, the prerequisite for real host-loss evidence.
 - [#38](https://github.com/o3kio/volvisor/issues/38) — three-host Rook-cell

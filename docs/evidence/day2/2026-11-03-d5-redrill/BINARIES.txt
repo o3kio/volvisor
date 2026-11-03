@@ -1,0 +1,31 @@
+Binary identity
+===============
+
+Product code: 1863a7ac250d20246c328a2fd4c4acca330e3693 (PR #69)
+Run HEAD:     940722ea3322df0a47834c307e2e0081c57e0b5e
+Build:        cargo build --locked, debug profile, clean worktree
+
+The product tree is identical between 1863a7a and 940722e; only the three
+day-2 harness scripts (d3.sh, d5.sh, lib.sh) differ. The binary's version
+stamp is the run HEAD because that was `git describe --tags --always` at build
+time. It is not a release tag: no tags exist.
+
+SHA256
+------
+b40a97c307194270d7cfd69bb1463ad2a2cc2ef0b43f48950862a37434f602f5  target/debug/volvisord
+
+Version stamp
+-------------
+volvisord 940722e
+
+Notes
+-----
+- Only volvisord was used. volvisor-witnessd was not used for this drill; no
+  witness SHA256 is claimed.
+- This is a debug-profile binary from `cargo build --locked`.
+- The binary SHA256 and `--version` were collected outside the raw drill log.
+  The raw header records `source_sha` and `worktree_dirty`, not the binary
+  digest. This file is corroborating metadata, not a byte-level anchor
+  captured inside the drill.
+- The version stamp is a repository description, not a content hash.
+- No release artifact, package or signed tag was produced.

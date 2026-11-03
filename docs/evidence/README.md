@@ -32,6 +32,14 @@ working directory. Read this page before adding a bundle or citing one.
   storage-side DRBD fencing, not a live binary upgrade, and not a data-plane
   backup. Total host loss/re-admission is **NOT RUN**. Procedures:
   [day-2 runbooks](../runbooks/day-2/README.md).
+- **D5 post-fix re-drill exists** under
+  [`docs/evidence/day2/2026-11-03-d5-redrill/`](day2/2026-11-03-d5-redrill/).
+  It re-runs D5 (ENOSPC) on the same single development host with product
+  code identical to merged `1863a7a` (the #58 fix, PR #69) and a clean
+  worktree. It covers the normal uncommitted state-save path and re-confirms
+  the journal path; the cleanup-failure, post-rename carve-out and
+  unreadable-reread branches are test-covered, not fault-injected. It is a
+  single-host debug-build lab result, not production or multi-host evidence.
 - **Transport/TLS evidence exists** under
   [`docs/evidence/transport-tls/`](transport-tls/2026-11-02-devhost-netns/).
   It is a **same-host** netns/veth run: a real rustls listener, private-CA

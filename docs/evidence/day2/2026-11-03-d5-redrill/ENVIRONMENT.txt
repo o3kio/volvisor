@@ -1,0 +1,104 @@
+D5 post-fix re-drill environment
+================================
+Run window: 2026-11-03T20:21:59Z .. 2026-11-03T20:22:02Z
+Orchestrator run: start 2026-11-03T20:21:59Z, end 2026-11-03T20:22:02Z, exit 0
+Post-run capture: 2026-11-03T20:22:04Z
+Host: dev (single development host; not a multi-host lab)
+Runner: uid=0(root)
+
+Run-time identity (recorded in the raw drill header)
+----------------------------------------------------
+source_sha:      940722ea3322df0a47834c307e2e0081c57e0b5e
+worktree_dirty:  no
+runner:          uid=0
+The `worktree_dirty` flag comes from `git -C "$REPO" status --porcelain`,
+which includes untracked, non-ignored files. The harness scripts are tracked
+at `940722e`, the same commit the header records, so a clean worktree binds
+both the product tree and the script bytes. See SCRIPTS.txt.
+The separate `raw/orchestrator-run.txt` records the command, start and end
+timestamps and exit status (0).
+
+Product-code identity
+---------------------
+The merged product revision is
+1863a7ac250d20246c328a2fd4c4acca330e3693 (PR #69).
+The run's HEAD was the harness commit 940722e, three commits on top of 1863a7a.
+`git diff --name-only 1863a7a 940722e -- crates/ Cargo.toml Cargo.lock
+release-scope.toml` is empty; only the three day-2 scripts (d3.sh, d5.sh,
+lib.sh) differ. The product code executed is therefore identical to 1863a7a.
+
+Tags: none (`git tag --list` is empty; `git describe --tags --always` =
+940722e).
+
+Host
+----
+uname:   Linux dev 6.8.0-142-generic x86_64
+Kernel:  6.8.0-142-generic
+CPUs:    16
+Memory:  31 GiB
+Host name and kernel are from the raw drill header. Architecture, CPU count
+and memory were collected at bundle-authoring time on the same host; the
+drill does not record them.
+Every daemon, client and the lab ran on 127.0.0.1 on this host.
+
+Toolchain (collected at bundle-authoring time on the same host)
+---------------------------------------------------------------
+These versions are recorded for orientation. The raw drill log does not
+capture tool versions; only source_sha, worktree_dirty, host, kernel, runner
+and timestamps are in the header.
+rustc:   rustc 1.99.0 (b940084d7 2026-09-28)
+cargo:   cargo 1.99.0 (5f94df478 2026-08-27)
+lvm:     LVM version 2.03.16(2) (2022-05-18); Library 1.02.185; Driver 4.48.0
+python3: Python 3.12.3
+jq:      jq-1.7
+curl:    curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13
+losetup: losetup from util-linux 2.39.3
+flock:   flock from util-linux 2.39.3
+
+Lab topology
+------------
+- Part A: journal directory on a dedicated 256 KiB tmpfs
+  ($RUN/lab-d5/journalfs); fake provider; no LVM.
+- Part B: loop-backed volume group vg-d5lvm on /dev/loop0; provider state on
+  a second 256 KiB tmpfs ($RUN/lab-d5/statefs); journal on ordinary storage
+  ($RUN/lab-d5/lvm-journal), so only the state save hits ENOSPC after
+  lvcreate.
+- The lab creates disposable loop devices, volume groups and tmpfs mounts and
+  tears them down. Do not run it on a host with production volume groups.
+
+Absent capabilities / non-claims
+--------------------------------
+Second host:      none. No multi-host path, no independent failure domain.
+Real disk:        no. ENOSPC was injected with tmpfs, not a failing device.
+Inode exhaustion: not injected.
+Thin-pool data exhaustion: not injected.
+LVM metadata exhaustion:   not injected.
+Ceph:             not used; not present in this run.
+DRBD:             not used; no DRBD path exercised.
+Real NVMe/SAN:    not used. Part B storage is a loop device.
+BMC/fencing:      none.
+Release artifact: none. Debug build; no tag and no packaged install.
+Concurrent writer: none. No kill -9 during the failure window.
+Witness daemon:   not used. Only volvisord ran.
+
+Raw log retention
+-----------------
+The harness opens each daemon log with `>`, so a restart truncates it. Before
+each restart the drill copies the current incarnation to
+raw/d5-daemon.pre-restart.log and raw/d5-lvm-daemon.pre-restart.log. The
+current-incarnation logs (raw/*.daemon.log) hold the post-restart activity,
+including the terminal replay.
+
+The LVM journal at journal/d5-lvm-journal.log was not snapshotted by the
+drill itself. The orchestrator copied it out of the run directory's
+lab-d5/lvm-journal/journal.log after the drill had finished and the daemons
+were stopped, during the same post-run capture as raw/post-run-cleanup.txt.
+It is the raw journal bytes, bound by MANIFEST.sha256; there is no in-log
+`cp` line for it, so this is an out-of-band capture disclosed here for the
+same reason BINARIES.txt discloses its own out-of-band digests.
+
+Secrets
+-------
+The run created disposable bearer-token curl configs under $RUN/configs/.
+They were not copied into this bundle. Only raw command output, records and
+the LVM journal were copied.
