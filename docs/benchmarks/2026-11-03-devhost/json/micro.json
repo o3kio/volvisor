@@ -1,0 +1,259 @@
+{
+  "accepted": {
+    "count": 1224,
+    "max_ms": 184.242,
+    "mean_ms": 19.673,
+    "min_ms": 0.096,
+    "p50_ms": 1.206,
+    "p95_ms": 144.198,
+    "p99_ms": 173.958
+  },
+  "argv": [
+    "/root/git/volvisor-wt/w2-43/scripts/bench/bench.py",
+    "micro",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "57811",
+    "--token-file",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/configs/token",
+    "--out-dir",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z",
+    "--journal",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/lab/journal/journal.log",
+    "--state",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/lab/lvm-state.json",
+    "--repo",
+    "/root/git/volvisor-wt/w2-43",
+    "--binary",
+    "/root/git/volvisor-wt/w2-43/target/release/volvisord",
+    "--config",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/configs/volvisord.toml",
+    "--daemon-log",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/raw/daemon.daemon.log",
+    "--pidfile",
+    "/tmp/opencode/volvisor-bench-20261103T125250Z/records/daemon.pid",
+    "--daemon-pid",
+    "2048161",
+    "--create-delete-iterations",
+    "40",
+    "--cycle-iterations",
+    "150",
+    "--grow-iterations",
+    "30",
+    "--inspect-iterations",
+    "400",
+    "--list-iterations",
+    "100",
+    "--capabilities-iterations",
+    "100"
+  ],
+  "capabilities_iterations": 100,
+  "create_delete_iterations": 40,
+  "cycle_iterations": 150,
+  "error_codes": {},
+  "error_rate": 0.0,
+  "errors": 0,
+  "generated_utc": "2026-11-03T12:54:03Z",
+  "grow_increment_bytes": 8388608,
+  "grow_iterations": 30,
+  "host": "dev",
+  "inspect_iterations": 400,
+  "kernel": "6.8.0-142-generic",
+  "list_iterations": 100,
+  "network_error_kinds": {},
+  "network_errors": 0,
+  "ops": 1224,
+  "overall": {
+    "count": 1224,
+    "max_ms": 184.242,
+    "mean_ms": 19.673,
+    "min_ms": 0.096,
+    "p50_ms": 1.206,
+    "p95_ms": 144.198,
+    "p99_ms": 173.958
+  },
+  "per_op": {
+    "attach": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.912,
+      "mean_ms": 1.339,
+      "min_ms": 1.201,
+      "p50_ms": 1.32,
+      "p95_ms": 1.52,
+      "p99_ms": 1.637
+    },
+    "capabilities": {
+      "count": 100,
+      "errors": 0,
+      "max_ms": 0.178,
+      "mean_ms": 0.113,
+      "min_ms": 0.1,
+      "p50_ms": 0.106,
+      "p95_ms": 0.135,
+      "p99_ms": 0.173
+    },
+    "create": {
+      "count": 72,
+      "errors": 0,
+      "max_ms": 174.616,
+      "mean_ms": 146.696,
+      "min_ms": 123.904,
+      "p50_ms": 144.016,
+      "p95_ms": 164.455,
+      "p99_ms": 174.616
+    },
+    "delete": {
+      "count": 72,
+      "errors": 0,
+      "max_ms": 133.714,
+      "mean_ms": 108.842,
+      "min_ms": 93.016,
+      "p50_ms": 113.09,
+      "p95_ms": 123.511,
+      "p99_ms": 133.714
+    },
+    "detach": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.797,
+      "mean_ms": 1.322,
+      "min_ms": 1.162,
+      "p50_ms": 1.295,
+      "p95_ms": 1.58,
+      "p99_ms": 1.76
+    },
+    "grow": {
+      "count": 30,
+      "errors": 0,
+      "max_ms": 184.242,
+      "mean_ms": 167.068,
+      "min_ms": 153.762,
+      "p50_ms": 164.083,
+      "p95_ms": 184.196,
+      "p99_ms": 184.242
+    },
+    "inspect": {
+      "count": 400,
+      "errors": 0,
+      "max_ms": 0.296,
+      "mean_ms": 0.123,
+      "min_ms": 0.096,
+      "p50_ms": 0.117,
+      "p95_ms": 0.156,
+      "p99_ms": 0.232
+    },
+    "list": {
+      "count": 100,
+      "errors": 0,
+      "max_ms": 0.231,
+      "mean_ms": 0.124,
+      "min_ms": 0.109,
+      "p50_ms": 0.12,
+      "p95_ms": 0.147,
+      "p99_ms": 0.154
+    },
+    "report": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.614,
+      "mean_ms": 1.316,
+      "min_ms": 1.197,
+      "p50_ms": 1.301,
+      "p95_ms": 1.489,
+      "p99_ms": 1.536
+    }
+  },
+  "python": "3.12.3",
+  "read": {
+    "count": 600,
+    "max_ms": 0.296,
+    "mean_ms": 0.121,
+    "min_ms": 0.096,
+    "p50_ms": 0.116,
+    "p95_ms": 0.152,
+    "p99_ms": 0.227
+  },
+  "reads": 600,
+  "scenario": "micro",
+  "setup": {
+    "cycle_create_status": 200,
+    "grow_create_status": 200,
+    "journal": {
+      "bytes_per_mutation": 901.998,
+      "delta_bytes": 562847,
+      "end_bytes": 562847,
+      "mutations": 624,
+      "note": "append-only journal; derived from measured file growth",
+      "start_bytes": 0
+    },
+    "journal_start_bytes": 0,
+    "state": {
+      "delta_bytes": -1,
+      "end_bytes": 269,
+      "note": "whole state file is rewritten and fsynced per mutation; samples are file size after the create at that volume count; not separately timed",
+      "peak_bytes": 29678,
+      "samples": [
+        {
+          "journal_bytes": 506532,
+          "last_create_ms": 123.904,
+          "state_bytes": 6486,
+          "volumes": 1
+        },
+        {
+          "journal_bytes": 514445,
+          "last_create_ms": 144.251,
+          "state_bytes": 11708,
+          "volumes": 8
+        },
+        {
+          "journal_bytes": 541634,
+          "last_create_ms": 164.455,
+          "state_bytes": 29678,
+          "volumes": 32
+        }
+      ],
+      "start_bytes": 270
+    },
+    "state_peak_bytes": 29678,
+    "state_scale": [
+      {
+        "journal_bytes": 506532,
+        "last_create_ms": 123.904,
+        "state_bytes": 6486,
+        "volumes": 1
+      },
+      {
+        "journal_bytes": 514445,
+        "last_create_ms": 144.251,
+        "state_bytes": 11708,
+        "volumes": 8
+      },
+      {
+        "journal_bytes": 541634,
+        "last_create_ms": 164.455,
+        "state_bytes": 29678,
+        "volumes": 32
+      }
+    ],
+    "state_start_bytes": 270
+  },
+  "source_sha": "e3aa365ea65b865c8310a42ea6b459b038f0ab24",
+  "status": "OK",
+  "status_counts": {
+    "200": 1224
+  },
+  "volume_size_bytes": 16777216,
+  "worktree_dirty": false,
+  "write": {
+    "count": 624,
+    "max_ms": 184.242,
+    "mean_ms": 38.473,
+    "min_ms": 1.162,
+    "p50_ms": 1.349,
+    "p95_ms": 163.909,
+    "p99_ms": 174.177
+  },
+  "writes": 624
+}
