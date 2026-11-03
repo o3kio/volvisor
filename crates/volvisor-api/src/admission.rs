@@ -84,9 +84,13 @@ impl Admission {
     }
 }
 
-/// Liveness and observability endpoints are never admission-controlled.
+/// Liveness, readiness and observability endpoints are never
+/// admission-controlled.
 fn is_exempt(route: &str) -> bool {
-    matches!(route, "/healthz" | "/v2/healthz" | "/metrics")
+    matches!(
+        route,
+        "/healthz" | "/v2/healthz" | "/readyz" | "/v2/readyz" | "/metrics"
+    )
 }
 
 /// The route's bound, if it is read-only. Journaled mutations deliberately

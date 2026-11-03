@@ -41,12 +41,14 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::MutexGuard;
+use std::time::Instant;
 
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::Instrument;
 use volvisor_journal::{IntentAppend, Journal};
 use volvisor_types::request::{
     AttachVolumeRequest, CreateVolumeRequest, DeleteVolumeRequest, DetachVolumeRequest,
@@ -337,8 +339,46 @@ where
 // whose fall-through control flow does not factor further without
 // scattering the ordering the module docs promise; the length is the
 // honesty, not complexity.
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn execute_resolvable<R, F, Fut, I, IFut>(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: OperationId,
+    request_hash: [u8; 32],
+    payload: Value,
+    success_status: Option<StatusCode>,
+    failures: FailureReplay,
+    inspect: I,
+    run: F,
+) -> Result<Response, ApiError>
+where
+    R: Serialize,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<R, ApiError>>,
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = Result<Option<R>, ApiError>>,
+{
+    let span = tracing::info_span!(
+        "operation",
+        kind = op_kind,
+        operation_id = %operation_id,
+    );
+    execute_resolvable_inner(
+        state,
+        op_kind,
+        operation_id,
+        request_hash,
+        payload,
+        success_status,
+        failures,
+        inspect,
+        run,
+    )
+    .instrument(span)
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_resolvable_inner<R, F, Fut, I, IFut>(
     state: &SharedState,
     op_kind: &'static str,
     operation_id: OperationId,
@@ -429,7 +469,16 @@ where
         let append = {
             let mut journal = lock_journal(state)?;
             journal.append_intent(operation_id.clone(), request_hash, op_kind, payload)
-        }?;
+        };
+        let append = match append {
+            Ok(append) => append,
+            Err(error) => {
+                state
+                    .metrics
+                    .record_journal_append_failure("intent", op_kind);
+                return Err(error);
+            }
+        };
         match append {
             IntentAppend::New => {
                 // The intent is durable and no outcome exists: the
@@ -493,7 +542,27 @@ where
     // Reaching this point after an in-flight resolution means the
     // inspection proved the act had not landed — the act's own first
     // step re-verifies (never a blind re-execution).
-    let result = run().await;
+    let provider_span = tracing::info_span!(
+        "provider_call",
+        provider = %state.provider.name(),
+        kind = op_kind,
+        operation_id = %operation_id,
+    );
+    let started = Instant::now();
+    let result = run().instrument(provider_span.clone()).await;
+    let elapsed = started.elapsed();
+    let outcome = if result.is_ok() { "success" } else { "failure" };
+    state
+        .metrics
+        .record_provider_operation(op_kind, outcome, elapsed);
+    tracing::info!(
+        parent: &provider_span,
+        kind = op_kind,
+        operation_id = %operation_id,
+        outcome,
+        elapsed_ms = %elapsed.as_millis(),
+        "provider call completed"
+    );
     finish_outcome(state, op_kind, &operation_id, result, success_status)
 }
 
@@ -530,6 +599,9 @@ where
             // the campaign's after-outcome crash point.
             consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
+                state
+                    .metrics
+                    .record_journal_append_failure("outcome", op_kind);
                 // The mutation DID succeed and the caller must learn the
                 // truth; only the replay fidelity is compromised, and any
                 // later replay fails closed as in-doubt.
@@ -542,6 +614,12 @@ where
                 );
             }
             state.metrics.record_operation(op_kind, "success");
+            tracing::info!(
+                kind = op_kind,
+                operation_id = %operation_id,
+                outcome = "success",
+                "operation completed"
+            );
             Ok(with_audit_id(json_response(status, &body), operation_id))
         }
         Err(error) => {
@@ -555,6 +633,9 @@ where
             };
             consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
+                state
+                    .metrics
+                    .record_journal_append_failure("outcome", op_kind);
                 tracing::error!(
                     kind = op_kind,
                     operation_id = %operation_id,
@@ -564,6 +645,12 @@ where
                 );
             }
             state.metrics.record_operation(op_kind, "failure");
+            tracing::info!(
+                kind = op_kind,
+                operation_id = %operation_id,
+                outcome = "failure",
+                "operation completed"
+            );
             Err(error)
         }
     }
@@ -638,6 +725,9 @@ where
                 )
             };
             if let Err(journal_error) = journaled {
+                state
+                    .metrics
+                    .record_journal_append_failure("outcome", op_kind);
                 tracing::error!(
                     kind = op_kind,
                     operation_id = %operation_id,
