@@ -37,10 +37,19 @@ verdict below.
   It proves the **normal uncommitted state-save path** fails closed and
   converges, and re-confirms the journal path. It does not fault-inject the
   cleanup-failure, post-rename carve-out or unreadable-durable-reread branches;
-  those remain test-covered. [#70](https://github.com/o3kio/volvisor/issues/70)
-  is separate out-of-scope work: grow/delete/move persist divergence, the
-  kill-9 `lvcreate`→persist orphan window, and a real post-rename
-  directory-fsync fault seam.
+  those remain test-covered.
+- [#70](https://github.com/o3kio/volvisor/issues/70) is addressed by the
+  provider-state intent journaling in this change: durable-first
+  create/grow/delete intents, startup adoption/roll-forward/completion, move
+  persist-point rollback, and a test-only `AfterRenameBeforeDirFsync` seam on
+  the real save path. The per-mutation contracts, startup recovery and
+  operator tails are documented in
+  [lvm-state-divergence.md](../runbooks/day-2/lvm-state-divergence.md). The
+  additive intent maps bump the durable LVM schema to v2 under the
+  [schema compatibility policy](../schema-compatibility.md) (v1 files still
+  load and upgrade on write; an older binary refuses v2 typed). They are
+  covered by deterministic simulation tests, **not** a hardware kill-9
+  drill, so this changes no gate verdict.
 - No gate becomes met; gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
   remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
   READY**.
@@ -68,7 +77,7 @@ pre-production, production-ready, or a release candidate.
 | #40 transport/auth | Landed | `ad9efb0` | Same-host capture; cross-host validation open |
 | #42 provider consolidation | Landed | `db04182` | Parity suite uses simulated Ceph/DRBD worlds; no real clusters |
 | #45 admission control | Landed | `0c853f3` | No resumable operation handle/long-poll; one uniform read timeout, not per-route values; rate limiting is opt-in |
-| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 is separate out-of-scope persist work |
+| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 persist contracts are implemented and deterministically test-covered (not hardware-drilled), documented in `lvm-state-divergence.md` |
 | #44 observability | Landed | `5017ea0`; [docs](../operations/observability.md) | State-save duration and lease/epoch gauges deliberately omitted; real migration trace **not run** |
 | #43 benchmarks | Landed | `575acfc`; [bundle](../benchmarks/2026-11-03-devhost/REPORT.md) | Single host, loop-backed LVM, control plane only; 25.0 min soak, **not 24 h**; no real Ceph/DRBD/physical-disk LVM |
 | #49 harness flake | Partial | `5037db9` | LVM mid-move abort flake fixed; fuzz targets, interleaving tests and nightly flake rate remain open |
@@ -144,12 +153,14 @@ report mapping every gate to evidence. Current status:
    by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
    `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
    `940722e`; the cleanup-failure, carve-out and unreadable-reread branches
-   remain test-covered, not drilled. The separate out-of-scope work
+   remain test-covered, not drilled. [#70](https://github.com/o3kio/volvisor/issues/70)
    (grow/delete/move persist divergence, the kill-9 `lvcreate`→persist orphan
-   window, and a real post-rename directory-fsync fault seam) is
-   [#70](https://github.com/o3kio/volvisor/issues/70). The measured
-   lock/journal/retirement growth remains an open finding. No gate verdict
-   changes, and none is a resolved production issue.
+   window, and a real post-rename directory-fsync fault seam) is implemented
+   and deterministically test-covered in this change; it is not
+   hardware-drilled. See
+   [lvm-state-divergence.md](../runbooks/day-2/lvm-state-divergence.md). The
+   measured lock/journal/retirement growth remains an open finding. No gate
+   verdict changes, and none is a resolved production issue.
 
 ## What must not be claimed
 
