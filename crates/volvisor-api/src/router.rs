@@ -5,10 +5,15 @@
 //! request exactly once, enforces the route's role rule and emits one
 //! structured audit event; the role extractors are defense in depth. A
 //! metrics middleware records `http_requests_total` (route pattern + status
-//! code) for every matched route; a request body limit from
-//! [`crate::ApiConfig`] guards every endpoint. `<healthz>` stays open for
-//! liveness probes; reads are open only in the documented legacy/tokenless
-//! posture (see [`crate::auth`]).
+//! code) for every matched route.
+//!
+//! Admission control (issue #45) sits around the same routes: a global
+//! concurrency cap and a read-only route timeout, then a per-principal rate
+//! limit after the principal is resolved. A request body limit from
+//! [`crate::ApiConfig`] guards every endpoint, including streamed bodies.
+//! `<healthz>` and `/metrics` bypass admission control so probes and
+//! monitoring stay available while load is shed; reads are open only in the
+//! documented legacy/tokenless posture (see [`crate::auth`]).
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
@@ -16,17 +21,39 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 
+use crate::ApiConfig;
+use crate::admission::{self, Admission};
 use crate::auth;
 use crate::handlers;
 use crate::peer;
 use crate::state::SharedState;
 
+/// Build the Volume API v2 router with the legacy body-limit argument and
+/// otherwise-default admission control.
+///
+/// Kept for existing callers (the campaign rig and daemon tests). New code
+/// should use [`router_with_config`] so timeouts, the concurrency cap and
+/// per-principal limits are explicit.
+pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
+    let config = ApiConfig {
+        max_body_bytes,
+        ..ApiConfig::default()
+    };
+    router_with_config(state, &config)
+}
+
 /// Build the Volume API v2 router.
 ///
-/// `max_body_bytes` bounds the accepted request body size (see
-/// [`crate::ApiConfig`]; requests beyond the limit are rejected before
-/// parsing).
-pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
+/// `config.max_body_bytes` bounds the accepted request body size (requests
+/// beyond the limit — including streamed bodies without a
+/// `Content-Length` — are rejected with `PAYLOAD_TOO_LARGE` before parsing).
+/// `config` also supplies the read-only route timeout, the global
+/// concurrency cap and the per-principal rate limit. See
+/// `docs/admission-control.md` for the long-operation model: journaled
+/// mutations are never wrapped in a wall-clock timeout.
+#[allow(clippy::too_many_lines)] // the route table is deliberately one readable block
+pub fn router_with_config(state: SharedState, config: &ApiConfig) -> Router {
+    let admission = Admission::new(*config);
     Router::new()
         .route(
             "/v2/volumes",
@@ -148,15 +175,23 @@ pub fn router(state: SharedState, max_body_bytes: usize) -> Router {
         // Authentication/authorization/audit runs inside the metrics layer so
         // denied requests are still counted; `MatchedPath` is resolved by
         // then, which is what the route access matrix keys on.
+        // Layers are applied bottom-to-top: the last call is outermost.
+        // Request order is metrics -> admission guard -> auth -> rate
+        // limit -> body limit -> handler.
+        .layer(DefaultBodyLimit::max(config.max_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            admission.clone(),
+            admission::rate_limit,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authorize_and_audit,
         ))
+        .layer(middleware::from_fn_with_state(admission, admission::guard))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_http_request,
         ))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 

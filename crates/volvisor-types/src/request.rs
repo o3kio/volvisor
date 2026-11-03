@@ -765,10 +765,19 @@ pub struct InspectVolumeResponse {
 }
 
 /// ListVolumes response.
+///
+/// Pagination is additive (Volume API v2 section 2): `volumes` keeps its
+/// existing meaning, and `next_cursor` is present only when more entries
+/// follow. A request without `limit` preserves the legacy unlimited listing
+/// and carries no cursor, so older clients never silently lose volumes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListVolumesResponse {
-    /// Volumes visible in the request scope.
+    /// Volumes visible in the request scope, ordered by `volume_id`.
     pub volumes: Vec<InspectVolumeResponse>,
+    /// Opaque continuation token; absent on the last page and on the
+    /// legacy unlimited listing. Never parse it client-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Adopt-and-promote request (P4a plan §5/§6, contract section 8): the

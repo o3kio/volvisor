@@ -14,7 +14,7 @@
 // heuristics do not apply to the handler boundary.
 #![allow(clippy::needless_pass_by_value)]
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
@@ -26,11 +26,13 @@ use volvisor_types::request::{
     MoveVolumeBackingRequest, ReportAttachmentStateRequest,
 };
 use volvisor_types::{
-    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, LendDeviceRequest,
-    MigrationId, ProjectId, ReclaimDeviceRequest, ReleaseDeviceRequest, ResolveQuarantineRequest,
-    VolumeId,
+    ApiError, CapabilitySet, ClaimDeviceRequest, DeviceId, FencingProof, ID_MAX_LEN,
+    LendDeviceRequest, MigrationId, ProjectId, ReclaimDeviceRequest, ReleaseDeviceRequest,
+    ResolveQuarantineRequest, VolumeId,
 };
 
+use crate::admission::ListLimit;
+use crate::config::DEFAULT_MAX_LIST_LIMIT;
 use crate::error::{ApiErrorReply, json_response, text_response, to_json_value};
 use crate::extract::{RequireAdmin, RequireOperator, RequireRead, ValidJson};
 use crate::ops;
@@ -64,13 +66,20 @@ pub(crate) async fn create_volume(
     .map_err(ApiErrorReply::from)
 }
 
-/// `GET /v2/volumes` — ListVolumes, optionally scoped to one project.
+/// `GET /v2/volumes` — ListVolumes, optionally scoped to one project and
+/// paginated with an opaque cursor.
 ///
-/// Unknown query parameters are ignored (a `serde_urlencoded` limitation);
-/// an invalid `project_id` value is rejected with `INVALID_REQUEST`.
+/// Ordering is stable (`volume_id` ascending). Requests without `limit`
+/// preserve the legacy unlimited listing (the compatibility choice: an old
+/// client must never silently lose volumes) and carry no `next_cursor`;
+/// requests with `limit` are bounded by `1..=max_list_limit` and return an
+/// opaque `next_cursor` while more entries follow. Unknown query parameters
+/// are ignored (a `serde_urlencoded` limitation); an invalid `project_id`,
+/// `limit` or `cursor` value is rejected with `INVALID_REQUEST`.
 pub(crate) async fn list_volumes(
     State(state): State<SharedState>,
     _read: RequireRead,
+    limit_extension: Option<Extension<ListLimit>>,
     query: Result<Query<ListVolumesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Response, ApiErrorReply> {
     let query = query
@@ -78,12 +87,90 @@ pub(crate) async fn list_volumes(
             ApiError::invalid_request(format!("invalid query string: {rejection}"))
         })?
         .0;
-    let volumes = state
+    let max_limit = limit_extension.map_or(DEFAULT_MAX_LIST_LIMIT, |Extension(limit)| limit.0);
+    let mut volumes = state
         .provider
         .list_volumes(query.project_id.as_ref())
         .await?;
-    let body = to_json_value(&ListVolumesResponse { volumes })?;
+    // Stable ordering independent of the provider's map/iteration order.
+    volumes.sort_by(|left, right| left.volume_id.as_str().cmp(right.volume_id.as_str()));
+    let (volumes, next_cursor) =
+        paginate(volumes, query.limit, query.cursor.as_deref(), max_limit)?;
+    let body = to_json_value(&ListVolumesResponse {
+        volumes,
+        next_cursor,
+    })?;
     Ok(json_response(StatusCode::OK, &body))
+}
+
+/// Apply the opaque-cursor page window over a `volume_id`-ordered list.
+fn paginate(
+    mut volumes: Vec<volvisor_types::request::InspectVolumeResponse>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    max_limit: usize,
+) -> Result<
+    (
+        Vec<volvisor_types::request::InspectVolumeResponse>,
+        Option<String>,
+    ),
+    ApiError,
+> {
+    if let Some(limit) = limit {
+        if limit == 0 || limit > max_limit {
+            return Err(ApiError::invalid_request(format!(
+                "limit must be between 1 and {max_limit}"
+            )));
+        }
+    }
+    if let Some(cursor) = cursor {
+        let after = decode_cursor(cursor)?;
+        volumes.retain(|volume| volume.volume_id.as_str() > after.as_str());
+    }
+    let Some(limit) = limit else {
+        return Ok((volumes, None));
+    };
+    if volumes.len() <= limit {
+        return Ok((volumes, None));
+    }
+    let next_cursor = encode_cursor(volumes[limit - 1].volume_id.as_str());
+    volumes.truncate(limit);
+    Ok((volumes, Some(next_cursor)))
+}
+
+/// Encode the last served `volume_id` as an opaque, versioned cursor.
+///
+/// Hex keeps the token query-string safe with no new dependency. The format
+/// is deliberately documented as opaque: clients echo it back, never parse
+/// it, so the server can change the encoding later.
+fn encode_cursor(volume_id: &str) -> String {
+    let mut encoded = String::with_capacity(3 + volume_id.len() * 2);
+    encoded.push_str("v1.");
+    for byte in volume_id.bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Decode and validate an opaque cursor from the previous page.
+fn decode_cursor(cursor: &str) -> Result<VolumeId, ApiError> {
+    let invalid = || {
+        ApiError::invalid_request(
+            "invalid cursor; pass back the opaque next_cursor from the previous page",
+        )
+    };
+    let encoded = cursor.strip_prefix("v1.").ok_or_else(invalid)?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 || encoded.len() > ID_MAX_LEN * 2 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+        bytes.push(u8::from_str_radix(pair, 16).map_err(|_| invalid())?);
+    }
+    let raw = String::from_utf8(bytes).map_err(|_| invalid())?;
+    VolumeId::try_from(raw).map_err(|_| invalid())
 }
 
 /// `GET /v2/volumes/{volume_id}` — InspectVolume.
@@ -965,6 +1052,10 @@ fn parse_device_id(raw: &str) -> Result<DeviceId, ApiError> {
 pub(crate) struct ListVolumesQuery {
     /// Restrict the listing to this project.
     project_id: Option<ProjectId>,
+    /// Requested page size. Absent preserves the legacy unlimited listing.
+    limit: Option<usize>,
+    /// Opaque continuation token from the previous page's `next_cursor`.
+    cursor: Option<String>,
 }
 
 /// Wire body of the detach endpoint: the typed detach request plus the

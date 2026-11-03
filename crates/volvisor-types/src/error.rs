@@ -61,6 +61,17 @@ pub enum ApiErrorCode {
     UnsafeDataLoss,
     /// Backing Ceph cluster is unhealthy.
     CephClusterUnhealthy,
+    /// The caller exceeded its per-principal admission rate; retry after
+    /// the `Retry-After` delay.
+    RateLimited,
+    /// The server's global in-flight concurrency cap is exhausted; retry
+    /// after the `Retry-After` delay.
+    Overloaded,
+    /// A bounded read request exceeded its route timeout.
+    RequestTimeout,
+    /// The request body exceeded the configured maximum (including a
+    /// streamed/chunked body that never declared a length).
+    PayloadTooLarge,
     /// Malformed request (validation-level rejection).
     InvalidRequest,
     /// Referenced object does not exist.
@@ -101,6 +112,10 @@ impl ApiErrorCode {
             Self::OperationInDoubt => "OPERATION_IN_DOUBT",
             Self::UnsafeDataLoss => "UNSAFE_DATA_LOSS",
             Self::CephClusterUnhealthy => "CEPH_CLUSTER_UNHEALTHY",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::Overloaded => "OVERLOADED",
+            Self::RequestTimeout => "REQUEST_TIMEOUT",
+            Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::NotFound => "NOT_FOUND",
             Self::InvalidState => "INVALID_STATE",
@@ -121,9 +136,12 @@ impl ApiErrorCode {
             | Self::InvalidRequest => 400,
             Self::NotFound => 404,
             Self::Forbidden => 403,
+            Self::RateLimited => 429,
+            Self::RequestTimeout => 504,
+            Self::PayloadTooLarge => 413,
             Self::VmmHandoffUnsupported => 501,
             Self::NoSafeCapacity | Self::ThinMetadataExhausted => 507,
-            Self::CephClusterUnhealthy => 503,
+            Self::CephClusterUnhealthy | Self::Overloaded => 503,
             Self::Internal => 500,
             Self::InsufficientFailureDomains
             | Self::ForeignDeviceState
@@ -287,6 +305,10 @@ impl ApiError {
             "OPERATION_IN_DOUBT" => ApiErrorCode::OperationInDoubt,
             "UNSAFE_DATA_LOSS" => ApiErrorCode::UnsafeDataLoss,
             "CEPH_CLUSTER_UNHEALTHY" => ApiErrorCode::CephClusterUnhealthy,
+            "RATE_LIMITED" => ApiErrorCode::RateLimited,
+            "OVERLOADED" => ApiErrorCode::Overloaded,
+            "REQUEST_TIMEOUT" => ApiErrorCode::RequestTimeout,
+            "PAYLOAD_TOO_LARGE" => ApiErrorCode::PayloadTooLarge,
             "INVALID_REQUEST" => ApiErrorCode::InvalidRequest,
             "NOT_FOUND" => ApiErrorCode::NotFound,
             "INVALID_STATE" => ApiErrorCode::InvalidState,
@@ -350,6 +372,10 @@ mod tests {
             ApiErrorCode::OperationInDoubt,
             ApiErrorCode::UnsafeDataLoss,
             ApiErrorCode::CephClusterUnhealthy,
+            ApiErrorCode::RateLimited,
+            ApiErrorCode::Overloaded,
+            ApiErrorCode::RequestTimeout,
+            ApiErrorCode::PayloadTooLarge,
             ApiErrorCode::Forbidden,
         ];
         for code in codes {
@@ -423,6 +449,10 @@ mod tests {
             ApiErrorCode::OperationInDoubt,
             ApiErrorCode::UnsafeDataLoss,
             ApiErrorCode::CephClusterUnhealthy,
+            ApiErrorCode::RateLimited,
+            ApiErrorCode::Overloaded,
+            ApiErrorCode::RequestTimeout,
+            ApiErrorCode::PayloadTooLarge,
             ApiErrorCode::InvalidRequest,
             ApiErrorCode::NotFound,
             ApiErrorCode::InvalidState,

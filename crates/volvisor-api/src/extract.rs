@@ -4,7 +4,7 @@ use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use serde::de::DeserializeOwned;
-use volvisor_types::ApiError;
+use volvisor_types::{ApiError, ApiErrorCode};
 
 use crate::auth::{AuthContext, Role};
 use crate::error::{ApiErrorReply, json_response};
@@ -29,9 +29,16 @@ where
         let json = axum::extract::Json::<T>::from_request(req, state)
             .await
             .map_err(|rejection| {
-                ApiErrorReply(ApiError::invalid_request(format!(
-                    "malformed request body: {rejection}"
-                )))
+                let status = rejection.status();
+                let error = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    ApiError::new(
+                        ApiErrorCode::PayloadTooLarge,
+                        "request body exceeds the configured maximum",
+                    )
+                } else {
+                    ApiError::invalid_request(format!("malformed request body: {rejection}"))
+                };
+                ApiErrorReply(error)
             })?;
         Ok(ValidJson(json.0))
     }

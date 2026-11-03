@@ -9,7 +9,7 @@
 //! | Method & path | Operation |
 //! |---|---|
 //! | `POST /v2/volumes` | CreateVolume |
-//! | `GET /v2/volumes` | ListVolumes (`?project_id=` optional filter) |
+//! | `GET /v2/volumes` | ListVolumes (`?project_id=` filter, optional `?limit=`/`?cursor=` pagination) |
 //! | `GET /v2/volumes/{volume_id}` | InspectVolume |
 //! | `POST /v2/volumes/{volume_id}/attach` | AttachVolume |
 //! | `POST /v2/volumes/{volume_id}/detach` | DetachVolume (body carries `attachment_id`) |
@@ -81,6 +81,18 @@
 //! peer call is never a consumer call, and the admin token is
 //! rejected on the peer surface (and vice versa).
 //!
+//! ## Admission control (issue #45)
+//!
+//! The router installs a global concurrency cap, a read-only route timeout
+//! and a per-principal rate limit (see the `admission` module and
+//! `docs/admission-control.md`). A journaled mutation is never wrapped in a
+//! wall-clock timeout: the request owns the operation to completion, and a
+//! retry uses the same `operation_id` (replay or `OPERATION_IN_DOUBT`).
+//! There is no asynchronous operation handle or long-poll surface.
+//! `429 RATE_LIMITED` and `503 OVERLOADED` carry `Retry-After`; a read-only
+//! timeout is `504 REQUEST_TIMEOUT`; an oversized or streamed body beyond
+//! `max_body_bytes` is `413 PAYLOAD_TOO_LARGE`.
+//!
 //! ## Error and auth model
 //!
 //! Every rejection carries the contract's JSON error shape
@@ -105,6 +117,11 @@
 // Tests may use expect/unwrap for invariant assertions; production code may not.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+/// Admission control: read timeouts, a global concurrency cap and
+/// per-principal rate limits (issue #45).
+mod admission;
+#[cfg(test)]
+mod admission_tests;
 /// Scoped credentials, role enforcement and the request audit event.
 pub mod auth;
 mod config;
@@ -128,7 +145,7 @@ mod tests;
 pub use config::ApiConfig;
 pub use crash::{CRASH_PANIC_PREFIX, CrashHooks, CrashPoint, KillSwitch};
 pub use metrics::Metrics;
-pub use router::router;
+pub use router::{router, router_with_config};
 pub use state::{AppState, SharedState};
 
 /// The journal operation-kind constants — the crash hook's armed
