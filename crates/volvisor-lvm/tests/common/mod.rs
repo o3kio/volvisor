@@ -27,9 +27,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use volvisor_lvm::provider::{LvmProvider, lv_name_for};
-use volvisor_lvm::state::{DeviceEntry, LvmState};
+use volvisor_lvm::state::{CreateIntent, DeleteIntent, DeviceEntry, GrowIntent, LvmState};
 use volvisor_lvm::{CommandOutput, CommandRunner, FakeRunner, RealRunner};
-use volvisor_types::{ApiError, DeviceId, DeviceRole, VolumeId, VolumeLifecycle};
+use volvisor_types::request::ErasurePolicy;
+use volvisor_types::{
+    ApiError, DeviceId, DeviceRole, OperationId, ProjectId, VolumeId, VolumeLifecycle,
+};
 
 /// VG prefix used by the fixtures.
 pub const VG_PREFIX: &str = "vvtest";
@@ -126,6 +129,13 @@ pub struct FakeLvm {
     /// When true, `lvextend` claims success but never updates `lvs`
     /// (verification-failure injection).
     pub lvextend_silent: bool,
+    /// When set, `lvcreate` makes this state file unreadable and creates
+    /// a directory at its sibling `.tmp` path after creating the LV:
+    /// the deterministic shape of "the durable file became unreadable
+    /// between the durable intent save and the final save, and the
+    /// compensating clear-save also fails". The re-read fails closed
+    /// and the unreadable durable file survives for the operator.
+    pub break_state_on_lvcreate: Option<PathBuf>,
     /// Physical extent size `lvcreate`/`lvextend` round up to.
     pub extent_size: u64,
     /// When true, `vgcreate` fails (claim crash-window injection).
@@ -166,6 +176,7 @@ impl Default for FakeLvm {
             fail_blkdiscard: false,
             lvcreate_silent: false,
             lvextend_silent: false,
+            break_state_on_lvcreate: None,
             extent_size: EXTENT_BYTES,
             fail_vgcreate: false,
             fail_pvremove: false,
@@ -500,6 +511,17 @@ pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<Comma
                     }
                 }
             }
+            // Deterministic unreadable-durable injection: the file the
+            // next compensation re-reads is corrupt even though the
+            // intent save that preceded this command was valid. The
+            // sibling `.tmp` directory makes the compensation's
+            // clear-save fail too, so the unreadable file survives.
+            if let Some(state_path) = &world.break_state_on_lvcreate {
+                std::fs::write(state_path, b"{ not valid provider state").ok();
+                let mut tmp_name = state_path.clone().into_os_string();
+                tmp_name.push(".tmp");
+                std::fs::create_dir(std::path::PathBuf::from(tmp_name)).ok();
+            }
             Some(CommandOutput::success(String::new()))
         }
         "lvextend" => {
@@ -795,6 +817,26 @@ pub fn provider_from_with_timing(
     world: &Arc<Mutex<FakeLvm>>,
     timing: volvisor_lvm::provider::MoveTiming,
 ) -> Arc<LvmProvider> {
+    try_provider_from_with_timing(state_path, world, timing).expect("provider construction")
+}
+
+/// Fallible [`provider_from`]: startup reconciliation errors (an
+/// ambiguous grow, an undersized create-intent LV, a delete intent on
+/// an attached volume) are returned typed instead of panicking, so a
+/// test can pin fail-closed startup.
+pub fn try_provider_from(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<FakeLvm>>,
+) -> Result<Arc<LvmProvider>, ApiError> {
+    try_provider_from_with_timing(state_path, world, default_move_timing())
+}
+
+/// [`try_provider_from`] with explicit move timing.
+pub fn try_provider_from_with_timing(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<FakeLvm>>,
+    timing: volvisor_lvm::provider::MoveTiming,
+) -> Result<Arc<LvmProvider>, ApiError> {
     let runner = FakeLvm::runner(world);
     LvmProvider::new(
         runner,
@@ -804,7 +846,6 @@ pub fn provider_from_with_timing(
         AUTH_TOKEN.to_owned(),
     )
     .map(|provider| Arc::new(provider.with_move_timing(timing)))
-    .expect("provider construction")
 }
 
 /// Seed a volume entry directly into a state file (reconciliation tests).
@@ -861,6 +902,104 @@ pub fn seed_move(
     state.save(state_path).expect("seed move state");
 }
 
+/// Seed a durable create intent directly into a state file (startup
+/// recovery tests: the intent a dead incarnation left before `lvcreate`
+/// committed the volume record). The LV name is the id-derived one, so
+/// the intent owns exactly the LV the provider would derive.
+pub fn seed_create_intent(
+    state_path: &std::path::Path,
+    volume_id: &str,
+    vg_name: &str,
+    requested_size_bytes: u64,
+    creation_payload: &str,
+) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let mut state = LvmState::load(state_path).expect("load state");
+    state.insert_create_intent(
+        volume_id.clone(),
+        CreateIntent {
+            vg_name: vg_name.to_owned(),
+            lv_name: lv_name_for(&volume_id),
+            requested_size_bytes,
+            project_id: ProjectId::new("seed-project").expect("valid project id"),
+            block_size: 4096,
+            creation_payload: creation_payload.to_owned(),
+        },
+    );
+    state.save(state_path).expect("seed create intent state");
+}
+
+/// Seed a durable grow intent directly into a state file (the grow a
+/// dead incarnation journaled before `lvextend`'s outcome committed).
+pub fn seed_grow_intent(
+    state_path: &std::path::Path,
+    volume_id: &str,
+    operation_id: &str,
+    from_size_bytes: u64,
+    requested_size_bytes: u64,
+    expected_generation: u64,
+) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let mut state = LvmState::load(state_path).expect("load state");
+    state.insert_grow_intent(
+        volume_id,
+        GrowIntent {
+            operation_id: OperationId::new(operation_id).expect("valid fixture operation id"),
+            from_size_bytes,
+            requested_size_bytes,
+            expected_generation,
+        },
+    );
+    state.save(state_path).expect("seed grow intent state");
+}
+
+/// Seed a durable delete intent directly into a state file (the delete
+/// authorization a dead incarnation journaled before the destructive
+/// commands ran).
+pub fn seed_delete_intent(
+    state_path: &std::path::Path,
+    volume_id: &str,
+    operation_id: &str,
+    expected_generation: u64,
+    erasure_policy: ErasurePolicy,
+) {
+    let volume_id = VolumeId::new(volume_id).expect("valid volume id");
+    let mut state = LvmState::load(state_path).expect("load state");
+    state.insert_delete_intent(
+        volume_id,
+        DeleteIntent {
+            operation_id: OperationId::new(operation_id).expect("valid fixture operation id"),
+            expected_generation,
+            erasure_policy,
+        },
+    );
+    state.save(state_path).expect("seed delete intent state");
+}
+
+/// Hand-seed one LV into the simulated world (startup-recovery tests:
+/// the LV a dead incarnation's `lvcreate`/`lvextend` left behind).
+///
+/// This is **not** a provider mutation: it inserts the `vg/lv` entry
+/// and, when the VG has a registered PV, places the LV on that first
+/// PV and consumes its extents from the PV's free space — exactly the
+/// shape `lvcreate` would have produced. No command is scripted.
+pub fn add_lv(world: &Arc<Mutex<FakeLvm>>, vg_name: &str, lv_name: &str, size_bytes: u64) {
+    let mut world = world.lock().expect("world lock");
+    let path = format!("{vg_name}/{lv_name}");
+    world.lvs.insert(path.clone(), size_bytes);
+    let placement = world
+        .pv_vg
+        .iter()
+        .find(|(_, pv_vg)| pv_vg.as_str() == vg_name)
+        .map(|(pv, _)| pv.clone());
+    if let Some(pv) = placement {
+        world.lv_devices.insert(path, vec![pv.clone()]);
+        if let Some(free) = world.pv_free.get_mut(&pv) {
+            *free = free.saturating_sub(size_bytes);
+        }
+    }
+}
+
 /// Build a fixture over the simulated LVM with a pre-claimed pool.
 pub fn fixture() -> Fixture {
     let state_path = leak_tempdir().join("state.json");
@@ -879,12 +1018,22 @@ fn fixture_at(state_path: PathBuf, claimed: bool) -> Fixture {
         seed_claimed_state(&state_path);
     }
     let world = Arc::new(Mutex::new(FakeLvm::with_claimed_pool()));
+    fixture_from_state(state_path, world)
+}
+
+/// Build a [`Fixture`] over an **existing** state file and simulated
+/// world, running startup reconciliation as the constructor.
+///
+/// Unlike [`fixture`]/[`unclaimed_fixture`], the caller seeds the state
+/// (volumes, intents) and the world (hand-seeded LVs) first; the
+/// retained runner makes the construction's command invocations
+/// assertable.
+pub fn fixture_from_state(state_path: PathBuf, world: Arc<Mutex<FakeLvm>>) -> Fixture {
     let runner = FakeLvm::runner(&world);
-    let sysfs_root = leak_tempdir();
     let provider = LvmProvider::new(
         Arc::clone(&runner) as Arc<dyn CommandRunner>,
         state_path.clone(),
-        sysfs_root,
+        leak_tempdir(),
         VG_PREFIX.to_owned(),
         AUTH_TOKEN.to_owned(),
     )

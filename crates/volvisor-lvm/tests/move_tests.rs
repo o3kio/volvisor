@@ -76,6 +76,7 @@ use volvisor_lvm::state::{LvmState, MoveRecord};
 use volvisor_provider::FakeRunner;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{fixture_attach_request, fixture_create_request};
+use volvisor_types::crash::{STORE_LVM_STATE, StoreSavePoint};
 use volvisor_types::request::MoveVolumeBackingRequest;
 use volvisor_types::{ApiErrorCode, MoveVolumeBackingState, OperationId, VolumeId};
 
@@ -1230,6 +1231,461 @@ async fn a_dropped_volume_loses_its_move_record() {
     let restarted = provider_from_with_timing(&state_path, &fixture.world, default_move_timing());
     let report = restarted.move_reconcile_pass().expect("pass");
     assert_eq!(report.dropped, Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// The persist points: injected store-save failures at the move's
+// commit boundaries. A fresh drive performs exactly three LVM-state
+// saves — PREPARING, COPYING, COMPLETE — so `skip` 0/1/2 targets save
+// 1/2/3 (different points neither consume nor decrement the arm).
+// ---------------------------------------------------------------------------
+
+/// The `PREPARING` save is the move's sole reconciliation anchor: if it
+/// cannot land, nothing durable exists to classify against, so the drive
+/// starts no `pvmove` at all. The failure is fail-closed and does not
+/// wedge the volume — a later normal move runs the whole sequence.
+#[tokio::test]
+async fn a_preparing_save_failure_starts_no_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-preparing";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The drive's first state save is the PREPARING anchor: skip = 0
+    // fails exactly there, before `pvmove` can start.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the PREPARING save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("PREPARING record could not be saved"),
+        "the error names the unsaved anchor: {error}"
+    );
+    assert!(
+        error.detail.contains("no pvmove was started"),
+        "the error states the fail-closed outcome: {error}"
+    );
+
+    // No durable anchor means no world mutation: no pvmove ran, no
+    // mirror is live, and the state file is exactly the pre-move shape.
+    assert!(
+        fixture.world.lock().expect("world").moves.is_empty(),
+        "the failed anchor must start no move"
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 0, "no pvmove invocation");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert!(record.is_none(), "the failed anchor left no record");
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+
+    // The failed save did not wedge the volume: the one-shot arm is
+    // consumed, and a fresh operation drives the whole move.
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the retry move completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the retry's record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The `PREPARING` save's rename can land even though the save reported an
+/// error at the directory-fsync boundary. The durable anchor then exists,
+/// so the in-memory record is kept and the error says so — but the call
+/// still starts no `pvmove`. A retry re-attaches to the durable anchor and
+/// drives the move to completion.
+#[tokio::test]
+async fn a_preparing_save_failure_after_rename_keeps_the_anchor_and_starts_no_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-preparing-rename";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // Fail the anchor save after its rename: the durable record exists
+    // even though the save returned an error.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the PREPARING save fails after its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("reached the durable state"),
+        "the error says the anchor landed: {error}"
+    );
+    assert!(
+        error.detail.contains("no pvmove was started"),
+        "the error states the fail-closed outcome: {error}"
+    );
+
+    // The anchor is durable and the in-memory record was kept, but no
+    // world mutation happened.
+    assert!(
+        fixture.world.lock().expect("world").moves.is_empty(),
+        "the failed anchor must start no move"
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 0, "no pvmove invocation");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the anchor's rename landed");
+    assert_eq!(record.state, MoveVolumeBackingState::Preparing);
+    assert_eq!(record.target_pv, MOVE_TARGET_PV);
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+
+    // The kept in-memory anchor lets the retry re-attach without a
+    // second PREPARING save, and the move completes with one bump.
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the retry move completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the retry's record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The `COPYING` save follows the already-started `pvmove`: its failure
+/// cannot un-start the kernel-side move. The prior durable record
+/// (`PREPARING`) remains the anchor, and the next incarnation's startup
+/// reconcile observes the live mirror, lets it land, and verifies the
+/// completion with exactly one generation bump.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart narrative
+async fn a_copying_save_failure_keeps_the_anchor_and_startup_completes() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-copying";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 1 passes the PREPARING save and fails the COPYING save:
+    // the pvmove is already running, so the anchor stays PREPARING.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COPYING save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the pvmove was started but its COPYING record could not be saved"),
+        "the error names the started-but-unrecorded move: {error}"
+    );
+    assert!(
+        error
+            .detail
+            .contains("the durable prior record is the anchor"),
+        "the error names the surviving anchor: {error}"
+    );
+
+    // The world started the move; the durable anchor still says
+    // PREPARING and the generation was never bumped. The fake world
+    // keeps the source placement until the move lands.
+    assert_eq!(
+        fixture.world.lock().expect("world").moves.len(),
+        1,
+        "the pvmove is live despite the failed COPYING save"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the durable anchor").state,
+        MoveVolumeBackingState::Preparing
+    );
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    // The restart's constructor reconcile observes the world (the move
+    // lands across its two lvs queries) and completes the verified
+    // relocation: one bump, target placement, no live move.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "exactly one bump across the restart");
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert!(fixture.world.lock().expect("world").moves.is_empty());
+    // The constructor's reconcile runs with `redrive = false`, so it
+    // starts no pvmove; the re-issue answers the durable record. The
+    // single invocation under test is the first incarnation's.
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    // A same-target re-issue answers the completed record without
+    // another pvmove and without a second bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-after", MOVE_TARGET_PV, 2),
+        )
+        .await
+        .expect("the completed record answers");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (_, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1, "no new pvmove");
+}
+
+/// The `COMPLETE` save failing **before** its rename: the world already
+/// relocated, but the durable file still holds the prior `COPYING`
+/// record and generation. The in-memory provider restores that prior
+/// durable shape (never a completion against a prior record), and the
+/// restart's verified relocation completes it with one bump.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart narrative
+async fn a_complete_save_failure_recovers_with_one_bump() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-complete";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 2 passes the PREPARING and COPYING saves; the COMPLETE
+    // save fails after its tmp write, before the rename — the durable
+    // file still holds COPYING and generation 1.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        2,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COMPLETE save fails before its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the durable move record still says the prior state"),
+        "the error names the surviving prior record: {error}"
+    );
+    assert!(
+        error
+            .detail
+            .contains("reconciliation will complete the move"),
+        "the error names the recovery path: {error}"
+    );
+
+    // The world already relocated; the durable anchor has not.
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the prior record").state,
+        MoveVolumeBackingState::Copying
+    );
+    assert_eq!(generation, 1);
+
+    // The contract restores the prior durable shape in memory too: the
+    // provider never reports a completion against a prior durable
+    // record (no 200-until-restart).
+    let inspected = fixture
+        .provider
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the restored in-memory state");
+    assert_eq!(inspected.generation, 1);
+
+    // The restart proves the relocation and completes the record
+    // exactly once.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "exactly one bump");
+    let inspected = restarted
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the completed volume");
+    assert_eq!(inspected.generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+
+    // A same-target re-issue answers the completed record without
+    // another pvmove and without a second bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-after", MOVE_TARGET_PV, 2),
+        )
+        .await
+        .expect("the completed record answers");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (_, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The post-rename carve-out: the `COMPLETE` save's rename landed before
+/// the injected directory-fsync failure, so the **new** state is the
+/// durable truth. The in-memory completion is kept (never rolled back
+/// against a durable file that already has it), and a restart must not
+/// bump the generation again.
+#[tokio::test]
+async fn a_complete_save_failure_after_rename_is_the_carve_out() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-rename";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 2 passes the PREPARING and COPYING saves; the COMPLETE
+    // save fails at the directory-fsync boundary, after its rename.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        2,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COMPLETE save fails after its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the durable state already records the completed move"),
+        "the error names the landed completion: {error}"
+    );
+    assert!(
+        error.detail.contains("volume generation 2"),
+        "the error names the landed generation: {error}"
+    );
+
+    // The rename is the commit: both the durable file and the
+    // in-memory view record the completion and generation 2.
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    let inspected = fixture
+        .provider
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the kept in-memory completion");
+    assert_eq!(
+        inspected.generation, 2,
+        "the in-memory completion is kept, never rolled back"
+    );
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+
+    // A restart must not bump again: the completed record is a
+    // historical fact and the durable generation is already 2.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let inspected = restarted
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.generation, 2, "no second bump across the restart");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the settled record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
 }
 
 // ---------------------------------------------------------------------------
