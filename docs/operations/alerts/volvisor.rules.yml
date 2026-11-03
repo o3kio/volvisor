@@ -1,0 +1,129 @@
+# Example Prometheus alert rules for volvisord (issue #44).
+#
+# These are EXAMPLES, not tuned SLOs. Thresholds, windows and `for:` values
+# must be set from real traffic and provider latencies. The rules assume the
+# scrape job is named `volvisor`; adjust that matcher (or the job name in
+# your scrape config) before applying.
+#
+# Metric semantics and cardinality bounds:
+#   docs/operations/observability.md
+#
+# Readiness is not a metric. Probe `/readyz` with the orchestrator or a
+# blackbox exporter; do not infer readiness from `up` alone.
+groups:
+  - name: volvisor-core
+    rules:
+      - alert: VolvisorJournalAppendFailures
+        expr: |
+          sum by (stage, kind) (
+            increase(journal_append_failures_total{job="volvisor"}[5m])
+          ) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Journal append failures ({{ $labels.stage }}/{{ $labels.kind }})"
+          description: >-
+            A mutation reached the journal pipeline but an append failed.
+            Intent failures refuse the mutation; outcome failures leave replay
+            fidelity compromised (the operation may fail closed as in-doubt).
+            Check journal disk space, permissions and filesystem health before
+            retrying with the same operation_id.
+
+      - alert: VolvisorReconcileStale
+        expr: |
+          max by (scope) (
+            reconcile_age_seconds{job="volvisor", scope=~"grow|move"}
+          ) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Background reconcile ({{ $labels.scope }}) is stale"
+          description: >-
+            No successful {{ $labels.scope }} reconcile pass has completed for
+            over five minutes. A failed or blocked pass does not refresh this
+            gauge. Check provider and VMM logs for the recurring failure.
+            (`scope="startup"` is intentionally excluded: its age grows for
+            the life of the process.)
+
+      - alert: VolvisorWitnessUnreachable
+        expr: |
+          witness_reachable{job="volvisor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Configured witness is unreachable"
+          description: >-
+            The bounded transport probe to the configured witness failed.
+            Readiness is also failing. This is reachability only; confirm the
+            witness process, its journal and its authority state before
+            resuming any writer. Do not treat a recovered TCP probe as proof
+            that the witness's durable state is healthy.
+
+      - alert: VolvisorHttpErrorRateSpike
+        expr: |
+          sum by (route, instance) (
+            rate(http_requests_total{job="volvisor", code=~"5.."}[5m])
+          )
+          /
+          clamp_min(
+            sum by (route, instance) (
+              rate(http_requests_total{job="volvisor"}[5m])
+            ),
+            0.001
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP 5xx rate above 5% on {{ $labels.route }}"
+          description: >-
+            More than 5% of requests on this route failed with a 5xx over the
+            last five minutes. Distinguish provider failures (operations_total
+            with outcome="failure") from journal failures and startup/readiness
+            problems. Example threshold only.
+
+      - alert: VolvisorLatencyBudgetBurn
+        expr: |
+          sum by (route, instance) (
+            rate(http_request_duration_seconds_bucket{
+              job="volvisor", le="1", class=~"2xx|3xx"
+            }[5m])
+          )
+          /
+          clamp_min(
+            sum by (route, instance) (
+              rate(http_request_duration_seconds_count{
+                job="volvisor", class=~"2xx|3xx"
+              }[5m])
+            ),
+            0.001
+          ) < 0.99
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Under 99% of successful {{ $labels.route }} requests within 1s"
+          description: >-
+            Example latency-budget burn: fewer than 99% of successful requests
+            finished within the 1s bucket for ten minutes. The 1s bound and 99%
+            target are placeholders, not a product SLO. Split by provider kind
+            (`provider_operation_duration_seconds`) to find the slow layer.
+
+      - alert: VolvisorLoadShedding
+        expr: |
+          sum by (route, instance) (
+            rate(http_requests_total{job="volvisor", code=~"429|503"}[5m])
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admission control is shedding load on {{ $labels.route }}"
+          description: >-
+            Sustained 429 RATE_LIMITED or 503 OVERLOADED responses. Honour
+            Retry-After with jitter. 429 means the per-principal limit is
+            active; 503 means the global concurrency cap stayed exhausted.
+            Scale capacity or reduce offered load; do not bypass admission.
