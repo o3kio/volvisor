@@ -13,6 +13,7 @@ Related:
 - [SPEC-0001](../docs/specs/SPEC-0001-storage-cell-v0.md)
 - [Storage-class semantics v1](storage-class-semantics-v1.md)
 - [Replicated-async v1](replicated-async-v1.md)
+- [Provider authoring guide](../docs/provider-authoring.md)
 
 This document is normative. If descriptive design text disagrees with this
 contract, this contract wins until it is deliberately versioned.

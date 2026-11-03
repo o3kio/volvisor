@@ -37,6 +37,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use volvisor_provider::VolumeProvider;
+use volvisor_provider::semantics::{
+    AttachmentIdentity, AttachmentRecordView, ensure_expected_attachment_generation,
+    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+};
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Health,
     LocalProtectionAxis, PoolProtection, Provisioning, RemoteProtectionAxis, VolumeClass,
@@ -47,8 +51,8 @@ use volvisor_types::request::{
     GrowVolumeRequest, GrowVolumeResponse, InspectVolumeResponse, LocalProtectionModeRequest,
 };
 use volvisor_types::{
-    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, Pool, PoolId,
-    ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
+    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, CapabilitySet, HostId, Pool,
+    PoolId, ProjectId, VolumeId, VolumeLifecycle, validate_api_version,
 };
 
 use crate::report::{
@@ -1410,18 +1414,12 @@ impl CephRbdProvider {
         // recorded replays the recorded response (even if the volume
         // generation has since moved) and never fabricates a second
         // attachment; the same id with a different payload conflicts.
+        let identity = AttachmentIdentity::from_request(volume_id, req, mode);
         for (recorded_volume, stored) in state.volumes() {
             if let Some(record) = stored.runtime.attachment.as_ref() {
                 if record.id == req.attachment_id {
-                    if *recorded_volume == *volume_id
-                        && record.vm_id == req.vm_id
-                        && record.host_id == req.host_id
-                        && record.access_mode == mode
-                        && record.vmm_disk_id == req.vmm_disk_id
-                    {
-                        return Ok(attach_response(record, &stored.entry));
-                    }
-                    return Err(ApiError::idempotency_conflict(&req.attachment_id));
+                    resolve_attachment_replay(recorded_volume, record, &identity)?;
+                    return Ok(attach_response(record, &stored.entry));
                 }
             }
         }
@@ -1429,18 +1427,8 @@ impl CephRbdProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
-        if req.expected_volume_generation != stored.entry.generation {
-            return Err(ApiError::stale_generation(
-                req.expected_volume_generation,
-                stored.entry.generation,
-            ));
-        }
-        if stored.runtime.attachment.is_some() {
-            return Err(ApiError::new(
-                ApiErrorCode::WriterAlreadyActive,
-                format!("volume {volume_id} already has an active attachment"),
-            ));
-        }
+        ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
+        ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
         match stored.runtime.state {
             VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
             other => {
@@ -1508,12 +1496,10 @@ impl CephRbdProvider {
                 "attachment {attachment_id} is not attached to volume {volume_id}"
             )));
         }
-        if req.expected_attachment_generation != record.generation {
-            return Err(ApiError::stale_generation(
-                req.expected_attachment_generation,
-                record.generation,
-            ));
-        }
+        ensure_expected_attachment_generation(
+            req.expected_attachment_generation,
+            record.generation,
+        )?;
         // The drain proof (`vm_stopped_or_io_drained_proof`) is a
         // type-mandatory attestation: authority is never released without
         // one, though the provider cannot verify the claim itself
@@ -2191,6 +2177,32 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
         },
         // No VMM integration exists: evidence honestly starts at Prepared.
         state: AttachmentState::Prepared,
+    }
+}
+
+impl AttachmentRecordView for AttachmentRecord {
+    fn attachment_id(&self) -> &AttachmentId {
+        &self.id
+    }
+
+    fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    fn host_id(&self) -> &HostId {
+        &self.host_id
+    }
+
+    fn access_mode(&self) -> AccessMode {
+        self.access_mode
+    }
+
+    fn vmm_disk_id(&self) -> Option<&str> {
+        self.vmm_disk_id.as_deref()
+    }
+
+    fn attachment_generation(&self) -> u64 {
+        self.generation
     }
 }
 

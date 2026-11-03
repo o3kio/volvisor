@@ -10,6 +10,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::semantics::{
+    AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
+    ensure_attachment_id_not_retired, ensure_expected_attachment_generation,
+    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+};
 use async_trait::async_trait;
 use volvisor_types::domain::{
     AccessMode, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend, Generation, Health,
@@ -22,9 +27,9 @@ use volvisor_types::request::{
     ReplicationModeRequest, ReportAttachmentStateRequest, ReportAttachmentStateResponse,
 };
 use volvisor_types::{
-    ApiError, ApiErrorCode, Attachment, AttachmentId, AttachmentState, Capability, CapabilitySet,
-    PoolId, ProjectId, VolumeId, VolumeLifecycle, initial_state_revision, unix_ms_now,
-    validate_api_version,
+    ApiError, ApiErrorCode, Attachment, AttachmentEvidence, AttachmentId, AttachmentState,
+    Capability, CapabilitySet, HostId, PoolId, ProjectId, VolumeId, VolumeLifecycle,
+    initial_state_revision, unix_ms_now, validate_api_version,
 };
 
 /// Host identity the fake places every volume on.
@@ -435,35 +440,30 @@ fn resolve_attach_identity(
     // Idempotent replay by attachment identity: a crash-replayed request
     // must never fabricate a second attachment (Volume API v2 section 3).
     if let Some(existing) = state.attachments.get(&req.attachment_id) {
-        let same_payload = existing.volume_id == *volume_id
-            && existing.vm_id == req.vm_id
-            && existing.host_id == req.host_id
-            && existing.access_mode == requested_mode(req.access_mode)
-            && existing.vmm_disk_id == req.vmm_disk_id;
-        if same_payload {
-            let vol = state.volumes.get(volume_id).ok_or_else(|| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!(
-                        "fake state invariant violated: attachment {} without volume {volume_id}",
-                        req.attachment_id
-                    ),
-                )
-            })?;
-            return Ok(Some(attach_response(existing, vol)));
-        }
-        return Err(ApiError::attachment_id_conflict(&req.attachment_id));
+        let identity =
+            AttachmentIdentity::from_request(volume_id, req, requested_mode(req.access_mode));
+        resolve_attachment_replay(&existing.volume_id, existing, &identity)?;
+        let vol = state.volumes.get(volume_id).ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "fake state invariant violated: attachment {} without volume {volume_id}",
+                    req.attachment_id
+                ),
+            )
+        })?;
+        return Ok(Some(attach_response(existing, vol)));
     }
 
     // A report-capable provider must not reuse an attachment id that this
     // volume already consumed: a delayed report from the old instance
     // would otherwise be applied to the new one.
-    if state
-        .retired_attachments
-        .contains(&(volume_id.clone(), req.attachment_id.clone()))
-    {
-        return Err(ApiError::attachment_id_conflict(&req.attachment_id));
-    }
+    ensure_attachment_id_not_retired(
+        state
+            .retired_attachments
+            .contains(&(volume_id.clone(), req.attachment_id.clone())),
+        &req.attachment_id,
+    )?;
     Ok(None)
 }
 
@@ -493,12 +493,7 @@ fn apply_attach(
         .volumes
         .get_mut(volume_id)
         .ok_or_else(|| not_found(volume_id))?;
-    if req.expected_volume_generation != vol.generation.0 {
-        return Err(ApiError::stale_generation(
-            req.expected_volume_generation,
-            vol.generation.0,
-        ));
-    }
+    ensure_expected_generation(req.expected_volume_generation, vol.generation.0)?;
     if !matches!(
         vol.state,
         VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded
@@ -514,12 +509,10 @@ fn apply_attach(
     match mode {
         AccessMode::SingleWriter => {
             // A writer excludes every other attachment, readers included.
-            if vol.current_writer.is_some() || !vol.attachment_ids.is_empty() {
-                return Err(ApiError::new(
-                    ApiErrorCode::WriterAlreadyActive,
-                    format!("volume {volume_id} already has an active attachment"),
-                ));
-            }
+            ensure_no_active_attachment(
+                vol.current_writer.is_some() || !vol.attachment_ids.is_empty(),
+                volume_id,
+            )?;
         }
         AccessMode::ReadOnly => {
             if vol.current_writer.is_some() {
@@ -582,12 +575,10 @@ fn apply_detach(
             "attachment {attachment_id} does not belong to volume {volume_id}"
         )));
     }
-    if req.expected_attachment_generation != attachment_generation {
-        return Err(ApiError::stale_generation(
-            req.expected_attachment_generation,
-            attachment_generation,
-        ));
-    }
+    ensure_expected_attachment_generation(
+        req.expected_attachment_generation,
+        attachment_generation,
+    )?;
     // The drain proof is a type-mandatory attestation (`DrainProof`); the
     // provider requires it but cannot verify it — authority is only
     // released with the proof present (Volume API v2 section 3).
@@ -898,6 +889,68 @@ fn attachment_view(attachment: &Attachment) -> AttachmentView {
     }
 }
 
+impl AttachmentRecordView for Attachment {
+    fn attachment_id(&self) -> &AttachmentId {
+        &self.id
+    }
+
+    fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    fn host_id(&self) -> &HostId {
+        &self.host_id
+    }
+
+    fn access_mode(&self) -> AccessMode {
+        self.access_mode
+    }
+
+    fn vmm_disk_id(&self) -> Option<&str> {
+        self.vmm_disk_id.as_deref()
+    }
+
+    fn attachment_generation(&self) -> u64 {
+        self.generation.0
+    }
+}
+
+impl AttachmentStateRecord for Attachment {
+    fn attachment_state(&self) -> AttachmentState {
+        self.state
+    }
+
+    fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+
+    fn evidence(&self) -> Option<AttachmentEvidence> {
+        self.evidence
+    }
+
+    fn reporter(&self) -> Option<&str> {
+        self.reporter.as_deref()
+    }
+
+    fn recorded_at_ms(&self) -> Option<u64> {
+        self.recorded_at_ms
+    }
+
+    fn record_reported_state(
+        &mut self,
+        state: AttachmentState,
+        evidence: AttachmentEvidence,
+        reporter: Option<String>,
+        recorded_at_ms: u64,
+    ) {
+        self.state = state;
+        self.state_revision += 1;
+        self.evidence = Some(evidence);
+        self.reporter = reporter;
+        self.recorded_at_ms = Some(recorded_at_ms);
+    }
+}
+
 /// Apply a consumer report. The generation fence is checked but never
 /// advanced; evidence advances monotonically and a lower/equal report is an
 /// idempotent no-op.
@@ -917,56 +970,28 @@ fn apply_report(
             provider.name
         )));
     }
-    let (attachment_volume, attachment_generation, current_state) =
-        match state.attachments.get(&req.attachment_id) {
-            Some(att) => (att.volume_id.clone(), att.generation.0, att.state),
-            None => {
-                return Err(ApiError::not_found(format!(
-                    "attachment {} not found",
-                    req.attachment_id
-                )));
-            }
-        };
+    let attachment_volume = match state.attachments.get(&req.attachment_id) {
+        Some(att) => att.volume_id.clone(),
+        None => {
+            return Err(ApiError::not_found(format!(
+                "attachment {} not found",
+                req.attachment_id
+            )));
+        }
+    };
     if attachment_volume != *volume_id {
         return Err(ApiError::not_found(format!(
             "attachment {} does not belong to volume {volume_id}",
             req.attachment_id
         )));
     }
-    if req.expected_attachment_generation != attachment_generation {
-        return Err(ApiError::stale_generation(
-            req.expected_attachment_generation,
-            attachment_generation,
-        ));
-    }
-
-    let applied = req.state > current_state;
-    if applied {
-        let attachment = state
-            .attachments
-            .get_mut(&req.attachment_id)
-            .ok_or_else(|| {
-                ApiError::not_found(format!("attachment {} not found", req.attachment_id))
-            })?;
-        attachment.state = req.state;
-        attachment.state_revision += 1;
-        attachment.evidence = Some(req.evidence);
-        attachment.reporter.clone_from(&req.reporter);
-        attachment.recorded_at_ms = Some(unix_ms_now());
-    }
-    let attachment = state.attachments.get(&req.attachment_id).ok_or_else(|| {
-        ApiError::not_found(format!("attachment {} not found", req.attachment_id))
-    })?;
-    Ok(ReportAttachmentStateResponse {
-        attachment_id: attachment.id.clone(),
-        state: attachment.state,
-        state_revision: attachment.state_revision,
-        evidence: attachment.evidence,
-        reporter: attachment.reporter.clone(),
-        recorded_at_ms: attachment.recorded_at_ms,
-        attachment_generation: attachment.generation.0,
-        applied,
-    })
+    let attachment = state
+        .attachments
+        .get_mut(&req.attachment_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("attachment {} not found", req.attachment_id))
+        })?;
+    apply_attachment_report(attachment, req, unix_ms_now())
 }
 
 fn used_bytes(state: &FakeState) -> u64 {

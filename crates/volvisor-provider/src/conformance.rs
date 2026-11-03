@@ -18,6 +18,16 @@
 //! the rate-limit honored-or-refused rule, observed-target
 //! validation).
 //!
+//! [`assert_parity`] is the cross-provider parity suite: it drives the shared
+//! lifecycle (create/attach replay, attachment-id conflicts, single-writer
+//! admission, volume/attachment generation fencing, detach/delete finality) and
+//! compares decision classes against both the shared expected fixture and the
+//! in-memory reference provider. The report/tombstone branch is
+//! capability-conditional: providers advertising
+//! [`Capability::AttachmentStateReport`] must implement the positive contract,
+//! and a provider without it must fail closed. `provider_conformance_tests!`
+//! generates a `parity` test alongside the per-check tests.
+//!
 //! The kit targets the P0 `native-local` profile: fixtures build
 //! `native-local` thick volumes, and post-create evidence is asserted to be
 //! `PrototypeOnly`.
@@ -35,7 +45,7 @@ use volvisor_types::request::{
     MoveVolumeBackingRequest, ReportAttachmentStateRequest,
 };
 use volvisor_types::{
-    ApiErrorCode, AttachmentId, AttachmentState, Capability, Frontend, HostId,
+    ApiError, ApiErrorCode, AttachmentId, AttachmentState, Capability, Frontend, HostId,
     MoveVolumeBackingState, OperationId, ProjectId, VolumeId, VolumeLifecycle,
 };
 
@@ -1057,8 +1067,567 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// Cross-provider parity driver
+// ---------------------------------------------------------------------------
+
+/// The outcome class of one parity step.
+///
+/// The parity suite compares *classes*, never backend-specific details
+/// (device paths, health, protection axes): every provider must make the same
+/// decision at each step of the shared lifecycle. `Other` keeps an unexpected
+/// typed error visible instead of collapsing it to a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParityOutcome {
+    /// Create succeeded.
+    Created,
+    /// An idempotent create or attach replay returned the recorded result.
+    Replayed,
+    /// Attach succeeded.
+    Attached,
+    /// Detach succeeded.
+    Detached,
+    /// Delete succeeded.
+    Deleted,
+    /// The request conflicted with recorded state (`IDEMPOTENCY_CONFLICT`).
+    Conflict,
+    /// A generation fence refused the request (`STALE_GENERATION`).
+    Stale,
+    /// Single-writer admission refused a second writer.
+    WriterActive,
+    /// The resource does not exist for this operation.
+    NotFound,
+    /// The request is invalid in the current lifecycle state.
+    InvalidState,
+    /// The class/policy/field is unsupported (fail-closed).
+    Unsupported,
+    /// A consumer report advanced the evidence rank.
+    Applied(AttachmentState),
+    /// A consumer report was an idempotent no-op at the current rank.
+    NoOp(AttachmentState),
+    /// Any other typed error code (a divergence unless both sides emit it).
+    Other(ApiErrorCode),
+}
+
+impl ParityOutcome {
+    fn from_error(error: &ApiError) -> Self {
+        match error.code {
+            ApiErrorCode::IdempotencyConflict => Self::Conflict,
+            ApiErrorCode::StaleGeneration => Self::Stale,
+            ApiErrorCode::WriterAlreadyActive => Self::WriterActive,
+            ApiErrorCode::NotFound => Self::NotFound,
+            ApiErrorCode::InvalidState => Self::InvalidState,
+            ApiErrorCode::UnsupportedClassOrPolicy => Self::Unsupported,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// One named step and the class of its observed outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParityStep {
+    /// Stable step name (part of the expected fixture).
+    pub name: &'static str,
+    /// Observed outcome class.
+    pub outcome: ParityOutcome,
+}
+
+fn outcome<T>(result: Result<T, ApiError>, success: ParityOutcome) -> ParityOutcome {
+    match result {
+        Ok(_) => success,
+        Err(error) => ParityOutcome::from_error(&error),
+    }
+}
+
+fn report_outcome(
+    result: Result<volvisor_types::request::ReportAttachmentStateResponse, ApiError>,
+) -> ParityOutcome {
+    match result {
+        Ok(response) if response.applied => ParityOutcome::Applied(response.state),
+        Ok(response) => ParityOutcome::NoOp(response.state),
+        Err(error) => ParityOutcome::from_error(&error),
+    }
+}
+
+fn step(name: &'static str, outcome: ParityOutcome) -> ParityStep {
+    ParityStep { name, outcome }
+}
+
+/// The expected universal parity sequence shared by every provider.
+///
+/// This is the reference fixture: attach replay, attachment-id conflicts,
+/// single-writer admission, and volume/attachment generation fencing must be
+/// indistinguishable across backends.
+#[must_use]
+pub fn expected_universal_parity() -> Vec<ParityStep> {
+    use ParityOutcome::{
+        Attached, Conflict, Created, Deleted, Detached, NotFound, Replayed, Stale, WriterActive,
+    };
+    vec![
+        step("create", Created),
+        step("create-replay", Replayed),
+        step("create-payload-conflict", Conflict),
+        step("attach-stale-before-attach", Stale),
+        step("attach", Attached),
+        step("attach-replay", Replayed),
+        step("attach-stale-after-attach", Stale),
+        step("attach-same-id-different-payload", Conflict),
+        step("attach-second-writer", WriterActive),
+        step("detach-stale", Stale),
+        step("detach", Detached),
+        step("detach-again", NotFound),
+        step("delete-stale", Stale),
+        step("delete", Deleted),
+        step("inspect-after-delete", NotFound),
+    ]
+}
+
+/// Run the universal shared-semantics sequence against `provider`.
+///
+/// Every provider must return [`expected_universal_parity`] (and therefore the
+/// same sequence as the in-memory reference provider). The sequence never
+/// advertises backend-specific behavior: no device handles, health axes,
+/// capabilities, grow or consumer reports participate.
+#[allow(clippy::too_many_lines)]
+pub async fn run_universal_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep> {
+    let volume_id = "parity-universal";
+    let mut steps = Vec::new();
+
+    let create = fixture_create_request(volume_id, GIB);
+    let created = provider.create_volume(&create).await;
+    let volume_generation = created.as_ref().map_or(0, |volume| volume.generation);
+    steps.push(step("create", outcome(created, ParityOutcome::Created)));
+
+    steps.push(step(
+        "create-replay",
+        outcome(
+            provider.create_volume(&create).await,
+            ParityOutcome::Replayed,
+        ),
+    ));
+
+    let mut conflicting = fixture_create_request(volume_id, 2 * GIB);
+    conflicting.operation_id =
+        OperationId::new("op-parity-create-conflict").expect("valid fixture operation id");
+    steps.push(step(
+        "create-payload-conflict",
+        outcome(
+            provider.create_volume(&conflicting).await,
+            ParityOutcome::Replayed,
+        ),
+    ));
+
+    let stale_before =
+        fixture_attach_request(volume_id, "parity-stale-before", volume_generation + 1_000);
+    steps.push(step(
+        "attach-stale-before-attach",
+        outcome(
+            provider
+                .attach_volume(&create.volume_id, &stale_before)
+                .await,
+            ParityOutcome::Attached,
+        ),
+    ));
+
+    let attach = fixture_attach_request(volume_id, "parity-attachment", volume_generation);
+    let attached = provider.attach_volume(&create.volume_id, &attach).await;
+    let attachment_generation = attached
+        .as_ref()
+        .map_or(0, |response| response.attachment_generation);
+    steps.push(step("attach", outcome(attached, ParityOutcome::Attached)));
+
+    // A replay keeps the *original* expected volume generation: replay
+    // identity wins over the (now stale) generation fence.
+    steps.push(step(
+        "attach-replay",
+        outcome(
+            provider.attach_volume(&create.volume_id, &attach).await,
+            ParityOutcome::Replayed,
+        ),
+    ));
+
+    let stale_after = fixture_attach_request(volume_id, "parity-stale-after", volume_generation);
+    steps.push(step(
+        "attach-stale-after-attach",
+        outcome(
+            provider
+                .attach_volume(&create.volume_id, &stale_after)
+                .await,
+            ParityOutcome::Attached,
+        ),
+    ));
+
+    let mut different =
+        fixture_attach_request(volume_id, "parity-attachment", volume_generation + 1);
+    "parity-other-vm".clone_into(&mut different.vm_id);
+    steps.push(step(
+        "attach-same-id-different-payload",
+        outcome(
+            provider.attach_volume(&create.volume_id, &different).await,
+            ParityOutcome::Replayed,
+        ),
+    ));
+
+    let second_writer =
+        fixture_attach_request(volume_id, "parity-second-writer", volume_generation + 1);
+    steps.push(step(
+        "attach-second-writer",
+        outcome(
+            provider
+                .attach_volume(&create.volume_id, &second_writer)
+                .await,
+            ParityOutcome::Attached,
+        ),
+    ));
+
+    let stale_detach = fixture_detach_request("parity-attachment", attachment_generation + 1);
+    steps.push(step(
+        "detach-stale",
+        outcome(
+            provider
+                .detach_volume(&create.volume_id, &attach.attachment_id, &stale_detach)
+                .await,
+            ParityOutcome::Detached,
+        ),
+    ));
+
+    let detach = fixture_detach_request("parity-attachment", attachment_generation);
+    let detached = provider
+        .detach_volume(&create.volume_id, &attach.attachment_id, &detach)
+        .await;
+    let generation_after_detach = detached
+        .as_ref()
+        .map_or(volume_generation + 2, |volume| volume.generation);
+    steps.push(step("detach", outcome(detached, ParityOutcome::Detached)));
+
+    steps.push(step(
+        "detach-again",
+        outcome(
+            provider
+                .detach_volume(&create.volume_id, &attach.attachment_id, &detach)
+                .await,
+            ParityOutcome::Detached,
+        ),
+    ));
+
+    steps.push(step(
+        "delete-stale",
+        outcome(
+            provider
+                .delete_volume(
+                    &create.volume_id,
+                    &fixture_delete_request(volume_id, volume_generation),
+                )
+                .await,
+            ParityOutcome::Deleted,
+        ),
+    ));
+
+    steps.push(step(
+        "delete",
+        outcome(
+            provider
+                .delete_volume(
+                    &create.volume_id,
+                    &fixture_delete_request(volume_id, generation_after_detach),
+                )
+                .await,
+            ParityOutcome::Deleted,
+        ),
+    ));
+
+    steps.push(step(
+        "inspect-after-delete",
+        outcome(
+            provider.inspect_volume(&create.volume_id).await,
+            ParityOutcome::Created,
+        ),
+    ));
+
+    steps
+}
+
+/// The expected report/tombstone parity sequence.
+///
+/// Report-capable providers apply consumer reports monotonically, keep the
+/// attachment generation fixed, answer repeated/lower reports as no-ops,
+/// refuse a stale generation, and retire the attachment id. Providers that do
+/// not advertise [`Capability::AttachmentStateReport`] must fail closed with
+/// `NOT_FOUND` instead of synthesizing evidence.
+#[must_use]
+pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
+    use ParityOutcome::{
+        Applied, Attached, Conflict, Created, Deleted, Detached, NoOp, NotFound, Stale,
+    };
+    if report_capable {
+        vec![
+            step("create", Created),
+            step("attach", Attached),
+            step("report-advertised", Applied(AttachmentState::Advertised)),
+            step("report-active", Applied(AttachmentState::Active)),
+            step("report-equal", NoOp(AttachmentState::Active)),
+            step("report-lower", NoOp(AttachmentState::Active)),
+            step("report-stale", Stale),
+            step("detach", Detached),
+            step("report-after-detach", NotFound),
+            step("reattach-retired-id", Conflict),
+        ]
+    } else {
+        vec![
+            step("create", Created),
+            step("attach", Attached),
+            step("report-without-capability", NotFound),
+            step("detach", Detached),
+            step("delete", Deleted),
+            step("inspect-after-delete", NotFound),
+        ]
+    }
+}
+
+/// Run the report/tombstone parity sequence against `provider`.
+///
+/// The driver branches on the advertised capability so the same fixture
+/// states the positive contract (fake/LVM) and the fail-closed contract
+/// (Ceph/DRBD), without either side skipping the check.
+#[allow(clippy::too_many_lines)]
+pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep> {
+    let volume_id = "parity-reports";
+    let report_capable = provider
+        .capabilities()
+        .contains(Capability::AttachmentStateReport);
+    let mut steps = Vec::new();
+
+    let create = fixture_create_request(volume_id, GIB);
+    let created = provider.create_volume(&create).await;
+    let volume_generation = created.as_ref().map_or(0, |volume| volume.generation);
+    steps.push(step("create", outcome(created, ParityOutcome::Created)));
+
+    let attach = fixture_attach_request(volume_id, "parity-report-attachment", volume_generation);
+    let attached = provider.attach_volume(&create.volume_id, &attach).await;
+    let attachment_generation = attached
+        .as_ref()
+        .map_or(0, |response| response.attachment_generation);
+    // `attach` always succeeds in the fixture.
+    steps.push(step("attach", outcome(attached, ParityOutcome::Attached)));
+
+    if report_capable {
+        steps.push(step(
+            "report-advertised",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Advertised,
+                            AttachmentEvidence::VmmConfigured,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+        steps.push(step(
+            "report-active",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+        steps.push(step(
+            "report-equal",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+        steps.push(step(
+            "report-lower",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Advertised,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+        steps.push(step(
+            "report-stale",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation + 1,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+    } else {
+        steps.push(step(
+            "report-without-capability",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Advertised,
+                            AttachmentEvidence::VmmConfigured,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+    }
+
+    // Reports never advance the attachment generation: this detach still
+    // fences on the original generation.
+    let detach = fixture_detach_request("parity-report-attachment", attachment_generation);
+    let detached = provider
+        .detach_volume(&create.volume_id, &attach.attachment_id, &detach)
+        .await;
+    let generation_after_detach = detached
+        .as_ref()
+        .map_or(volume_generation + 2, |volume| volume.generation);
+    steps.push(step("detach", outcome(detached, ParityOutcome::Detached)));
+
+    if report_capable {
+        steps.push(step(
+            "report-after-detach",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
+            ),
+        ));
+        let reattach = fixture_attach_request(
+            volume_id,
+            "parity-report-attachment",
+            generation_after_detach,
+        );
+        steps.push(step(
+            "reattach-retired-id",
+            outcome(
+                provider.attach_volume(&create.volume_id, &reattach).await,
+                ParityOutcome::Attached,
+            ),
+        ));
+    } else {
+        steps.push(step(
+            "delete",
+            outcome(
+                provider
+                    .delete_volume(
+                        &create.volume_id,
+                        &fixture_delete_request(volume_id, generation_after_detach),
+                    )
+                    .await,
+                ParityOutcome::Deleted,
+            ),
+        ));
+        steps.push(step(
+            "inspect-after-delete",
+            outcome(
+                provider.inspect_volume(&create.volume_id).await,
+                ParityOutcome::Created,
+            ),
+        ));
+    }
+
+    steps
+}
+
+// ---------------------------------------------------------------------------
 // Suite entry points
 // ---------------------------------------------------------------------------
+
+/// Run the cross-provider parity suite against `provider`.
+///
+/// Fails when the provider's decision classes diverge from either the shared
+/// expected fixture or the in-memory reference provider. The report/tombstone
+/// branch is capability-conditional: capable providers must match the positive
+/// contract, non-capable providers must fail closed.
+///
+/// # Errors
+/// A description of the first divergent sequence.
+pub async fn assert_parity(provider: &dyn VolumeProvider) -> Result<(), String> {
+    let reference = crate::fake::FakeProvider::new();
+
+    let reference_universal = run_universal_parity(&reference).await;
+    let universal = run_universal_parity(provider).await;
+    if universal != reference_universal {
+        return Err(format!(
+            "universal parity diverges from the reference provider:\n  reference: \
+             {reference_universal:?}\n  provider:  {universal:?}"
+        ));
+    }
+    let expected = expected_universal_parity();
+    if universal != expected {
+        return Err(format!(
+            "universal parity does not match the shared fixture:\n  expected: {expected:?}\n  \
+             provider: {universal:?}"
+        ));
+    }
+
+    let report_capable = provider
+        .capabilities()
+        .contains(Capability::AttachmentStateReport);
+    let reports = run_report_parity(provider).await;
+    let expected_reports = expected_report_parity(report_capable);
+    if reports != expected_reports {
+        return Err(format!(
+            "report/tombstone parity does not match the shared fixture:\n  expected: \
+             {expected_reports:?}\n  provider: {reports:?}"
+        ));
+    }
+    if report_capable {
+        let reference_reports = run_report_parity(&reference).await;
+        if reports != reference_reports {
+            return Err(format!(
+                "report/tombstone parity diverges from the reference provider:\n  reference: \
+                 {reference_reports:?}\n  provider:  {reports:?}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Run every conformance check against `provider`.
 ///
@@ -1256,6 +1825,14 @@ macro_rules! provider_conformance_tests {
                 let outcome = $crate::conformance::check_move_contract(provider).await;
                 assert_eq!(outcome, Ok(()), "conformance failure");
             }
+
+            #[tokio::test]
+            async fn parity() {
+                let provider = $make_provider();
+                let provider: &dyn $crate::VolumeProvider = &*provider;
+                let outcome = $crate::conformance::assert_parity(provider).await;
+                assert_eq!(outcome, Ok(()), "parity failure");
+            }
         }
     };
 }
@@ -1280,6 +1857,34 @@ mod tests {
         let provider: &dyn VolumeProvider = &provider;
         let outcome = assert_conformance(provider).await;
         assert_eq!(outcome, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn universal_parity_is_the_expected_sequence() {
+        let provider = FakeProvider::new();
+        assert_eq!(
+            run_universal_parity(&provider).await,
+            expected_universal_parity()
+        );
+    }
+
+    #[tokio::test]
+    async fn report_parity_is_the_expected_sequence() {
+        let provider = FakeProvider::new();
+        assert_eq!(
+            run_report_parity(&provider).await,
+            expected_report_parity(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_incapable_fake_fails_closed_on_reports() {
+        let provider = FakeProvider::new()
+            .with_capabilities(CapabilitySet::of([Capability::Create, Capability::Attach]));
+        assert_eq!(
+            run_report_parity(&provider).await,
+            expected_report_parity(false)
+        );
     }
 
     /// A provider that does not advertise `resize` must still pass the
