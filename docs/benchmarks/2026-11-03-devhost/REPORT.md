@@ -105,11 +105,13 @@ the run's 606 MiB daemon log is stored as `raw/daemon.daemon.log.gz` because
 forges reject individual files above 100 MiB. The bundle is a copy of the
 run directory plus this authored report; no measurement file was edited.
 
-The pull request head is `1a2402b`. Every commit after `e3aa365` is
-documentation or the publish-time size guard in `scripts/bench/publish.sh`;
-none changes the measured binary, the load generator, or the summarizer. The
-run-time source is therefore exactly `e3aa365`, and this report does not
-claim measurements from `1a2402b`.
+The measurement was taken at `e3aa365`. Commits after it in this line of
+history — `1a2402b`, the later documentation correction, and the merge of
+`main` at `5037db9` (a test-only change) — are documentation or the
+publish-time size guard in `scripts/bench/publish.sh`; none changes the
+measured binary, the load generator, or the summarizer. The run-time source
+is therefore exactly `e3aa365`, which remains an ancestor for inspection,
+and this report does not claim measurements from any later commit.
 
 ## 4. Capacity table: 1/8/32/128 mixed in-flight
 
