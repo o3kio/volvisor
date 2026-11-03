@@ -1,0 +1,6 @@
+# orchestrator run record
+# command: REPO=/root/git/volvisor-wt-d5 BIN=/root/git/volvisor-wt-d5/target/debug RUN=/tmp/opencode/volvisor-d5-redrill-20261103T202159Z bash docs/runbooks/day-2/scripts/d5.sh
+# cwd: /root/git/volvisor-wt-d5
+# start: 2026-11-03T20:21:59Z
+# end: 2026-11-03T20:22:02Z
+# exit_status: 0

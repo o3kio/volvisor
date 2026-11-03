@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "volumes": {
+    "vol-d5-lvm-baseline": {
+      "entry": {
+        "vg_name": "vg-d5lvm",
+        "lv_name": "vol-vol-d5-lvm-baseline-3498a2bf",
+        "size_bytes": 67108864,
+        "requested_size_bytes": 67108864,
+        "generation": 1,
+        "data_epoch": 0,
+        "project_id": "day2",
+        "block_size": 4096,
+        "creation_payload": "{\"api_version\":\"volvisor.volume.v2\",\"class\":\"native-local\",\"encryption\":null,\"local_protection\":null,\"logical_block_size\":null,\"migration_policy\":null,\"placement\":null,\"project_id\":\"day2\",\"provisioning\":null,\"replication\":null,\"size_bytes\":67108864,\"volume_id\":\"vol-d5-lvm-baseline\"}"
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null
+      }
+    },
+    "vol-d5-lvm-full": {
+      "entry": {
+        "vg_name": "vg-d5lvm",
+        "lv_name": "vol-vol-d5-lvm-full-58c0134e",
+        "size_bytes": 67108864,
+        "requested_size_bytes": 67108864,
+        "generation": 1,
+        "data_epoch": 0,
+        "project_id": "day2",
+        "block_size": 4096,
+        "creation_payload": "{\"api_version\":\"volvisor.volume.v2\",\"class\":\"native-local\",\"encryption\":null,\"local_protection\":null,\"logical_block_size\":null,\"migration_policy\":null,\"placement\":null,\"project_id\":\"day2\",\"provisioning\":null,\"replication\":null,\"size_bytes\":67108864,\"volume_id\":\"vol-d5-lvm-full\"}"
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null
+      }
+    }
+  },
+  "devices": {
+    "dev-d2d5-lvm01": {
+      "stable_identity": "day2-lab-d5-lvm",
+      "path": "/dev/loop0",
+      "vg_name": "vg-d5lvm",
+      "role": "native_pool",
+      "owner_generation": 1
+    }
+  },
+  "moves": {}
+}

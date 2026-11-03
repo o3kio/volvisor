@@ -17,6 +17,34 @@ statement, or an SLA.
   `nearline-replicated` are `not-run` and explicitly **not claimed**. The
   `native-local` suite is a loop-device gate, not real-NVMe qualification.
 
+## Post-report addendum (2026-11-03)
+
+This addendum records work that landed after the report's basis. **The basis
+of this report remains `main` at `575acfc`**, and the addendum changes no gate
+verdict below.
+
+- [PR #69](https://github.com/o3kio/volvisor/pull/69) merged at
+  `1863a7ac250d20246c328a2fd4c4acca330e3693`, fixing
+  [#58](https://github.com/o3kio/volvisor/issues/58).
+- D5 (ENOSPC) was re-drilled post-fix (both parts) at harness
+  `940722ea3322df0a47834c307e2e0081c57e0b5e` (`940722e`) on one development
+  host. `git diff --name-only 1863a7a 940722e -- crates/ Cargo.toml
+  Cargo.lock release-scope.toml` is empty, so the product code is identical to
+  merged `1863a7a`; only the three day-2 harness scripts (`d3.sh`, `d5.sh`,
+  `lib.sh`) differ. The raw header records a clean worktree.
+- Bundle:
+  [`docs/evidence/day2/2026-11-03-d5-redrill/`](../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
+  It proves the **normal uncommitted state-save path** fails closed and
+  converges, and re-confirms the journal path. It does not fault-inject the
+  cleanup-failure, post-rename carve-out or unreadable-durable-reread branches;
+  those remain test-covered. [#70](https://github.com/o3kio/volvisor/issues/70)
+  is separate out-of-scope work: grow/delete/move persist divergence, the
+  kill-9 `lvcreate`→persist orphan window, and a real post-rename
+  directory-fsync fault seam.
+- No gate becomes met; gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
+  remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
+  READY**.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |
@@ -40,7 +68,7 @@ pre-production, production-ready, or a release candidate.
 | #40 transport/auth | Landed | `ad9efb0` | Same-host capture; cross-host validation open |
 | #42 provider consolidation | Landed | `db04182` | Parity suite uses simulated Ceph/DRBD worlds; no real clusters |
 | #45 admission control | Landed | `0c853f3` | No resumable operation handle/long-poll; one uniform read timeout, not per-route values; rate limiting is opt-in |
-| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58 |
+| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 is separate out-of-scope persist work |
 | #44 observability | Landed | `5017ea0`; [docs](../operations/observability.md) | State-save duration and lease/epoch gauges deliberately omitted; real migration trace **not run** |
 | #43 benchmarks | Landed | `575acfc`; [bundle](../benchmarks/2026-11-03-devhost/REPORT.md) | Single host, loop-backed LVM, control plane only; 25.0 min soak, **not 24 h**; no real Ceph/DRBD/physical-disk LVM |
 | #49 harness flake | Partial | `5037db9` | LVM mid-move abort flake fixed; fuzz targets, interleaving tests and nightly flake rate remain open |
@@ -57,6 +85,7 @@ source is `e3aa365`; it remains an ancestor of `main` for inspection.
 | [Tier V, CH v43.0.0](../evidence/tier-v/2026-10-10-devhost/) | recorded in bundle | One physical development host; simulated storage | The same scenarios on the older VMM; fail-closed grow-retry branch | Grow notification on v43, real-host durability |
 | [Transport/TLS same-host](../evidence/transport-tls/2026-11-02-devhost-netns/) | base `a6591d9`, dirty tree | One kernel; netns/veth peers | TLS/mTLS, untrusted-cert rejection, insecure-bind refusal, encrypted pcap, audit attribution | Cross-host witness/peer hop, live rotation, HSM/TPM |
 | [Day-2 drills](../evidence/day2/2026-11-03-devhost/REPORT.md) | `e551d26`, clean worktree | One host | D1/D4/D5/D6/D7 drilled; 181-entry manifest verifies | D2/D3 full paths, D8 host loss, live upgrade/rollback, DRBD fencing, multi-host |
+| [D5 post-fix re-drill](../evidence/day2/2026-11-03-d5-redrill/REPORT.md) | `1863a7a` product / `940722e` harness, clean worktree | One host; loop LVM; 256 KiB tmpfs ENOSPC | The normal uncommitted state-save path fails closed and converges: 500 with ENOSPC and the state `.tmp` path, byte-identical old state, LV compensated, 404 in the same process and after restart, terminal same-`operation_id` replay, new-`operation_id` 200/`Ready`, one LV for the new volume and two durable records total, no residue; journal path re-confirmed | The three non-injected tails (cleanup failure, post-rename carve-out, unreadable durable re-read), real disk/inode/thin-pool failure, multi-host, production readiness |
 | [Control-plane benchmarks](../benchmarks/2026-11-03-devhost/REPORT.md) | `e3aa365`, clean worktree | One host, loop-backed LVM, loopback HTTP | 1/8/32/128 sweep, 25-min soak, restart replay, 46-entry manifest verifies | Data path, real backends, 24 h soak, production capacity or SLA |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
@@ -109,12 +138,18 @@ report mapping every gate to evidence. Current status:
    DRBD fencing.
 5. **#43 — credible backend numbers and 24 h soak.** Single-host loop-LVM
    only; no real Ceph/DRBD/physical-disk numbers and no 24 h run.
-6. **#49 / #58 / #62 / #63 / #64 — assurance and real findings.** Fuzzing and
-   interleaving tests are not implemented; the ENOSPC state-save leak is fixed
-   in code by [PR #69](https://github.com/o3kio/volvisor/pull/69) with a
-   real-LVM regression test (`#58`), while the measured
-   lock/journal/retirement growth remains an open finding. None is a resolved
-   production issue.
+6. **#49 / #62 / #63 / #64 — open assurance and growth findings; #58 fixed.**
+   Fuzzing and
+   interleaving tests are not implemented. The ENOSPC state-save leak is fixed
+   by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
+   `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
+   `940722e`; the cleanup-failure, carve-out and unreadable-reread branches
+   remain test-covered, not drilled. The separate out-of-scope work
+   (grow/delete/move persist divergence, the kill-9 `lvcreate`→persist orphan
+   window, and a real post-rename directory-fsync fault seam) is
+   [#70](https://github.com/o3kio/volvisor/issues/70). The measured
+   lock/journal/retirement growth remains an open finding. No gate verdict
+   changes, and none is a resolved production issue.
 
 ## What must not be claimed
 
@@ -140,6 +175,14 @@ sudo ./scripts/test-lvm.sh
 python3 scripts/release-scope.py check
 (cd docs/benchmarks/2026-11-03-devhost && sha256sum -c MANIFEST.sha256)
 (cd docs/evidence/day2/2026-11-03-devhost && sha256sum -c MANIFEST.sha256)
+```
+
+The D5 post-fix re-drill bundle was added after `575acfc`, so verify it from
+the commit that contains this addendum, not from `575acfc`:
+
+```bash
+git checkout <commit-containing-this-addendum>
+(cd docs/evidence/day2/2026-11-03-d5-redrill && sha256sum -c MANIFEST.sha256)
 ```
 
 Ceph and DRBD suites remain `not-run`; running them without a provisioned

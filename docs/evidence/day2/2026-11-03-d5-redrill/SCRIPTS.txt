@@ -1,0 +1,83 @@
+D5 harness scripts: provenance record
+====================================
+
+Unlike the pre-fix bundle at e551d26 — where the harness was absent from the
+recorded commit's tree and its bytes could not be bound to the run — this
+drill ran with all three day-2 harness scripts tracked at the commit recorded
+in the raw header.
+
+Run HEAD:      940722ea3322df0a47834c307e2e0081c57e0b5e
+Header:        # source_sha: 940722ea3322df0a47834c307e2e0081c57e0b5e
+Header:        # worktree_dirty: no
+
+`worktree_dirty` is derived from `git -C "$REPO" status --porcelain`, which
+reports tracked modifications and untracked, non-ignored files. The scripts
+are tracked at 940722e, the same commit the header records, and the header
+declares the worktree clean. The files at that commit are therefore the
+closest auditable bytes for this run, and no separate untracked copy was
+recorded. There is still no in-log digest: the binding rests on the recorded
+SHA plus the clean-worktree flag.
+
+SHA256 at 940722e (matches the worktree files)
+----------------------------------------------
+3ba417118f6017f8788a007ab5da60ab03a5f7dd05a53eadf41dd1310d026e76  d5.sh
+32fea568975b6ccebd5d9c2563eeaea982378f204cc82203f9e65c8b4f9b0b67  lib.sh
+46ef59267ba9f5c8a978a46bb911809917539c436051020fed18d67e2c620607  d3.sh
+
+What changed relative to the pre-fix drills
+-------------------------------------------
+Three commits sit on top of product commit 1863a7a:
+
+  c9458423b018e8293da543b04a79b65ee79df726
+    "D5: assert the post-#58 fail-closed state-save contract"
+    Rewrote D5 part B to assert the new contract: 500/INTERNAL with the state
+    .tmp path and ENOSPC, no manual remediation, byte-identical old state, no
+    .tmp residue, the failed-volume LV removed, same-process and post-restart
+    404, baseline still served, terminal same-operation_id replay, a new
+    operation_id 200/Ready, and exactly one LV for the new volume with two
+    durable volume records at the end.
+
+  863c4c83f90cee27055e297226d416a7daef9148
+    "D5 harness: make the lab teardown ownership guard work"
+    Fixed the lab-teardown ownership guard in lib.sh.
+
+  940722ea3322df0a47834c307e2e0081c57e0b5e
+    "D5 harness: count cap failures and harden the ENOSPC setup"
+    Made cap/cap_stdin count an unexpected command status in the parent shell
+    (the command runs in the pipeline's subshell, so a wrapped api_expect
+    status mismatch previously did not reach ASSERT_FAILS), with CAP_EXPECT_RC
+    naming an expected nonzero status; d3.sh uses CAP_EXPECT_RC=7 for its
+    intentional witness-outage transport failure. Also verified each tmpfs
+    mount before filling it, capped fill_fs at 512 KiB and counted actual
+    bytes written, asserted zero free KiB at ENOSPC, preserved the
+    pre-restart daemon logs, asserted the baseline is still Ready after the
+    restart, failed the drill when a daemon ignores TERM and escalated to
+    KILL so it cannot hold the tmpfs open, made the EXIT trap escalate to
+    KILL and fall back to a lazy unmount, asserted the refused Part A create
+    is INTERNAL and that its append grew the journal before ENOSPC (tolerating
+    an empty recorded size), and added the carve-out, byte-identical replay
+    (cmp), replay-log, provisioned-bytes and trailing-bytes assertions.
+
+`git diff --name-only 1863a7a 940722e -- crates/ Cargo.toml Cargo.lock
+release-scope.toml` is empty. `git diff --stat 1863a7a 940722e` shows only
+docs/runbooks/day-2/scripts/d3.sh, docs/runbooks/day-2/scripts/d5.sh and
+docs/runbooks/day-2/scripts/lib.sh. No product source changed.
+
+Extract and verify the exact blobs with:
+  git show 940722e:docs/runbooks/day-2/scripts/d5.sh | sha256sum
+  git show 940722e:docs/runbooks/day-2/scripts/lib.sh | sha256sum
+  git show 940722e:docs/runbooks/day-2/scripts/d3.sh | sha256sum
+
+The three hashes above are the hashes of the files in the worktree at bundle
+authoring time, and they match `git show 940722e:...` for all three scripts.
+
+If this PR is squash-merged, `940722e` may not be reachable from the merged
+history. The commit that contains this bundle carries the same three script
+bytes; verify them there:
+
+  sha256sum docs/runbooks/day-2/scripts/d5.sh \
+            docs/runbooks/day-2/scripts/lib.sh \
+            docs/runbooks/day-2/scripts/d3.sh
+
+All must equal the values above. Do not treat an unreachable pre-merge SHA
+as if it were still fetchable; use the hash comparison instead.

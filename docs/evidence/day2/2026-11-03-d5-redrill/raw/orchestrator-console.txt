@@ -1,0 +1,321 @@
+
+### 2026-11-03T20:21:59Z host=dev
+mounted tmpfs size=256k on /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+daemon d5-daemon healthy pid=3721978 port=59121
+
+### 2026-11-03T20:21:59Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-journal.curl POST http://127.0.0.1:59121/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-baseline.json 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-baseline.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+exit=0
+
+### 2026-11-03T20:21:59Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256     4       252   2% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+exit=0
+journal size=1124 last-page slack=2972 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=2217 last-page slack=1879 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=3308 last-page slack=788 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=4398 last-page slack=3794 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=5487 last-page slack=2705 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=6586 last-page slack=1606 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=7682 last-page slack=510 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=8782 last-page slack=3506 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=9875 last-page slack=2413 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=10963 last-page slack=1325 bytes
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+journal size=12060 last-page slack=228 bytes
+
+### 2026-11-03T20:21:59Z host=dev
+$ fill_fs /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs filler.bin
+filled=249856 stop=No space left on device
+exit=0
+
+### 2026-11-03T20:21:59Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256   256         0 100% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+exit=0
+ASSERT PASS: journal filesystem has zero KiB available at ENOSPC == 0
+journal before the failed append: size=12060 sha=41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172
+
+### 2026-11-03T20:21:59Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-journal.curl POST http://127.0.0.1:59121/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-full.json 500 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-full.resp.json
+HTTP 500 (want 500) POST http://127.0.0.1:59121/v2/volumes
+exit=0
+{"code":"INTERNAL","message":"failed to write journal record: No space left on device (os error 28)"}
+ASSERT PASS: journal ENOSPC code == INTERNAL
+ASSERT PASS: journal ENOSPC detail contains No\ space\ left\ on\ device
+
+### 2026-11-03T20:21:59Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-journal.curl GET http://127.0.0.1:59121/v2/volumes/vol-d5-full '' 404 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-full-absent.json
+HTTP 404 (want 404) GET http://127.0.0.1:59121/v2/volumes/vol-d5-full
+exit=0
+journal size immediately after the failed append: 12288
+ASSERT PASS: the failed append grew the journal past the valid prefix before ENOSPC
+
+### 2026-11-03T20:21:59Z host=dev
+stopped d5-daemon pid=3721978 sig=TERM
+
+### 2026-11-03T20:21:59Z host=dev
+$ cp /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/raw/d5-daemon.daemon.log /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/raw/d5-daemon.pre-restart.log
+exit=0
+
+### 2026-11-03T20:21:59Z host=dev
+$ rm -f /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs/filler.bin
+exit=0
+
+### 2026-11-03T20:21:59Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256    12       244   5% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs
+exit=0
+daemon d5-daemon healthy pid=3722216 port=59121
+ASSERT PASS: torn append truncated back to the valid prefix == 12060
+ASSERT PASS: valid journal prefix unchanged after ENOSPC recovery == 41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172
+
+### 2026-11-03T20:22:00Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-journal.curl POST http://127.0.0.1:59121/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-full.json 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-create-full.retry.json
+HTTP 200 (want 200) POST http://127.0.0.1:59121/v2/volumes
+exit=0
+ASSERT PASS: retried volume id == vol-d5-full
+stopped d5-daemon pid=3722216 sig=TERM
+
+### 2026-11-03T20:22:00Z host=dev
+$ python3 - /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/journalfs/journal/journal.log
+valid_frames=24 valid_prefix=13166 file_size=13166
+exit=0
+
+### 2026-11-03T20:22:00Z host=dev
+mounted tmpfs size=256k on /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+lab setup tag=d5-lvm loop=/dev/loop0 vg=vg-d5lvm state=/tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+daemon d5-lvm-daemon healthy pid=3722316 port=60651
+
+### 2026-11-03T20:22:00Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl POST http://127.0.0.1:60651/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-baseline.json 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-baseline.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:60651/v2/volumes
+exit=0
+
+### 2026-11-03T20:22:00Z host=dev
+$ cp /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-state-baseline.json
+exit=0
+state before the failed save: size=1023 sha=687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2
+baseline LV=vol-vol-d5-lvm-baseline-3498a2bf failed-volume LV=vol-vol-d5-lvm-full-58c0134e
+ASSERT PASS: LV name derivation matches the durable baseline record == vol-vol-d5-lvm-baseline-3498a2bf
+
+### 2026-11-03T20:22:00Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+exit=0
+
+### 2026-11-03T20:22:00Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256     4       252   2% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+exit=0
+
+### 2026-11-03T20:22:00Z host=dev
+$ fill_fs /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs filler.bin
+filled=258048 stop=No space left on device
+exit=0
+
+### 2026-11-03T20:22:00Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256   256         0 100% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+exit=0
+ASSERT PASS: state filesystem has zero KiB available at ENOSPC == 0
+
+### 2026-11-03T20:22:00Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl POST http://127.0.0.1:60651/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.json 500 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.resp.json
+HTTP 500 (want 500) POST http://127.0.0.1:60651/v2/volumes
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ cat /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.resp.json
+{"code":"INTERNAL","message":"failed to write /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json.tmp: No space left on device (os error 28)"}exit=0
+ASSERT PASS: state save ENOSPC error code == INTERNAL
+ASSERT PASS: state save ENOSPC message names the OS error contains No\ space\ left\ on\ device
+ASSERT PASS: state save ENOSPC message names the exact state tmp path contains /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json.tmp
+ASSERT PASS: compensating lvremove succeeded (no manual remediation named) does not contain manual\ lvremove
+ASSERT PASS: failure is the uncommitted-save compensation, not the post-rename carve-out does not contain were\ kept
+
+### 2026-11-03T20:22:01Z host=dev
+$ sha256sum /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2  /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+exit=0
+ASSERT PASS: durable state file unchanged by the failed save == 687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2
+ASSERT PASS: durable state file size unchanged by the failed save == 1023
+ASSERT PASS: durable state has no failed-volume record == false
+ASSERT PASS: durable state text does not contain the failed volume id does not contain vol-d5-lvm-full
+
+### 2026-11-03T20:22:01Z host=dev
+$ ls -la /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+total 260
+drwxrwxrwt 2 root root     80 Nov  3 20:22 .
+drwxr-xr-x 5 root root   4096 Nov  3 20:22 ..
+-rw------- 1 root root 258048 Nov  3 20:22 filler.bin
+-rw------- 1 root root   1023 Nov  3 20:22 lvm-state.json
+exit=0
+.tmp residue after the failed save: <none>
+ASSERT PASS: no .tmp residue after the failed state save == ''
+
+### 2026-11-03T20:22:01Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+exit=0
+ASSERT PASS: no LV for the failed volume does not contain vol-vol-d5-lvm-full-58c0134e
+ASSERT PASS: exactly one LV (the baseline) remains == 1
+ASSERT PASS: baseline LV still present contains vol-vol-d5-lvm-baseline-3498a2bf
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-full '' 404 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full-now.json
+HTTP 404 (want 404) GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-full
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl GET http://127.0.0.1:60651/v2/volumes '' 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-list-now.json
+HTTP 200 (want 200) GET http://127.0.0.1:60651/v2/volumes
+exit=0
+ASSERT PASS: one volume in the same-process list == 1
+ASSERT PASS: same-process list volume ids == vol-d5-lvm-baseline
+
+### 2026-11-03T20:22:01Z host=dev
+stopped d5-lvm-daemon pid=3722316 sig=TERM
+
+### 2026-11-03T20:22:01Z host=dev
+$ cp /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/raw/d5-lvm-daemon.daemon.log /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/raw/d5-lvm-daemon.pre-restart.log
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ rm -f /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/filler.bin
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ df -k /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs                256     4       252   2% /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+exit=0
+daemon d5-lvm-daemon healthy pid=3722624 port=60651
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-full '' 404 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full-after.json
+HTTP 404 (want 404) GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-full
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-baseline '' 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-baseline-after.json
+HTTP 200 (want 200) GET http://127.0.0.1:60651/v2/volumes/vol-d5-lvm-baseline
+exit=0
+{
+  "volume_id": "vol-d5-lvm-baseline",
+  "state": "Ready",
+  "provisioned_bytes": 67108864
+}
+ASSERT PASS: baseline volume id after restart == vol-d5-lvm-baseline
+ASSERT PASS: baseline volume state after restart == Ready
+
+### 2026-11-03T20:22:01Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+exit=0
+ASSERT PASS: baseline LV still present after restart contains vol-vol-d5-lvm-baseline-3498a2bf
+ASSERT PASS: only the baseline LV present after restart == 1
+
+### 2026-11-03T20:22:01Z host=dev
+$ sha256sum /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2  /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+exit=0
+ASSERT PASS: durable state still matches the pre-failure snapshot after restart == 687daef08cb3932b9063fbf90d01a6771490c557daff8a30d5a2f6b77e15a4b2
+ASSERT PASS: durable state size still matches the pre-failure snapshot after restart == 1023
+ASSERT PASS: durable state still has no failed-volume record after restart == false
+ASSERT PASS: durable state text still lacks the failed volume id after restart does not contain vol-d5-lvm-full
+
+### 2026-11-03T20:22:01Z host=dev
+$ ls -la /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+total 8
+drwxrwxrwt 2 root root   60 Nov  3 20:22 .
+drwxr-xr-x 5 root root 4096 Nov  3 20:22 ..
+-rw------- 1 root root 1023 Nov  3 20:22 lvm-state.json
+exit=0
+.tmp residue after restart: <none>
+ASSERT PASS: no .tmp residue after restart == ''
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl POST http://127.0.0.1:60651/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.json 500 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.replay.json
+HTTP 500 (want 500) POST http://127.0.0.1:60651/v2/volumes
+exit=0
+
+### 2026-11-03T20:22:01Z host=dev
+$ cat /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full.replay.json
+{"code":"INTERNAL","message":"failed to write /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json.tmp: No space left on device (os error 28)"}exit=0
+ASSERT PASS: same operation_id terminal replay keeps INTERNAL == INTERNAL
+ASSERT PASS: same operation_id terminal replay serves the recorded message == failed\ to\ write\ /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json.tmp:\ No\ space\ left\ on\ device\ \(os\ error\ 28\)
+ASSERT PASS: same operation_id terminal replay body is byte-identical (cmp) == identical
+ASSERT PASS: daemon log records the replay path without execution contains replaying\ recorded\ outcome\ without\ executing
+ASSERT PASS: terminal replay added no durable volume == 1
+ASSERT PASS: terminal replay added no failed-volume record == false
+
+### 2026-11-03T20:22:01Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+exit=0
+ASSERT PASS: terminal replay left only the baseline LV == 1
+
+### 2026-11-03T20:22:01Z host=dev
+$ api_expect /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/configs/d5-lvm.curl POST http://127.0.0.1:60651/v2/volumes /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full-newop.json 200 /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-full-newop.resp.json
+HTTP 200 (want 200) POST http://127.0.0.1:60651/v2/volumes
+exit=0
+{
+  "volume_id": "vol-d5-lvm-full",
+  "state": "Ready",
+  "provisioned_bytes": 67108864
+}
+ASSERT PASS: new-operation volume id == vol-d5-lvm-full
+ASSERT PASS: new-operation volume state == Ready
+ASSERT PASS: new-operation provisioned bytes == 67108864
+
+### 2026-11-03T20:22:02Z host=dev
+$ cp /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/records/d5-lvm-state-final.json
+exit=0
+
+### 2026-11-03T20:22:02Z host=dev
+$ sha256sum /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+43e090d7635dfe855a48f31d4b225c98d9f80c5ada364e0aa4730cb520557e1d  /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs/lvm-state.json
+exit=0
+durable failed-volume LV name=vol-vol-d5-lvm-full-58c0134e
+ASSERT PASS: durable record uses the derived failed-volume LV name == vol-vol-d5-lvm-full-58c0134e
+
+### 2026-11-03T20:22:02Z host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d5lvm
+  vol-vol-d5-lvm-baseline-3498a2bf vg-d5lvm 64.00m
+  vol-vol-d5-lvm-full-58c0134e     vg-d5lvm 64.00m
+exit=0
+ASSERT PASS: baseline plus new-volume LV (total 2) == 2
+ASSERT PASS: the new volume's derived LV name appears exactly once == 1
+ASSERT PASS: baseline LV still present after the new create contains vol-vol-d5-lvm-baseline-3498a2bf
+ASSERT PASS: durable state holds exactly two volume records == 2
+ASSERT PASS: durable state holds the new volume record == true
+ASSERT PASS: durable state retains the baseline record == true
+
+### 2026-11-03T20:22:02Z host=dev
+$ ls -la /tmp/opencode/volvisor-d5-redrill-20261103T202159Z/lab-d5/statefs
+total 8
+drwxrwxrwt 2 root root   60 Nov  3 20:22 .
+drwxr-xr-x 5 root root 4096 Nov  3 20:22 ..
+-rw------- 1 root root 1767 Nov  3 20:22 lvm-state.json
+exit=0
+.tmp residue after the successful create: <none>
+ASSERT PASS: no .tmp residue after the successful create == ''
+stopped d5-lvm-daemon pid=3722624 sig=TERM
+ASSERT SUMMARY: 0 failures
+D5 COMPLETE
