@@ -45,8 +45,9 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
 
 - **Journal ENOSPC:** a failed attempt is never acknowledged as durable; no
   acknowledged state is lost; the torn append is removed on restart. The
-  failed create is 404 when nothing executed (intent append failed, or the
-  provider call failed); if `GET` is 200, the volume is real and served.
+  failed create is 404 when nothing executed (the intent append failed, or
+  the provider call failed without landing anything — the section C
+  carve-out excepted); if `GET` is 200, the volume is real and served.
   **RTO:** free space, restart, verify, retry with a new `operation_id`;
   seconds in the lab.
 - **State ENOSPC:** the failed create is not acknowledged as durable.
@@ -141,8 +142,10 @@ sha256sum /var/lib/volvisor/journal/journal.log
 ```
 
 Expected: health `{"status":"ok"}`, and the size is the pre-failure valid
-prefix. D5 observed 12060 before the failed append, 12288 immediately after
-(the torn append), and 12060 after restart, with the prefix SHA256 unchanged
+prefix. A `failed to fsync journal record` flavor may instead leave the
+complete frame in place, so the size can exceed the pre-failure prefix. D5
+observed 12060 before the failed append, 12288 immediately after (the torn
+append), and 12060 after restart, with the prefix SHA256 unchanged
 (`41bcc95a...`).
 
 5. Retry the original operation **with the same `operation_id`** only when
@@ -153,10 +156,12 @@ prefix. D5 observed 12060 before the failed append, 12288 immediately after
    journaled and the provider call failed; a same-`operation_id` retry does
    not re-execute — it replays the recorded 500 when the failure outcome
    fit in the journal, and fails closed as `OPERATION_IN_DOUBT` when it did
-   not. The same applies to `failed to fsync journal record` (the frame may
-   already be on disk; treat the retry as non-executing). If step 2 observed
+   not. The same applies to `failed to fsync journal record`: the frame may
+   already be on disk — if it survived, the retry fails closed as
+   `OPERATION_IN_DOUBT`; if it was lost, the retry re-executes having created
+   nothing the first time (at most one volume either way). If step 2 observed
    a `200`, the volume exists: verify the volume and LV, do not re-create,
-   and expect the same id not to re-execute. In every case, close the
+   and expect the same id not to re-execute. In every other case, close the
    operation with a **new `operation_id`** and the same payload after
    inspecting journal/state.
 
@@ -259,10 +264,13 @@ curl -fsS http://127.0.0.1:8080/healthz
    - **carve-out:** `GET` is 200, the LV is present, and the durable state
      contains the volume. Do not remove it; confirm it appears exactly once
      in `GET /v2/volumes`, then resume at step 5's carve-out bullet;
-   - **indeterminate:** `GET` is 404 and the durable file could not be read,
-     with or without an LV (the compensating `lvremove` may also have failed
-     and named `manual lvremove`). Do not retry or delete anything; compare a
-     backup and escalate with the state and LVM output.
+   - **indeterminate:** if the durable file still cannot be read, the daemon
+     will not have started (the step-2 `healthz` check failed) — escalate
+     with the state and LVM output. If it now reads: `GET` is 404 when no
+     record survived (a remaining LV is the step-4 orphan tail), and 200
+     when a record survived (the volume is `Failed` if its LV was removed,
+     or served if the LV remains). Do not retry or delete anything until
+     the file proves the record absent.
 
    Anything else is a state/LVM disagreement: stop and investigate before
    serving.

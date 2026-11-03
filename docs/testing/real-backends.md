@@ -40,8 +40,9 @@ integration tests (`test result: ok. 7 passed; 0 failed`), among them the
 #58 ENOSPC regression
 (`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`);
 the run's evidence is a local artifact under the configured
-`VOLVISOR_TEST_OUTPUT_DIR` and is not committed. The earlier 2026-11-02 run recorded `110` passing tests and six
-integration tests before that regression existed. On the same host,
+`VOLVISOR_TEST_OUTPUT_DIR` and is not committed. The earlier 2026-11-02 run
+recorded `110` passing tests and six integration tests before that regression
+existed. On the same host,
 `./scripts/test-ceph.sh` and `./scripts/test-drbd.sh` exited `2` at
 `ceph.missing-tool.ceph` and `drbd.missing-tool.drbdadm` respectively — loud
 prerequisite failures, not skips and not suite results.
