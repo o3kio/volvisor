@@ -51,11 +51,16 @@
 //!   authorization untouched and fails startup); completion removes the
 //!   settled move record with the volume and intent in one atomic save.
 //! - **Move**: `PREPARING` is the reconciliation anchor. A failed
-//!   `PREPARING` save starts no `pvmove`; a failed `COPYING`/`COMPLETE`
-//!   save keeps the prior durable record in memory, or the just-saved
+//!   `PREPARING` save starts no `pvmove`. A failed `COPYING` save keeps
+//!   the prior durable record in memory, or the just-saved `Copying`
 //!   record when its rename landed or the durable file cannot be
-//!   re-read (possibly durable), and leaves classification to
-//!   startup/reconcile — the world is never assumed lost and never
+//!   re-read (possibly durable). A failed `COMPLETE` save restores the
+//!   prior record and generation when the re-read proves the durable
+//!   file still says the prior state, but keeps the verified completion
+//!   (with its bumped generation) when the rename landed or the re-read
+//!   fails — so a later save cannot erase the completion or regress the
+//!   generation. In every case classification is left to
+//!   startup/reconcile: the world is never assumed lost and never
 //!   blindly restarted.
 //!
 //! Create is fail-closed: if the state save fails, the just-created LV is
@@ -283,6 +288,13 @@ pub struct MoveReconcileReport {
     pub parked_unobservable: Vec<VolumeId>,
     /// PREPARING records whose `pvmove` was (re-)started this pass.
     pub redriven: Vec<VolumeId>,
+    /// PREPARING records whose re-drive did not start this pass: the
+    /// foreign-move scan could not clear the source (an out-of-band
+    /// `pvmove` is active there, or the world could not be observed),
+    /// the record has no usable source/target, or the `pvmove` start
+    /// itself failed. The record stays PREPARING and is retried on the
+    /// next tick; surfaced so a persistent failure is not silent.
+    pub redrive_failed: Vec<VolumeId>,
     /// Records dropped (their volume no longer exists).
     pub dropped: Vec<VolumeId>,
     /// Records skipped: the world could not be observed this pass
@@ -631,13 +643,17 @@ impl LvmProvider {
     /// fails, the error says the durable create intent remains and
     /// startup recovery will adopt the LV only if it is present and at
     /// least the requested size; otherwise a manual `lvremove` is
-    /// required. Neither failure ever masks the original save error.
+    /// required. When the clear's rename did not land (or its re-read is
+    /// unknown) the removed intent is re-inserted in memory, so a later
+    /// successful save cannot erase the durable anchor. Neither failure
+    /// ever masks the original save error.
     fn compensate_unpersisted_create(
         &self,
         state: &mut LvmState,
         volume_id: &VolumeId,
         vg_name: &str,
         lv_name: &str,
+        intent: Option<CreateIntent>,
         save_error: ApiError,
     ) -> ApiError {
         let committed = LvmState::load(&self.state_path)
@@ -680,36 +696,55 @@ impl LvmProvider {
         // the rename may have landed, in which case the durable intent
         // is gone and the compensation is complete.
         if let Err(clear_error) = self.persist(state) {
+            // If the durable file may still hold the create intent, put
+            // it back in memory: a later successful save from this
+            // provider must not erase an authorization startup
+            // recovery still has to classify (the LV may be present if
+            // the checked `lvremove` failed). The intent was removed
+            // from memory before the failed final save, so the removed
+            // copy is the only value available when the re-read itself
+            // is unknown.
+            let mut reinsert: Option<CreateIntent> = None;
             match LvmState::load(&self.state_path) {
-                Ok(durable) if durable.create_intent(volume_id).is_some() => {
-                    detail.push_str(
-                        "; the durable create intent could not be cleared (the failed save \
-                         left it in place) and remains durable: startup recovery will adopt the \
-                         LV only if it is present and at least the requested size",
-                    );
-                    if removed {
+                Ok(durable) => match durable.create_intent(volume_id) {
+                    Some(durable_intent) => {
+                        // The rename did not land: keep memory matching
+                        // the durable file.
+                        reinsert = Some(durable_intent.clone());
                         detail.push_str(
-                            "; the LV was removed, so recovery will drop the intent once it \
-                             observes no such LV",
+                            "; the durable create intent could not be cleared (the failed save \
+                             left it in place) and remains durable: startup recovery will adopt the \
+                             LV only if it is present and at least the requested size",
                         );
-                    } else {
-                        detail.push_str("; otherwise manual lvremove ");
-                        detail.push_str(vg_name);
-                        detail.push('/');
-                        detail.push_str(lv_name);
-                        detail.push_str(" is required");
+                        if removed {
+                            detail.push_str(
+                                "; the LV was removed, so recovery will drop the intent once it \
+                                 observes no such LV",
+                            );
+                        } else {
+                            detail.push_str("; otherwise manual lvremove ");
+                            detail.push_str(vg_name);
+                            detail.push('/');
+                            detail.push_str(lv_name);
+                            detail.push_str(" is required");
+                        }
                     }
-                }
-                Ok(_) => {
-                    // The clear save's rename landed: the intent is gone
-                    // and memory/durable agree on the compensated state.
-                    detail.push_str(
-                        "; the compensating clear save reported an error but the durable \
-                         state no longer records the create intent (its rename landed), so the \
-                         compensated state is durable",
-                    );
-                }
+                    None => {
+                        // The clear save's rename landed: the intent is
+                        // gone and memory/durable agree on the
+                        // compensated state.
+                        detail.push_str(
+                            "; the compensating clear save reported an error but the durable \
+                             state no longer records the create intent (its rename landed), so the \
+                             compensated state is durable",
+                        );
+                    }
+                },
                 Err(load_error) => {
+                    // Unknown: treat the intent as possibly durable and
+                    // keep it in memory so the next save cannot erase it
+                    // before a restart classifies it.
+                    reinsert = intent;
                     detail.push_str(
                         "; the durable create intent could not be verified after the failed \
                          clear save",
@@ -734,6 +769,9 @@ impl LvmProvider {
                         detail.push_str(" is required");
                     }
                 }
+            }
+            if let Some(intent) = reinsert {
+                state.insert_create_intent(volume_id.clone(), intent);
             }
             let cleanup_note = format!(" (cleanup save failed: {clear_error})");
             detail.push_str(&cleanup_note);
@@ -1670,7 +1708,10 @@ impl LvmProvider {
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
         // The final save commits the volume record and the intent
-        // removal together.
+        // removal together. Keep the intent so a failed compensating
+        // clear save can put it back in memory when the durable file
+        // may still hold it.
+        let create_intent = state.create_intent(&req.volume_id).cloned();
         state.remove_create_intent(&req.volume_id);
         if let Err(save_error) = self.persist(&mut state) {
             return Err(self.compensate_unpersisted_create(
@@ -1678,6 +1719,7 @@ impl LvmProvider {
                 &req.volume_id,
                 &vg_name,
                 &lv_name,
+                create_intent,
                 save_error,
             ));
         }
@@ -2766,10 +2808,12 @@ impl LvmProvider {
     /// A failed final save is classified against a re-read of the
     /// durable file: if it already records the `COMPLETE` record and
     /// the new generation (the post-rename carve-out) the in-memory
-    /// completion is kept; otherwise the previous generation and
-    /// previous move record are restored in memory and the error says
-    /// the durable record still says the prior state, which
-    /// reconciliation will complete.
+    /// completion is kept; if it records the prior state the previous
+    /// generation and previous move record are restored in memory and
+    /// the error says reconciliation will complete the move; if the
+    /// re-read itself fails, the verified completion is kept as
+    /// possibly durable (never rolled back, so a later save cannot
+    /// regress the generation or erase the anchor).
     #[allow(clippy::too_many_lines)] // one verified-completion/persist-classification narrative
     fn finish_complete(
         &self,
@@ -2897,47 +2941,69 @@ impl LvmProvider {
             // durable file re-read decides whether the completion
             // landed (post-rename) or the prior record is still the
             // anchor.
-            let committed = LvmState::load(&self.state_path).is_ok_and(|durable| {
-                durable
-                    .move_record(volume_id)
-                    .is_some_and(|stored| stored.state == MoveVolumeBackingState::Complete)
-                    && durable
-                        .volume(volume_id)
-                        .is_some_and(|stored| stored.entry.generation == new_generation)
-            });
-            if committed {
-                return Err(ApiError::new(
-                    save_error.code,
-                    format!(
-                        "{}; the durable state already records the completed move and volume \
-                         generation {new_generation}, so the in-memory completion was kept",
-                        save_error.detail
-                    ),
-                ));
-            }
-            // The durable file still says the prior state: restore it
-            // in memory (never leave a completion against a prior
-            // durable record) and let reconciliation complete the
-            // move.
-            if let Some(stored) = state.volume_mut(volume_id) {
-                stored.entry.generation = previous_generation;
-            }
-            match previous_record {
-                Some(previous) => {
-                    state.insert_move(volume_id.clone(), previous);
+            match LvmState::load(&self.state_path) {
+                Ok(durable) => {
+                    let committed = durable
+                        .move_record(volume_id)
+                        .is_some_and(|stored| stored.state == MoveVolumeBackingState::Complete)
+                        && durable
+                            .volume(volume_id)
+                            .is_some_and(|stored| stored.entry.generation == new_generation);
+                    if committed {
+                        return Err(ApiError::new(
+                            save_error.code,
+                            format!(
+                                "{}; the durable state already records the completed move and \
+                                 volume generation {new_generation}, so the in-memory completion \
+                                 was kept",
+                                save_error.detail
+                            ),
+                        ));
+                    }
+                    // The durable file still says the prior state:
+                    // restore it in memory (never leave a completion
+                    // against a prior durable record) and let
+                    // reconciliation complete the move.
+                    if let Some(stored) = state.volume_mut(volume_id) {
+                        stored.entry.generation = previous_generation;
+                    }
+                    match previous_record {
+                        Some(previous) => {
+                            state.insert_move(volume_id.clone(), previous);
+                        }
+                        None => {
+                            state.remove_move(volume_id);
+                        }
+                    }
+                    return Err(ApiError::new(
+                        save_error.code,
+                        format!(
+                            "{}; the durable move record still says the prior state \
+                             (generation {previous_generation}), so reconciliation will complete \
+                             the move",
+                            save_error.detail
+                        ),
+                    ));
                 }
-                None => {
-                    state.remove_move(volume_id);
+                Err(load_error) => {
+                    // Unknown: the completion's rename may have landed.
+                    // Keep the verified completion and the bumped
+                    // generation in memory (never roll back against a
+                    // possibly-durable file) so a later save cannot
+                    // erase the COMPLETE record or regress the
+                    // generation; report it honestly.
+                    return Err(ApiError::new(
+                        save_error.code,
+                        format!(
+                            "{}; the completion's durable record could not be re-read \
+                             ({load_error}), so treat the completed move and volume generation \
+                             {new_generation} as possibly durable — do not complete it again; \
+                             a retry or restart verifies the world before acting",
+                            save_error.detail
+                        ),
+                    ));
                 }
             }
-            return Err(ApiError::new(
-                save_error.code,
-                format!(
-                    "{}; the durable move record still says the prior state (generation \
-                     {previous_generation}), so reconciliation will complete the move",
-                    save_error.detail
-                ),
-            ));
         }
         response.ok_or_else(|| not_found(volume_id))
     }
@@ -3274,10 +3340,14 @@ impl LvmProvider {
     ///
     /// A re-attach to an existing PREPARING/COPYING record saves
     /// nothing (an unchanged state has no durable boundary to write;
-    /// the operation-id refresh lands with the COPYING save). A new
-    /// record must be persisted before `pvmove` starts: if that save
-    /// fails the in-memory record is removed and the caller starts
-    /// nothing (no durable anchor would mean a blind restart).
+    /// the operation-id refresh lands with the COPYING save) and must
+    /// still target the same PV. A new record requires the verified
+    /// source from admission and must be persisted before `pvmove`
+    /// starts: if that save fails the in-memory record is removed and
+    /// the caller starts nothing (no durable anchor would mean a blind
+    /// restart), except when the save's rename may have landed — then
+    /// the in-memory anchor is kept as possibly durable and the caller
+    /// still starts nothing.
     fn journal_move_intent(
         &self,
         volume_id: &VolumeId,
@@ -3317,10 +3387,50 @@ impl LvmProvider {
                     MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
                 ) =>
             {
+                // The record may have been replaced between admission
+                // and this lock. Only the target this caller asked for
+                // is a legitimate re-attach; a different target is a
+                // newer/different move, never adopted silently. A
+                // record with no source cannot drive or classify a
+                // pvmove: refuse it rather than pass an empty PV.
+                if record.source_pv.is_empty() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidState,
+                        format!(
+                            "the move record for volume {volume_id} has no recorded source PV; \
+                             refusing to drive a move that cannot be classified"
+                        ),
+                    ));
+                }
+                if record.target_pv != req.target_pool_id {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidState,
+                        format!(
+                            "the move record for volume {volume_id} now targets {} rather \
+                             than {}; refusing to attach to a different move",
+                            record.target_pv, req.target_pool_id
+                        ),
+                    ));
+                }
                 (record.source_pv.clone(), record.clone())
             }
             _ => {
-                let source = fallback_source.unwrap_or_default().to_owned();
+                // A fresh drive always carries a source verified from
+                // the world. Admission may have decided to re-attach and
+                // the record then vanished/settled under a concurrent
+                // operation; a source-less PREPARING record could never
+                // re-drive or classify a pvmove, so refuse instead.
+                let Some(source) = fallback_source else {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidState,
+                        format!(
+                            "the move record for volume {volume_id} changed while the move \
+                             was being admitted (no active record remains); refusing to journal \
+                             a move without a verified source — retry the move"
+                        ),
+                    ));
+                };
+                let source = source.to_owned();
                 let record = crate::state::MoveRecord {
                     operation_id: req.operation_id.clone(),
                     source_pv: source.clone(),
@@ -3335,22 +3445,42 @@ impl LvmProvider {
         };
         if inserted {
             if let Err(save_error) = self.persist(&mut state) {
-                // Classify the failed anchor save: if its rename landed,
-                // the durable file already holds this PREPARING record.
-                // Keep the in-memory anchor so a retry re-attaches to it
-                // (and startup reconcile classifies it), but the current
-                // call still starts no pvmove. A load error is treated
-                // as "not confirmed durable" and the in-memory anchor is
-                // dropped: no durable anchor means no pvmove.
-                let anchor_durable = LvmState::load(&self.state_path).is_ok_and(|durable| {
-                    durable.move_record(volume_id).is_some_and(|stored| {
-                        stored.state == MoveVolumeBackingState::Preparing
-                            && stored.source_pv == record.source_pv
-                            && stored.target_pv == record.target_pv
-                    })
+                return Err(self.classify_preparing_save_failure(
+                    &mut state,
+                    volume_id,
+                    &record,
+                    &save_error,
+                ));
+            }
+        }
+        Ok((source, record))
+    }
+
+    /// Classify a failed `PREPARING`-anchor save after the record was
+    /// inserted in memory.
+    ///
+    /// If the save's rename landed, the durable file already holds this
+    /// PREPARING record: the in-memory anchor is kept and the caller
+    /// still starts no `pvmove`. If the re-read proves no durable anchor,
+    /// the in-memory record is removed (no anchor means no `pvmove`). If
+    /// the re-read itself fails, the anchor may be durable: keep it in
+    /// memory so a later save cannot erase it, and still start nothing.
+    fn classify_preparing_save_failure(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        record: &crate::state::MoveRecord,
+        save_error: &ApiError,
+    ) -> ApiError {
+        match LvmState::load(&self.state_path) {
+            Ok(durable) => {
+                let anchor_durable = durable.move_record(volume_id).is_some_and(|stored| {
+                    stored.state == MoveVolumeBackingState::Preparing
+                        && stored.source_pv == record.source_pv
+                        && stored.target_pv == record.target_pv
                 });
                 if anchor_durable {
-                    return Err(ApiError::new(
+                    return ApiError::new(
                         save_error.code,
                         format!(
                             "the move's PREPARING record reported a save error but reached the \
@@ -3359,20 +3489,33 @@ impl LvmProvider {
                              classify — do not assume the move failed: {}",
                             save_error.detail
                         ),
-                    ));
+                    );
                 }
                 state.remove_move(volume_id);
-                return Err(ApiError::new(
+                ApiError::new(
                     save_error.code,
                     format!(
                         "the move's PREPARING record could not be saved, so no pvmove was \
                          started: {}",
                         save_error.detail
                     ),
-                ));
+                )
+            }
+            Err(load_error) => {
+                // Unknown: the anchor may be durable. Keep the in-memory
+                // record so a later save cannot erase a possibly-durable
+                // PREPARING anchor; no pvmove was started either way.
+                ApiError::new(
+                    save_error.code,
+                    format!(
+                        "the move's PREPARING record reported a save error, but the durable \
+                         record could not be re-read ({load_error}); treat it as possibly \
+                         durable and start no pvmove — a retry or restart classifies it: {}",
+                        save_error.detail
+                    ),
+                )
             }
         }
-        Ok((source, record))
     }
 
     /// Drive one online same-VG extent move.
@@ -3380,12 +3523,14 @@ impl LvmProvider {
     /// The `PREPARING` record is the sole reconciliation anchor: its
     /// save must land before `pvmove` starts (a failed save starts
     /// nothing). A failed `COPYING` save restores the prior record in
-    /// memory unless the rename landed, in which case the durable
-    /// COPYING record is kept; a failed `COMPLETE` save restores the
-    /// prior record (or keeps the completion only when the durable file
-    /// already has it). In every case startup/reconcile classifies the
-    /// durable record against the observed world — there is no blind
-    /// restart.
+    /// memory unless the rename landed or the durable file cannot be
+    /// re-read, in which case the just-saved `Copying` record is kept as
+    /// possibly durable. A failed `COMPLETE` save restores the prior
+    /// record and generation when the re-read proves the prior state, but
+    /// keeps the verified completion when the rename landed or the
+    /// re-read fails (never regressing the generation). In every case
+    /// startup/reconcile classifies the durable record against the
+    /// observed world — there is no blind restart.
     async fn move_volume_backing_inner(
         &self,
         volume_id: &VolumeId,
@@ -3796,21 +3941,13 @@ impl LvmProvider {
             }
             match record.state {
                 MoveVolumeBackingState::Preparing if redrive => {
-                    // The pvmove never verifiably started: re-drive
-                    // the journaled intent. A start failure leaves
-                    // the record PREPARING for the next tick.
-                    if self
-                        .start_pvmove(&vg_name, &lv_name, &record.source_pv, &record.target_pv)
-                        .is_ok()
-                    {
-                        let mut state = self.lock_state()?;
-                        if let Some(record) = state.move_record_mut(&volume_id) {
-                            record.state = MoveVolumeBackingState::Copying;
-                            record.detail = None;
-                        }
-                        self.persist(&mut state)?;
-                        report.redriven.push(volume_id);
-                    }
+                    self.redrive_preparing_move(
+                        &volume_id,
+                        &vg_name,
+                        &lv_name,
+                        &record,
+                        &mut report,
+                    )?;
                 }
                 MoveVolumeBackingState::Copying => {
                     // The move ended without relocating: park (unless
@@ -3841,6 +3978,50 @@ impl LvmProvider {
             }
         }
         Ok(report)
+    }
+
+    /// Re-drive a PREPARING record whose `pvmove` verifiably never
+    /// started.
+    ///
+    /// A source-less record is malformed and must never reach `pvmove`.
+    /// A foreign move on the source (invisible to the records-only
+    /// guard) would make a scoped `pvmove` attach to it and ignore its
+    /// arguments, so the same world scan a fresh start performs runs
+    /// first. Any refusal or start failure leaves the record PREPARING
+    /// for the next tick and is reported (`redrive_failed`), never
+    /// swallowed; a successful start rolls the record to COPYING.
+    fn redrive_preparing_move(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        record: &crate::state::MoveRecord,
+        report: &mut MoveReconcileReport,
+    ) -> Result<(), ApiError> {
+        if record.source_pv.is_empty() || record.target_pv.is_empty() {
+            report.redrive_failed.push(volume_id.clone());
+            return Ok(());
+        }
+        if self
+            .guard_fresh_move_source(vg_name, &record.source_pv)
+            .is_err()
+        {
+            report.redrive_failed.push(volume_id.clone());
+            return Ok(());
+        }
+        match self.start_pvmove(vg_name, lv_name, &record.source_pv, &record.target_pv) {
+            Ok(()) => {
+                let mut state = self.lock_state()?;
+                if let Some(stored) = state.move_record_mut(volume_id) {
+                    stored.state = MoveVolumeBackingState::Copying;
+                    stored.detail = None;
+                }
+                self.persist(&mut state)?;
+                report.redriven.push(volume_id.clone());
+            }
+            Err(_) => report.redrive_failed.push(volume_id.clone()),
+        }
+        Ok(())
     }
 
     /// The unobservable-world tail of one reconcile record: below
@@ -3935,37 +4116,59 @@ impl LvmProvider {
             if let Err(save_error) = self.persist(&mut state) {
                 // Classify the failed resolution save: if its rename
                 // landed, the durable file already records FAILED and
-                // the in-memory resolution matches it. Otherwise never
-                // leave FAILED in memory against a durable IN_DOUBT:
-                // restore the parked record (with its previous detail).
-                let committed = LvmState::load(&self.state_path).is_ok_and(|durable| {
-                    durable.move_record(volume_id).is_some_and(|stored| {
-                        stored.state == MoveVolumeBackingState::Failed
-                            && stored.source_pv == record.source_pv
-                            && stored.target_pv == record.target_pv
-                    })
-                });
-                if committed {
-                    return Err(ApiError::new(
-                        save_error.code,
-                        format!(
-                            "{}; the durable state already records the verified rollback of \
-                             volume {volume_id} as FAILED, so the in-memory resolution was kept",
-                            save_error.detail
-                        ),
-                    ));
+                // the in-memory resolution matches it. If it still says
+                // IN_DOUBT, restore the parked record (with its previous
+                // detail) so memory matches the durable file.
+                match LvmState::load(&self.state_path) {
+                    Ok(durable) => {
+                        let committed = durable.move_record(volume_id).is_some_and(|stored| {
+                            stored.state == MoveVolumeBackingState::Failed
+                                && stored.source_pv == record.source_pv
+                                && stored.target_pv == record.target_pv
+                        });
+                        if committed {
+                            return Err(ApiError::new(
+                                save_error.code,
+                                format!(
+                                    "{}; the durable state already records the verified \
+                                     rollback of volume {volume_id} as FAILED, so the in-memory \
+                                     resolution was kept",
+                                    save_error.detail
+                                ),
+                            ));
+                        }
+                        if let Some(previous) = previous {
+                            state.insert_move(volume_id.clone(), previous);
+                        }
+                        return Err(ApiError::new(
+                            save_error.code,
+                            format!(
+                                "{}; the verified rollback of volume {volume_id} could not be \
+                                 recorded durably, so the durable IN_DOUBT record remains the \
+                                 anchor",
+                                save_error.detail
+                            ),
+                        ));
+                    }
+                    Err(load_error) => {
+                        // Unknown: the resolution's rename may have
+                        // landed. Keep the verified FAILED resolution in
+                        // memory (it is the outcome this pass proved
+                        // from the world) so a later save cannot erase a
+                        // possibly-durable FAILED record; report it
+                        // honestly so an operator does not assume the
+                        // park remains.
+                        return Err(ApiError::new(
+                            save_error.code,
+                            format!(
+                                "{}; the rollback resolution's durable record could not be \
+                                 re-read ({load_error}), so treat the verified FAILED \
+                                 resolution of volume {volume_id} as possibly durable",
+                                save_error.detail
+                            ),
+                        ));
+                    }
                 }
-                if let Some(previous) = previous {
-                    state.insert_move(volume_id.clone(), previous);
-                }
-                return Err(ApiError::new(
-                    save_error.code,
-                    format!(
-                        "{}; the verified rollback of volume {volume_id} could not be recorded \
-                         durably, so the durable IN_DOUBT record remains the anchor",
-                        save_error.detail
-                    ),
-                ));
             }
             report.resolved_failed.push(volume_id.clone());
         }

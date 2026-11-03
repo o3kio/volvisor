@@ -1017,6 +1017,66 @@ async fn a_crash_after_the_preparing_save_re_drives_on_the_retry_pass() {
 }
 
 #[tokio::test]
+async fn a_foreign_pvmove_on_the_source_skips_the_redrive_and_reports_it() {
+    let fixture = move_fixture();
+    let volume = "vol-move-redrive-foreign";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    // An out-of-band pvmove evacuates another LV of the VG off the same
+    // source PV. A scoped pvmove would attach to it and ignore its
+    // arguments, so the retry pass must not re-drive blindly.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let other = format!("{CLAIMED_VG}/vol-move-redrive-other-lv");
+        world.lvs.insert(other.clone(), 64 * MIB);
+        world
+            .lv_devices
+            .insert(other.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+        world.moves.insert(
+            other,
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: "/dev/pv-c".to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let report = restarted.move_reconcile_pass().expect("pass");
+    assert_eq!(report.redriven, Vec::new());
+    assert_eq!(report.redrive_failed, vec![volume_id(volume)]);
+    assert_eq!(
+        pvmove_count(&fixture.runner),
+        0,
+        "no blind second pvmove started over the foreign move"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Preparing,
+        "the record stays PREPARING for the next tick"
+    );
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn a_crash_after_the_pvmove_start_rolls_the_record_to_copying() {
     let fixture = move_fixture();
     let volume = "vol-move-crash-started";

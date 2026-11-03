@@ -136,6 +136,12 @@ pub struct FakeLvm {
     /// compensating clear-save also fails". The re-read fails closed
     /// and the unreadable durable file survives for the operator.
     pub break_state_on_lvcreate: Option<PathBuf>,
+    /// When set, `lvcreate` creates a directory at this state file's
+    /// sibling `.tmp` path after creating the LV: the final save and
+    /// its compensating clear save both fail, but the durable file
+    /// (with the intent) stays valid and readable — the deterministic
+    /// shape of "the clear's rename did not land".
+    pub poison_tmp_on_lvcreate: Option<PathBuf>,
     /// Physical extent size `lvcreate`/`lvextend` round up to.
     pub extent_size: u64,
     /// When true, `vgcreate` fails (claim crash-window injection).
@@ -188,6 +194,7 @@ impl Default for FakeLvm {
             lvcreate_silent: false,
             lvextend_silent: false,
             break_state_on_lvcreate: None,
+            poison_tmp_on_lvcreate: None,
             extent_size: EXTENT_BYTES,
             fail_vgcreate: false,
             fail_pvremove: false,
@@ -540,6 +547,15 @@ pub fn script(world: &mut FakeLvm, program: &str, args: &[&str]) -> Option<Comma
             // clear-save fail too, so the unreadable file survives.
             if let Some(state_path) = &world.break_state_on_lvcreate {
                 std::fs::write(state_path, b"{ not valid provider state").ok();
+                let mut tmp_name = state_path.clone().into_os_string();
+                tmp_name.push(".tmp");
+                std::fs::create_dir(std::path::PathBuf::from(tmp_name)).ok();
+            }
+            // Deterministic blocked-tmp injection: the durable file
+            // (holding the intent) stays valid, but the final save and
+            // the compensating clear save both fail at the `.tmp`
+            // path.
+            if let Some(state_path) = &world.poison_tmp_on_lvcreate {
                 let mut tmp_name = state_path.clone().into_os_string();
                 tmp_name.push(".tmp");
                 std::fs::create_dir(std::path::PathBuf::from(tmp_name)).ok();

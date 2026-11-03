@@ -71,9 +71,10 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
   cleanup-failure tail. The normal uncommitted-save path was re-drilled
   post-fix at product `1863a7a` / harness `940722e`: the failed create stayed
   non-durable, the LV was compensated, and same-process plus post-restart GET
-  returned 404. The cleanup-failure, carve-out and indeterminate branches
-  were not fault-injected in that re-drill; they remain the five-outcome
-  procedure above and are covered by tests, not by an end-to-end drill.
+  returned 404. The cleanup-failure, carve-out, clear-save and indeterminate
+  branches were not fault-injected in that re-drill; they remain the
+  six-outcome procedure above and are covered by tests, not by an
+  end-to-end drill.
 
 ## Preconditions
 
@@ -258,6 +259,12 @@ Expected post-fix:
   contains the volume;
 - **cleanup failure:** `GET` returns 404 but the LV is present, and the 500
   detail names `manual lvremove <vg>/<lv>`;
+- **clear-save failure (issue #70):** a known command failure left a durable
+  intent that the clear save could not remove, or the compensating clear save
+  after a failed final save could not remove it. `GET` returns 404; the
+  intent is kept in memory. If the LV is absent, restart drops the intent; if
+  present, startup adopts it only at or above the requested size (see
+  [lvm-state-divergence.md](lvm-state-divergence.md));
 - **indeterminate:** `GET` returns 404 and the durable file could not be
   read; no LV exists, or the LV remains if the compensating `lvremove` also
   failed. Compare a backup before acting; a valid surviving record will load
@@ -280,7 +287,7 @@ systemctl start volvisord.service
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-3. Re-check the volume and LV against the five outcomes above:
+3. Re-check the volume and LV against the six outcomes above:
 
    - **intent-save failure:** `GET` is still 404, no LV exists, and any
      durable intent whose LV is absent is dropped at startup; nothing ran, so
@@ -291,6 +298,10 @@ curl -fsS http://127.0.0.1:8080/healthz
    - **carve-out:** `GET` is 200, the LV is present, and the durable state
      contains the volume. Do not remove it; confirm it appears exactly once
      in `GET /v2/volumes`, then resume at step 5's carve-out bullet;
+   - **clear-save failure:** `GET` is 404. A retained create intent is
+     classified at startup: an absent LV drops it, a present LV is adopted
+     only at or above the requested size. Follow the create tail in
+     [lvm-state-divergence.md](lvm-state-divergence.md);
    - **indeterminate:** if the durable file still cannot be read, the daemon
      will not have started (the step-2 `healthz` check failed) — escalate
      with the state and LVM output. If it now reads: `GET` is 404 when no

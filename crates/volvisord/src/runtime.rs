@@ -415,6 +415,15 @@ fn log_move_pass(
                     "verifiably-unstarted move re-driven"
                 );
             }
+            for volume_id in &report.redrive_failed {
+                tracing::warn!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "PREPARING move could not be re-driven this pass (a foreign pvmove \
+                     on the source, an unobservable scan, or a start failure); retried \
+                     next tick"
+                );
+            }
             for volume_id in &report.marked_copying {
                 tracing::info!(
                     kind = "move_reconcile",

@@ -2314,6 +2314,83 @@ async fn a_create_clear_save_failure_keeps_the_intent_in_memory() {
     assert_eq!(err.code, ApiErrorCode::NotFound);
 }
 
+/// A create whose final save fails runs the checked compensation; when
+/// that compensation's clear save also fails **before its rename**, the
+/// durable file still holds the create intent. Memory must put it back,
+/// or the next successful save would erase the anchor and orphan an LV
+/// whose `lvremove` also failed.
+#[tokio::test]
+async fn a_create_compensation_clear_failure_keeps_the_intent_in_memory() {
+    let fixture = fixture();
+    let volume = "create-compensation-clear-fails";
+    let id = volume_id(volume);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    // `lvcreate` succeeds, then blocks the `.tmp` path: the final save
+    // fails pre-rename (the valid durable file still holds the intent)
+    // and the compensating clear save fails the same way.
+    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = Some(fixture.state_path.clone());
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("the final save and its compensating clear both fail");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail
+            .contains("durable create intent could not be cleared"),
+        "the failed clear is reported honestly: {err}"
+    );
+    assert!(
+        err.detail.contains("cleanup save failed"),
+        "the compensation save failure is reported: {err}"
+    );
+
+    // The checked compensation removed the LV and the durable file still
+    // holds the intent (the clear's rename did not land).
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the compensating lvremove removed the LV"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state is still readable");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the pre-rename clear failure left the intent durable"
+    );
+
+    // Unblock saves and drive a later successful mutation from the same
+    // in-memory provider: the re-inserted intent must survive it.
+    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = None;
+    let mut tmp_name = fixture.state_path.clone().into_os_string();
+    tmp_name.push(".tmp");
+    std::fs::remove_dir(std::path::PathBuf::from(tmp_name)).expect("unblock the tmp path");
+    fixture
+        .provider
+        .create_volume(&fixture_create_request("create-compensation-witness", GIB))
+        .await
+        .expect("a second create saves the in-memory state");
+    let durable = LvmState::load(&fixture.state_path).expect("durable after the next save");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the re-inserted create intent survived a later save"
+    );
+
+    // Startup observes no intent-owned LV and drops the intent.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.create_intents().is_empty(), "{durable:?}");
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("no volume was fabricated");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
 // -- Grow -------------------------------------------------------------------
 
 #[tokio::test]
