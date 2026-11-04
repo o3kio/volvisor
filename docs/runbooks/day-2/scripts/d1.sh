@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # D1: stopped-state backup, destructive drift, restore; prove attachment
-# state/revision/tombstones survive and post-backup operations are lost.
+# state/revision/generation fence survive and post-backup operations are lost.
 # shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
@@ -104,7 +104,7 @@ api_expect "$CURL" POST "$BASE/v2/volumes/vol-d1-b/detach" "$RUN/records/$TAG-de
 say "inspect A before backup"
 curl --fail-with-body --silent --show-error --config "$CURL" "$BASE/v2/volumes/vol-d1-a" >"$RUN/records/$TAG-inspect-a-before.json"
 tee -a "$LOG" < "$RUN/records/$TAG-inspect-a-before.json"
-say "inspect B before backup (tombstone source)"
+say "inspect B before backup (retired-generation source)"
 curl --fail-with-body --silent --show-error --config "$CURL" "$BASE/v2/volumes/vol-d1-b" >"$RUN/records/$TAG-inspect-b-before.json"
 tee -a "$LOG" < "$RUN/records/$TAG-inspect-b-before.json"
 
@@ -119,7 +119,7 @@ assert_no_writer "$JOURNAL" "backup consistency point has no writer"
 cap "record state checksums before backup" sha256sum "$JOURNAL/journal.log" "$STATE"
 PRE_JOURNAL_SHA="$(sha256sum "$JOURNAL/journal.log" | cut -d' ' -f1)"
 PRE_STATE_SHA="$(sha256sum "$STATE" | cut -d' ' -f1)"
-cap "record attachment and tombstone facts in the durable store" jq '{a: .volumes["vol-d1-a"].runtime.attachment, b_tombstones: .volumes["vol-d1-b"].runtime.retired_attachment_filter.inserted}' "$STATE"
+cap "record attachment and retired-generation facts in the durable store" jq '{a: .volumes["vol-d1-a"].runtime.attachment, b_generation: .volumes["vol-d1-b"].entry.generation, b_filter: (.volumes["vol-d1-b"].runtime.retired_attachment_filter // "absent")}' "$STATE"
 
 BACKUP_T0="$(date +%s.%N)"
 cap "backup the whole stopped state directory" tar --xattrs --acls -C "$RUN/lab-$TAG" -cpf "$BACKUP/state.tar" journal
@@ -143,7 +143,7 @@ cap "restored state checksum (must equal the pre-backup checksum)" sha256sum "$J
 assert_eq "$(sha256sum "$JOURNAL/journal.log" | cut -d' ' -f1)" "$PRE_JOURNAL_SHA" "restored journal is byte-identical to the backup source"
 assert_eq "$(sha256sum "$STATE" | cut -d' ' -f1)" "$PRE_STATE_SHA" "restored state is byte-identical to the backup source"
 assert_no_writer "$JOURNAL" "restored journal has no writer before restart"
-cap "prove restored durable facts" jq '{a: .volumes["vol-d1-a"].runtime.attachment, b_tombstones: .volumes["vol-d1-b"].runtime.retired_attachment_filter.inserted}' "$STATE"
+cap "prove restored durable facts" jq '{a: .volumes["vol-d1-a"].runtime.attachment, b_generation: .volumes["vol-d1-b"].entry.generation, b_filter: (.volumes["vol-d1-b"].runtime.retired_attachment_filter // "absent")}' "$STATE"
 start_volvisord_bin "$D1_BIN" "$D1_RESTORE" "$CFG" "$PORT" || exit 1
 RESTORE_T1="$(date +%s.%N)"
 awk -v a="$RESTORE_T0" -v b="$RESTORE_T1" 'BEGIN { printf "restore_to_health_duration_secs=%.3f\n", b-a }' | tee -a "$LOG"
@@ -159,16 +159,23 @@ A_EVIDENCE_AFTER="$(json_get "$RUN/records/$TAG-inspect-a-after.json" '.attachme
 assert_eq "$A_STATE_AFTER" "active" "post-restore attachment state"
 assert_eq "$A_REV_AFTER" "2" "post-restore attachment state_revision"
 assert_eq "$A_EVIDENCE_AFTER" "guest_confirmed" "post-restore attachment evidence"
-TOMBSTONE_AFTER="$(json_get "$STATE" '.volumes["vol-d1-b"].runtime.retired_attachment_filter.inserted')"
-assert_eq "$TOMBSTONE_AFTER" "1" "post-restore tombstone count"
+B_GENERATION_AFTER="$(json_get "$STATE" '.volumes["vol-d1-b"].entry.generation')"
+assert_eq "$B_GENERATION_AFTER" "3" "post-restore retired volume generation"
+B_FILTER_AFTER="$(json_get "$STATE" '.volumes["vol-d1-b"].runtime.retired_attachment_filter // "absent"')"
+assert_eq "$B_FILTER_AFTER" "absent" "new writes do not populate the legacy tombstone filter"
 
-say "prove the tombstone is enforced: reusing att-d1-b must be refused"
-api "$CURL" POST "$BASE/v2/volumes/vol-d1-b/attach" "$RUN/records/$TAG-reattach-b.json" >"$RUN/records/$TAG-reattach-b-after.json"
-REATTACH_STATUS="$(cat "$RUN/records/last.status")"
-tee -a "$LOG" < "$RUN/records/$TAG-reattach-b-after.json"
-printf 'HTTP %s for retired-attachment reattach\n' "$REATTACH_STATUS" | tee -a "$LOG"
-assert_eq "$REATTACH_STATUS" "409" "retired attachment id refusal status"
-assert_contains "$(cat "$RUN/records/$TAG-reattach-b-after.json")" "IDEMPOTENCY_CONFLICT" "retired attachment refusal code"
+say "prove the generation fence: reusing att-d1-b is a new instance"
+api_expect "$CURL" POST "$BASE/v2/volumes/vol-d1-b/attach" "$RUN/records/$TAG-reattach-b.json" 200 "$RUN/records/$TAG-reattach-b-after.json"
+B_REATTACH_GEN="$(json_get "$RUN/records/$TAG-reattach-b-after.json" '.attachment_generation')"
+printf 'reattached att-d1-b generation=%s\n' "$B_REATTACH_GEN" | tee -a "$LOG"
+assert_eq "$B_REATTACH_GEN" "3" "re-attach records the consumed volume generation"
+
+cat >"$RUN/records/$TAG-delayed-report-b.json" <<'EOF'
+{"api_version":"volvisor.volume.v2","operation_id":"op-d1-delayed-report-b","attachment_id":"att-d1-b","expected_attachment_generation":1,"state":"active","evidence":"guest_confirmed","reporter":"day2-drill-guest"}
+EOF
+say "prove a delayed report from the retired instance is fenced"
+api_expect "$CURL" POST "$BASE/v2/volumes/vol-d1-b/attachment-state" "$RUN/records/$TAG-delayed-report-b.json" 409 "$RUN/records/$TAG-delayed-report-b.resp.json"
+assert_contains "$(cat "$RUN/records/$TAG-delayed-report-b.resp.json")" "STALE_GENERATION" "delayed retired-generation report code"
 
 say "prove the post-backup volume C is not in restored state (expected RPO loss)"
 api "$CURL" GET "$BASE/v2/volumes/vol-d1-c" >"$RUN/records/$TAG-inspect-c-after.json"

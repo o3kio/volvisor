@@ -1053,7 +1053,7 @@ fn a_pre_p6b_attachment_record_loads_without_the_disk_id() {
 }
 
 #[tokio::test]
-async fn attachment_id_reuse_after_detach_is_refused() {
+async fn reattaching_a_consumed_id_fences_the_retired_instance_by_generation() {
     let fixture = fixture();
     let created = fixture
         .provider
@@ -1076,26 +1076,52 @@ async fn attachment_id_reuse_after_detach_is_refused() {
         .await
         .expect("detach");
 
-    // A report-capable provider refuses to reuse a consumed id: a delayed
-    // report from the old instance must never label a new one.
+    // Reusing an id is a new instance with a strictly greater generation.
+    // It is not refused, so a churned volume stays usable (issue #63).
     let reused = fixture_attach_request("reuse-vol", "reuse-att", detached.generation);
-    let err = fixture
+    let reattached = fixture
         .provider
         .attach_volume(&created.volume_id, &reused)
         .await
-        .expect_err("consumed attachment id reuse");
-    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+        .expect("re-attach with a consumed id is a new instance");
+    assert!(
+        reattached.attachment_generation > first.attachment_generation,
+        "the new instance must fence the retired one by generation"
+    );
 
-    // The tombstone is durable: a restart still refuses the reuse.
+    // A delayed report from the retired instance carries the old
+    // generation and is refused; it never labels the new instance.
+    let delayed = fixture_report_request(
+        "reuse-att",
+        first.attachment_generation,
+        AttachmentState::Active,
+        AttachmentEvidence::GuestConfirmed,
+    );
+    let err = fixture
+        .provider
+        .report_attachment_state(&created.volume_id, &delayed)
+        .await
+        .expect_err("a delayed report from the retired generation");
+    assert_eq!(err.code, ApiErrorCode::StaleGeneration);
+
+    // The fence is durable: a restart still refuses the retired generation.
     let restarted = common::provider_from(&fixture.state_path, &fixture.world);
     let err = restarted
-        .attach_volume(&created.volume_id, &reused)
+        .report_attachment_state(&created.volume_id, &delayed)
         .await
-        .expect_err("consumed attachment id reuse after restart");
-    assert_eq!(err.code, ApiErrorCode::IdempotencyConflict);
+        .expect_err("the retired generation after restart");
+    assert_eq!(err.code, ApiErrorCode::StaleGeneration);
 
-    // A fresh id is admitted normally.
-    let fresh = fixture_attach_request("reuse-vol", "reuse-att-2", detached.generation);
+    // A fresh id is admitted normally after the new instance detaches.
+    let detached2 = restarted
+        .detach_volume(
+            &created.volume_id,
+            &reattached.attachment_id,
+            &fixture_detach_request("reuse-att", reattached.attachment_generation),
+        )
+        .await
+        .expect("detach the new instance");
+    let fresh = fixture_attach_request("reuse-vol", "reuse-att-2", detached2.generation);
     restarted
         .attach_volume(&created.volume_id, &fresh)
         .await

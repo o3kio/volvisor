@@ -8,12 +8,12 @@
 //! state. It performs no real I/O: every support claim it makes is
 //! `PrototypeOnly` evidence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::semantics::{
     AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
-    ensure_attachment_id_not_retired, ensure_expected_attachment_generation,
-    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+    ensure_expected_attachment_generation, ensure_expected_generation, ensure_no_active_attachment,
+    resolve_attachment_replay,
 };
 use async_trait::async_trait;
 use volvisor_types::domain::{
@@ -48,10 +48,6 @@ struct FakeState {
     attachments: BTreeMap<AttachmentId, Attachment>,
     /// Canonical creation payload per volume id (idempotent-create check).
     creation_payloads: BTreeMap<VolumeId, String>,
-    /// Attachment ids retired by detach, keyed by volume. A report-capable
-    /// provider refuses to reuse one for the volume's lifetime: a delayed
-    /// report from the old instance must never label a new one.
-    retired_attachments: BTreeSet<(VolumeId, AttachmentId)>,
     /// Fault injected by [`FakeProvider::set_next_failure`].
     next_failure: Option<ApiError>,
     /// Whether the fake admin device is claimed (admin-surface tests).
@@ -455,15 +451,9 @@ fn resolve_attach_identity(
         return Ok(Some(attach_response(existing, vol)));
     }
 
-    // A report-capable provider must not reuse an attachment id that this
-    // volume already consumed: a delayed report from the old instance
-    // would otherwise be applied to the new one.
-    ensure_attachment_id_not_retired(
-        state
-            .retired_attachments
-            .contains(&(volume_id.clone(), req.attachment_id.clone())),
-        &req.attachment_id,
-    )?;
+    // A consumed id is not tombstoned: the strictly increasing attachment
+    // generation (see `apply_attach`) fences a delayed report from the old
+    // instance against any later one.
     Ok(None)
 }
 
@@ -529,7 +519,9 @@ fn apply_attach(
         volume_id: volume_id.clone(),
         vm_id: req.vm_id.clone(),
         host_id: req.host_id.clone(),
-        generation: Generation(1),
+        // Strictly increasing per volume: the detach/report fence. It is the
+        // volume generation this attach consumes, never a constant `1`.
+        generation: Generation(vol.generation.0),
         // Host-scoped, ephemeral, deterministic; contains no secret material.
         frontend: Frontend::VirtioBlk {
             host_device_path: format!("/dev/volvisor-fake/{volume_id}"),
@@ -588,9 +580,6 @@ fn apply_detach(
         .get_mut(volume_id)
         .ok_or_else(|| not_found(volume_id))?;
     state.attachments.remove(attachment_id);
-    state
-        .retired_attachments
-        .insert((volume_id.clone(), attachment_id.clone()));
     vol.attachment_ids.retain(|id| id != attachment_id);
     if vol.current_writer.as_ref() == Some(attachment_id) {
         vol.current_writer = None;
@@ -710,11 +699,6 @@ fn apply_delete(
     }
     state.volumes.remove(volume_id);
     state.creation_payloads.remove(volume_id);
-    // The volume's lifetime ends here: ids it consumed are not retired
-    // against a future volume that reuses the same volume id.
-    state
-        .retired_attachments
-        .retain(|(volume, _)| volume != volume_id);
     Ok(())
 }
 
@@ -1198,14 +1182,14 @@ mod tests {
 
         let mut reader = fixture_attach_request("fake-readers", "fake-readers-r1", 1);
         reader.access_mode = AccessModeRequest::ReadOnly;
-        provider
+        let reader = provider
             .attach_volume(&vid, &reader)
             .await
             .expect("first reader");
 
         let mut reader2 = fixture_attach_request("fake-readers", "fake-readers-r2", 2);
         reader2.access_mode = AccessModeRequest::ReadOnly;
-        provider
+        let reader2 = provider
             .attach_volume(&vid, &reader2)
             .await
             .expect("second reader");
@@ -1229,7 +1213,7 @@ mod tests {
             .detach_volume(
                 &vid,
                 &attachment_id("fake-readers-r1"),
-                &fixture_detach_request("fake-readers-r1", 1),
+                &fixture_detach_request("fake-readers-r1", reader.attachment_generation),
             )
             .await
             .expect("detach reader 1");
@@ -1237,7 +1221,7 @@ mod tests {
             .detach_volume(
                 &vid,
                 &attachment_id("fake-readers-r2"),
-                &fixture_detach_request("fake-readers-r2", 1),
+                &fixture_detach_request("fake-readers-r2", reader2.attachment_generation),
             )
             .await
             .expect("detach reader 2");

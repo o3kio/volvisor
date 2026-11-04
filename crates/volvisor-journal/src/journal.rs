@@ -815,7 +815,7 @@ impl Journal {
     /// window. A collision (different id, same 64-bit fingerprint) also
     /// answers `true`; the caller must fail closed either way.
     ///
-    /// This is an O(1) membership test against [`TombstoneRing`]'s index, not
+    /// This is an O(1) membership test against the tombstone ring's index, not
     /// a scan of the ring (which may hold `max_tombstones` entries).
     #[must_use]
     pub fn is_tombstoned(&self, operation_id: &OperationId) -> bool {

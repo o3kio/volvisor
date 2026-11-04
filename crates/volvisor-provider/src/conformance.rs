@@ -888,11 +888,12 @@ pub async fn check_move_contract(provider: &dyn VolumeProvider) -> Result<(), St
 ///
 /// A provider advertising [`Capability::AttachmentStateReport`] must:
 /// advance evidence monotonically (`prepared < advertised < active`),
-/// keep `attachment_generation` fixed as the detach fence, answer a
+/// keep `attachment_generation` fixed across reports, answer a
 /// repeated/lower report as an idempotent no-op (`applied=false` without
 /// downgrading), refuse a stale instance generation, expose the full
 /// per-attachment view on inspect, answer `NOT_FOUND` after detach, and
-/// refuse reuse of a consumed attachment id (`IDEMPOTENCY_CONFLICT`).
+/// record a strictly greater generation for a re-attach so a delayed
+/// report carrying the retired generation is `STALE_GENERATION`.
 /// A provider without the capability is skipped; its typed `NOT_FOUND` is
 /// the default trait behavior, and the capability-gated path is covered by
 /// the fake's `report_requires_the_capability` test.
@@ -1108,19 +1109,43 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         Ok(_) => return Err("a report after detach must not succeed".to_owned()),
     }
 
-    // A report-capable provider must refuse to reuse the consumed id: a
-    // delayed report from the old instance must never label a new one.
+    // A re-attach records a strictly greater generation. A delayed report
+    // from the retired instance must never label the new one, even when the
+    // consumer reuses the attachment id: its old generation is stale.
+    let retired_generation = attached.attachment_generation;
     let after_detach = provider
         .inspect_volume(&create.volume_id)
         .await
         .map_err(|e| format!("inspect_volume after detach: {e}"))?;
     let reattach = fixture_attach_request(volume_id, attachment_id, after_detach.generation);
-    match provider.attach_volume(&create.volume_id, &reattach).await {
-        Err(e) if e.code == ApiErrorCode::IdempotencyConflict => Ok(()),
+    let reattached = provider
+        .attach_volume(&create.volume_id, &reattach)
+        .await
+        .map_err(|e| format!("re-attach after detach: {e}"))?;
+    require(
+        reattached.attachment_generation > retired_generation,
+        "a re-attach must record a strictly greater attachment generation",
+    )?;
+    match provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                retired_generation,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::StaleGeneration => Ok(()),
         Err(e) => Err(format!(
-            "reusing a consumed attachment id must fail with IDEMPOTENCY_CONFLICT, got {e}"
+            "a delayed report from the retired generation must fail with STALE_GENERATION, got {e}"
         )),
-        Ok(_) => Err("reusing a consumed attachment id must not succeed".to_owned()),
+        Ok(_) => Err(
+            "a delayed report from the retired generation must not label the new instance"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1414,15 +1439,14 @@ pub async fn run_universal_parity(provider: &dyn VolumeProvider) -> Vec<ParitySt
 /// The expected report/tombstone parity sequence.
 ///
 /// Report-capable providers apply consumer reports monotonically, keep the
-/// attachment generation fixed, answer repeated/lower reports as no-ops,
-/// refuse a stale generation, and retire the attachment id. Providers that do
-/// not advertise [`Capability::AttachmentStateReport`] must fail closed with
-/// `NOT_FOUND` instead of synthesizing evidence.
+/// attachment generation fixed across reports, answer repeated/lower reports
+/// as no-ops, refuse a stale generation, and record a strictly greater
+/// generation on re-attach. Providers that do not advertise
+/// [`Capability::AttachmentStateReport`] must fail closed with `NOT_FOUND`
+/// instead of synthesizing evidence.
 #[must_use]
 pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
-    use ParityOutcome::{
-        Applied, Attached, Conflict, Created, Deleted, Detached, NoOp, NotFound, Stale,
-    };
+    use ParityOutcome::{Applied, Attached, Created, Deleted, Detached, NoOp, NotFound, Stale};
     if report_capable {
         vec![
             step("create", Created),
@@ -1434,7 +1458,7 @@ pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
             step("report-stale", Stale),
             step("detach", Detached),
             step("report-after-detach", NotFound),
-            step("reattach-retired-id", Conflict),
+            step("reattach-new-generation", Attached),
         ]
     } else {
         vec![
@@ -1608,7 +1632,7 @@ pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep>
             generation_after_detach,
         );
         steps.push(step(
-            "reattach-retired-id",
+            "reattach-new-generation",
             outcome(
                 provider.attach_volume(&create.volume_id, &reattach).await,
                 ParityOutcome::Attached,

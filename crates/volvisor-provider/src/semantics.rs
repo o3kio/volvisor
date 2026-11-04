@@ -25,9 +25,9 @@
 //! - monotonic consumer attachment-state reports (a report never advances
 //!   the attachment generation, never downgrades, and an equal/lower report
 //!   is an idempotent no-op);
-//! - tombstone rejection for retired attachment ids, wherever consumer
-//!   reports are advertised, so per-id evidence is never misattributed to a
-//!   new instance.
+//! - a strictly increasing per-volume attachment generation as the
+//!   detach/report fence, so per-id evidence is never misattributed to a
+//!   new instance even when a consumer reuses an attachment id.
 //!
 //! Backend-specific and deliberately *not* generalized here:
 //!
@@ -36,8 +36,9 @@
 //! - ownership proofs and foreign-state classification;
 //! - DRBD writer-authority leases, fencing and migration cuts;
 //! - Ceph mapping/zombie reconciliation and LVM online-move records;
-//! - the tombstone persistence layout (LVM stores a list, the fake a set)
-//!   and whether a backend advertises consumer reports at all (Ceph/DRBD
+//! - the optional legacy tombstone layout (a bounded filter remains in the
+//!   LVM v3 shape for decode compatibility) and whether a backend advertises
+//!   consumer reports at all (Ceph/DRBD
 //!   do not).
 
 use volvisor_types::request::{
@@ -147,8 +148,11 @@ pub fn ensure_expected_generation(expected: u64, current: u64) -> Result<(), Api
 /// Fence an attachment-level mutation (detach or a state report) against the
 /// recorded attachment generation.
 ///
-/// The attachment generation is the detach token; a consumer report validates
-/// it but never advances it.
+/// The attachment generation is the detach/report token. It is **strictly
+/// increasing per volume**: each new instance records a generation greater
+/// than every earlier instance on that volume, so a delayed detach or report
+/// from a retired instance is fenced even if a consumer reuses its id. A
+/// consumer report validates the token but never advances it.
 ///
 /// # Errors
 /// `STALE_GENERATION` when `expected` does not equal `current`.
@@ -176,8 +180,12 @@ pub fn ensure_no_active_attachment(
 
 /// Refuse reuse of an attachment id the volume already consumed.
 ///
-/// The tombstone exists so a delayed report from a retired instance can never
-/// label a new one.
+/// This is **optional defence in depth**, not the authoritative fence: a
+/// provider must fence delayed evidence with the strictly increasing
+/// [`ensure_expected_attachment_generation`] regardless. Retaining an exact
+/// tombstone forever is unbounded and a Bloom filter's false positives would
+/// refuse fresh ids (issue #63), so neither the LVM provider nor the
+/// conformance fake calls this in the ordinary path.
 ///
 /// # Errors
 /// `IDEMPOTENCY_CONFLICT` when `retired` is true.

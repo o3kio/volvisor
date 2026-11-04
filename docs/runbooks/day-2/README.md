@@ -128,6 +128,10 @@ from the removed v3 `retired_attachment_ids` vector to the bounded
 `retired_attachment_filter`; that run, including the behavioral
 `409 IDEMPOTENCY_CONFLICT`, is retained in the
 [2026-11-04 bundle](../../evidence/day2/2026-11-04-devhost-live/REPORT.md#d1--backup-drift-restore).
+That bundle predates ADR-0012. The current `d1.sh` asserts the strictly
+increasing attachment-generation fence instead (re-attach succeeds with the
+consumed volume generation; a delayed retired-generation report is
+`STALE_GENERATION`), so re-run the drill before citing current behavior.
 A full `run-all.sh` has not been re-run end-to-end for this batch; run it
 before citing the whole sequence.
 

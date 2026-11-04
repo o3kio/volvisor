@@ -28,6 +28,8 @@ control-plane bundle predates those changes (`e3aa365`). The missing work is
 therefore verification, not another feature:
 
 - close two review findings in the new journal compaction path;
+- fix the attachment-churn regression found by the first post-fix run
+  (ADR-0012: the strictly increasing attachment generation is the fence);
 - add reproducible before/after comparison tooling;
 - re-run the single-host control-plane benchmark on the fixed tree and
   publish an honest comparison bundle;
@@ -50,6 +52,11 @@ availability, durability or zero-RPO statement. In particular:
 - no claim that #62/#63/#64 are "fixed in production" beyond the measured
   single-host behavior;
 - no change to the five readiness gate verdicts.
+
+ADR-0012 is a deliberate contract amendment, not a capability claim: it
+replaces a per-id tombstone mechanism that the measurement showed to be
+unsound under churn with an already-persisted, strictly increasing token. It
+does not raise the maturity of any storage class.
 
 ## Slices
 
@@ -80,6 +87,40 @@ the new compaction path:
 **Acceptance.** The journal, retention, schema and fail-closed tests pass
 with and without `test-faults`; a blocked compaction target produces
 bounded attempts; tombstone membership matches the old semantics exactly.
+
+### C1b — attachment-churn regression found by the first post-fix run
+
+**Gap.** The first clean-tree C3 run exposed a serious regression in the
+Phase A [#63](https://github.com/o3kio/volvisor/issues/63) fix. The
+fixed-size Bloom filter of retired attachment ids saturates on a churned
+volume; every fresh id then matches as a false positive and is refused with
+`IDEMPOTENCY_CONFLICT`. In the 25-minute soak that produced **1,413,505**
+spurious conflicts (99.1% of 1,425,668 attach attempts), so the throughput
+numbers from that run are invalid and a legitimately churned volume is
+effectively unusable. A probabilistic filter cannot enforce "refuse a
+consumed id" without also refusing ids that were never consumed.
+
+**Deliverables.**
+
+- [ADR-0012](../adr/0012-monotonic-attachment-generation-fence.md) makes the
+  **strictly increasing per-volume `attachment_generation`** the
+  detach/report fence and stops requiring an unbounded per-id tombstone. The
+  generation is the volume generation the attach consumed, so the first
+  attach on a fresh volume is still `1`, a re-attach is strictly greater, and
+  a delayed report or detach from a retired instance is `STALE_GENERATION`
+  even if the consumer reuses the id.
+- the LVM provider and the conformance fake stop inserting into and
+  consulting the retired-id filter; the schema-v3 field remains decodable
+  (and is omitted while empty), so no schema bump is needed;
+- the contract's attachment-id bullet is amended to state the generation
+  invariant and to make an exact tombstone optional defence in depth;
+- conformance, parity, LVM, API and day-2 D1 assertions move from the
+  retired-id `409` to the generation fence.
+
+**Acceptance.** A churned volume admits fresh ids without conflicts; a
+delayed report from a retired generation is `STALE_GENERATION`; the fence
+survives a restart; conformance and parity pass for the fake and LVM
+provider.
 
 ### C2 — before/after comparison tooling
 

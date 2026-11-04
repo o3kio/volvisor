@@ -95,8 +95,8 @@ use std::time::{Duration, Instant};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::semantics::{
     AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
-    ensure_attachment_id_not_retired, ensure_expected_attachment_generation,
-    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+    ensure_expected_attachment_generation, ensure_expected_generation, ensure_no_active_attachment,
+    resolve_attachment_replay,
 };
 use volvisor_types::domain::{
     AccessMode, AttachmentEvidence, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend,
@@ -1967,13 +1967,6 @@ impl LvmProvider {
         let stored = state
             .volume_mut(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
-        ensure_attachment_id_not_retired(
-            stored
-                .runtime
-                .retired_attachments
-                .maybe_contains(&req.attachment_id),
-            &req.attachment_id,
-        )?;
         ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
         ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
         match stored.runtime.state {
@@ -1986,11 +1979,16 @@ impl LvmProvider {
             }
         }
 
+        // The attachment generation is the detach/report fence and is
+        // strictly increasing per volume: it is the volume generation this
+        // attach consumed, never a constant `1`. A delayed report or detach
+        // from a retired instance therefore carries an older generation and
+        // is refused, even if a consumer reuses the attachment id.
         let record = AttachmentRecord {
             id: req.attachment_id.clone(),
             vm_id: req.vm_id.clone(),
             host_id: req.host_id.clone(),
-            generation: 1,
+            generation: stored.entry.generation,
             access_mode: mode,
             vmm_disk_id: req.vmm_disk_id.clone(),
             state: AttachmentState::Prepared,
@@ -2040,9 +2038,11 @@ impl LvmProvider {
         // one, though the provider cannot verify the claim itself
         // (Volume API v2 section 3).
 
-        let retired_id = record.id.clone();
+        // The retired id is not tombstoned: the strictly increasing
+        // attachment generation is the fence, so a delayed report for this
+        // instance is `STALE_GENERATION` against any later one. Bounding
+        // per-id state is what keeps a churned volume usable (issue #63).
         stored.runtime.attachment = None;
-        stored.runtime.retired_attachments.insert(&retired_id);
         if stored.runtime.state == VolumeLifecycle::Attached {
             stored.runtime.state = VolumeLifecycle::Ready;
         }
@@ -5479,6 +5479,50 @@ mod read_snapshot_tests {
             read_snapshot: RwLock::new(Arc::new(state)),
         };
         (Arc::new(provider), volume_id)
+    }
+
+    /// Regression for the Phase C benchmark finding: a schema-v3 state
+    /// file can carry a saturated legacy `retired_attachment_filter`.
+    /// Consulting it (as the Phase A code did) refuses every fresh id as a
+    /// false positive. The generation is the fence, so the attach must
+    /// succeed and the legacy bits must be ignored.
+    #[tokio::test]
+    async fn a_saturated_legacy_retired_filter_does_not_refuse_fresh_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            let runtime = &mut state.volume_mut(&volume_id).expect("volume").runtime;
+            for index in 0..10_000u32 {
+                runtime
+                    .retired_attachments
+                    .insert(&AttachmentId::new(format!("legacy-att-{index}")).expect("valid id"));
+            }
+            assert!(
+                runtime
+                    .retired_attachments
+                    .maybe_contains(&AttachmentId::new("fresh-att").expect("valid id")),
+                "the legacy filter is saturated and would false-positive a fresh id"
+            );
+        }
+        let fresh = AttachmentId::new("fresh-att").expect("valid id");
+        let request = volvisor_types::request::AttachVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-attach-fresh").expect("valid id"),
+            vm_id: "vm-fresh".to_owned(),
+            host_id: volvisor_types::HostId::new("host-fresh").expect("valid id"),
+            attachment_id: fresh.clone(),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let attached = provider
+            .attach_volume(&volume_id, &request)
+            .await
+            .expect("a saturated legacy filter must not refuse a fresh id");
+        assert_eq!(attached.attachment_id, fresh);
+        assert_eq!(attached.attachment_generation, 1);
     }
 
     #[test]

@@ -59,28 +59,23 @@ const RETIRED_ATTACHMENT_FILTER_HASHES: u64 = 7;
 /// Byte length of [`RETIRED_ATTACHMENT_FILTER_BITS`].
 const RETIRED_ATTACHMENT_FILTER_BYTES: usize = RETIRED_ATTACHMENT_FILTER_BITS / 8;
 
-/// Fixed-size, monotone tombstone filter for a volume's consumed
-/// attachment ids.
+/// Fixed-size Bloom filter for a volume's consumed attachment ids.
 ///
-/// The stale-attachment contract (AGENTS rule 8) requires the provider
-/// to refuse an attachment id that a volume consumed earlier in its
-/// lifetime, so the history cannot be adversarially truncated or
-/// evicted. A plain cap/retention window would therefore be a
-/// correctness regression. This structure is the standard bounded
-/// alternative: a Bloom filter
-///
-/// - has **no false negatives** (a definitely-consumed id always
-///   matches), so a stale id is never accepted;
-/// - may have false positives, which are resolved in the fail-closed
-///   direction (a *new* id is refused as `IDEMPOTENCY_CONFLICT`);
-/// - never clears a bit, and is removed only together with its volume.
+/// **Legacy schema-v3 shape, no longer authoritative.** This filter was
+/// introduced for issue #63 to bound the schema-v1/v2
+/// `retired_attachment_ids` vector, but it is unsound as a refusal
+/// mechanism: once a churned volume fills it, every fresh id is a false
+/// positive and is refused as `IDEMPOTENCY_CONFLICT`, making the volume
+/// unusable. It has **no false negatives** (`true` is "consumed or a false
+/// positive"), which is why it must never be used to reject a request. The
+/// current provider keeps the type only to decode a v3 file without losing
+/// data and never inserts into or consults it; delayed reports are fenced
+/// by the strictly increasing attachment generation.
 ///
 /// Bits are set from SHA-256 double hashing over the id's bytes, so the
 /// on-disk representation is stable across process restarts and
-/// architectures. `inserted` is the saturation metric: the store is
-/// bounded even after a pathological number of attachments, and the
-/// false-positive rate grows as the filter fills. The number of bits
-/// and probes are schema properties; changing either requires another
+/// architectures. `inserted` is the legacy saturation metric. The number of
+/// bits and probes are schema properties; changing either requires another
 /// schema bump.
 ///
 /// The filter is serialized as an object holding the bit array as a
@@ -149,8 +144,10 @@ impl RetiredAttachmentFilter {
 
     /// Whether `id` may have been consumed by this volume.
     ///
-    /// `false` is definitive (never consumed). `true` is "consumed or a
-    /// false positive"; callers must refuse.
+    /// `false` is definitive (never consumed). `true` means "consumed or a
+    /// false positive", so it is **diagnostic only**: treating it as an
+    /// authoritative refusal would reject fresh ids once the filter fills.
+    /// The attachment generation is the fence.
     #[must_use]
     pub fn maybe_contains(&self, id: &AttachmentId) -> bool {
         filter_indices(id.as_str()).all(|index| self.bits[index / 8] & (1 << (index % 8)) != 0)
@@ -341,11 +338,12 @@ pub struct VolumeRuntime {
     pub state: VolumeLifecycle,
     /// The single recorded attachment, if any (single-writer P0 profile).
     pub attachment: Option<AttachmentRecord>,
-    /// Bounded tombstones for attachment ids this volume consumed
-    /// earlier in its lifetime. A report-capable provider refuses to
-    /// reuse one: per-id evidence (`state_revision`) must never be
-    /// applied to a different instance. Omitted while empty so a
-    /// never-attached volume stays compact.
+    /// **Legacy schema-v3 tombstones**, retained only so a v3 state file
+    /// decodes without loss. The current provider never inserts into or
+    /// consults this filter: a delayed report is fenced by the strictly
+    /// increasing attachment generation, and refusing a Bloom-filter hit
+    /// would reject fresh ids once the filter fills (issue #63). Omitted
+    /// while empty so a never-attached volume stays compact.
     #[serde(
         rename = "retired_attachment_filter",
         default,

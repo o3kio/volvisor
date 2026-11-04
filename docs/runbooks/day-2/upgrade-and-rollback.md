@@ -209,7 +209,8 @@ There is no in-place downgrade. The supported procedure is:
 4. Reconcile backend resources created after the backup (they are outside the
    restored control-plane state). The live drill left the post-backup LV in
    the VG; restoring state did not delete it.
-5. Verify attachments and tombstones, then resume workloads.
+5. Verify attachments (state/revision/evidence and generation) and any legacy
+   tombstone filter, then resume workloads.
 
 Lab-equivalent commands (from `d2-live.sh`, after stopping the new daemon):
 

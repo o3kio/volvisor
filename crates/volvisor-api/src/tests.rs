@@ -654,19 +654,38 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(gone["code"], json!("NOT_FOUND"));
 
-    // A consumed attachment id cannot be re-attached under a new operation:
-    // per-id evidence must never be misattributed to a new instance.
+    // Reusing the consumed id is a new instance with a strictly greater
+    // generation, not a refusal: a churned volume stays usable.
     let mut reattach =
         serde_json::to_value(fixture_attach_request("vol-report", "att-report-1", 3))
             .expect("serialize attach fixture");
     reattach["operation_id"] = json!("op-reattach-consumed-id");
-    let (status, reuse_body) = send_json(
+    let (status, reattached) = send_json(
         &app,
         json_request(Method::POST, "/v2/volumes/vol-report/attach", &reattach),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        reattached["attachment_generation"].as_u64().unwrap_or(0) > 1,
+        "the new instance must fence the retired one by generation: {reattached}"
+    );
+
+    // A delayed report from the retired instance still carries generation 1
+    // and is refused; per-id evidence never labels the new instance.
+    let mut delayed = lower.clone();
+    delayed["operation_id"] = json!("op-report-retired-generation");
+    let (status, retired_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &delayed,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(reuse_body["code"], json!("IDEMPOTENCY_CONFLICT"));
+    assert_eq!(retired_body["code"], json!("STALE_GENERATION"));
 }
 
 /// Report envelope rejections happen before the journal: no record, and

@@ -97,7 +97,7 @@ assert_no_writer "$JOURNAL" "stopped state has no writer before reading the upgr
 
 cap "after the first successful write the file carries schema_version 3" jq '.schema_version' "$STATE"
 cap "the attachment state/revision survived the upgrade-on-write" jq '.volumes["vol-upgrade-n1"].runtime.attachment | {state,state_revision,evidence}' "$STATE"
-cap "the v2 tombstone vector was imported into the v3 filter" jq '.volumes["vol-upgrade-tombstone"].runtime | {legacy_vector: (.retired_attachment_ids // "absent"), filter_inserted: .retired_attachment_filter.inserted}' "$STATE"
+cap "the v2 tombstone vector was imported into the legacy v3 filter (decode only)" jq '.volumes["vol-upgrade-tombstone"].runtime | {legacy_vector: (.retired_attachment_ids // "absent"), filter_inserted: .retired_attachment_filter.inserted}' "$STATE"
 assert_eq "$(jq -r '.schema_version' "$STATE")" "3" "upgraded schema_version"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state' "$STATE")" "active" "upgraded attachment state"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state_revision' "$STATE")" "3" "upgraded attachment state_revision"

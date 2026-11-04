@@ -165,8 +165,11 @@ authentication and must not contain control characters.
 - a mismatch is a typed `409 STALE_GENERATION`; the report is journaled as a
   terminal outcome and **does not move state**;
 - a report after detach is a typed `404 NOT_FOUND` for a new `operation_id`;
-- a consumed attachment id cannot be re-attached; that is
-  `IDEMPOTENCY_CONFLICT`, so a delayed report can never label a new instance.
+- a re-attach records a **strictly greater** `attachment_generation`, so a
+  delayed report carrying the retired generation is `STALE_GENERATION` and can
+  never label the new instance (ADR-0012). Consumers must still mint a fresh
+  attachment id per attach, but the fence does not depend on retaining an
+  unbounded tombstone.
 
 On `STALE_GENERATION`, stop reporting for that instance. Re-read
 `attachments[]` and re-attach with a fresh attachment id if the VM still needs

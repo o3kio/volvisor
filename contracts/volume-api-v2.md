@@ -85,10 +85,16 @@ frontend, vmm_disk_id, state, state_revision, evidence, reporter,
 recorded_at_ms
 ```
 
-`attachment_generation` is the **detach-fencing token**. `state_revision` is the
-monotonic evidence revision and is the only ordering input for `state`
-advancement; `recorded_at_ms` is a server-assigned receipt timestamp and never
-an ordering authority. `evidence` and `reporter` describe the current state's
+`attachment_generation` is the **detach/report-fencing token**. For a provider
+that advertises `attachment_state_report`, it is **strictly increasing per
+volume**: every new attachment instance records a generation greater than every
+earlier instance on that volume, including after a detach and across provider
+restarts, and it never restarts at `1` for a re-attach on a live volume (see
+[attachment-state reporting](#attachment-state-reporting)). Providers without
+the capability expose a provider-scoped token and consumers must treat it as
+opaque. `state_revision` is the monotonic evidence revision and is the only
+ordering input for `state` advancement; `recorded_at_ms` is a server-assigned
+receipt timestamp and never an ordering authority. `evidence` and `reporter` describe the current state's
 basis and are absent for a provider-recorded `prepared` attachment. The array
 is additive: older payloads without it decode as empty, and consumers must
 tolerate unknown additive fields. Its order is not significant: consumers
@@ -189,12 +195,20 @@ volvisor records it verbatim and never promotes it to a provider-verified fact.
 - A report never fabricates a `prepared` transition and never downgrades. When
   a consumer needs to re-observe, it reads `attachments[]`; it does not replay
   an old report.
-- Attachment ids must be unique for a volume's lifetime; a re-attach is a new
-  instance even if its generation restarts at `1`. Consumers must mint a fresh
-  id per attach. A provider that advertises `attachment_state_report` must
-  enforce this by refusing a consumed id with `IDEMPOTENCY_CONFLICT`, so a
-  delayed report can never be attributed to a new instance; providers without
-  the capability are not required to retain the tombstone.
+- Attachment ids must be unique for a volume's lifetime; consumers must mint a
+  fresh id per attach. Independently, a provider that advertises
+  `attachment_state_report` must fence delayed evidence with the strictly
+  increasing per-volume `attachment_generation` described above, so a delayed
+  report or detach from a retired instance can never be attributed to a new
+  one: an old generation is `STALE_GENERATION`, and an id that is not the
+  current instance is `NOT_FOUND`. A provider is **not required to retain an
+  unbounded tombstone of consumed ids**: doing so costs durable state and
+  processing proportional to the volume's lifetime attach count, and a
+  fixed-size probabilistic tombstone is unsound because its false positives
+  refuse fresh ids (observed as `IDEMPOTENCY_CONFLICT` on a churned volume in
+  issue #63). A provider that retains an exact tombstone MAY additionally
+  refuse a consumed id with `IDEMPOTENCY_CONFLICT` as defence in depth;
+  consumers must not depend on that refusal and must still mint fresh ids.
 - **Implementation subset (not a wider claim):** this revision is implemented
   by the `native-local` LVM provider and the conformance fake. `ceph-rbd` and
   `nearline-replicated` (DRBD) do not advertise `attachment_state_report` and

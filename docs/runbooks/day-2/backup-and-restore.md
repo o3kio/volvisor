@@ -4,8 +4,10 @@
 Evidence: [D1 raw log](../../evidence/day2/2026-11-04-devhost-live/raw/01-backup-restore-v3.log),
 [Report D1](../../evidence/day2/2026-11-04-devhost-live/REPORT.md#d1--backup-drift-restore).
 Drilled at product source `aad1720`, dirty caller worktree, one host, stopped
-daemon, loop-device LVM, with v3 tombstone-filter assertions. This page is the
-procedure; the log is the result.
+daemon, loop-device LVM, with pre-ADR-0012 v3 tombstone-filter assertions. That
+bundle is a historical record; the current harness asserts the attachment
+generation fence instead, so re-run D1 for current-binary evidence. This page
+is the procedure; the linked log is the historical result.
 
 ## Scope and non-goals
 
@@ -203,9 +205,10 @@ curl -fsS --config ~/.volvisor-admin.curl \
 ```
 
 Check at least: volume ids, `state`, `attachments[].state`,
-`attachments[].state_revision`, `attachments[].evidence`, and
-`retired_attachment_filter` (the bounded v3 tombstone filter, serialized as a
-`bits` hex string plus an `inserted` counter). D1 expected and observed:
+`attachments[].state_revision`, `attachments[].evidence`,
+`attachments[].attachment_generation`, and the volume generation. The
+`retired_attachment_filter` is legacy decode-only (ADR-0012) and may be absent
+from files written by current binaries. D1 expected and observed:
 
 ```json
 {
@@ -215,10 +218,13 @@ Check at least: volume ids, `state`, `attachments[].state`,
 }
 ```
 
-and the retired id `att-d1-b` is still represented by the restored tombstone
-filter (`inserted >= 1`, with no false negatives). A reattach of that retired
-id must return HTTP 409 `IDEMPOTENCY_CONFLICT`; that behavioral refusal is the
-stronger check because the filter can produce a fail-closed false positive.
+and `vol-d1-b` retains its pre-detach volume generation. The attachment-id
+tombstone filter is legacy (ADR-0012): new writes do not populate it, and the
+provider does not consult it. The surviving fence is the **strictly increasing
+per-volume `attachment_generation`**: re-attaching `att-d1-b` succeeds as a new
+instance with generation `3`, and a delayed report carrying the retired
+generation `1` returns HTTP 409 `STALE_GENERATION`. That is the behavioral
+check; do not assert the old `IDEMPOTENCY_CONFLICT` on id reuse.
 
 ## C. Backend reconciliation (mandatory)
 
@@ -249,9 +255,10 @@ data restore.
 - the tar digest is recorded;
 - restored file checksums match;
 - the daemon becomes healthy;
-- attachment state/revision/evidence and tombstones match the backup;
+- attachment state/revision/evidence and the volume generation match the backup;
 - post-backup operations are absent (404);
-- retired attachment ids are still refused;
+- a re-attach records a strictly greater generation and a delayed report from
+  the retired generation is `STALE_GENERATION`;
 - every extra LV is reconciled and recorded.
 
 ## If it fails
@@ -269,12 +276,15 @@ data restore.
 
 ## What was drilled
 
-D1 created A/B/C, attached A and B, reported A active, detached B (tombstone),
-stopped the daemon, copied the state directory, drifted by creating C,
-restored, and re-inspected. Evidence:
+D1 created A/B/C, attached A and B, reported A active, detached B, stopped the
+daemon, copied the state directory, drifted by creating C, restored, and
+re-inspected. The 2026-11-04 evidence bundle predates ADR-0012 and therefore
+records the retired-id `409 IDEMPOTENCY_CONFLICT` plus the v3 filter count:
 [raw/01-backup-restore-v3.log](../../evidence/day2/2026-11-04-devhost-live/raw/01-backup-restore-v3.log).
-The log contains the exact commands, timestamps, hashes and assertions,
-including the v3 filter count and the behavioral 409 for the retired id.
+The current harness instead asserts the generation fence (re-attach generation
+`3`, delayed generation `1` → `STALE_GENERATION`). Re-run the drill to produce
+evidence for the current binary; the historical bundle is not evidence for the
+new fence.
 
 **Limits:** single host; control-plane only; no witness quiesce in the drill;
 no VM-disk or LVM-metadata restore; loop-device LVM. A real disaster-recovery

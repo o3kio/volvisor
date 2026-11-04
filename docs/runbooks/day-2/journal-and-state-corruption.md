@@ -241,7 +241,8 @@ Procedure:
    overwrite it).
 2. Restore the whole state directory from the last verified stopped backup,
    following [backup-and-restore.md](backup-and-restore.md).
-3. Start and verify attachment state/revision/tombstones.
+3. Start and verify attachment state/revision/generation (the tombstone filter
+   is legacy decode-only).
 4. Reconcile backend LVs: the restored state may not describe LVs created
    after the backup; do not delete an LV whose state you cannot explain.
 5. If there is no backup, stop. Do not hand-edit or synthesize JSON. Escalate
@@ -259,7 +260,8 @@ as a first start and would silently lose the volume inventory.
 - A complete future/unknown frame is refused, **not** truncated.
 - A corrupt state file is refused and left byte-identical; recovery is from a
   verified backup, not a hand edit.
-- The post-recovery API shows the expected volumes/attachments/tombstones.
+- The post-recovery API shows the expected volumes and attachments, and any
+  restored legacy tombstone filter is intact (it is not consulted).
 
 ## What was drilled
 
