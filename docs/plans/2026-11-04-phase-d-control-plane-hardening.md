@@ -113,37 +113,101 @@ already durable. The create/grow/delete/move paths also use multi-save
 compensation and durable intents, so a partial conversion would mix two
 commit models.
 
-**Design of record (to be reviewed before code).**
+**Adversarial review (2026-11-04): NO-GO as first written.**
+An independent review read the full `persist()` funnel, `StateGuard`,
+`revert()`/`reconcile_failed_save()`, the compensation flows and the crash
+seams. It confirmed the leader-coalescing shape but rejected the initial
+"convert attach/detach/report while the rest stays synchronous" cut. The
+blocking findings:
 
-- A single durable-writer critical section (leader coalescing) separate from
-  the state mutex. A mutation captures `(sequence, encoded_state)` while it
-  holds the state lock, records the sequence, publishes the read snapshot
-  only after durability, and releases the lock.
-- A committer that acquires the writer section writes the **latest**
-  captured encoding, `fsync`s, renames and directory-`fsync`s once, then
-  marks every covered sequence durable. Waiters whose sequence is covered
-  return success without another fsync (group commit).
-- A failed write leaves the covered sequences unresolved; no sequence is
-  reported durable without a completed file+directory `fsync`. A sequence
-  covered by a later successful encoding is durable even if its own write
-  lost the race, and is reported as such.
-- Publication is monotonic: a lower sequence never replaces a higher
-  published snapshot. A failed uncovered sequence reconciles against the
-  durable file; if reconciliation cannot prove the outcome the provider
-  fails closed (poisoned/`INTERNAL`) rather than guessing.
-- The conversion is atomic per operation class. Start with
-  attach/detach/report (no LVM CLI, one save), then decide separately
-  whether create/grow/delete/move can share the model without weakening
-  their intent/compensation contracts.
+1. **Durable-file regression (critical).** A legacy direct save that lands
+   between a pipeline capture and the leader's write is erased when the
+   leader writes the older capture. The conversion cut is wrong.
+2. **`.tmp` collision (critical).** `sibling_tmp_path` is a fixed
+   `<path>.tmp`; a mixed model lets two writers truncate or delete each
+   other's temp file.
+3. **Publication and rollback (critical).** `StateGuard`'s drop publishes
+   uncommitted state when the lock is released early; `revert()` restores
+   the last durable snapshot and would erase other waiters' pending
+   in-memory mutations. The existing helpers assume one save per guard.
+4. **Failure protocol (high).** A failed leader can strand waiters, and a
+   later covering write can resurrect a mutation whose caller was already
+   told it failed. The API journal records provider failures terminally, so
+   a false failure is not recoverable by retry.
+5. **Leader panic (high).** A panic or armed crash seam in the leader parks
+   every waiter unless wake-all-on-poison is explicit.
+6. **Coverage invariant (high).** "Sequence ≥ mine is durable" is sound only
+   if captures are monotonic supersets and in-memory state is never rolled
+   back between captures.
+7. **Runtime blocking (medium).** The simple mutations run synchronously on
+   tokio workers; parking ~c128 workers on a condvar would starve `/healthz`
+   and unrelated routes.
+8. **Crash-seam determinism (medium).** Coalescing changes the physical save
+   count that `arm_save_failure(..., skip)` observes, and
+   `AfterRenameBeforeDirFsync` must keep one consistent classification.
 
-**Acceptance for the eventual code slice (not this batch).**
+**Corrected design of record.** The following are hard invariants, not
+options:
 
-- New deterministic tests: coalesced commits produce one fsync for N
-  waiters; a covered failure returns success only when the durable file
-  contains the mutation; an uncovered failure reverts or poisons and never
-  publishes; snapshot publication never regresses; the store-crash seams
-  still fire at every boundary.
-- Full workspace tests, journal fault tests and the conformance suite pass.
+- **One durable writer for every save.** `persist()` — including admin
+  claim/release and the compensation paths — routes through the single
+  writer from the first slice. No class keeps a second direct-file path.
+  Per-operation staging may only change *whether the caller releases the
+  state lock before waiting*.
+- **Slice 1 is a semantic no-op.** All callers still hold the state lock
+  across the wait; captures therefore never overlap. Unique per-write temp
+  names plus a startup sweep; publication moves from `StateGuard` drop to a
+  post-durability, sequence-tagged snapshot; the failure-keep branches that
+  rely on drop-publication are migrated explicitly. Existing tests, crash
+  seams and physical save counts must pass unchanged. **No throughput claim
+  from slice 1.**
+- **Slice 2 is the release-the-lock change.** Attach/detach/report capture
+  `(sequence, encoded bytes, snapshot)` under the lock, release it, and
+  wait. A leader writes the latest capture once and marks every covered
+  sequence durable. The win is one file `sync_all` plus one directory
+  `sync_all` for N covered waiters.
+- **Publication is post-durability and monotonic.** The read view is
+  sequence-tagged; a lower sequence never replaces a higher one. A failed
+  uncovered sequence is never published.
+- **Capture monotonicity.** In-memory state is never rolled back between
+  captures, so every later capture is a superset of every earlier one.
+- **Waiter resolution is guaranteed.** No waiter parks without a
+  barrier-guaranteed exit. A caller may be answered with an error only after
+  the pipeline proves that no pending capture contains its mutation.
+- **Failure barrier.** Stop accepting captures; drain or fail in-flight
+  leaders; reconcile each unresolved sequence against the durable file
+  (proven-landed → success-with-note; proven-absent → error; unreadable or
+  unprovable → poison); then align in-memory state exactly to the durable
+  file. Revert-to-snapshot is legal only at this quiesce point. Poison only
+  the unprovable case; a provably-not-durable failure keeps serving.
+- **Leader panic wakes everyone.** A panic or armed kill sets a writer
+  poison flag, wakes all waiters with a typed failure, and mirrors today's
+  mutex-poison behavior. The rig must still observe kills at the same task
+  boundary.
+- **Crash seams stay inside the physical write.** All four
+  `StoreSavePoint` consults remain. `AfterRenameBeforeDirFsync` keeps one
+  classification standard for both the waiter answer and reconciliation.
+  Concurrent rigs that assert exact save counts are audited and updated.
+- **Async-safe waiting.** Consume the wait on `spawn_blocking` or use an
+  async-aware notification; do not pin tokio workers on a std condvar.
+
+**Rejected alternatives.** Per-volume files need a multi-file commit for
+delete/move/create intent atomicity; an append-only WAL would rewrite every
+startup and reconciliation path; write-behind (ack before `fsync`) violates
+the attach fencing contract. None is a shortcut for this slice.
+
+**Acceptance for the eventual code slices (not this batch).**
+
+- Slice 1: all existing workspace, journal-fault, conformance and campaign
+  suites pass unchanged; a direct-save-vs-pending-capture interleaving is
+  impossible by construction; unique-temp cleanup is tested; the
+  post-durability publication window is tested; no save-count drift in
+  single-writer rigs.
+- Slice 2: deterministic tests for covered-failure success only when the
+  durable file proves it; no resurrection after an error (the journal's
+  terminal-replay rule); leader-kill wake-all; quiesced align on an
+  uncovered failure; monotonic publication; both fsyncs counted; every
+  crash seam still fires.
 - A new clean-tree benchmark at the implementation SHA is published with
   the same comparator; no throughput claim before that run.
 - #62 stays open until the code and the measurement both exist.
@@ -173,8 +237,12 @@ NOT MET with gates 3 and 4 partial.
 
 ## Order of work
 
-1. D1 (log volume) — self-contained, no protocol change.
-2. D2 (read posture) — self-contained, requires test and doc updates.
-3. D5 (ledger).
-4. D3 design review; implementation is a separate batch.
-5. D4 only when the accepting authority is recorded.
+1. **D1 (log volume) — delivered.** Self-contained, no protocol change.
+2. **D2 (read posture) — delivered.** Self-contained, tests and docs updated.
+3. **D5 (ledger) — delivered.**
+4. **D3 slice 1 (single-writer funnel) — next batch.** Semantic no-op; no
+   throughput claim; all existing suites and save counts unchanged.
+5. **D3 slice 2 (release the lock) — after slice 1 is reviewed and green.**
+   The only batch that may claim a throughput change, and only with the new
+   clean-tree measurement.
+6. D4 only when the accepting authority is recorded.
