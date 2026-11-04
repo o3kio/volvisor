@@ -13,11 +13,22 @@
 #
 # Part B (loop-device LVM provider): corrupt lvm-state.json -> startup
 # refuses with a typed parse error and the file is left byte-identical.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d4"
 begin_drill "04-torn-journal-and-corrupt-state"
-trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
+D4_CLEANED=0
+cleanup() {
+  [[ "$D4_CLEANED" -eq 1 ]] && return 0
+  D4_CLEANED=1
+  stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || true
+  if ! lvm_lab_teardown "$TAG-lvm"; then
+    printf 'ASSERT FAIL: lab teardown incomplete (loop/VG may still exist)\n' | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+}
+trap cleanup EXIT
 
 FRAMES="$RUN/records/$TAG-frames.py"
 cat >"$FRAMES" <<'PY'
@@ -75,52 +86,52 @@ cap "create a second volume so the last frame belongs to it" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-tail.json" 200 "$RUN/records/$TAG-create-tail.resp.json"
 stop_pidfile "$TAG-daemon" TERM
 
-LOGJ="$JOURNAL/journal.log"
-cp "$LOGJ" "$RUN/records/$TAG-journal-baseline.log"
-BASELINE_SIZE="$(stat -c %s "$LOGJ")"
-BASELINE_SHA="$(sha256sum "$LOGJ" | cut -d' ' -f1)"
-cap "frame map of the clean journal" frames "$LOGJ"
-cap "clean journal size/checksum" sha256sum "$LOGJ"
+JOURNAL_LOG="$JOURNAL/journal.log"
+cp "$JOURNAL_LOG" "$RUN/records/$TAG-journal-baseline.log"
+BASELINE_SIZE="$(stat -c %s "$JOURNAL_LOG")"
+BASELINE_SHA="$(sha256sum "$JOURNAL_LOG" | cut -d' ' -f1)"
+cap "frame map of the clean journal" frames "$JOURNAL_LOG"
+cap "clean journal size/checksum" sha256sum "$JOURNAL_LOG"
 printf 'baseline_size=%s baseline_sha=%s\n' "$BASELINE_SIZE" "$BASELINE_SHA" | tee -a "$LOG"
 
 say "A1: append garbage after the last frame (simulated torn append)"
-python3 - "$LOGJ" <<'PY'
+python3 - "$JOURNAL_LOG" <<'PY'
 import sys
 with open(sys.argv[1], "ab") as f:
     f.write(b"\xa5" * 64)
 PY
-cap "journal size after appending 64 garbage bytes" stat -c '%s %n' "$LOGJ"
+cap "journal size after appending 64 garbage bytes" stat -c '%s %n' "$JOURNAL_LOG"
 start_volvisord "$TAG-daemon" "$CFG" "$PORT" || exit 1
 cap "health after garbage-tail restart" curl -fsS "$BASE/healthz"
-assert_eq "$(stat -c %s "$LOGJ")" "$BASELINE_SIZE" "torn garbage tail truncated back to the valid prefix"
-assert_eq "$(sha256sum "$LOGJ" | cut -d' ' -f1)" "$BASELINE_SHA" "torn garbage tail left the valid prefix byte-identical"
+assert_eq "$(stat -c %s "$JOURNAL_LOG")" "$BASELINE_SIZE" "torn garbage tail truncated back to the valid prefix"
+assert_eq "$(sha256sum "$JOURNAL_LOG" | cut -d' ' -f1)" "$BASELINE_SHA" "torn garbage tail left the valid prefix byte-identical"
 cap "idempotent replay of the first create after garbage-tail recovery" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-keep.json" 200 "$RUN/records/$TAG-create-keep.replay.json"
 assert_eq "$(jq -r '.volume_id' "$RUN/records/$TAG-create-keep.replay.json")" "vol-d4-keep" "replayed volume id"
 stop_pidfile "$TAG-daemon" TERM
 
 say "A2: cut the last frame in half (simulated power loss mid-append)"
-FRAME_JSON="$(frames "$LOGJ")"
+FRAME_JSON="$(frames "$JOURNAL_LOG")"
 LAST_START="$(printf '%s' "$FRAME_JSON" | jq -r '.frames[-1].start')"
 PREFIX_SIZE="$(printf '%s' "$FRAME_JSON" | jq -r '.frames[-1].start')"
 printf 'last frame starts at %s; truncating to start+8\n' "$LAST_START" | tee -a "$LOG"
-truncate -s "$((LAST_START + 8))" "$LOGJ"
-cap "journal size after cutting the last frame" stat -c '%s %n' "$LOGJ"
+truncate -s "$((LAST_START + 8))" "$JOURNAL_LOG"
+cap "journal size after cutting the last frame" stat -c '%s %n' "$JOURNAL_LOG"
 start_volvisord "$TAG-daemon" "$CFG" "$PORT" || exit 1
-assert_eq "$(stat -c %s "$LOGJ")" "$PREFIX_SIZE" "half-written last frame truncated away"
-assert_eq "$(sha256sum "$LOGJ" | cut -d' ' -f1)" "$(head -c "$PREFIX_SIZE" "$RUN/records/$TAG-journal-baseline.log" | sha256sum | cut -d' ' -f1)" "recovered prefix matches the baseline prefix"
+assert_eq "$(stat -c %s "$JOURNAL_LOG")" "$PREFIX_SIZE" "half-written last frame truncated away"
+assert_eq "$(sha256sum "$JOURNAL_LOG" | cut -d' ' -f1)" "$(head -c "$PREFIX_SIZE" "$RUN/records/$TAG-journal-baseline.log" | sha256sum | cut -d' ' -f1)" "recovered prefix matches the baseline prefix"
 cap "the recovered journal still replays the earlier operation" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-keep.json" 200 "$RUN/records/$TAG-create-keep.replay2.json"
 cap "a new append succeeds from the recovered sequence" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-new.json" 200 "$RUN/records/$TAG-create-new.resp.json"
-cap "frame map after appending to the recovered journal" frames "$LOGJ"
+cap "frame map after appending to the recovered journal" frames "$JOURNAL_LOG"
 stop_pidfile "$TAG-daemon" TERM
 
 say "A3: append a complete CRC-valid frame that declares record_version 2"
-cp "$LOGJ" "$RUN/records/$TAG-journal-before-future.log"
-BEFORE_FUTURE_SHA="$(sha256sum "$LOGJ" | cut -d' ' -f1)"
-BEFORE_FUTURE_SIZE="$(stat -c %s "$LOGJ")"
-python3 - "$LOGJ" <<'PY'
+cp "$JOURNAL_LOG" "$RUN/records/$TAG-journal-before-future.log"
+BEFORE_FUTURE_SHA="$(sha256sum "$JOURNAL_LOG" | cut -d' ' -f1)"
+BEFORE_FUTURE_SIZE="$(stat -c %s "$JOURNAL_LOG")"
+python3 - "$JOURNAL_LOG" <<'PY'
 import json, struct, sys, zlib
 path = sys.argv[1]
 data = open(path, "rb").read()
@@ -144,8 +155,8 @@ with open(path, "ab") as f:
     f.write(frame)
 print(f"appended future-version frame sequence={seq} payload_len={len(payload)}")
 PY
-cap "future-version journal checksum and size before startup" sha256sum "$LOGJ"
-FUTURE_SIZE="$(stat -c %s "$LOGJ")"
+cap "future-version journal checksum and size before startup" sha256sum "$JOURNAL_LOG"
+FUTURE_SIZE="$(stat -c %s "$JOURNAL_LOG")"
 printf 'future_journal_size=%s\n' "$FUTURE_SIZE" | tee -a "$LOG"
 timeout 10s "$BIN/volvisord" --config "$CFG" >"$RUN/raw/$TAG-future-journal.daemon.log" 2>&1
 FUTURE_RC=$?
@@ -153,9 +164,9 @@ printf 'future-journal startup exit=%s\n' "$FUTURE_RC" | tee -a "$LOG"
 cap "future journal refusal stderr" cat "$RUN/raw/$TAG-future-journal.daemon.log"
 assert_eq "$FUTURE_RC" "1" "future journal record startup exit"
 assert_contains "$(cat "$RUN/raw/$TAG-future-journal.daemon.log")" "unsupported durable-state schema version" "typed future journal refusal"
-assert_eq "$(stat -c %s "$LOGJ")" "$FUTURE_SIZE" "future frame was not truncated"
-assert_eq "$(head -c "$BEFORE_FUTURE_SIZE" "$LOGJ" | sha256sum | cut -d' ' -f1)" "$BEFORE_FUTURE_SHA" "valid prefix before the future frame is untouched"
-cp "$RUN/records/$TAG-journal-before-future.log" "$LOGJ"
+assert_eq "$(stat -c %s "$JOURNAL_LOG")" "$FUTURE_SIZE" "future frame was not truncated"
+assert_eq "$(head -c "$BEFORE_FUTURE_SIZE" "$JOURNAL_LOG" | sha256sum | cut -d' ' -f1)" "$BEFORE_FUTURE_SHA" "valid prefix before the future frame is untouched"
+cp "$RUN/records/$TAG-journal-before-future.log" "$JOURNAL_LOG"
 
 # ---------------------------------------------------------------- part B
 say "B: corrupt the LVM durable state file and prove startup refuses without rewriting it"
@@ -190,6 +201,7 @@ assert_eq "$CORRUPT_RC" "1" "corrupt state startup exit"
 assert_contains "$(cat "$RUN/raw/$TAG-corrupt-state.daemon.log")" "lvm provider construction failed" "typed corrupt-state refusal"
 assert_eq "$(sha256sum "$LSTATE" | cut -d' ' -f1)" "$CORRUPT_SHA" "corrupt state file untouched (no silent rewrite)"
 
+cleanup
 if end_drill; then
   printf 'D4 COMPLETE\n'
 else

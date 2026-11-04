@@ -1,0 +1,520 @@
+# drill: 02b-live-upgrade-rollback
+# start: 2026-11-04T15:10:44Z
+# invocation: docs/runbooks/day-2/scripts/d2-live.sh
+# harness_sha256: 64056aa9d9c3f586e8f7fa259bf9dd455bc3e12aa825bce3fde85f822c82936d
+# lib_sha256: 0a3343d533250a463f4291de28fec20903df2bc551a1b75810cbade5b74c3df7
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: aad17201f03bfdfcec4b74d863b805bc7fa47c76
+# worktree_dirty: yes
+# runner: uid=0
+
+# old_commit: 8c2fc1a
+# new_commit: aad17201f03bfdfcec4b74d863b805bc7fa47c76
+# old_short: 8c2fc1a
+# new_short: aad1720
+
+### 2026-11-04T15:10:44Z create a disposable worktree at old commit 8c2fc1a host=dev
+$ git -C /root/git/volvisor-phase-a worktree add --detach /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a 8c2fc1a
+Preparing worktree (detached HEAD 8c2fc1a)
+HEAD is now at 8c2fc1a Fix #70: persist-divergence recovery for LVM create/grow/delete/move (#72)
+exit=0
+
+### 2026-11-04T15:10:44Z build the old binary from the old worktree host=dev
+$ env CARGO_TARGET_DIR=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old cargo build --manifest-path /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/Cargo.toml --locked -p volvisord
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling itoa v1.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling cfg-if v1.0.5
+   Compiling bytes v1.12.1
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling version_check v0.9.5
+   Compiling futures-core v0.3.34
+   Compiling serde v1.0.229
+   Compiling typenum v1.20.1
+   Compiling shlex v2.0.1
+   Compiling zmij v1.0.23
+   Compiling find-msvc-tools v0.1.15
+   Compiling serde_json v1.0.151
+   Compiling thiserror v2.0.21
+   Compiling memchr v2.8.3
+   Compiling tracing-core v0.1.36
+   Compiling slab v0.4.12
+   Compiling cc v1.11.0
+   Compiling zeroize v1.9.1
+   Compiling generic-array v0.14.7
+   Compiling equivalent v1.0.2
+   Compiling httparse v1.10.1
+   Compiling log v0.4.34
+   Compiling futures-sink v0.3.34
+   Compiling hashbrown v0.17.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling cpufeatures v0.2.17
+   Compiling untrusted v0.9.0
+   Compiling rustls v0.23.46
+   Compiling smallvec v1.16.2
+   Compiling atomic-waker v1.1.2
+   Compiling futures-task v0.3.34
+   Compiling http v1.5.0
+   Compiling fnv v1.0.7
+   Compiling tower-service v0.3.3
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.2
+   Compiling futures-util v0.3.34
+   Compiling futures-channel v0.3.34
+   Compiling subtle v2.6.1
+   Compiling httpdate v1.0.3
+   Compiling crc32fast v1.5.2
+   Compiling rustix v1.1.5
+   Compiling indexmap v2.14.2
+   Compiling tower-layer v0.3.3
+   Compiling percent-encoding v2.3.2
+   Compiling sync_wrapper v1.0.2
+   Compiling webpki-roots v1.0.11
+   Compiling bitflags v2.13.2
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling form_urlencoded v1.2.2
+   Compiling ryu v1.0.23
+   Compiling mime v0.3.17
+   Compiling linux-raw-sys v0.12.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling autocfg v1.5.1
+   Compiling matchit v0.8.4
+   Compiling rustversion v1.0.23
+   Compiling regex-syntax v0.8.11
+   Compiling digest v0.10.7
+   Compiling clap_lex v1.1.1
+   Compiling http-body v1.1.0
+   Compiling sha2 v0.10.9
+   Compiling http-body-util v0.1.5
+   Compiling errno v0.3.14
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling getrandom v0.2.17
+   Compiling fs-err v3.3.2
+   Compiling axum-core v0.5.6
+   Compiling anstyle v1.0.14
+   Compiling lazy_static v1.5.1
+   Compiling heck v0.5.0
+   Compiling winnow v1.0.4
+   Compiling clap_builder v4.6.7
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling ring v0.17.14
+   Compiling thread_local v1.1.10
+   Compiling winnow v0.7.15
+   Compiling arc-swap v1.9.3
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling either v1.19.0
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling volvisord v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisord)
+   Compiling nu-ansi-term v0.50.3
+   Compiling serde_path_to_error v0.1.20
+   Compiling regex-automata v0.4.18
+   Compiling serde_spanned v1.1.2
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.21
+   Compiling async-trait v0.1.92
+   Compiling clap_derive v4.6.7
+   Compiling matchers v0.2.0
+   Compiling tokio v1.54.1
+   Compiling tracing-attributes v0.1.31
+   Compiling clap v4.6.7
+   Compiling tracing v0.1.44
+   Compiling volvisor-types v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-types)
+   Compiling serde_urlencoded v0.7.1
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling rustls-webpki v0.103.16
+   Compiling tokio-util v0.7.20
+   Compiling tower v0.5.3
+   Compiling volvisor-provider v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-provider)
+   Compiling volvisor-journal v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-journal)
+   Compiling volvisor-handoff v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-handoff)
+   Compiling h2 v0.4.20
+   Compiling tokio-rustls v0.26.6
+   Compiling volvisor-tls v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-tls)
+   Compiling volvisor-lvm v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-lvm)
+   Compiling volvisor-ceph v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-ceph)
+   Compiling hyper v1.12.0
+   Compiling hyper-util v0.1.21
+   Compiling hyper-rustls v0.27.10
+   Compiling axum v0.8.9
+   Compiling axum-server v0.8.0
+   Compiling volvisor-witness v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-witness)
+   Compiling volvisor-api v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-api)
+   Compiling volvisor-drbd v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-old-8c2fc1a/crates/volvisor-drbd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.38s
+exit=0
+
+### 2026-11-04T15:11:04Z caller worktree is dirty; build NEW from a clean worktree at aad17201f03bfdfcec4b74d863b805bc7fa47c76 host=dev
+
+### 2026-11-04T15:11:04Z create a clean worktree at new commit aad17201f03bfdfcec4b74d863b805bc7fa47c76 host=dev
+$ git -C /root/git/volvisor-phase-a worktree add --detach /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720 aad17201f03bfdfcec4b74d863b805bc7fa47c76
+Preparing worktree (detached HEAD aad1720)
+HEAD is now at aad1720 docs: record architecture, ownership, and readiness posture (#50)
+exit=0
+
+### 2026-11-04T15:11:04Z build the new binary from the clean worktree host=dev
+$ env CARGO_TARGET_DIR=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new cargo build --manifest-path /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/Cargo.toml --locked -p volvisord
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling pin-project-lite v0.2.17
+   Compiling itoa v1.0.18
+   Compiling cfg-if v1.0.5
+   Compiling bytes v1.12.1
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling version_check v0.9.5
+   Compiling serde v1.0.229
+   Compiling futures-core v0.3.34
+   Compiling find-msvc-tools v0.1.15
+   Compiling typenum v1.20.1
+   Compiling shlex v2.0.1
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling thiserror v2.0.21
+   Compiling memchr v2.8.3
+   Compiling tracing-core v0.1.36
+   Compiling cc v1.11.0
+   Compiling slab v0.4.12
+   Compiling zeroize v1.9.1
+   Compiling generic-array v0.14.7
+   Compiling futures-sink v0.3.34
+   Compiling hashbrown v0.17.1
+   Compiling cpufeatures v0.2.17
+   Compiling untrusted v0.9.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling equivalent v1.0.2
+   Compiling httparse v1.10.1
+   Compiling log v0.4.34
+   Compiling smallvec v1.16.2
+   Compiling atomic-waker v1.1.2
+   Compiling http v1.5.0
+   Compiling fnv v1.0.7
+   Compiling futures-task v0.3.34
+   Compiling try-lock v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling rustls v0.23.46
+   Compiling want v0.3.2
+   Compiling futures-channel v0.3.34
+   Compiling subtle v2.6.1
+   Compiling futures-util v0.3.34
+   Compiling httpdate v1.0.3
+   Compiling tower-layer v0.3.3
+   Compiling crc32fast v1.5.2
+   Compiling indexmap v2.14.2
+   Compiling rustix v1.1.5
+   Compiling percent-encoding v2.3.2
+   Compiling sync_wrapper v1.0.2
+   Compiling webpki-roots v1.0.11
+   Compiling form_urlencoded v1.2.2
+   Compiling mime v0.3.17
+   Compiling bitflags v2.13.2
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling ryu v1.0.23
+   Compiling linux-raw-sys v0.12.1
+   Compiling rustversion v1.0.23
+   Compiling http-body v1.1.0
+   Compiling autocfg v1.5.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling matchit v0.8.4
+   Compiling regex-syntax v0.8.11
+   Compiling errno v0.3.14
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling getrandom v0.2.17
+   Compiling signal-hook-registry v1.4.8
+   Compiling digest v0.10.7
+   Compiling http-body-util v0.1.5
+   Compiling sha2 v0.10.9
+   Compiling lazy_static v1.5.1
+   Compiling fs-err v3.3.2
+   Compiling axum-core v0.5.6
+   Compiling heck v0.5.0
+   Compiling winnow v1.0.4
+   Compiling clap_lex v1.1.1
+   Compiling ring v0.17.14
+   Compiling anstyle v1.0.14
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.10
+   Compiling clap_builder v4.6.7
+   Compiling volvisord v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisord)
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling winnow v0.7.15
+   Compiling arc-swap v1.9.3
+   Compiling either v1.19.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling serde_spanned v1.1.2
+   Compiling regex-automata v0.4.18
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.21
+   Compiling async-trait v0.1.92
+   Compiling clap_derive v4.6.7
+   Compiling matchers v0.2.0
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio v1.54.1
+   Compiling clap v4.6.7
+   Compiling tracing v0.1.44
+   Compiling rustls-webpki v0.103.16
+   Compiling volvisor-types v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-types)
+   Compiling serde_urlencoded v0.7.1
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling tokio-util v0.7.20
+   Compiling tower v0.5.3
+   Compiling volvisor-provider v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-provider)
+   Compiling volvisor-journal v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-journal)
+   Compiling volvisor-handoff v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-handoff)
+   Compiling h2 v0.4.20
+   Compiling tokio-rustls v0.26.6
+   Compiling volvisor-tls v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-tls)
+   Compiling volvisor-ceph v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-ceph)
+   Compiling volvisor-lvm v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-lvm)
+   Compiling hyper v1.12.0
+   Compiling hyper-util v0.1.21
+   Compiling axum v0.8.9
+   Compiling hyper-rustls v0.27.10
+   Compiling axum-server v0.8.0
+   Compiling volvisor-witness v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-witness)
+   Compiling volvisor-api v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-api)
+   Compiling volvisor-drbd v0.1.0 (/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/src-new-aad1720/crates/volvisor-drbd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.43s
+exit=0
+
+### 2026-11-04T15:11:23Z old binary version stamp host=dev
+$ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord --version
+volvisord 8c2fc1a
+exit=0
+
+### 2026-11-04T15:11:23Z new binary version stamp host=dev
+$ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord --version
+volvisord aad1720
+exit=0
+ASSERT PASS: old build worktree HEAD is OLD_COMMIT == 8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+ASSERT PASS: old binary reports a volvisord version contains volvisord
+ASSERT PASS: new build worktree HEAD is NEW_COMMIT == aad17201f03bfdfcec4b74d863b805bc7fa47c76
+ASSERT PASS: new build worktree is clean == 0
+ASSERT PASS: new binary reports a volvisord version contains volvisord
+ASSERT PASS: new binary version stamp matches NEW_COMMIT == volvisord\ aad1720
+ASSERT PASS: new binary is not a dirty build does not contain -dirty
+
+### 2026-11-04T15:11:24Z record binary identity host=dev
+$ cat /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-binaries.txt
+old_bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord
+old_version=volvisord 8c2fc1a
+old_sha256=ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+new_bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord
+new_version=volvisord aad1720
+new_sha256=6ebac3f9c5bf3bee53caa7764ccffdbd8ebeea146a164a9aa511c6beaac633ab
+old_commit=8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+new_commit=aad17201f03bfdfcec4b74d863b805bc7fa47c76
+old_worktree_sha=8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+caller_worktree_dirty=yes
+new_worktree_dirty_at_build=0
+new_worktree_sha=aad17201f03bfdfcec4b74d863b805bc7fa47c76
+exit=0
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d2live" successfully created
+lab setup tag=d2live loop=/dev/loop0 vg=vg-d2live state=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+
+### 2026-11-04T15:11:24Z old binary accepts the shared config shape host=dev
+$ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord --check-config --config /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/configs/d2live-old.toml
+{"timestamp":"2026-11-04T15:11:24.430341Z","level":"INFO","fields":{"message":"volvisord configuration check passed","summary":"config ok: listen 127.0.0.1:46691, provider lvm, journal_dir /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal, transport plain-http loopback, read-auth open (legacy), no witness, migration disabled"}}
+exit=0
+
+### 2026-11-04T15:11:24Z new binary accepts the shared config shape host=dev
+$ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord --check-config --config /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/configs/d2live-new.toml
+{"timestamp":"2026-11-04T15:11:24.440820Z","level":"INFO","fields":{"message":"volvisord configuration check passed","summary":"config ok: listen 127.0.0.1:46691, provider lvm, journal_dir /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal, transport plain-http loopback, read-auth open (legacy), no witness, migration disabled"}}
+exit=0
+
+### 2026-11-04T15:11:24Z STEP 1 old binary: open the lab v1 state file and create the original volume host=dev
+daemon d2live-old-step1 healthy pid=2445098 port=46691 bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord sha256=ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+HTTP 200 (want 200) POST http://127.0.0.1:46691/v2/volumes
+HTTP 200 (want 200) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-original
+ASSERT PASS: old binary serves the original volume == vol-d2live-original
+ASSERT PASS: old binary reports the original size == 67108864
+
+### 2026-11-04T15:11:24Z old binary's first write stamped schema_version 2 host=dev
+$ jq .schema_version /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+2
+exit=0
+ASSERT PASS: old build wrote LVM state schema v2 == 2
+ASSERT PASS: original volume is in the v2 state == 67108864
+
+### 2026-11-04T15:11:24Z record lvs before the upgrade host=dev
+$ lvs --noheadings -o vg_name\,lv_name\,lv_size vg-d2live
+  vg-d2live vol-vol-d2live-original-190ad872 64.00m
+exit=0
+stopped d2live-old-step1 pid=2445098 sig=TERM
+
+### 2026-11-04T15:11:25Z STEP 1b old binary: reopen the v2 state and serve the original volume host=dev
+daemon d2live-old-v2 healthy pid=2445222 port=46691 bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord sha256=ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+HTTP 200 (want 200) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-original
+ASSERT PASS: old binary reopens v2 and serves the original volume == vol-d2live-original
+ASSERT PASS: old binary reports the original size after reopen == 67108864
+
+### 2026-11-04T15:11:25Z reopening the v2 file with the old binary leaves schema_version 2 host=dev
+$ jq .schema_version /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+2
+exit=0
+ASSERT PASS: old binary reopens v2 without rewriting its schema == 2
+stopped d2live-old-v2 pid=2445222 sig=TERM
+ASSERT PASS: backup consistency point has no writer (journal lock is free)
+
+### 2026-11-04T15:11:25Z record pre-upgrade state checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+702165cd0c04cca2aedadf28873898015bcf4fc9c962c4b6d8fb8bb7552aa68a  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+exit=0
+
+### 2026-11-04T15:11:25Z record pre-upgrade journal checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/journal.log
+acd0cd627bb5f16152589169afbcca4af764d11a2435cd340041ea3f7c25af9c  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/journal.log
+exit=0
+
+### 2026-11-04T15:11:25Z back up the whole stopped state directory host=dev
+$ tar -C /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal -cf /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-pre-upgrade-state.tar .
+exit=0
+
+### 2026-11-04T15:11:25Z pre-upgrade backup checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-pre-upgrade-state.tar
+55df9ffd321df43be508aae0040fd504e8c330a195f6acc91f557913c5e56346  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-pre-upgrade-state.tar
+exit=0
+
+### 2026-11-04T15:11:25Z STEP 3 new binary: open the v2 state and prove loading alone does not upgrade or rewrite it host=dev
+daemon d2live-new healthy pid=2445350 port=46691 bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord sha256=6ebac3f9c5bf3bee53caa7764ccffdbd8ebeea146a164a9aa511c6beaac633ab
+HTTP 200 (want 200) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-original
+ASSERT PASS: new binary serves the original volume == vol-d2live-original
+
+### 2026-11-04T15:11:25Z loading the v2 file alone leaves schema_version 2 host=dev
+$ jq .schema_version /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+2
+exit=0
+ASSERT PASS: new binary does not upgrade merely on open == 2
+ASSERT PASS: new binary does not rewrite the v2 state merely on open == 702165cd0c04cca2aedadf28873898015bcf4fc9c962c4b6d8fb8bb7552aa68a
+HTTP 200 (want 200) POST http://127.0.0.1:46691/v2/volumes
+HTTP 200 (want 200) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-original
+ASSERT PASS: original volume survives the upgrade == vol-d2live-original
+stopped d2live-new pid=2445350 sig=TERM
+ASSERT PASS: post-upgrade state has no writer before reading it (journal lock is free)
+
+### 2026-11-04T15:11:26Z the new binary's first write stamped schema_version 3 host=dev
+$ jq .schema_version /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+3
+exit=0
+ASSERT PASS: new build wrote LVM state schema v3 == 3
+ASSERT PASS: original volume size survives the upgrade == 67108864
+ASSERT PASS: original volume generation survives the upgrade == 1
+ASSERT PASS: post-upgrade volume is recorded == 67108864
+
+### 2026-11-04T15:11:26Z record post-upgrade state checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+9aa8aaf282f9fad4bd0098612ed416ce650db80a2248f5d1f7c5cfecaa5b7374  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+exit=0
+
+### 2026-11-04T15:11:26Z record post-upgrade journal checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-journal-post-upgrade.log
+03fb5e1cf8cc66e71184a389f9ebdf16d00de0f5f2e3d11e3ad5b58cc935af10  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-journal-post-upgrade.log
+exit=0
+
+### 2026-11-04T15:11:26Z STEP 4a old binary against the real post-upgrade directory (v2 journal + v3 state) host=dev
+
+### 2026-11-04T15:11:26Z old binary refuses the post-upgrade directory host=dev
+$ bash -c timeout\ 10s\ \"\$1\"\ --config\ \"\$2\"\ \>\"\$3\"\ 2\>\&1 _ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/configs/d2live-old.toml /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/raw/d2live-old-refusal.daemon.log
+exit=1
+
+### 2026-11-04T15:11:26Z old refusal stderr host=dev
+$ cat /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/raw/d2live-old-refusal.daemon.log
+{"timestamp":"2026-11-04T15:11:26.225327Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:46691","provider":"Lvm"}}
+Error: Config("open journal: INTERNAL: unsupported durable-state schema version: journal record state /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/journal.log declares schema_version 2, but this build supports at most 1; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")
+exit=0
+ASSERT PASS: typed future-version refusal on the real directory contains unsupported\ durable-state\ schema\ version
+ASSERT PASS: refusal names the journal artifact it opened first contains journal\ record
+ASSERT PASS: refusal names the v2 journal record contains schema_version\ 2
+ASSERT PASS: old build names its v1 journal ceiling contains supports\ at\ most\ 1
+ASSERT PASS: post-upgrade state untouched by old refusal == 9aa8aaf282f9fad4bd0098612ed416ce650db80a2248f5d1f7c5cfecaa5b7374
+ASSERT PASS: post-upgrade journal untouched by old refusal == 03fb5e1cf8cc66e71184a389f9ebdf16d00de0f5f2e3d11e3ad5b58cc935af10
+
+### 2026-11-04T15:11:26Z STEP 4b old binary against a fresh journal plus a copy of the v3 LVM state host=dev
+
+### 2026-11-04T15:11:26Z old binary refuses the isolated v3 LVM state host=dev
+$ bash -c timeout\ 10s\ \"\$1\"\ --config\ \"\$2\"\ \>\"\$3\"\ 2\>\&1 _ /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/configs/d2live-old-refusal.toml /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/raw/d2live-old-v3-refusal.daemon.log
+exit=1
+
+### 2026-11-04T15:11:26Z isolated v3 refusal stderr host=dev
+$ cat /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/raw/d2live-old-v3-refusal.daemon.log
+{"timestamp":"2026-11-04T15:11:26.302356Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:60537","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: unsupported durable-state schema version: lvm state /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/refusal/journal/lvm-state.json declares schema_version 3, but this build supports at most 2; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")
+exit=0
+ASSERT PASS: typed v3 refusal contains unsupported\ durable-state\ schema\ version
+ASSERT PASS: refusal names the v3 file contains schema_version\ 3
+ASSERT PASS: old build names its v2 ceiling contains supports\ at\ most\ 2
+ASSERT PASS: v3 state copy untouched by old refusal == 9aa8aaf282f9fad4bd0098612ed416ce650db80a2248f5d1f7c5cfecaa5b7374
+
+### 2026-11-04T15:11:26Z STEP 5 restore the pre-upgrade v2 state directory and restart the old binary host=dev
+
+### 2026-11-04T15:11:26Z restore the whole pre-upgrade state directory host=dev
+$ tar -C /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal -xf /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-pre-upgrade-state.tar
+exit=0
+
+### 2026-11-04T15:11:26Z restored state checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+702165cd0c04cca2aedadf28873898015bcf4fc9c962c4b6d8fb8bb7552aa68a  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/lab-d2live/journal/lvm-state.json
+exit=0
+ASSERT PASS: restored state is the pre-upgrade v2 file == 2
+ASSERT PASS: restored state is byte-identical to the backup source == 702165cd0c04cca2aedadf28873898015bcf4fc9c962c4b6d8fb8bb7552aa68a
+ASSERT PASS: restored journal is byte-identical to the backup source == acd0cd627bb5f16152589169afbcca4af764d11a2435cd340041ea3f7c25af9c
+daemon d2live-old healthy pid=2445662 port=46691 bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord sha256=ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+HTTP 200 (want 200) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-original
+ASSERT PASS: old binary serves the restored original volume == vol-d2live-original
+HTTP 404 (want 404) GET http://127.0.0.1:46691/v2/volumes/vol-d2live-upgrade
+
+### 2026-11-04T15:11:26Z post-backup volume response after restore host=dev
+$ cat /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-upgrade-after-restore.json
+{"code":"NOT_FOUND","message":"volume vol-d2live-upgrade not found"}exit=0
+
+### 2026-11-04T15:11:26Z record lvs after restore (the post-backup LV may remain for operator reconciliation) host=dev
+$ lvs --noheadings -o vg_name\,lv_name\,lv_size vg-d2live
+  vg-d2live vol-vol-d2live-original-190ad872 64.00m
+  vg-d2live vol-vol-d2live-upgrade-6b86c4b0  64.00m
+exit=0
+stopped d2live-old pid=2445662 sig=TERM
+ASSERT PASS: restored state has no writer before teardown (journal lock is free)
+
+### 2026-11-04T15:11:26Z record the state/journal digest table host=dev
+$ cat /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/records/d2live-sha256.txt
+pre_upgrade_state_sha256=702165cd0c04cca2aedadf28873898015bcf4fc9c962c4b6d8fb8bb7552aa68a
+pre_upgrade_journal_sha256=acd0cd627bb5f16152589169afbcca4af764d11a2435cd340041ea3f7c25af9c
+post_upgrade_state_sha256=9aa8aaf282f9fad4bd0098612ed416ce650db80a2248f5d1f7c5cfecaa5b7374
+post_upgrade_journal_sha256=03fb5e1cf8cc66e71184a389f9ebdf16d00de0f5f2e3d11e3ad5b58cc935af10
+pre_upgrade_backup_sha256=55df9ffd321df43be508aae0040fd504e8c330a195f6acc91f557913c5e56346
+exit=0
+  Logical volume "vol-vol-d2live-original-190ad872" successfully removed.
+  Logical volume "vol-vol-d2live-upgrade-6b86c4b0" successfully removed.
+  Volume group "vg-d2live" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d2live loop=/dev/loop0 vg=vg-d2live
+
+# end: 2026-11-04T15:11:27Z
+ASSERT SUMMARY: 0 failures
+D2 LIVE COMPLETE

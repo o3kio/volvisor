@@ -10,11 +10,23 @@
 # B: a second daemon pointed at the same journal directory must refuse to
 #    start (single-writer flock), and the first daemon must keep serving.
 #    The same lock rule is shown for two witness daemons on one state dir.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d6"
 begin_drill "06-crash-loop-and-lock"
-trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || true; stop_pidfile "$TAG-witness" TERM >/dev/null 2>&1 || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
+D6_CLEANED=0
+cleanup() {
+  [[ "$D6_CLEANED" -eq 1 ]] && return 0
+  D6_CLEANED=1
+  stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || true
+  stop_pidfile "$TAG-witness" TERM >/dev/null 2>&1 || true
+  if ! lvm_lab_teardown "$TAG-lvm"; then
+    printf 'ASSERT FAIL: lab teardown incomplete (loop/VG may still exist)\n' | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+}
+trap cleanup EXIT
 
 frames_ok() {
   python3 - "$1" <<'PY'
@@ -169,6 +181,7 @@ cap "the first witness is still healthy after the refused second start" curl -fs
 
 stop_pidfile "$TAG-witness" TERM
 stop_pidfile "$TAG-daemon" TERM
+cleanup
 
 if end_drill; then
   printf 'D6 COMPLETE\n'

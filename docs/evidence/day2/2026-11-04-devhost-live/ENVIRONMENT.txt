@@ -1,0 +1,118 @@
+Day-2 drill environment — 2026-11-04
+====================================
+
+Run directories and windows (UTC)
+----------------------------------
+D2 live cross-binary:
+  RUN:  /tmp/opencode/volvisor-d2live-final3-20261104T151044Z
+  log:  raw/02b-live-upgrade-rollback.log
+  window: 2026-11-04T15:10:44Z .. 2026-11-04T15:11:27Z
+  exit: 0 (ASSERT SUMMARY: 0 failures; D2 LIVE COMPLETE)
+
+D2 v3 same-binary policy:
+  RUN:  /tmp/opencode/volvisor-d2-final3-20261104T145816Z
+  log:  raw/02-schema-upgrade-v3.log
+  window: 2026-11-04T14:58:16Z .. 2026-11-04T14:58:21Z
+  exit: 0 (ASSERT SUMMARY: 0 failures; D2 COMPLETE)
+
+D1 backup/restore (v3 assertions):
+  RUN:  /tmp/opencode/volvisor-d1-final3-20261104T145858Z
+  log:  raw/01-backup-restore-v3.log
+  window: 2026-11-04T14:58:58Z .. 2026-11-04T14:59:01Z
+  exit: 0 (ASSERT SUMMARY: 0 failures; D1 COMPLETE)
+
+Preflight:
+  RUN:  /tmp/opencode/volvisor-preflight-final3-20261104T145906Z
+  logs: raw/preflight-all.log (all areas, --check-old-build)
+        raw/preflight-d2-strict.log (--only d2 --strict --check-old-build)
+  start: all-areas 2026-11-04T14:59:06Z; D2-strict 2026-11-04T14:59:25Z
+         (each log records its own start)
+  exit: 0 (all-areas VERDICT: NOT RUN; D2-only strict VERDICT: READY)
+
+Host and toolchain
+------------------
+Host: dev (single physical development host; not a multi-host lab)
+Runner: uid=0(root) gid=0(root) groups=0(root)
+
+Exact command output (uname, rustc, cargo, LVM, jq, python3, curl, tar,
+flock, losetup) is in [TOOLCHAIN.txt](TOOLCHAIN.txt). It was captured from
+the operator shell during bundle assembly, not by a drill; the drill logs
+record the kernel release and host in their headers.
+
+Key versions:
+  kernel:  6.8.0-142-generic (x86_64)
+  rustc:   1.99.0 (b940084d7 2026-09-28)
+  cargo:   1.99.0 (5f94df478 2026-08-27)
+  LVM:     2.03.16(2) (2022-05-18); Library 1.02.185; Driver 4.48.0
+  jq:      jq-1.7
+  python3: Python 3.12.3
+  curl:    8.5.0
+  tar:     GNU tar 1.35
+  flock:   util-linux 2.39.3
+  losetup: util-linux 2.39.3
+
+Source identity and harness binding
+-----------------------------------
+Product source: aad17201f03bfdfcec4b74d863b805bc7fa47c76 (aad1720)
+Old commit:     8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c (8c2fc1a)
+Caller worktree: dirty (Phase B is uncommitted); every raw drill header
+                 records worktree_dirty: yes.
+D2 live NEW build: clean disposable worktree at aad1720
+                 (new_worktree_dirty_at_build=0, version has no -dirty,
+                  worktree HEAD asserted equal to NEW_COMMIT).
+D2 live OLD build: disposable detached worktree at 8c2fc1a
+                 (worktree HEAD asserted equal to OLD_COMMIT).
+D1/D2 build:     caller target/debug/volvisord, version aad1720-dirty,
+                 sha256 80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9,
+                 captured at each drill's run time.
+
+Each drill log header records harness_sha256 and lib_sha256; those values
+match the current scripts in SCRIPTS.txt. Preflight logs record their exact
+argv, start time, repository state, and exit status.
+
+Lab construction
+----------------
+- D1 and D2 live use a loop-backed LVM VG on a sparse file. The LVM provider
+  skips loop devices during discovery, so the harness seeds an
+  operator-provisioned device claim (`role: native_pool`) pointing at the loop
+  device. This is a lab scaffold, not a production claim procedure.
+- D2 uses loop LVM plus the repository's golden schema fixtures, with the
+  fixture `vg_name` rewritten to the lab VG so the restored volume can be
+  served as Attached rather than Failed.
+- D2 live uses separate config files for OLD and NEW; the config fields used
+  (listen, journal_dir, provider, lvm_vg_prefix, device_claim_token,
+  lvm_state_path, admin_token) are accepted by both commits.
+- The D2 live pre-upgrade backup is a tar of the whole stopped journal
+  directory (v2 lvm-state.json, v1 journal.log and journal.lock), not a
+  single-file copy. The post-upgrade journal is retained at
+  records/d2live-journal-post-upgrade.log.
+
+Preflight result (report only)
+------------------------------
+D2 live:              READY (--check-old-build passed; no missing D2
+                      prerequisite)
+D3 storage-side:      NOT RUN (no DRBD 9 module, no drbdadm, no peer/witness
+                      configuration)
+D8 host loss:         NOT RUN (no D8_HOSTS, witness URL, oracle, BMC host or
+                      storage backend configured)
+Overall:              VERDICT: NOT RUN (D2 live: READY; D3 storage-side:
+                      NOT RUN; D8: NOT RUN)
+D2-only --strict:     VERDICT: READY (D2 live: READY), exit 0
+
+Absent capabilities (blockers, not silent skips)
+------------------------------------------------
+drbdadm:        not found
+drbd kernel:    not loaded (no /sys/module/drbd or /proc/drbd)
+Second host:    none. Every daemon and client ran on 127.0.0.1.
+BMC/fencing:    none; preflight treats configuration alone as NOT RUN.
+Ceph:           operator-observed at bundle-assembly time: no ceph/rbd CLI
+                or cluster. Preflight did not probe it because
+                D8_STORAGE_BACKEND was unset.
+Witness:        no configured D3/D8 witness URL.
+D8 topology:    no >=3 host list, oracle host or shared DRBD/Ceph backend.
+
+Production posture
+------------------
+This is a single-host debug-build lab result. It does not claim production
+support, an SLA, zero-RPO, hardware evidence, a signed release, a 24h soak or
+D3-storage/D8 success.

@@ -13,11 +13,35 @@
 #    404; after a restart it is still 404, a replay of the same
 #    operation_id stays the recorded 500 (terminal failure), a fresh
 #    operation_id succeeds exactly once, and state/LVM agree throughout.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d5"
 begin_drill "05-enospc"
-trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-daemon" KILL >/dev/null 2>&1 || true; stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-lvm-daemon" KILL >/dev/null 2>&1 || true; umount "$RUN/lab-$TAG/journalfs" 2>/dev/null || umount -l "$RUN/lab-$TAG/journalfs" 2>/dev/null || true; umount "$RUN/lab-$TAG/statefs" 2>/dev/null || umount -l "$RUN/lab-$TAG/statefs" 2>/dev/null || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
+D5_CLEANED=0
+cleanup() {
+  [[ "$D5_CLEANED" -eq 1 ]] && return 0
+  D5_CLEANED=1
+  stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || {
+    stop_pidfile "$TAG-daemon" KILL >/dev/null 2>&1 || true
+  }
+  stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || {
+    stop_pidfile "$TAG-lvm-daemon" KILL >/dev/null 2>&1 || true
+  }
+  local fs
+  for fs in "$RUN/lab-$TAG/journalfs" "$RUN/lab-$TAG/statefs"; do
+    umount "$fs" 2>/dev/null || umount -l "$fs" 2>/dev/null || true
+    if mountpoint -q "$fs"; then
+      printf 'ASSERT FAIL: %s is still mounted after teardown\n' "$fs" | tee -a "$LOG"
+      ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    fi
+  done
+  if ! lvm_lab_teardown "$TAG-lvm"; then
+    printf 'ASSERT FAIL: lab teardown incomplete (loop/VG may still exist)\n' | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+}
+trap cleanup EXIT
 
 # fill_fs <dir> <name>: write chunks (shrinking from 4 KiB to 1 byte)
 # until the filesystem refuses, leaving effectively zero free bytes. The
@@ -79,6 +103,7 @@ stop_daemon() {
     stop_pidfile "$name" KILL || true
     printf 'FAIL: %s did not stop on TERM\n' "$name" | tee -a "$LOG"
     ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    cleanup
     end_drill || true
     exit 1
   fi
@@ -89,6 +114,9 @@ stop_daemon() {
 fail_drill() {
   printf 'FAIL: %s\n' "$1" | tee -a "$LOG"
   ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  # Teardown can add failures; run it before the summary so the printed count
+  # includes them. The EXIT trap then re-enters cleanup, which is idempotent.
+  cleanup
   end_drill || true
   exit 1
 }
@@ -195,7 +223,7 @@ printf 'journal before the failed append: size=%s sha=%s\n' "$JOURNAL_SIZE_BEFOR
 
 cap "a create whose intent append hits ENOSPC is refused" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-full.json" 500 "$RUN/records/$TAG-create-full.resp.json"
-cat "$RUN/records/$TAG-create-full.resp.json" | tee -a "$LOG"
+tee -a "$LOG" < "$RUN/records/$TAG-create-full.resp.json"
 printf '\n' | tee -a "$LOG"
 assert_eq "$(jq -r '.code' "$RUN/records/$TAG-create-full.resp.json")" "INTERNAL" "journal ENOSPC code"
 assert_contains "$(cat "$RUN/records/$TAG-create-full.resp.json")" "No space left on device" "journal ENOSPC detail"
@@ -406,6 +434,7 @@ TMP_AFTER_SUCCESS="$(find "$SFS" -maxdepth 1 -name '*.tmp' -print)"
 printf '.tmp residue after the successful create: %s\n' "${TMP_AFTER_SUCCESS:-<none>}" | tee -a "$LOG"
 assert_eq "$TMP_AFTER_SUCCESS" "" "no .tmp residue after the successful create"
 stop_daemon "$TAG-lvm-daemon"
+cleanup
 
 if end_drill; then
   printf 'D5 COMPLETE\n'

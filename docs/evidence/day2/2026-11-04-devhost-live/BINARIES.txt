@@ -1,0 +1,53 @@
+Binaries used by the 2026-11-04 day-2 evidence
+==============================================
+
+D2 live cross-binary drill
+--------------------------
+OLD
+  commit:      8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+  version:     volvisord 8c2fc1a
+  path:        /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord
+  sha256:      ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+  build:       CARGO_TARGET_DIR=<run>/target-old cargo build \
+                 --manifest-path <run>/src-old-8c2fc1a/Cargo.toml \
+                 --locked -p volvisord
+  worktree:    detached worktree, HEAD asserted equal to the resolved
+                 OLD_COMMIT (old_worktree_sha in records/d2live-binaries.txt)
+
+NEW
+  commit:      aad17201f03bfdfcec4b74d863b805bc7fa47c76
+  version:     volvisord aad1720
+  path:        /tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord
+  sha256:      6ebac3f9c5bf3bee53caa7764ccffdbd8ebeea146a164a9aa511c6beaac633ab
+  build:       CARGO_TARGET_DIR=<run>/target-new cargo build \
+                 --manifest-path <run>/src-new-aad1720/Cargo.toml \
+                 --locked -p volvisord
+  worktree:    clean detached worktree at aad1720
+                 (new_worktree_dirty_at_build=0; version stamp carries no
+                  -dirty suffix; worktree HEAD asserted equal to NEW_COMMIT)
+
+D1 backup/restore and D2 v3 same-binary policy drills
+-----------------------------------------------------
+  path:        /root/git/volvisor-phase-a/target/debug/volvisord
+  version:     volvisord aad1720-dirty
+  sha256:      80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+  commit:      aad17201f03bfdfcec4b74d863b805bc7fa47c76 (product source)
+  note:        D1 and D2 used the same caller-worktree build. The `-dirty`
+               suffix and `worktree_dirty: yes` in the raw headers are
+               recorded, not hidden. Phase B adds tests/scripts/docs only; the
+               product source under test is the aad1720 commit. These two
+               drills are not clean-worktree provenance claims.
+
+Notes
+-----
+- All builds are debug profile (`cargo build` with no `--release`).
+- The version stamp is `git describe --tags --always --dirty`; no release tag
+  exists at either commit. Because a tagged commit's stamp can omit the SHA,
+  the drill asserts build-worktree HEAD equality rather than SHA containment.
+- The D2 drill captures its binary digest *after* its `cargo test -p
+  volvisord` step, immediately before starting the daemon, so the record
+  cannot name a binary that the test build replaced.
+- OLD and NEW were removed with their disposable worktrees after the run.
+- Binary identity was captured at run time into records/d1-binaries.txt,
+  records/d2-binaries.txt and records/d2live-binaries.txt. Every daemon start
+  line in the raw logs also records the binary path and sha256.

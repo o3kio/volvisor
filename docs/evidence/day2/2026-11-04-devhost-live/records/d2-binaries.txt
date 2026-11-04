@@ -1,0 +1,5 @@
+binary_path=/root/git/volvisor-phase-a/target/debug/volvisord
+binary_version=volvisord aad1720-dirty
+binary_sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+caller_worktree_dirty=yes
+source_sha=aad17201f03bfdfcec4b74d863b805bc7fa47c76

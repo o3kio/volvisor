@@ -114,12 +114,13 @@ production-support claim is made or implied (AGENTS rule 12).
 Day-2 recovery procedures and their drill results are in the
 [day-2 runbook index](docs/runbooks/day-2/README.md). The executable drills and
 raw records are in the
-[2026-11-03 single-host evidence bundle](docs/evidence/day2/2026-11-03-devhost/).
+[2026-11-03 single-host bundle](docs/evidence/day2/2026-11-03-devhost/) and the
+[2026-11-04 D1/D2 day-2 bundle](docs/evidence/day2/2026-11-04-devhost-live/).
 
 | Area | Recorded verdict |
 |---|---|
 | Control-plane backup/restore with attachment state, revision and tombstones | **DRILLED** |
-| Schema compatibility, upgrade-on-write and future-version refusal | **PARTIAL** — live old-binary → new-binary upgrade/rollback not run |
+| Schema compatibility, upgrade-on-write and future-version refusal | **DRILLED (single-host lab)** — real old-binary → new-binary upgrade and restore-based rollback; no rolling multi-host/package drill |
 | Lost/unreachable witness service | **PARTIAL** — storage-side DRBD fencing not run |
 | Torn journal tail and corrupt state file | **DRILLED** |
 | ENOSPC on journal/state writes | **DRILLED**; the state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code ([PR #69](https://github.com/o3kio/volvisor/pull/69)), post-fix path covered by a regression test |

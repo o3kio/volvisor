@@ -1,0 +1,180 @@
+# drill: 01-backup-restore
+# start: 2026-11-04T14:58:58Z
+# invocation: docs/runbooks/day-2/scripts/d1.sh
+# harness_sha256: cea3e9e57f9c4b08642f7735aaa4f13e6c233b980d445568f4712c9376c1a2f0
+# lib_sha256: 0a3343d533250a463f4291de28fec20903df2bc551a1b75810cbade5b74c3df7
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: aad17201f03bfdfcec4b74d863b805bc7fa47c76
+# worktree_dirty: yes
+# runner: uid=0
+
+
+### 2026-11-04T14:58:58Z record the D1 drill binary identity (version, sha256, dirty flag) host=dev
+$ cat /tmp/opencode/volvisor-d1-final3-20261104T145858Z/records/d1-binaries.txt
+binary_path=/root/git/volvisor-phase-a/target/debug/volvisord
+binary_version=volvisord aad1720-dirty
+binary_sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+caller_worktree_dirty=yes
+source_sha=aad17201f03bfdfcec4b74d863b805bc7fa47c76
+exit=0
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d246a" successfully created
+lab setup tag=d1 loop=/dev/loop0 vg=vg-d246a state=/tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+
+### 2026-11-04T14:58:59Z config check (lvm lab) host=dev
+$ /root/git/volvisor-phase-a/target/debug/volvisord --config /tmp/opencode/volvisor-d1-final3-20261104T145858Z/configs/d1.toml --check-config
+{"timestamp":"2026-11-04T14:58:59.147201Z","level":"INFO","fields":{"message":"volvisord configuration check passed","summary":"config ok: listen 127.0.0.1:50595, provider lvm, journal_dir /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal, transport plain-http loopback, read-auth open (legacy), no witness, migration disabled"}}
+exit=0
+daemon d1-daemon-create healthy pid=2404557 port=50595 bin=/root/git/volvisor-phase-a/target/debug/volvisord sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes/vol-d1-a/attach
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes/vol-d1-b/attach
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes/vol-d1-a/attachment-state
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes/vol-d1-b/detach
+
+### 2026-11-04T14:58:59Z inspect A before backup host=dev
+{"allocated_bytes":67108864,"attachment_ids":["att-d1-a"],"attachments":[{"access_mode":"single_writer","attachment_generation":1,"attachment_id":"att-d1-a","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-d246a/vol-vol-d1-a-cbf6b154"}},"host_id":"host-d1","recorded_at_ms":1793804339786,"reporter":"day2-drill-guest","state":"active","state_revision":2,"vm_id":"vm-d1-a","vmm_disk_id":"disk0"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-d1-a","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":2,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Attached","volume_id":"vol-d1-a"}
+### 2026-11-04T14:58:59Z inspect B before backup (tombstone source) host=dev
+{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":3,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-b"}ASSERT PASS: pre-backup attachment state == active
+ASSERT PASS: pre-backup attachment state_revision == 2
+
+### 2026-11-04T14:58:59Z stop daemon for the backup (consistency point) host=dev
+stopped d1-daemon-create pid=2404557 sig=TERM
+ASSERT PASS: backup consistency point has no writer (journal lock is free)
+
+### 2026-11-04T14:58:59Z record state checksums before backup host=dev
+$ sha256sum /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/journal.log /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+2ba84f530a027ac686ed126190c71084eabd05d635a96a64cc2699814c15b92a  /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/journal.log
+a03326d91df348e2e8b0da8d2cfde9a0e8fd9dc5bba23a03f6ae266f01c8aa48  /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+exit=0
+
+### 2026-11-04T14:58:59Z record attachment and tombstone facts in the durable store host=dev
+$ jq \{a:\ .volumes\[\"vol-d1-a\"\].runtime.attachment\,\ b_tombstones:\ .volumes\[\"vol-d1-b\"\].runtime.retired_attachment_filter.inserted\} /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+{
+  "a": {
+    "id": "att-d1-a",
+    "vm_id": "vm-d1-a",
+    "host_id": "host-d1",
+    "generation": 1,
+    "access_mode": "single_writer",
+    "vmm_disk_id": "disk0",
+    "state": "active",
+    "state_revision": 2,
+    "evidence": "guest_confirmed",
+    "reporter": "day2-drill-guest",
+    "recorded_at_ms": 1793804339786
+  },
+  "b_tombstones": 1
+}
+exit=0
+
+### 2026-11-04T14:58:59Z backup the whole stopped state directory host=dev
+$ tar --xattrs --acls -C /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1 -cpf /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/backup/state.tar journal
+exit=0
+
+### 2026-11-04T14:58:59Z backup archive checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/backup/state.tar
+80d35e9e31fa299ab856c706ea171cc7b7277042bac4047fbc89cd8430dd204c  /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/backup/state.tar
+exit=0
+backup_duration_secs=0.015
+
+### 2026-11-04T14:58:59Z start after backup and create a post-backup operation (vol-d1-c) host=dev
+daemon d1-daemon-drift healthy pid=2404772 port=50595 bin=/root/git/volvisor-phase-a/target/debug/volvisord sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+HTTP 200 (want 200) POST http://127.0.0.1:50595/v2/volumes
+
+### 2026-11-04T14:59:00Z post-backup inspect C host=dev
+$ curl --fail-with-body --silent --show-error --config /tmp/opencode/volvisor-d1-final3-20261104T145858Z/configs/d1.curl http://127.0.0.1:50595/v2/volumes/vol-d1-c
+{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":1,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-c"}exit=0
+stopped d1-daemon-drift pid=2404772 sig=TERM
+
+### 2026-11-04T14:59:00Z prove post-backup drift is in the live state host=dev
+$ jq -r .volumes\ \|\ keys\[\] /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+vol-d1-a
+vol-d1-b
+vol-d1-c
+exit=0
+
+### 2026-11-04T14:59:00Z live backend LVs before restore (C exists only here) host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d246a
+  vol-vol-d1-a-cbf6b154 vg-d246a 64.00m
+  vol-vol-d1-b-9f35eafc vg-d246a 64.00m
+  vol-vol-d1-c-a5c297c9 vg-d246a 64.00m
+exit=0
+
+### 2026-11-04T14:59:00Z restore the stopped-state backup host=dev
+
+### 2026-11-04T14:59:00Z move the drifted live directory aside (never deleted) host=dev
+$ mv /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal.drifted
+exit=0
+
+### 2026-11-04T14:59:00Z extract the backup host=dev
+$ tar --xattrs --acls -C /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1 -xpf /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/backup/state.tar
+exit=0
+
+### 2026-11-04T14:59:00Z restored state checksum (must equal the pre-backup checksum) host=dev
+$ sha256sum /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/journal.log /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+2ba84f530a027ac686ed126190c71084eabd05d635a96a64cc2699814c15b92a  /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/journal.log
+a03326d91df348e2e8b0da8d2cfde9a0e8fd9dc5bba23a03f6ae266f01c8aa48  /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+exit=0
+ASSERT PASS: restored journal is byte-identical to the backup source == 2ba84f530a027ac686ed126190c71084eabd05d635a96a64cc2699814c15b92a
+ASSERT PASS: restored state is byte-identical to the backup source == a03326d91df348e2e8b0da8d2cfde9a0e8fd9dc5bba23a03f6ae266f01c8aa48
+ASSERT PASS: restored journal has no writer before restart (journal lock is free)
+
+### 2026-11-04T14:59:00Z prove restored durable facts host=dev
+$ jq \{a:\ .volumes\[\"vol-d1-a\"\].runtime.attachment\,\ b_tombstones:\ .volumes\[\"vol-d1-b\"\].runtime.retired_attachment_filter.inserted\} /tmp/opencode/volvisor-d1-final3-20261104T145858Z/lab-d1/journal/lvm-state.json
+{
+  "a": {
+    "id": "att-d1-a",
+    "vm_id": "vm-d1-a",
+    "host_id": "host-d1",
+    "generation": 1,
+    "access_mode": "single_writer",
+    "vmm_disk_id": "disk0",
+    "state": "active",
+    "state_revision": 2,
+    "evidence": "guest_confirmed",
+    "reporter": "day2-drill-guest",
+    "recorded_at_ms": 1793804339786
+  },
+  "b_tombstones": 1
+}
+exit=0
+daemon d1-daemon-restore healthy pid=2404919 port=50595 bin=/root/git/volvisor-phase-a/target/debug/volvisord sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+restore_to_health_duration_secs=0.323
+
+### 2026-11-04T14:59:00Z post-restore assertions host=dev
+{"allocated_bytes":67108864,"attachment_ids":["att-d1-a"],"attachments":[{"access_mode":"single_writer","attachment_generation":1,"attachment_id":"att-d1-a","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-d246a/vol-vol-d1-a-cbf6b154"}},"host_id":"host-d1","recorded_at_ms":1793804339786,"reporter":"day2-drill-guest","state":"active","state_revision":2,"vm_id":"vm-d1-a","vmm_disk_id":"disk0"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-d1-a","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":2,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Attached","volume_id":"vol-d1-a"}{"allocated_bytes":67108864,"attachment_ids":[],"attachments":[],"backend_class":"native-local","backend_health":"Unknown","current_writer":null,"effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":3,"health":"Unknown","project_id":"day2","provisioned_bytes":67108864,"state":"Ready","volume_id":"vol-d1-b"}ASSERT PASS: post-restore attachment state == active
+ASSERT PASS: post-restore attachment state_revision == 2
+ASSERT PASS: post-restore attachment evidence == guest_confirmed
+ASSERT PASS: post-restore tombstone count == 1
+
+### 2026-11-04T14:59:00Z prove the tombstone is enforced: reusing att-d1-b must be refused host=dev
+{"code":"IDEMPOTENCY_CONFLICT","message":"attachment_id att-d1-b is already bound to a different attachment instance or was consumed earlier in this volume's lifetime"}HTTP 409 for retired-attachment reattach
+ASSERT PASS: retired attachment id refusal status == 409
+ASSERT PASS: retired attachment refusal code contains IDEMPOTENCY_CONFLICT
+
+### 2026-11-04T14:59:00Z prove the post-backup volume C is not in restored state (expected RPO loss) host=dev
+{"code":"NOT_FOUND","message":"volume vol-d1-c not found"}HTTP 404 for post-backup volume after restore
+ASSERT PASS: post-backup volume absent after restore == 404
+
+### 2026-11-04T14:59:01Z show the orphaned backend LV left by the discarded post-backup operation host=dev
+
+### 2026-11-04T14:59:01Z backend LVs after restore (operator reconciliation required for C) host=dev
+$ lvs --noheadings -o lv_name\,vg_name\,lv_size vg-d246a
+  vol-vol-d1-a-cbf6b154 vg-d246a 64.00m
+  vol-vol-d1-b-9f35eafc vg-d246a 64.00m
+  vol-vol-d1-c-a5c297c9 vg-d246a 64.00m
+exit=0
+stopped d1-daemon-restore pid=2404919 sig=TERM
+  Logical volume "vol-vol-d1-a-cbf6b154" successfully removed.
+  Logical volume "vol-vol-d1-b-9f35eafc" successfully removed.
+  Logical volume "vol-vol-d1-c-a5c297c9" successfully removed.
+  Volume group "vg-d246a" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d1 loop=/dev/loop0 vg=vg-d246a
+
+# end: 2026-11-04T14:59:01Z
+ASSERT SUMMARY: 0 failures
+D1 COMPLETE

@@ -1,0 +1,35 @@
+Harness scripts used by the 2026-11-04 day-2 evidence
+=====================================================
+
+These scripts are part of the Phase B change; they are not present in the
+product commit `aad1720`. Each drill's raw log records its own
+`harness_sha256` and `lib_sha256` in the header at run time, so the retained
+log is bound to the exact bytes that produced it. The hashes below are the
+current working-tree hashes and match those headers.
+
+cea3e9e57f9c4b08642f7735aaa4f13e6c233b980d445568f4712c9376c1a2f0  d1.sh
+fb9fc4c5bb9a98a9932c650326da726b409203fac1a7c02f6560751209b41d68  d2.sh
+64056aa9d9c3f586e8f7fa259bf9dd455bc3e12aa825bce3fde85f822c82936d  d2-live.sh
+14decf0b0e3eeabd2beaf0ee86ce0213bb39ff52c459ea70cd1cfcd0ffd939b7  preflight.sh
+0a3343d533250a463f4291de28fec20903df2bc551a1b75810cbade5b74c3df7  lib.sh
+4d36e43eb8dfe276bf15b6c35a53f21c3ea2a3e4d0d789b65de8f567a66faf55  run-all.sh
+
+Run binding
+-----------
+- D1:     RUN=/tmp/opencode/volvisor-d1-final3-20261104T145858Z,
+          raw/01-backup-restore-v3.log header hashes match d1.sh + lib.sh.
+- D2:     RUN=/tmp/opencode/volvisor-d2-final3-20261104T145816Z,
+          raw/02-schema-upgrade-v3.log header hashes match d2.sh + lib.sh.
+- D2 live: RUN=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z,
+          raw/02b-live-upgrade-rollback.log header hashes match d2-live.sh +
+          lib.sh.
+- Preflight: RUN=/tmp/opencode/volvisor-preflight-final3-20261104T145906Z,
+          raw/preflight-all.log and raw/preflight-d2-strict.log record their
+          exact argv, start time, repository state and exit status. The
+          preflight script does not source lib.sh, so its header is absent;
+          the current file hash above is the hash at the retained runs, and
+          the script did not change after them.
+
+`run-all.sh` is included because it is the documented entry point, but these
+runs invoked the drills individually. A full end-to-end `run-all.sh` run is
+not claimed by this bundle.

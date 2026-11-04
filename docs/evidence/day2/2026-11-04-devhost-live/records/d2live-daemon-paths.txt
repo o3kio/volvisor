@@ -1,0 +1,2 @@
+/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord
+/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord
