@@ -28,8 +28,10 @@ The release binary was built before the harness started with
 clean tree at aab773b. `--skip-build` therefore records the same tree that
 produced the binary; it is not a stale-binary workaround.
 
-The run window was 2026-11-04T17:02:12Z .. 2026-11-04T17:32:25Z. The harness
-exited 0 (`BENCH_RC=0`).
+The run window was 2026-11-04T17:02:12Z .. 2026-11-04T17:32:25Z.
+`raw/00-orchestration.log` ends with a `done:` line and a clean lab teardown,
+and records no failure. The outer command's exit status was not captured in
+the bundle, so this file does not quote one.
 
 Post-run tools
 --------------

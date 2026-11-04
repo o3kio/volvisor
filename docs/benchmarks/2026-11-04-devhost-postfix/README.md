@@ -4,9 +4,9 @@ This bundle records a re-run of the issue
 [#43](https://github.com/o3kio/volvisor/issues/43) harness **after** the
 Phase C state-substrate fixes (`#62`, `#63`, `#64`) and
 [ADR-0012](../../adr/0012-monotonic-attachment-generation-fence.md). It is the
-valid post-fix measurement; it supersedes the preliminary `ec6f9df` run and
-replaces the invalid pre-fix `331391e` conflict storm. It is a **single-host
-development-lab**
+valid post-fix measurement. (An earlier preliminary run at `ec6f9df` was not
+published and is not evidence here.) It replaces the invalid pre-fix
+`331391e` conflict storm. It is a **single-host development-lab**
 record: one `volvisord` on one host, a disposable loop-backed LVM volume
 group, control-plane HTTP only. It is **not** production evidence, **not** a
 data-path benchmark, **not** an SLA, and **not** the issue's 24-hour soak (a
@@ -47,8 +47,9 @@ churn, not to establish capacity:
   recorded 1,413,505 spurious conflicts on 1,425,668 attach attempts.
 - **Provider state no longer grows with attachment history.** End state is
   **3,055 bytes** (delta **−173 bytes** over the soak, max 3,675 bytes),
-  versus 2,522,793 bytes before. The retired-id filter is no longer written or
-  consulted (ADR-0012).
+  versus 2,522,793 bytes before. The legacy retired-id filter is no longer
+  inserted from the attach/detach path or consulted, and fresh state files omit
+  it; a loaded legacy filter still round-trips (ADR-0012).
 - **The journal stays bounded.** End journal is **27,982,748 bytes** (delta
   **−30,500,383**), max **75,497,833 bytes**, versus 271,399,822 bytes before.
 - **Restart replay is healthy.** The mid-soak restart listed 4/4 volumes in
@@ -66,11 +67,11 @@ These are findings, not fixes, and they are not production claims:
   (delta **+1,780,896 KiB**) and peaked at **2,323,028 KiB** during
   compaction. That is consistent with allocator/compaction transients, but a
   leak is neither proven nor ruled out. No RSS cap or fix is claimed.
-- **The default INFO daemon log is unbounded.** The 25-minute run produced
-  **2,572,981,477 bytes** (≈2.4 GiB) and **9,072,853** lines
-  (9,072,376 INFO, 477 WARN) with no rotation. The committed copy is
-  `raw/daemon.daemon.log.gz` (77,732,175 bytes compressed). Logging volume is
-  an operational finding, not a durable-state defect.
+- **The default INFO daemon log is unbounded.** The ~30-minute run (including
+  the 25-minute soak) produced **2,572,981,477 bytes** (≈2.4 GiB) and
+  **9,072,853** lines (9,072,376 INFO, 477 WARN) with no rotation. The
+  committed copy is `raw/daemon.daemon.log.gz` (77,732,175 bytes compressed).
+  Logging volume is an operational finding, not a durable-state defect.
 - **The 25-minute soak is not the 24-hour soak.** The 24 h soak is **NOT
   RUN**.
 
@@ -123,14 +124,18 @@ in `configs/`; the bundle has no bearer or claim token.
 ## Reproduction
 
 ```bash
+# Build the release binary first (REPORT.md §3), then use a fresh run dir.
 sudo scripts/bench/run-all.sh \
-  --run-dir /tmp/opencode/volvisor-bench-phasec-final-20261104 \
+  --run-dir /tmp/opencode/volvisor-bench-$(date -u +%Y%m%dT%H%M%SZ) \
   --skip-build --sweep-seconds 30 --soak-minutes 25
 ```
 
-The run directory named above is the workspace copy used to build this
-bundle; the committed bundle is the durable evidence copy. Verify the bundle
-with `sha256sum -c MANIFEST.sha256`. Re-generate the comparison with:
+Use a **fresh** run directory: `run-all.sh` appends to an existing run's logs
+and does not clean its journal/state. The recorded run used
+`/tmp/opencode/volvisor-bench-phasec-final-20261104`; that workspace copy is
+now populated and must not be reused verbatim. The committed bundle is the
+durable evidence copy. Verify the bundle with
+`sha256sum -c MANIFEST.sha256`. Re-generate the comparison with:
 
 ```bash
 python3 scripts/bench/compare.py \

@@ -1,7 +1,7 @@
 # Start here
 
 Status: **implemented prototype; no production support**
-Date: 2026-11-02
+Date: 2026-11-02 (last evidence update: 2026-11-04)
 Intended release: `v0.1.0` — **not tagged, not published**
 
 Volvisor is a Rust workspace that implements a volume virtualization control
@@ -51,7 +51,7 @@ The implementation and its in-repo tests cover:
   [2026-11-04 post-fix control-plane bundle](benchmarks/2026-11-04-devhost-postfix/REPORT.md)
   at `aab773b` records 0 HTTP errors and 0 attachment conflicts, a ~3 KB
   provider state file, and a bounded journal over a 25-minute soak. This is
-  not the 24-hour soak and not capacity evidence; RSS high-water (2.32 GiB)
+  not the 24-hour soak and not capacity evidence; RSS high-water (≈2.22 GiB)
   and the unbounded default INFO daemon log remain open findings.
 
 A `--check-config` pass proves the binary runs and accepts a configuration.

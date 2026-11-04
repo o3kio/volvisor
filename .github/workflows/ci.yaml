@@ -68,6 +68,8 @@ jobs:
         run: python3 scripts/validate-traces.py docs/operations/traces/*.jsonl
       - name: Test the flake-rate report
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - name: Test the benchmark comparison tool
+        run: python3 -m unittest discover -s scripts/bench/tests -p 'test_*.py' -v
       - name: Validate the release gate graph
         run: |
           ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f) }' \

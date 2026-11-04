@@ -146,24 +146,27 @@ claim.
 - **C3 — post-fix measurement.** A clean-tree run at
   `aab773b7b58448e41ba22b21372785b3c58e7381` (binary SHA256
   `238895a42097fd06f33e30f941873b3a9ca82b623efaf2a60c6f375d2d1edf4a`)
-  completed with `BENCH_RC=0` and is published as the
+  completed (the orchestration log ends with `done:` after a clean teardown)
+  and is published as the
   [2026-11-04 post-fix bundle](../benchmarks/2026-11-04-devhost-postfix/REPORT.md)
   with its [before/after comparison](../benchmarks/2026-11-04-devhost-postfix/comparison/comparison.md).
   The pre-fix conflict storm is preserved only as a labelled
   [invalid-run artifact](../benchmarks/2026-11-04-devhost-invalid-prefix/README.md).
   Headline results: 5,424,744 soak ops at 3616.49 ops/s, **0 HTTP errors and
   0 `IDEMPOTENCY_CONFLICT`** (70 client network errors at the deliberate
-  restart), state end **3,055 B** (max 3,675 B), journal max **75.5 MiB**
-  and end **28.0 MiB**, mid-soak restart healthy in **0.552 s** with 4/4
-  volumes. Against 2026-11-03, soak ops are +351.1 %, c1/c8 ops/s +17.2 %/
-  +52.3 %, c32/c128 −4.1 %/−2.6 %, soak journal end −89.7 % and state end
-  −99.88 %.
-- **Open residuals (not fixes).** RSS peaked at **2.32 GiB** and did not
-  return to its start value; the peak coincides with a post-compaction journal
-  minimum, which is consistent with allocator transients but proves neither a
-  leak nor its absence. The default INFO daemon log produced **2.57 GB** in
-  25 minutes with no rotation. Neither is a durable-state defect and neither
-  is claimed fixed. The run is one host, loop-LVM, control-plane only, and a
+  restart), state end **3,055 B** (max 3,675 B), journal max **75.5 MB
+  (72.0 MiB)** and end **28.0 MB (26.7 MiB)**, mid-soak restart healthy in
+  **0.552 s** with 4/4 volumes. Against 2026-11-03, soak ops are +351.1 %,
+  c1/c8 ops/s +17.2 %/+52.3 %, c32/c128 −4.1 %/−2.6 %, soak journal end
+  −89.7 % and state end −99.88 %.
+- **Open residuals (not fixes).** RSS peaked at **2,323,028 KiB (≈2.22 GiB)**
+  and did not return to its start value; the peak coincides with a
+  post-compaction journal minimum, which is consistent with allocator
+  transients but proves neither a leak nor its absence. The default INFO
+  daemon log produced **2.57 GB** over the ~30-minute run (including the
+  25-minute soak) with no rotation. Neither is a durable-state defect and
+  neither is claimed fixed. The run is one host, loop-LVM, control-plane only,
+  and a
   shortened **25-minute** soak; the 24-hour soak is **NOT RUN**. Issue **#62**
   is not closed by this measurement.
 - **Validation:** `cargo fmt`, workspace tests, clippy and rustdoc with
@@ -318,7 +321,9 @@ report mapping every gate to evidence. Current status:
    names the few defense-in-depth branches covered by construction rather than
    a dedicated fault test); it is not hardware-drilled. See
    [lvm-state-divergence.md](../runbooks/day-2/lvm-state-divergence.md). The
-   measured lock/journal/retirement growth remains an open finding. No gate
+   measured lock/journal/retirement growth remains an open finding at the
+   issue level; the Phase C addendum above records the post-fix journal/state
+   measurement and its remaining RSS/log residuals. No gate
    verdict changes, and none is a resolved production issue.
 
 ## What must not be claimed

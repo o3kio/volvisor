@@ -49,7 +49,7 @@ under crash. Correctness evidence is the test suite and conformance checks at
 | Scenario | Shape | Result | Raw record |
 |---|---|---|---|
 | Micro | concurrency 1: create/delete, attach→report→detach, grow, inspect, list, capabilities; state-file scaling at 1/8/32 live volumes | 0 errors in 1,224 recorded ops | [micro.json](json/micro.json), [micro.csv](summary/micro.csv) |
-| Mixed sweep | 1 / 8 / 32 / 128 in-flight, 60 % read-ratio target, 30 s per tier | 0 errors; throughput falls above 8 in-flight | [mixed-c1](json/mixed-c1.json), [c8](json/mixed-c8.json), [c32](json/mixed-c32.json), [c128](json/mixed-c128.json) |
+| Mixed sweep | 1 / 8 / 32 / 128 in-flight, 70 % read-ratio target, 30 s per tier | 0 errors; throughput falls above 8 in-flight | [mixed-c1](json/mixed-c1.json), [c8](json/mixed-c8.json), [c32](json/mixed-c32.json), [c128](json/mixed-c128.json) |
 | Admission cap probe | 128 in-flight, cap 32, 1 s queue timeout, 15 s (diagnostic) | queued, no `503`; see §6 | [mixed-cap32-c128.json](json/mixed-cap32-c128.json) |
 | Rate-limit shedding probe | 64 in-flight, 50 req/s burst 50, 15 s (diagnostic) | 952 × `429 RATE_LIMITED`; 51.255 accepted ops/s | [mixed-rate50-c64.json](json/mixed-rate50-c64.json) |
 | Shortened soak | 25 min, 4 workers, continuous attach/report/detach/grow, restart at 12 min, per-second resource samples | completed; state bounded, journal bounded, RSS high-water filed | [soak.json](json/soak.json), [soak-timeline.csv](csv/soak-timeline.csv) |
@@ -84,7 +84,9 @@ default admission cap is 256 for the four tiers.
 
 All 196,614 recorded requests returned 2xx; no `503`, `429` or network error
 occurred in the default-cap sweep. Durations were 30.0 s, 30.004 s, 30.014 s
-and 31.138 s; the excess is client join/teardown time, not extra load.
+and 31.138 s; the c128 timeline records 126 ops in the final second, consistent
+with in-flight drain rather than additional load, though the bundle does not
+separate join/teardown from load.
 
 The `state max B` column is the largest state file observed during the tier.
 It is not a clean function of live volumes, because each mixed worker owns one
@@ -180,17 +182,18 @@ planned restart. They are not provider or admission errors; the soak status is
 | state bytes | 3,228 | 3,055 | −173 | 2,529 | 3,675 |
 | fds | 19 | 17 | −2 | 13 | 21 |
 
-The journal stayed bounded: it never exceeded **75.5 MiB** and ended at
-**28.0 MiB**, versus 271.4 MiB before. The configured `max_log_bytes` is
-64 MiB; after the first compaction the trigger additionally requires 64 MiB of
-growth since the last compaction, so the log can overshoot the bound by up to
-that floor between rewrites. The observed 75.5 MiB maximum is consistent with
-that hysteresis. The state file never exceeded **3,675 B** and ended at
-**3,055 B**, versus 2.5 MiB before.
+The journal stayed bounded: it never exceeded **75.5 MB (72.0 MiB)** and ended
+at **28.0 MB (26.7 MiB)**, versus 271.4 MB (258.8 MiB) before. The effective
+(default) `max_log_bytes` is 64 MiB (the benchmark config sets no journal
+section); after the first compaction the trigger additionally requires 64 MiB
+of growth since the last compaction, so the log can overshoot the bound by up
+to that floor between rewrites. The observed 75.5 MB maximum is consistent
+with that hysteresis. The state file never exceeded **3,675 B** and ended at
+**3,055 B**, versus 2.52 MB (2.41 MiB) before.
 
-**RSS is the open residual.** It rose to **2.32 GiB** and did not fall back to
-its start value. The peak is not monotonic and coincides with a
-post-compaction journal minimum: at elapsed 1184.355 s RSS was
+**RSS is the open residual.** It rose to **2,323,028 KiB (≈2.22 GiB)** and did
+not fall back to its start value. The peak is not monotonic and coincides with
+a post-compaction journal minimum: at elapsed 1184.355 s RSS was
 2,323,028 KiB while the journal was 8,388,384 B, its minimum for the run and
 consistent with a just-completed compaction. At the journal maximum
 (75,497,833 B, elapsed 863.986 s) RSS was 830,572 KiB. That is consistent
@@ -209,11 +212,14 @@ Exact values from [summary/state-scale.csv](summary/state-scale.csv):
 
 State grows with live volume count but not with attachment history. The
 2026-11-03 bundle measured 6,486 / 11,708 / 29,678 B for the same 1/8/32
-shape; the reduction is the retired-id filter no longer being written.
+shape; the reduction is the retired-id tombstone/vector no longer being
+written.
 
 ### Daemon log (operational finding)
 
-The default daemon log at INFO level is **unbounded**:
+The default daemon log at INFO level is **unbounded**. It covers the whole
+~30-minute run (micro, sweeps, probes, soak and restarts), not only the
+25-minute soak:
 
 | metric | value |
 |---|---:|
@@ -264,12 +270,18 @@ verified and both runs are clean-tree.
 | soak state end | 2,522,793 B | 3,055 B | −99.88 % |
 | soak RSS delta | +621,716 KiB | +1,780,896 KiB | +186.4 % |
 
-The soak operation count is not a like-for-like workload: the pre-fix run
-kept retrying refused attaches and recorded fewer successful detaches. The
-comparison tool reports the raw counts; it does not normalise away the
-different acceptance mix. The sweep rows are the cleaner comparison, and
-their shape is unchanged: c8 improves, c32/c128 regress slightly, high
-in-flight latency remains dominated by serialization.
+Both soaks recorded **0 attach errors and 0 attachment conflicts**; the
+178/70 network errors are client reconnects at the deliberate restart. The
+operation mix is nearly identical (both ≈50 % inspect, ≈24 % list, ≈6.7 % each
+attach/report/detach), so the +351.1 % operation delta is a throughput/latency
+change, not a different acceptance mix: the pre-fix soak ran at 801.656 ops/s
+with p95 16.804 ms, the post-fix soak at 3616.49 ops/s with p95 3.410 ms
+(4.51×), consistent with the pre-fix run rewriting a growing 2.5 MB
+provider-state file per mutation. The comparison tool reports raw counts and
+per-minute normalisation; it does not apply a fixed-dataset correction. The
+sweep rows are the cleaner comparison, and their shape is unchanged: c8
+improves, c32/c128 regress slightly, high in-flight latency remains dominated
+by serialization.
 
 ## 10. Caveats and NOT RUN
 
