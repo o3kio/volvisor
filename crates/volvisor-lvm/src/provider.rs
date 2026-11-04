@@ -18,10 +18,13 @@
 //! caller still holds the provider state lock across the save and its
 //! wait, so captures never overlap; the funnel adds the seam slice 2
 //! will use when callers release that lock before waiting. The writer
-//! uses a unique `<path>.<pid>.<sequence>.tmp` per physical write, so
-//! two writers can never truncate or delete each other's temp file. The
-//! constructor sweeps stale sibling temp files from a crashed save
-//! before it loads or writes state (see [`crate::state`]).
+//! uses a unique bounded `.volvisor-<hash>.<pid>.<sequence>.tmp` per
+//! physical write, so two writers can never truncate or delete each
+//! other's temp file, and providers on the same canonical state path
+//! share one gate in this process. The constructor sweeps stale sibling
+//! temp files from a crashed save before it loads or writes state (see
+//! [`crate::state`]). Cross-process exclusion remains the journal flock;
+//! two daemons must not alias a custom `lvm_state_path`.
 //!
 //! # Durable mutation contracts
 //!
@@ -97,10 +100,10 @@
 //! health are `Unknown` until proven; `evidence_status` is
 //! `PrototypeOnly`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -380,21 +383,51 @@ pub struct LvmProvider {
 /// no-op beyond excluding a hypothetical second writer that did not hold
 /// the state lock.
 ///
+/// The gate is **per canonical state path in this process**, not per
+/// provider instance: two `LvmProvider`s on the same state path share one
+/// `Arc<Mutex<()>>`, so a poisoned save is visible to both there, while
+/// different paths get independent gates. Cross-process exclusion is the
+/// journal flock, not this gate; two daemons must not alias a custom
+/// `lvm_state_path`.
+///
 /// A panic in the save (including an armed crash seam) poisons both the
 /// state lock and this gate, matching the existing fail-closed writer
 /// behavior: later writers get a typed `INTERNAL` error instead of
 /// proceeding from an unknown state.
+///
+/// The gate is a leaf with respect to the provider state lock: nothing
+/// acquires the state lock while holding it, and the only other locks a
+/// save takes inside it are the short-lived temp-registry and crash-hook
+/// mutexes, none of which acquires the gate.
 struct DurableWriter {
-    /// Serializes whole physical save attempts.
-    gate: Mutex<()>,
+    /// Serializes whole physical save attempts for one state path.
+    gate: Arc<Mutex<()>>,
 }
 
+/// Process-wide gates keyed by canonical state-path identity. A `Weak`
+/// lets a dropped provider's gate go away; dead entries are pruned on
+/// every lookup.
+static WRITER_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
 impl DurableWriter {
-    /// A fresh writer gate (nothing armed; no writes performed).
-    fn new() -> Self {
-        Self {
-            gate: Mutex::new(()),
-        }
+    /// The writer gate shared by every provider on `path` in this
+    /// process (nothing armed; no writes performed).
+    fn new(path: &Path) -> Self {
+        let identity = crate::state::canonical_state_identity(path);
+        let mut gates = WRITER_GATES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = gates
+            .get(&identity)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(identity, Arc::downgrade(&gate));
+                gate
+            });
+        Self { gate }
     }
 
     /// Perform one durable save through the crash-hooked atomic writer.
@@ -573,6 +606,7 @@ impl LvmProvider {
         crate::state::sweep_stale_temps(&state_path);
         let state = LvmState::load(&state_path)?;
         let read_snapshot = Arc::new(state.clone());
+        let writer = DurableWriter::new(&state_path);
         let provider = Self {
             runner,
             state_path,
@@ -580,7 +614,7 @@ impl LvmProvider {
             vg_prefix,
             expected_auth_token,
             store_crash: Arc::new(StoreCrashHooks::new()),
-            writer: DurableWriter::new(),
+            writer,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
@@ -5542,12 +5576,12 @@ mod read_snapshot_tests {
         );
         let provider = LvmProvider {
             runner: Arc::new(volvisor_provider::FakeRunner::with_queue(Vec::new())),
+            writer: DurableWriter::new(&state_path),
             state_path,
             sysfs_root: dir.path().to_path_buf(),
             vg_prefix: "vg-volvisor".to_owned(),
             expected_auth_token: "test-token".to_owned(),
             store_crash: Arc::new(StoreCrashHooks::new()),
-            writer: DurableWriter::new(),
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state.clone()),
@@ -6048,6 +6082,40 @@ mod read_snapshot_tests {
             snapshot.move_record(&volume_id),
             Some(&completed),
             "the landed completion is untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod durable_writer_tests {
+    use super::*;
+
+    #[test]
+    fn writers_share_the_gate_only_for_the_same_state_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let other_path = dir.path().join("other.json");
+
+        let first = DurableWriter::new(&state_path);
+        let same = DurableWriter::new(&state_path);
+        let different = DurableWriter::new(&other_path);
+
+        assert!(
+            Arc::ptr_eq(&first.gate, &same.gate),
+            "two writers on the same state path must share one gate"
+        );
+        assert!(
+            !Arc::ptr_eq(&first.gate, &different.gate),
+            "different state paths must not share a gate"
+        );
+
+        // The canonical parent makes lexically different spellings of
+        // the same file share the gate too.
+        let alias = dir.path().join(".").join("state.json");
+        let aliased = DurableWriter::new(&alias);
+        assert!(
+            Arc::ptr_eq(&first.gate, &aliased.gate),
+            "the canonical state-path identity must alias the same gate"
         );
     }
 }

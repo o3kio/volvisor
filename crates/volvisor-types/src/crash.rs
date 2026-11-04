@@ -27,11 +27,16 @@
 //! - every store constructs its own hook instance **empty**, and no
 //!   route, request body, config value or input path can reach it;
 //! - only the constructing test rig — the sole caller of
-//!   [`StoreCrashHooks::arm`] and [`StoreCrashHooks::set_kill_switch`]
-//!   — can change that (the stores expose their instance through
-//!   read-only accessors so a rig can register its kill switch, the
-//!   same discipline as the journal-append hook in
-//!   `volvisor-api`);
+//!   [`StoreCrashHooks::arm`], [`StoreCrashHooks::set_kill_switch`],
+//!   [`StoreCrashHooks::arm_save_failure`] and
+//!   [`StoreCrashHooks::arm_save_failure_until_cleared`] (the latter two
+//!   record a private `SaveFailureArm`) — can change that (the stores
+//!   expose their instance through read-only accessors so a rig can
+//!   register its kill switch or failure arm, the same discipline as the
+//!   journal-append hook in `volvisor-api`). These entry points are
+//!   **rig-only and unreachable from configuration or HTTP**; the
+//!   persistent variant is `pub` because the rigs live in other crates,
+//!   not because it is part of the production surface;
 //! - [`StoreCrashHooks::consult`] is `pub` only because the save
 //!   sites live in other crates; without an armed entry matching
 //!   the exact `(store, point)` pair it does nothing.

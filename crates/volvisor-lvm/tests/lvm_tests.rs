@@ -628,11 +628,45 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
 
 #[tokio::test]
 async fn startup_sweeps_only_this_state_paths_stale_temps() {
+    // Mirrors the bounded temp namespace in `volvisor_lvm::state`: the
+    // hash is stable FNV-1a 64 over the state path's identity bytes.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
+        }
+        hash
+    }
+    fn hashed_temp_path(
+        state_path: &std::path::Path,
+        pid: u64,
+        sequence: u64,
+    ) -> std::path::PathBuf {
+        state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .join(format!(
+                ".volvisor-{:016x}.{pid}.{sequence}.tmp",
+                state_path_hash(state_path)
+            ))
+    }
+    fn state_path_hash(state_path: &std::path::Path) -> u64 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            fnv1a64(state_path.as_os_str().as_bytes())
+        }
+        #[cfg(not(unix))]
+        {
+            fnv1a64(state_path.to_string_lossy().as_bytes())
+        }
+    }
+
     let fixture = fixture();
     let parent = fixture.state_path.parent().expect("state parent");
-    let mut stale_name = fixture.state_path.clone().into_os_string();
-    stale_name.push(".999999.1.tmp");
-    let stale = std::path::PathBuf::from(stale_name);
+    let stale = hashed_temp_path(&fixture.state_path, u64::from(std::process::id()), 1);
     fs::write(&stale, b"stale temp from a crashed save").expect("write stale temp");
     let mut legacy_name = fixture.state_path.clone().into_os_string();
     legacy_name.push(".tmp");
@@ -642,17 +676,23 @@ async fn startup_sweeps_only_this_state_paths_stale_temps() {
     // Files that are not provably this state path's temp namespace.
     let foreign = parent.join("other-state.json.123.456.tmp");
     fs::write(&foreign, b"another state file's temp").expect("write foreign file");
+    let foreign_hash = parent.join(format!(
+        ".volvisor-{:016x}.123.456.tmp",
+        state_path_hash(&fixture.state_path) ^ 1
+    ));
+    fs::write(&foreign_hash, b"another hash's temp").expect("write foreign hash file");
     let malformed = parent.join("state.json.notnumeric.tmp");
     fs::write(&malformed, b"not a provider temp").expect("write malformed file");
 
     let _restarted = common::provider_from(&fixture.state_path, &fixture.world);
 
-    assert!(!stale.exists(), "the stale unique temp is swept at startup");
+    assert!(!stale.exists(), "the stale hashed temp is swept at startup");
     assert!(
         !legacy.exists(),
         "the legacy fixed temp is swept at startup"
     );
     assert!(foreign.exists(), "another state file's temp survives");
+    assert!(foreign_hash.exists(), "another state path's hash survives");
     assert!(malformed.exists(), "a non-numeric middle survives");
 }
 

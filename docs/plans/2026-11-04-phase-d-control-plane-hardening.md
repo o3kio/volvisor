@@ -155,12 +155,18 @@ options:
   Per-operation staging may only change *whether the caller releases the
   state lock before waiting*.
 - **Slice 1 is a semantic no-op.** All callers still hold the state lock
-  across the wait; captures therefore never overlap. Unique per-write temp
-  names plus a startup sweep; publication moves from `StateGuard` drop to a
-  post-durability, sequence-tagged snapshot; the failure-keep branches that
-  rely on drop-publication are migrated explicitly. Existing tests, crash
-  seams and physical save counts must pass unchanged. **No throughput claim
-  from slice 1.**
+  across the wait; captures therefore never overlap. Each physical write
+  uses a bounded, path-hashed temp name
+  (`.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, so it
+  cannot exceed `NAME_MAX`) plus a startup sweep. The sweep never removes
+  a temp registered in flight by this process, removes same-pid leftovers
+  immediately, and removes a foreign-pid temp only after a one-hour
+  grace; cross-process exclusion remains the journal flock, so two
+  daemons must not alias a custom `lvm_state_path`. Publication moves
+  from `StateGuard` drop to a post-durability, sequence-tagged snapshot;
+  the failure-keep branches that rely on drop-publication are migrated
+  explicitly. Existing tests, crash seams and physical save counts must
+  pass unchanged. **No throughput claim from slice 1.**
 - **Slice 2 is the release-the-lock change.** Attach/detach/report capture
   `(sequence, encoded bytes, snapshot)` under the lock, release it, and
   wait. A leader writes the latest capture once and marks every covered
