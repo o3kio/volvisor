@@ -44,12 +44,15 @@
 //! Two intermediate temp shapes were never released: `f0e5237`'s
 //! `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s lexical-path-hash
 //! namespace. For an already-canonical spelling (the common case) the
-//! final sweep still recognizes and removes the `a8c23d6` leftovers; only
-//! one created through a non-canonical spelling (symlink, `./` or `..`)
-//! is orphaned by the canonical-identity hash change. The `f0e5237` shape
-//! is genuinely never recognized. Those unrecognized leftovers need manual
-//! removal; do not broaden the sweep to add the `f0e5237` shape or the
-//! orphaned non-canonical `a8c23d6` spelling.
+//! final sweep recognizes the `a8c23d6` namespace, so already-stale
+//! same-pid or aged leftovers are removed under the pid/grace policy; a
+//! fresh foreign-pid leftover still waits out the one-hour grace. Only a
+//! leftover created through a non-canonical spelling (symlink, `./`, `..`
+//! or a bare relative path) is orphaned by the canonical-identity hash
+//! change. The `f0e5237` shape is genuinely never recognized. Those
+//! unrecognized leftovers need manual removal; do not broaden the sweep to
+//! add the `f0e5237` shape or the orphaned non-canonical `a8c23d6`
+//! spelling.
 //!
 //! This sweep is not cross-process writer exclusion. Cross-process
 //! exclusion is the journal flock; two daemons must not alias one state
@@ -1756,7 +1759,7 @@ mod tests {
         assert_eq!(
             sweep_stale_temps(&path),
             0,
-            "a future mtime fails duration_since, so the sweep leaves it alone"
+            "a future mtime is treated as not provably stale and is never swept"
         );
         assert!(hashed.exists(), "a future hashed temp is never swept");
         assert!(legacy.exists(), "a future legacy temp is never swept");
@@ -1990,7 +1993,7 @@ mod tests {
             .collect();
         assert_eq!(
             entries_after, entries_before,
-            "the failed temp create must leave no residue in the state parent"
+            "the failed temp create must leave no residue in the state parent's parent directory"
         );
     }
 

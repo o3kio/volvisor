@@ -177,11 +177,13 @@ options:
   unchanged. Two intermediate temp shapes were never released:
   `f0e5237`'s `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s
   lexical-path-hash namespace. For an already-canonical spelling (the
-  common case) the final sweep still recognizes and removes the latter;
-  only a leftover created through a non-canonical spelling (symlink, `./`
-  or `..`) is orphaned by the canonical-identity hash change. The
-  `f0e5237` shape is genuinely never recognized. Those unrecognized
-  leftovers need manual removal. All existing suites pass; two
+  common case) the final sweep recognizes the `a8c23d6` namespace, so
+  already-stale same-pid or aged leftovers are removed under the pid/grace
+  policy; a fresh foreign-pid leftover still waits out the one-hour grace.
+  Only a leftover created through a non-canonical spelling (symlink, `./`,
+  `..` or a bare relative path) is orphaned by the canonical-identity hash
+  change. The `f0e5237` shape is genuinely never recognized. Those
+  unrecognized leftovers need manual removal. All existing suites pass; two
   failure-injection rigs were re-mechanized onto the injected `AfterTmpWrite`
   consult because unique temp names removed the fixed `.tmp` path they used
   to block (see the slice-1 acceptance note). Physical save counts are
@@ -245,7 +247,9 @@ the attach fencing contract. None is a shortcut for this slice.
   `TMPDIR` and panics (not skips) where the filesystem refuses symlinks
   (for example some FAT/NFS mounts); `d5.sh` Part B was not live-drilled at
   this SHA in this environment, so its `.volvisor-` message assertion is
-  code-derived until the next drill.
+  code-derived until the next drill. The slice-1 review loop is complete:
+  every adversarial-review finding is either closed or explicitly recorded
+  above as a residual.
 - Slice 2: deterministic tests for covered-failure success only when the
   durable file proves it; no resurrection after an error (the journal's
   terminal-replay rule); leader-kill wake-all; quiesced align on an
@@ -285,7 +289,8 @@ keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
 2. **D2 (read posture) — delivered.** Self-contained, tests and docs updated.
 3. **D5 (ledger) — delivered.**
 4. **D3 slice 1 (single-writer funnel) — delivered** (`f0e5237`,
-   `a8c23d6`, `a068947`, `913c347`). Semantic no-op: callers still hold the
+   `a8c23d6`, `a068947`, `913c347`, `aae0e09`, and the follow-up test/doc
+   corrections). Semantic no-op: callers still hold the
    provider state lock across every save; no coalescing; no
    wire/schema/durability change; no throughput claim; all existing suites
    green and physical save counts unchanged.

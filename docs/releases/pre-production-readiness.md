@@ -211,10 +211,13 @@ or hardware claim.
   the single durable-writer funnel and initial startup sweep (`f0e5237`);
   the bounded hashed temp namespace, hardened sweep and per-state-path
   in-process writer gate (`a8c23d6`); canonical-path keying of the temp-name
-  hash (`a068947`); and test/doc-only evidence tightening (`913c347`). The
-  `a8c23d6` hash was lexical, so `a068947` is what makes a
-  symlink/`./`/`..` spelling share its predecessor's temp namespace. This is
-  a semantic no-op: callers still hold the provider state lock across every
+  hash (`a068947`); and test/doc-only evidence corrections (`913c347`,
+  `aae0e09`, and the slice-1 review-evidence corrections through this
+  loop). The `a8c23d6` hash was lexical, so `a068947` is what makes a
+  symlink/`./`/`..` spelling share its predecessor's temp namespace. No
+  production behavior changed after `a068947`: everything since is
+  test/doc-only evidence correction. This is a semantic no-op: callers
+  still hold the provider state lock across every
   save, there is no coalescing, no wire/schema/durability change, and **no
   throughput claim**. The earlier
   post-fix c32 −4.1 % / c128 −2.6 % measurement predates slice 1 and is not
