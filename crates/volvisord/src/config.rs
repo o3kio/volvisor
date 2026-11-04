@@ -82,6 +82,11 @@ pub struct AdmissionConfig {
     /// Maximum accepted `GET /v2/volumes?limit=`.
     #[serde(default = "default_max_list_limit")]
     pub max_list_limit: usize,
+    /// Optional per-route read-timeout overrides. Absent or unset keys fall
+    /// back to `read_timeout_secs`; see `docs/admission-control.md` for the
+    /// exact key-to-matched-path mapping.
+    #[serde(default)]
+    pub route_timeouts: RouteTimeoutsConfig,
 }
 
 impl Default for AdmissionConfig {
@@ -93,8 +98,145 @@ impl Default for AdmissionConfig {
             rate_limit_per_second: default_rate_limit_per_second(),
             rate_limit_burst: default_rate_limit_burst(),
             max_list_limit: default_max_list_limit(),
+            route_timeouts: RouteTimeoutsConfig::default(),
         }
     }
+}
+
+/// The `[admission.route_timeouts]` table: optional per-route overrides of
+/// `admission.read_timeout_secs`, keyed by named route. Every key is
+/// optional; an absent key falls back to the default read timeout. Values
+/// are seconds in `1..=3600`. Mutations are never bounded by any entry
+/// (see `docs/admission-control.md`).
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTimeoutsConfig {
+    /// `GET /v2/volumes` (list volumes).
+    #[serde(default)]
+    pub list_volumes_secs: Option<u64>,
+    /// `GET /v2/volumes/{volume_id}` (inspect volume).
+    #[serde(default)]
+    pub inspect_volume_secs: Option<u64>,
+    /// `GET /v2/capabilities`.
+    #[serde(default)]
+    pub capabilities_secs: Option<u64>,
+    /// `GET /v2/migrations/{migration_id}` (observe handoff).
+    #[serde(default)]
+    pub observe_migration_secs: Option<u64>,
+    /// `GET /v2/admin/devices` (device list).
+    #[serde(default)]
+    pub list_devices_secs: Option<u64>,
+    /// `GET /v2/admin/devices/{device_id}/ownership`.
+    #[serde(default)]
+    pub device_ownership_secs: Option<u64>,
+    /// `POST /v2/vms/{vm_id}/check-mobility` (read-only eligibility check).
+    #[serde(default)]
+    pub check_mobility_secs: Option<u64>,
+    /// `GET /v2/internal/peer/health` (read-only peer health probe).
+    #[serde(default)]
+    pub peer_health_secs: Option<u64>,
+    /// `POST /v2/internal/peer/verify-lineage` (read-only barrier-time
+    /// lineage observation; never journaled).
+    #[serde(default)]
+    pub verify_lineage_secs: Option<u64>,
+}
+
+impl RouteTimeoutsConfig {
+    /// Convert the configured seconds to the API layer's Copy override
+    /// struct. Validation (range checks) runs separately.
+    #[must_use]
+    pub fn to_route_timeouts(self) -> volvisor_api::RouteTimeouts {
+        volvisor_api::RouteTimeouts {
+            list_volumes: self.list_volumes_secs.map(std::time::Duration::from_secs),
+            inspect_volume: self.inspect_volume_secs.map(std::time::Duration::from_secs),
+            capabilities: self.capabilities_secs.map(std::time::Duration::from_secs),
+            observe_migration: self
+                .observe_migration_secs
+                .map(std::time::Duration::from_secs),
+            list_devices: self.list_devices_secs.map(std::time::Duration::from_secs),
+            device_ownership: self
+                .device_ownership_secs
+                .map(std::time::Duration::from_secs),
+            check_mobility: self.check_mobility_secs.map(std::time::Duration::from_secs),
+            peer_health: self.peer_health_secs.map(std::time::Duration::from_secs),
+            verify_lineage: self.verify_lineage_secs.map(std::time::Duration::from_secs),
+        }
+    }
+}
+
+/// The `[journal]` table: bounded retention and compaction policy for the
+/// intent journal (issue #64).
+///
+/// Compaction rewrites the log as one snapshot, retaining the newest
+/// `max_retained_operations` terminal operations (in-flight intents are
+/// never evicted) and the newest `max_tombstones` evicted-operation
+/// fingerprints. A retried operation whose entry was evicted within the
+/// tombstone window answers `410 OPERATION_EXPIRED` instead of re-executing;
+/// beyond the window it is indistinguishable from a new operation. Keep the
+/// window in operations above the longest client retry horizon. See
+/// `docs/schema-compatibility.md` and `docs/configuration.md`.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Terminal operations retained in the registry and compaction snapshot
+    /// (`1..=10_000_000`). In-flight intents are always retained.
+    #[serde(default = "default_journal_max_retained_operations")]
+    pub max_retained_operations: usize,
+    /// Newest evicted-operation fingerprints retained by the tombstone ring
+    /// (`1..=10_000_000`). A zero ring would silently re-execute retries.
+    #[serde(default = "default_journal_max_tombstones")]
+    pub max_tombstones: usize,
+    /// Compact after this many valid records in the current log
+    /// (`2..=100_000_000`).
+    #[serde(default = "default_journal_max_log_records")]
+    pub max_log_records: u64,
+    /// Compact after the log reaches this many bytes; `0` disables the byte
+    /// trigger (the record-count and retention triggers still apply).
+    #[serde(default = "default_journal_max_log_bytes")]
+    pub max_log_bytes: u64,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_operations: default_journal_max_retained_operations(),
+            max_tombstones: default_journal_max_tombstones(),
+            max_log_records: default_journal_max_log_records(),
+            max_log_bytes: default_journal_max_log_bytes(),
+        }
+    }
+}
+
+impl JournalConfig {
+    /// Convert the daemon knob table to the journal crate's retention policy.
+    /// Range validation runs separately in `Config::validate`.
+    #[must_use]
+    pub fn to_retention(self) -> volvisor_journal::JournalRetention {
+        volvisor_journal::JournalRetention {
+            max_retained_operations: self.max_retained_operations,
+            max_tombstones: self.max_tombstones,
+            max_log_records: self.max_log_records,
+            // `0` is the documented "disable the byte trigger" spelling; the
+            // journal crate's `None` carries the same meaning.
+            max_log_bytes: (self.max_log_bytes != 0).then_some(self.max_log_bytes),
+        }
+    }
+}
+
+fn default_journal_max_retained_operations() -> usize {
+    volvisor_journal::DEFAULT_MAX_RETAINED_OPERATIONS
+}
+
+fn default_journal_max_tombstones() -> usize {
+    volvisor_journal::DEFAULT_MAX_TOMBSTONES
+}
+
+fn default_journal_max_log_records() -> u64 {
+    volvisor_journal::DEFAULT_MAX_LOG_RECORDS
+}
+
+fn default_journal_max_log_bytes() -> u64 {
+    volvisor_journal::DEFAULT_MAX_LOG_BYTES
 }
 
 /// Daemon configuration (TOML file at `--config`).
@@ -214,6 +356,11 @@ pub struct Config {
     /// pagination maximum). See `docs/admission-control.md`.
     #[serde(default)]
     pub admission: AdmissionConfig,
+    /// Bounded journal retention and compaction policy (issue #64). Defaults
+    /// bound restart memory and log growth; see `[journal]` in
+    /// `docs/configuration.md`.
+    #[serde(default)]
+    pub journal: JournalConfig,
     /// Base URL of the writer-authority witness (drbd provider only,
     /// e.g. `https://10.0.0.3:9101`). When set, the provider is
     /// witness-managed: every promotion acquires a lease first, a
@@ -576,6 +723,7 @@ impl Config {
         volvisor_api::ApiConfig {
             max_body_bytes: self.max_body_bytes,
             read_timeout: std::time::Duration::from_secs(self.admission.read_timeout_secs),
+            route_timeouts: self.admission.route_timeouts.to_route_timeouts(),
             admission_wait_timeout: std::time::Duration::from_secs(
                 self.admission.queue_timeout_secs,
             ),
@@ -1095,6 +1243,7 @@ impl Config {
             }
         }
         self.validate_admission_fields()?;
+        self.validate_journal_fields()?;
         self.validate_drbd_field_shapes()?;
         // An explicitly empty token is a configuration mistake: unset means
         // "fail closed, loopback only", while "" would authenticate an empty
@@ -1166,6 +1315,86 @@ impl Config {
         if !(1..=1000).contains(&admission.max_list_limit) {
             return Err(DaemonError::Config(
                 "admission.max_list_limit must be between 1 and 1000".to_owned(),
+            ));
+        }
+        for (key, value) in [
+            (
+                "list_volumes_secs",
+                admission.route_timeouts.list_volumes_secs,
+            ),
+            (
+                "inspect_volume_secs",
+                admission.route_timeouts.inspect_volume_secs,
+            ),
+            (
+                "capabilities_secs",
+                admission.route_timeouts.capabilities_secs,
+            ),
+            (
+                "observe_migration_secs",
+                admission.route_timeouts.observe_migration_secs,
+            ),
+            (
+                "list_devices_secs",
+                admission.route_timeouts.list_devices_secs,
+            ),
+            (
+                "device_ownership_secs",
+                admission.route_timeouts.device_ownership_secs,
+            ),
+            (
+                "check_mobility_secs",
+                admission.route_timeouts.check_mobility_secs,
+            ),
+            (
+                "peer_health_secs",
+                admission.route_timeouts.peer_health_secs,
+            ),
+            (
+                "verify_lineage_secs",
+                admission.route_timeouts.verify_lineage_secs,
+            ),
+        ] {
+            if let Some(secs) = value {
+                if !(1..=3600).contains(&secs) {
+                    return Err(DaemonError::Config(format!(
+                        "admission.route_timeouts.{key} must be between 1 and 3600"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Journal retention/compaction bounds (issue #64). Zero-valued limits
+    /// are refused: a zero registry bound evicts every terminal operation
+    /// immediately and a zero tombstone ring silently re-executes retries.
+    /// `max_log_bytes = 0` is the one deliberate exception: it disables the
+    /// byte trigger while the record-count and retention triggers remain.
+    fn validate_journal_fields(&self) -> Result<(), DaemonError> {
+        let journal = &self.journal;
+        if !(1..=10_000_000).contains(&journal.max_retained_operations) {
+            return Err(DaemonError::Config(
+                "journal.max_retained_operations must be between 1 and 10000000".to_owned(),
+            ));
+        }
+        if !(1..=10_000_000).contains(&journal.max_tombstones) {
+            return Err(DaemonError::Config(
+                "journal.max_tombstones must be between 1 and 10000000 (a zero ring would \
+                 silently re-execute evicted operations)"
+                    .to_owned(),
+            ));
+        }
+        if !(2..=100_000_000).contains(&journal.max_log_records) {
+            return Err(DaemonError::Config(
+                "journal.max_log_records must be between 2 and 100000000".to_owned(),
+            ));
+        }
+        if journal.max_log_bytes > (1 << 40) {
+            return Err(DaemonError::Config(
+                "journal.max_log_bytes must not exceed 1099511627776 (1 TiB); use 0 to disable \
+                 the byte trigger"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -1442,6 +1671,7 @@ device_claim_token = \"scoped-destructive-auth\"
         let api = cfg.api_config();
         assert_eq!(api.max_body_bytes, 1 << 20);
         assert_eq!(api.read_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(api.route_timeouts, volvisor_api::RouteTimeouts::default());
         assert_eq!(api.rate_limit_per_second, 0);
         assert_eq!(api.rate_limit_burst, 0);
     }
@@ -1492,6 +1722,159 @@ device_claim_token = \"scoped-destructive-auth\"
         );
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn route_timeout_overrides_are_parsed_and_mapped() {
+        let raw = format!(
+            "{}\n[admission]\nread_timeout_secs = 30\n\
+             [admission.route_timeouts]\n\
+             list_volumes_secs = 5\n\
+             device_ownership_secs = 120\n\
+             check_mobility_secs = 1\n\
+             verify_lineage_secs = 45\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+        let route_timeouts = cfg.api_config().route_timeouts;
+        assert_eq!(
+            route_timeouts.list_volumes,
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            route_timeouts.device_ownership,
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            route_timeouts.check_mobility,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            route_timeouts.verify_lineage,
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(
+            route_timeouts.inspect_volume, None,
+            "an unset key keeps the default fallback"
+        );
+        // The default read timeout is unchanged by the override table.
+        assert_eq!(
+            cfg.api_config().read_timeout,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn route_timeout_overrides_are_range_checked() {
+        for (key, value) in [
+            ("list_volumes_secs", 0),
+            ("inspect_volume_secs", 3601),
+            ("capabilities_secs", 0),
+            ("observe_migration_secs", 3601),
+            ("list_devices_secs", 0),
+            ("device_ownership_secs", 3601),
+            ("check_mobility_secs", 0),
+            ("peer_health_secs", 3601),
+            ("verify_lineage_secs", 0),
+        ] {
+            let raw = format!(
+                "{}\n[admission.route_timeouts]\n{key} = {value}\n",
+                minimal_toml()
+            );
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg
+                .validate()
+                .expect_err("out-of-range route timeout must be refused");
+            assert!(
+                error.to_string().contains(key),
+                "error names the offending key {key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_timeout_overrides_reject_unknown_keys() {
+        let raw = format!(
+            "{}\n[admission.route_timeouts]\nnot_a_route_secs = 5\n",
+            minimal_toml()
+        );
+        assert!(
+            toml::from_str::<Config>(&raw).is_err(),
+            "an unknown route-timeout key must be refused, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn journal_retention_defaults_are_bounded_and_mapped() {
+        let cfg: Config = toml::from_str(&minimal_toml()).expect("parse");
+        assert!(cfg.validate().is_ok());
+        let retention = cfg.journal.to_retention();
+        assert_eq!(
+            retention,
+            volvisor_journal::JournalRetention::default(),
+            "absent [journal] preserves the journal crate defaults"
+        );
+        assert!(retention.max_log_bytes.is_some());
+    }
+
+    #[test]
+    fn journal_retention_is_parsed_and_zero_bytes_disables_only_the_byte_trigger() {
+        let raw = format!(
+            "{}\n[journal]\nmax_retained_operations = 128\nmax_tombstones = 256\n\
+             max_log_records = 10000\nmax_log_bytes = 0\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_ok());
+        let retention = cfg.journal.to_retention();
+        assert_eq!(retention.max_retained_operations, 128);
+        assert_eq!(retention.max_tombstones, 256);
+        assert_eq!(retention.max_log_records, 10_000);
+        assert_eq!(
+            retention.max_log_bytes, None,
+            "0 is the documented disable spelling, not a zero threshold"
+        );
+
+        let raw = format!(
+            "{}\n[journal]\nmax_retained_operations = 1\nmax_tombstones = 1\n\
+             max_log_records = 1\nmax_log_bytes = 1048576\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert_eq!(cfg.journal.to_retention().max_log_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn journal_retention_rejects_zero_bounds_and_unknown_keys() {
+        for (key, value) in [
+            ("max_retained_operations", 0),
+            ("max_tombstones", 0),
+            ("max_log_records", 0),
+        ] {
+            let raw = format!("{}\n[journal]\n{key} = {value}\n", minimal_toml());
+            let cfg: Config = toml::from_str(&raw).expect("parse");
+            let error = cfg
+                .validate()
+                .expect_err("a zero retention bound must be refused");
+            assert!(
+                error.to_string().contains(key),
+                "error names the offending key {key}: {error}"
+            );
+        }
+
+        let raw = format!(
+            "{}\n[journal]\nmax_retained_operations = 10000001\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(cfg.validate().is_err());
+
+        let raw = format!("{}\n[journal]\nnot_a_knob = 5\n", minimal_toml());
+        assert!(
+            toml::from_str::<Config>(&raw).is_err(),
+            "an unknown journal key must be refused, not silently ignored"
+        );
     }
 
     #[test]
