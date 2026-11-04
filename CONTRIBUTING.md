@@ -121,9 +121,20 @@ regresses in the normal `cargo test --workspace --locked` gate.
 `.github/workflows/fuzz.yaml` runs each target with a bounded budget
 nightly and on manual dispatch; see [`fuzz/README.md`](fuzz/README.md).
 
+[`scripts/flake-rate.py`](scripts/flake-rate.py) computes the observed
+campaign flake rate and the 14-consecutive-night flag from the JSONL samples
+the campaign-flake workflow uploads. The procedure, output semantics and
+exit codes are in
+[docs/testing/flake-rate.md](docs/testing/flake-rate.md). **No observed
+flake rate is published and issue #49's 14-night criterion is NOT MET**;
+one green run, the fuzz corpus and synthetic fixtures are not the criterion,
+and a rate must not be published without the downloaded nightly artifact
+history.
+
 Deterministic interleaving regressions cover the journal pin/compaction
-race (including the expired-operation retry paths) and the campaign
-harness's retained-listener stop/restart semantics.
+race (including the expired-operation retry paths), scheduled compaction
+between an intent and its outcome, and the campaign harness's
+retained-listener stop/restart semantics.
 
 Also present:
 
@@ -140,7 +151,11 @@ A bounded fuzz run and a green campaign sample are **not** a 14-night
 flake-rate claim. Issue #49's "no open campaign flake for 14 consecutive
 nightly runs" criterion remains open until those runs are recorded and
 published; `.github/workflows/campaign-flake.yaml` collects the samples but
-does not satisfy the criterion by itself.
+does not satisfy the criterion by itself. Run
+[`scripts/flake-rate.py`](scripts/flake-rate.py) over the downloaded
+artifact history (not the current run alone) before stating a rate or a
+`criterion_met` value; see
+[docs/testing/flake-rate.md](docs/testing/flake-rate.md).
 
 ### Hardware-lab access
 

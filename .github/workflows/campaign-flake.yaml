@@ -102,6 +102,32 @@ jobs:
             echo "campaign-flake: $failures of $iterations samples failed" >&2
             exit 1
           fi
+      # One workflow run is NOT the 14-consecutive-night criterion. This step
+      # reports only the samples this run produced, so the summary explains a
+      # red run. The `criterion_met` value below is deliberately scoped to
+      # these samples; assess the real criterion by downloading the historical
+      # campaign-flake artifacts and running the same script over all of their
+      # iterations.jsonl files. See docs/testing/flake-rate.md.
+      - name: Report the observed flake rate (current run only, not the 14-night criterion)
+        if: always()
+        run: |
+          set -eu
+          {
+            echo
+            echo "## flake rate for this workflow run (not the 14-night criterion)"
+            echo
+            echo "One workflow run is one sampling window, not 14 consecutive nights."
+            echo '`criterion_met` below is computed from these samples only.'
+            echo "Download the historical campaign-flake artifacts and run"
+            echo '`python3 scripts/flake-rate.py <artifact-dirs>/*/iterations.jsonl`'
+            echo "to assess the 14-night criterion; see docs/testing/flake-rate.md."
+            echo
+            if [ -f target/campaign-flake/iterations.jsonl ]; then
+              python3 scripts/flake-rate.py target/campaign-flake/iterations.jsonl
+            else
+              echo "No sample file was produced by this run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the flake evidence
         if: always()
         uses: actions/upload-artifact@v4

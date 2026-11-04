@@ -72,3 +72,12 @@ A bounded fuzz campaign is **not** a 14-night flake-rate claim, a
 coverage measurement, or production-support evidence. Issue #49's
 14-consecutive-night criterion remains open until the runs exist and
 are recorded.
+
+The campaign-flake samples are reported by
+[`scripts/flake-rate.py`](../scripts/flake-rate.py); see
+[`docs/testing/flake-rate.md`](../docs/testing/flake-rate.md). That tool
+computes the observed rate and the 14-night flag from the supplied JSONL
+artifacts only. **No observed flake rate is published and the 14-night
+criterion is NOT MET**: seeds, targets and one green run are not the
+criterion, and a rate must not be published without the downloaded
+nightly artifact history.
