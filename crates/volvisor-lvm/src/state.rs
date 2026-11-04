@@ -35,9 +35,11 @@
 //! pid component and is treated like a foreign writer: it is removed only
 //! when its mtime is older than that grace, because a fresh one may
 //! belong to an old binary during a rolling restart or to an operator's
-//! copy; non-regular entries are skipped. A temp whose mtime is in the
-//! future is never swept (`duration_since` fails), which is the
-//! conservative fail-safe. The real guarantee is therefore: active temps
+//! copy; non-regular entries are skipped. A foreign-pid or legacy temp
+//! whose mtime is in the future is never swept (`duration_since` fails),
+//! which is the conservative fail-safe; a same-pid unregistered temp is
+//! still removed immediately regardless of mtime. The real guarantee is
+//! therefore: active temps
 //! are never removed, stale same-pid temps are removed, and a foreign
 //! process's recent temp (or a fresh legacy temp) is left alone.
 //!
