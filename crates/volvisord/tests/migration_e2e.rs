@@ -204,6 +204,37 @@ fn assert_error_code(body: &str, code: &str) {
 
 // ------------------------------------------------------------- witness
 
+/// Take ownership of a bound listener as the retained copy a restart
+/// keeps open (the port is never rebound; a racing reconnect is
+/// queued by the kernel instead of refused).
+fn retain_listener(listener: TcpListener) -> std::net::TcpListener {
+    listener.into_std().expect("retain bound listener")
+}
+
+/// A Tokio listener over a duplicate of the retained descriptor.
+fn clone_listener(listener: &std::net::TcpListener) -> TcpListener {
+    let clone = listener.try_clone().expect("clone retained listener");
+    clone
+        .set_nonblocking(true)
+        .expect("nonblocking listener clone");
+    TcpListener::from_std(clone).expect("tokio listener clone")
+}
+
+/// A stopped server accepts and immediately closes connections: the
+/// outage remains observable, but the listening socket is never
+/// unbound, so a reconnect cannot race the restart with
+/// `ECONNREFUSED`.
+fn spawn_reject_loop(listener: TcpListener) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => drop(stream),
+                Err(_) => return,
+            }
+        }
+    })
+}
+
 /// The loopback witness: one durable directory (restarts reload the
 /// same journal), one frozen injected clock, per-host W8 credentials.
 struct WitnessHandle {
@@ -215,6 +246,10 @@ struct WitnessHandle {
     /// stopped (or before the first launch).
     shutdown: Option<tokio::sync::watch::Sender<()>>,
     serve: Option<JoinHandle<()>>,
+    /// The bound listener retained across restarts.
+    listener: std::net::TcpListener,
+    /// The reject loop installed while stopped.
+    reject: Option<JoinHandle<()>>,
 }
 
 impl WitnessHandle {
@@ -231,13 +266,17 @@ impl WitnessHandle {
             dir,
             shutdown: None,
             serve: None,
+            listener: retain_listener(listener),
+            reject: None,
         };
-        witness.launch(listener);
+        witness.launch();
         witness
     }
 
-    /// Serve the (re-loaded) core on `listener`.
-    fn launch(&mut self, listener: TcpListener) {
+    /// Serve the (re-loaded) core on a duplicate of the retained
+    /// listener.
+    fn launch(&mut self) {
+        let listener = clone_listener(&self.listener);
         let core = WitnessCore::open(
             &self.dir,
             WitnessCoreConfig {
@@ -278,23 +317,35 @@ impl WitnessHandle {
 
     /// Stop serving (the durable directory survives) and PROVE the
     /// stop: drop the graceful-shutdown trigger, then await the serve
-    /// future to completion — the listener is dropped AND every
-    /// already-accepted connection task has exited (in-flight
-    /// requests drained; no idle keep-alive connection is left
-    /// serviceable), so after this returns no request can complete
-    /// against the witness, whatever the client does with its pooled
-    /// connections. The abort shape this replaces closed the pooled
-    /// connections only asynchronously — a request dispatched right
-    /// after the abort could still be answered inside the close
-    /// window (the same race the drbd kits' shared `Server::stop`
-    /// gate removed).
+    /// future to completion — every already-accepted connection task
+    /// has exited (in-flight requests drained; no idle keep-alive
+    /// connection is left serviceable), so after this returns no
+    /// request can complete against the witness, whatever the client
+    /// does with its pooled connections. The abort shape this
+    /// replaces closed the pooled connections only asynchronously — a
+    /// request dispatched right after the abort could still be
+    /// answered inside the close window (the same race the drbd
+    /// kits' shared `Server::stop` gate removed).
     ///
     /// The drain is bounded (hyper 1.x graceful shutdown has no
     /// internal deadline, so a wedged in-flight connection would
     /// otherwise hang this forever): expiring [`WITNESS_DRAIN_BOUND`]
     /// is a kit failure — the stop did NOT prove unreachability —
-    /// never a pass.
+    /// never a pass. The retained listener then enters reject mode so
+    /// the outage is still observable without ever refusing TCP.
     async fn stop(&mut self) {
+        self.stop_serve().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        self.reject = Some(spawn_reject_loop(clone_listener(&self.listener)));
+    }
+
+    /// The serving-task half of [`WitnessHandle::stop`], shared with
+    /// [`WitnessHandle::restart`] (which keeps the listener in serve
+    /// mode instead of installing the reject loop).
+    async fn stop_serve(&mut self) {
         drop(self.shutdown.take());
         if let Some(serve) = self.serve.take() {
             let drained = tokio::time::timeout(WITNESS_DRAIN_BOUND, serve).await;
@@ -307,12 +358,17 @@ impl WitnessHandle {
         }
     }
 
-    /// Stop, then re-serve the SAME directory on the SAME address
-    /// (the journal replays; leases and barriers survive).
+    /// Stop, then re-serve the SAME directory on the SAME retained
+    /// address (the journal replays; leases and barriers survive). The
+    /// listener is never rebound, so a racing reconnect is queued, not
+    /// refused.
     async fn restart(&mut self) {
-        self.stop().await;
-        let listener = TcpListener::bind(self.addr).await.expect("rebind witness");
-        self.launch(listener);
+        self.stop_serve().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        self.launch();
     }
 
     /// The legacy admin (inspect-only) client.
@@ -474,11 +530,22 @@ struct Host {
     addr: SocketAddr,
     handle: Arc<volvisord::handoff::MigrationHandle>,
     serve: Option<JoinHandle<()>>,
+    /// The bound listener retained across restarts (never rebound).
+    listener: std::net::TcpListener,
+    /// The reject loop installed while stopped.
+    reject: Option<JoinHandle<()>>,
 }
 
 impl Host {
     /// Build and serve one daemon on `listener`.
     fn launch(core: Arc<HostCore>, listener: TcpListener) -> Host {
+        Self::launch_retained(core, retain_listener(listener))
+    }
+
+    /// [`Host::launch`] over an already-retained listener (the
+    /// restart path hands the same descriptor to the next launch).
+    fn launch_retained(core: Arc<HostCore>, listener: std::net::TcpListener) -> Host {
+        let serve_listener = clone_listener(&listener);
         let addr = listener.local_addr().expect("daemon local addr");
         let witness = Arc::new(HttpWitnessConnection::new(
             format!("http://{}", core.witness_addr),
@@ -523,18 +590,35 @@ impl Host {
         .with_peer_routes(Some(PEER_TOKEN.to_owned()), peer_ctx);
         let app = router(Arc::new(state), 1 << 20);
         let serve = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("daemon serves");
+            axum::serve(serve_listener, app)
+                .await
+                .expect("daemon serves");
         });
         Host {
             core,
             addr,
             handle,
             serve: Some(serve),
+            listener,
+            reject: None,
         }
     }
 
-    /// Stop serving (the journal flock frees with the serve task).
+    /// Stop serving (the journal flock frees with the serve task),
+    /// then install the reject loop on the retained listener so the
+    /// outage stays observable without ever unbinding the port.
     async fn stop(&mut self) {
+        self.stop_serve().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        self.reject = Some(spawn_reject_loop(clone_listener(&self.listener)));
+    }
+
+    /// The serving-task half of [`Host::stop`], shared with
+    /// [`Host::restart`] (which keeps the listener in serve mode).
+    async fn stop_serve(&mut self) {
         if let Some(serve) = self.serve.take() {
             serve.abort();
             let _ = serve.await;
@@ -542,13 +626,19 @@ impl Host {
     }
 
     /// Stop, then re-serve the SAME durable directories on the SAME
-    /// address: a new journal handle, a new migration store (records
-    /// re-loaded from disk), a fresh migration handle.
+    /// retained address: a new journal handle, a new migration store
+    /// (records re-loaded from disk), a fresh migration handle. The
+    /// listener is never rebound, so a racing reconnect is queued, not
+    /// refused.
     async fn restart(&mut self) {
-        self.stop().await;
-        let listener = TcpListener::bind(self.addr).await.expect("rebind daemon");
+        self.stop_serve().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
         let core = Arc::clone(&self.core);
-        *self = Host::launch(core, listener);
+        let listener = self.listener.try_clone().expect("retain daemon listener");
+        *self = Host::launch_retained(core, listener);
     }
 }
 

@@ -1,4 +1,10 @@
 /target
+# The fuzz workspace has its own target directory (nightly toolchain
+# artifacts); never commit it.
+/fuzz/target/
+# `cargo fuzz` crash/timeout artifacts are triage inputs, not evidence:
+# reproduce, then promote into `fuzz/corpus/` deliberately.
+/fuzz/artifacts/
 # The P5 campaign's evidence bundles (§6) — under target, ignored
 # again explicitly so the artifact location is unmistakable.
 /target/campaign-evidence/

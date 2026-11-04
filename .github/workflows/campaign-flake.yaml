@@ -1,0 +1,112 @@
+name: campaign-flake
+
+# Repeated campaign runs for the flake-rate evidence in issue #49.
+#
+# #49 requires **no open campaign flake for 14 consecutive nightly runs**
+# plus a published flake rate. This workflow is the evidence collector for
+# that criterion; it does not satisfy it by existing or by passing once.
+# Count the nightly runs and their results from the uploaded artifacts.
+#
+# The campaign's default suite is deterministic Tier S plus the Tier R/V
+# skip records. Repeated bounded runs here detect harness flakes (port
+# reuse, restart races, timing bounds) that a single green run hides.
+#
+# Triggers:
+#   * schedule          -- one sample per night;
+#   * workflow_dispatch -- an operator can run up to five samples now.
+#
+# A green run is not a production-support claim, not real-hardware
+# evidence, and not the 14-night criterion itself.
+
+on:
+  schedule:
+    # 03:17 UTC daily, after the fuzz campaign's slot.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Sequential campaign samples to run (1..=5)"
+        required: false
+        type: string
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  campaign:
+    name: campaign-flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate the sample count
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -eu
+          iterations="${ITERATIONS:-1}"
+          case "$iterations" in
+            ''|*[!0-9]*)
+              echo "iterations must be a whole number" >&2
+              exit 1
+              ;;
+          esac
+          # Bash arithmetic is 64-bit and wraps: bound the digit count
+          # first. The valid range is one digit.
+          if [ "${#iterations}" -gt 1 ]; then
+            echo "iterations must be between 1 and 5" >&2
+            exit 1
+          fi
+          if [ "$iterations" -lt 1 ] || [ "$iterations" -gt 5 ]; then
+            echo "iterations must be between 1 and 5" >&2
+            exit 1
+          fi
+      - name: Run the bounded campaign samples
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -eu
+          iterations="${ITERATIONS:-1}"
+          evidence="target/campaign-flake"
+          mkdir -p "$evidence"
+          failures=0
+          for iteration in $(seq 1 "$iterations"); do
+            started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            if cargo test -p volvisor-campaign --locked -- --test-threads=1; then
+              result=pass
+            else
+              result=fail
+              failures=$((failures + 1))
+            fi
+            finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            printf '{"iteration":%d,"result":"%s","started":"%s","finished":"%s","commit":"%s"}\n' \
+              "$iteration" "$result" "$started" "$finished" "$GITHUB_SHA" \
+              >> "$evidence/iterations.jsonl"
+            echo "campaign sample $iteration: $result"
+          done
+          {
+            echo "# campaign-flake samples"
+            echo
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- samples: $iterations"
+            echo "- failures: $failures"
+            echo
+            cat "$evidence/iterations.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failures" -ne 0 ]; then
+            echo "campaign-flake: $failures of $iterations samples failed" >&2
+            exit 1
+          fi
+      - name: Upload the flake evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-flake
+          path: target/campaign-flake/
+          if-no-files-found: warn
+          retention-days: 90

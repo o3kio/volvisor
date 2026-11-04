@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -21,10 +24,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The fuzz step below builds a separate workspace target dir.
+          # rust-cache splits this input on newlines, not spaces.
+          workspaces: |
+            .
+            fuzz
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo doc --locked --no-deps --document-private-items
+      # The fuzz workspace is excluded from the main workspace, so the
+      # commands above do not compile it. Keep the harness itself gated on
+      # every change; only the nondeterministic campaign stays scheduled.
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
 
   # The real-backend harness is itself code: keep the one-command scripts
   # syntactically sound, the release scope machine-readable, and the

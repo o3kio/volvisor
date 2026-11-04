@@ -1,0 +1,50 @@
+[package]
+name = "volvisor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The fuzz crate is a standalone workspace: its libfuzzer dependency
+# (only the sanitized campaigns need nightly) never enters the main
+# workspace's lockfile or `cargo test --workspace --locked`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+volvisor-journal = { path = "../crates/volvisor-journal" }
+volvisor-lvm = { path = "../crates/volvisor-lvm" }
+volvisor-types = { path = "../crates/volvisor-types" }
+
+[[bin]]
+name = "journal_frame"
+path = "fuzz_targets/journal_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_record"
+path = "fuzz_targets/journal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lvm_state"
+path = "fuzz_targets/lvm_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_validation"
+path = "fuzz_targets/request_validation.rs"
+test = false
+doc = false
+bench = false

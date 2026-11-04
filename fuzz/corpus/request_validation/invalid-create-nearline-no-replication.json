@@ -1,0 +1,1 @@
+{"api_version":"volvisor.volume.v2","operation_id":"op-fuzz-create-1","project_id":"tenant-fuzz","volume_id":"vol-fuzz-create-1","class":"nearline-replicated","size_bytes":1073741824,"logical_block_size":4096,"provisioning":"thin"}

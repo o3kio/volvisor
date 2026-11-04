@@ -1,0 +1,1 @@
+{"api_version":"volvisor.volume.v2","operation_id":"op-fuzz-detach-1","expected_attachment_generation":2,"vm_stopped_or_io_drained_proof":"io_drained"}

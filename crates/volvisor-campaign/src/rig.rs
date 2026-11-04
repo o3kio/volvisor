@@ -96,6 +96,41 @@ pub const POLL_BOUND: Duration = Duration::from_secs(15);
 /// See [`POLL_BOUND`].
 pub const POLL_STEP: Duration = Duration::from_millis(50);
 
+// --------------------------------------------------- listener retention
+
+/// Take ownership of a bound listener as the retained copy a restart
+/// keeps open. The socket stays bound (and keeps its accept backlog)
+/// across every stop/restart, so a peer reconnect that races the
+/// restart is queued by the kernel instead of refused; the serving
+/// task only ever holds a duplicate of this descriptor.
+fn retain_listener(listener: TcpListener) -> std::net::TcpListener {
+    listener.into_std().expect("retain bound listener")
+}
+
+/// A Tokio listener over a duplicate of the retained descriptor.
+fn clone_listener(listener: &std::net::TcpListener) -> TcpListener {
+    let clone = listener.try_clone().expect("clone retained listener");
+    clone
+        .set_nonblocking(true)
+        .expect("nonblocking listener clone");
+    TcpListener::from_std(clone).expect("tokio listener clone")
+}
+
+/// A stopped server accepts and immediately closes connections: the
+/// outage is still observable (no request can complete), but the
+/// listening socket is never unbound, so a reconnect cannot race the
+/// restart with `ECONNREFUSED`.
+fn spawn_reject_loop(listener: TcpListener) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => drop(stream),
+                Err(_) => return,
+            }
+        }
+    })
+}
+
 // ------------------------------------------------------- the panic hook
 
 /// Install this test binary's crash-injection filter (once): the
@@ -240,6 +275,9 @@ pub struct WitnessHandle {
     /// The live serve task's slot (taken at kill or stop) — an
     /// `Arc` so the kill switch's closure can hold a `Weak` to it.
     serve: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// The bound listener retained across restarts (see
+    /// [`retain_listener`]): the port is never rebound.
+    listener: std::net::TcpListener,
     /// Set by the witness kill switch; the scenarios poll it.
     killed: Arc<AtomicBool>,
 }
@@ -258,10 +296,11 @@ impl WitnessHandle {
             dir,
             crash: Arc::new(volvisor_types::crash::StoreCrashHooks::new()),
             serve: Arc::new(Mutex::new(None)),
+            listener: retain_listener(listener),
             killed: Arc::new(AtomicBool::new(false)),
         };
         witness.install_kill_switch();
-        witness.launch(listener).await;
+        witness.launch().await;
         witness
     }
 
@@ -285,8 +324,10 @@ impl WitnessHandle {
         }));
     }
 
-    /// Serve the (re-loaded) core on `listener`.
-    async fn launch(&mut self, listener: TcpListener) {
+    /// Serve the (re-loaded) core on a duplicate of the retained
+    /// listener.
+    async fn launch(&mut self) {
+        let listener = clone_listener(&self.listener);
         let mut core = open_witness_core(&self.dir).await;
         core.attach_store_crash_hooks(Arc::clone(&self.crash));
         let mut host_tokens = BTreeMap::new();
@@ -329,11 +370,9 @@ impl WitnessHandle {
         self.killed.load(Ordering::SeqCst)
     }
 
-    /// Stop the witness (the outage window: kill-free from the
-    /// seam's point of view — the listener goes away, the durable
-    /// journal survives) and await the serve task's death so the
-    /// journal `flock` frees for the restart.
-    pub async fn stop(&mut self) {
+    /// Stop the current serving (or reject) task and await its death,
+    /// keeping the listener bound. The durable directory survives.
+    async fn stop_current(&mut self) {
         if let Some(serve) = take_slot(&self.serve) {
             serve.abort();
             let _ = serve.await;
@@ -341,21 +380,41 @@ impl WitnessHandle {
         self.await_lingering_handlers().await;
     }
 
-    /// Restart the witness on the same address from the durable
-    /// journal (the W3 replay/roll-forward is the recovery): rebind,
+    /// Install the reject loop on the retained listener: a stopped
+    /// witness still accepts TCP (never `ECONNREFUSED`) but no request
+    /// can complete.
+    fn start_reject(&mut self) {
+        if let Some(previous) = take_slot(&self.serve) {
+            previous.abort();
+        }
+        *lock_slot(&self.serve) = Some(spawn_reject_loop(clone_listener(&self.listener)));
+    }
+
+    /// Stop the witness (the outage window: kill-free from the
+    /// seam's point of view — the listener stays bound in reject
+    /// mode, the durable journal survives) and await the serve
+    /// task's death so the journal `flock` frees for the restart.
+    pub async fn stop(&mut self) {
+        self.stop_current().await;
+        self.start_reject();
+    }
+
+    /// Restart the witness on the same retained address from the
+    /// durable journal (the W3 replay/roll-forward is the recovery):
     /// re-open the core, re-attach the shared crash seam, re-serve.
-    /// The kill flag resets with the relaunch (the comprehensive
-    /// review's S3, same rationale as [`Daemon::restart`]): the old
-    /// serve task is awaited dead first, so no late kill can land,
-    /// and a scenario polling [`WitnessHandle::is_killed`] after a
-    /// restart waits for the NEW kill, never reads the old one's
-    /// sticky residue (row 14 kills the witness in every F3/F4
-    /// cycle).
+    /// The listener is **never rebound** — the retained descriptor
+    /// stays in listen state through the whole restart, so a peer
+    /// reconnect racing the restart cannot be refused. The kill flag
+    /// resets with the relaunch (the comprehensive review's S3, same
+    /// rationale as [`Daemon::restart`]): the old serve task is
+    /// awaited dead first, so no late kill can land, and a scenario
+    /// polling [`WitnessHandle::is_killed`] after a restart waits for
+    /// the NEW kill, never reads the old one's sticky residue (row 14
+    /// kills the witness in every F3/F4 cycle).
     pub async fn restart(&mut self) {
-        self.stop().await;
+        self.stop_current().await;
         self.killed.store(false, Ordering::SeqCst);
-        let listener = TcpListener::bind(self.addr).await.expect("rebind witness");
-        self.launch(listener).await;
+        self.launch().await;
     }
 
     /// Bounded wait for the aborted serve future's detached
@@ -695,13 +754,28 @@ pub struct Daemon {
     /// store-save seam — the attempt-counter bump and the
     /// device-path recordings — arms hang off it).
     pub peer_preparations: TargetPreparationStore,
+    /// The bound listener retained across restarts (see
+    /// [`retain_listener`]): the port is never rebound.
+    listener: std::net::TcpListener,
+    /// The reject loop installed while stopped (a retained listener
+    /// cannot be closed without losing the no-rebind guarantee).
+    reject: Option<JoinHandle<()>>,
 }
 
 impl Daemon {
     /// Build and serve one daemon on `listener` (the e2e
     /// `Host::launch` composition, plus the retry task, the renewal
-    /// loop and the crash-hook wiring the campaign needs).
+    /// loop and the crash-hook wiring the campaign needs). The
+    /// listener is retained for the daemon's lifetime; each launch
+    /// serves a duplicate.
     pub async fn launch(core: Arc<DaemonCore>, listener: TcpListener) -> Daemon {
+        Self::launch_retained(core, retain_listener(listener)).await
+    }
+
+    /// [`Daemon::launch`] over an already-retained listener (the
+    /// restart path hands the same descriptor to the next launch).
+    async fn launch_retained(core: Arc<DaemonCore>, listener: std::net::TcpListener) -> Daemon {
+        let serve_listener = clone_listener(&listener);
         let addr = listener.local_addr().expect("daemon local addr");
         // The per-launch provider (§3.3's restart shape): state
         // re-loaded from disk, reconciled against the world, with
@@ -801,7 +875,9 @@ impl Daemon {
         .with_crash_hooks(Arc::clone(&core.crash));
         let app = router(Arc::new(state), 1 << 20);
         let serve = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("daemon serves");
+            axum::serve(serve_listener, app)
+                .await
+                .expect("daemon serves");
         });
 
         // Park the group where the kill switch (and only it) finds
@@ -825,6 +901,8 @@ impl Daemon {
             handle,
             provider,
             peer_preparations,
+            listener,
+            reject: None,
         }
     }
 
@@ -848,8 +926,22 @@ impl Daemon {
     }
 
     /// Kill-free teardown (scenario end / a graceful stop): abort
-    /// the group, await the death. The durable artifacts survive.
+    /// the group, await the death, then install the reject loop on
+    /// the retained listener. The durable artifacts survive and the
+    /// socket stays bound, so a subsequent restart never rebinds.
     pub async fn stop(&mut self) {
+        self.stop_group().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        self.reject = Some(spawn_reject_loop(clone_listener(&self.listener)));
+    }
+
+    /// Abort the current task group (if any) and await its death —
+    /// the shared first half of [`Daemon::stop`] and
+    /// [`Daemon::restart`]. The retained listener is untouched.
+    async fn stop_group(&mut self) {
         if let Some(group) = take_slot(&self.core.group) {
             abort_group(&group);
             *lock_slot(&self.core.dead_group) = Some(group);
@@ -857,21 +949,27 @@ impl Daemon {
         self.await_death().await;
     }
 
-    /// Re-serve the SAME durable directories on the SAME address
-    /// after a kill OR a graceful stop (§3.3's restart): a new
-    /// journal handle, a new migration store (records re-loaded from
-    /// disk), a fresh migration handle, a fresh retry task whose
-    /// startup pass is the recovery. `stop` first: a killed daemon's
-    /// group is already aborted and parked (the kill switch's own
-    /// act), while a HEALTHY daemon's group is still live — awaiting
-    /// it without the abort would wait forever, so the restart of a
-    /// healthy daemon (the operator's re-drive action) aborts and
-    /// parks its group exactly like a kill would have. The
-    /// `Journal::open` inside the launch is the flock-freedom proof
-    /// — it succeeds only when the old daemon's last `AppState`
-    /// `Arc` unwound.
+    /// Re-serve the SAME durable directories on the SAME retained
+    /// address after a kill OR a graceful stop (§3.3's restart): a
+    /// new journal handle, a new migration store (records re-loaded
+    /// from disk), a fresh migration handle, a fresh retry task whose
+    /// startup pass is the recovery. The listener is never rebound:
+    /// the kernel keeps accepting/queueing on it throughout, so a
+    /// peer reconnect cannot lose the restart race with
+    /// `ECONNREFUSED`. `stop_group` first: a killed daemon's group is
+    /// already aborted and parked (the kill switch's own act), while
+    /// a HEALTHY daemon's group is still live — awaiting it without
+    /// the abort would wait forever, so the restart of a healthy
+    /// daemon (the operator's re-drive action) aborts and parks its
+    /// group exactly like a kill would have. The `Journal::open`
+    /// inside the launch is the flock-freedom proof — it succeeds
+    /// only when the old daemon's last `AppState` `Arc` unwound.
     pub async fn restart(&mut self) {
-        self.stop().await;
+        self.stop_group().await;
+        if let Some(previous) = self.reject.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
         // The kill flag is per-LAUNCH state, not per-daemon state
         // (the comprehensive review's S3): the old launch's group is
         // fully dead — awaited above, so no late abort can land —
@@ -882,9 +980,9 @@ impl Daemon {
         // armed or fired. `Reply::Died` remains the primary kill
         // evidence; the flag is the polling convenience.
         self.core.killed.store(false, Ordering::SeqCst);
-        let listener = TcpListener::bind(self.addr).await.expect("rebind daemon");
+        let listener = self.listener.try_clone().expect("retain daemon listener");
         let core = Arc::clone(&self.core);
-        *self = Daemon::launch(core, listener).await;
+        *self = Daemon::launch_retained(core, listener).await;
     }
 }
 
