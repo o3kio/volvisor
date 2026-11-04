@@ -63,6 +63,16 @@ const MIN_COMPACTION_RECORD_GROWTH: u64 = 64;
 /// on every append.
 const MIN_COMPACTION_BYTE_GROWTH: u64 = 1024 * 1024;
 
+/// Maximum exponent of the failed-compaction retry backoff.
+///
+/// A failed compaction is retried after `2^streak` new records or
+/// `2^streak` MiB of new log bytes, capped at this exponent (64 records /
+/// 64 MiB). The first failure therefore still retries promptly (after one
+/// record, which preserves the "unblock and append again" recovery path),
+/// while a persistently failing compaction is attempted only O(log n) times
+/// over n appends instead of once per append.
+const MAX_COMPACTION_RETRY_SHIFT: u32 = 6;
+
 /// Journal retention/compaction policy (issue #64).
 ///
 /// Appends are still fsynced one record at a time. When a threshold is
@@ -138,6 +148,15 @@ impl JournalRetention {
         }
         Ok(())
     }
+}
+
+/// Growth required before a failed compaction may be retried.
+#[derive(Clone, Copy, Debug)]
+struct CompactionRetry {
+    /// Retry once the log again holds at least this many records.
+    at_records: u64,
+    /// Retry once the log again reaches at least this many bytes.
+    at_bytes: u64,
 }
 
 /// A recorded operation outcome, served to idempotent replays.
@@ -221,8 +240,10 @@ pub struct Journal {
     /// Terminal operations in terminal-order (oldest first), for bounded
     /// eviction at compaction.
     terminal_order: VecDeque<OperationId>,
-    /// Fingerprints of recently evicted terminal operations (oldest first).
-    tombstones: VecDeque<u64>,
+    /// Fingerprints of recently evicted terminal operations (oldest first),
+    /// paired with an O(1) membership index. Each fingerprint appears at most
+    /// once; see [`TombstoneRing`].
+    tombstones: TombstoneRing,
     /// Total operations evicted by compaction (diagnostic).
     evicted_operations: u64,
     next_sequence: u64,
@@ -241,10 +262,19 @@ pub struct Journal {
     /// Number of successful compactions (diagnostic).
     compactions: u64,
     /// Number of failed compaction attempts (diagnostic; a failed attempt
-    /// never fails the already-fsynced append and is retried next time).
+    /// never fails the already-fsynced append and is retried after bounded
+    /// new growth).
     compaction_failures: u64,
     /// Last compaction failure detail, if any (diagnostic).
     last_compaction_error: Option<String>,
+    /// Consecutive failed compaction attempts since the last success. Drives
+    /// the exponential retry backoff (`2^streak`, capped by
+    /// [`MAX_COMPACTION_RETRY_SHIFT`]); reset to zero on success.
+    compaction_failure_streak: u32,
+    /// Growth gate for retrying a failed compaction, or `None` when no
+    /// failure is pending. A persistently failing compaction is not attempted
+    /// on every append; the log must grow by the recorded amount first.
+    compaction_retry: Option<CompactionRetry>,
     /// Record count immediately after the last applied compaction. Used with
     /// [`MIN_COMPACTION_RECORD_GROWTH`] to prevent a below-snapshot record
     /// threshold from compacting on every append.
@@ -278,7 +308,9 @@ pub struct Journal {
 struct Replayed {
     operations: HashMap<OperationId, OperationState>,
     terminal_order: VecDeque<OperationId>,
-    tombstones: VecDeque<u64>,
+    /// Ordered eviction ring plus its O(1) membership index, replayed from a
+    /// snapshot and extended by bounded replay evictions.
+    tombstones: TombstoneRing,
     /// The subset of [`Replayed::tombstones`] that came from a durable
     /// compaction [`Snapshot`].
     ///
@@ -450,6 +482,8 @@ impl Journal {
             compactions: 0,
             compaction_failures: 0,
             last_compaction_error: None,
+            compaction_failure_streak: 0,
+            compaction_retry: None,
             last_compaction_records: 0,
             last_compaction_bytes: 0,
             dir_sync_pending: false,
@@ -780,10 +814,12 @@ impl Journal {
     /// Whether `operation_id` was evicted within the retained tombstone
     /// window. A collision (different id, same 64-bit fingerprint) also
     /// answers `true`; the caller must fail closed either way.
+    ///
+    /// This is an O(1) membership test against [`TombstoneRing`]'s index, not
+    /// a scan of the ring (which may hold `max_tombstones` entries).
     #[must_use]
     pub fn is_tombstoned(&self, operation_id: &OperationId) -> bool {
-        let wanted = fingerprint(operation_id);
-        self.tombstones.iter().any(|stored| *stored == wanted)
+        self.tombstones.contains(fingerprint(operation_id))
     }
 
     /// Pin `operation_id` against compaction eviction (idempotency re-drive
@@ -817,6 +853,19 @@ impl Journal {
     fn should_compact(&self) -> bool {
         if !self.compaction_enabled {
             return false;
+        }
+        // A failed compaction must not be retried on every append: the same
+        // threshold remains crossed (and `compactions == 0` still bypasses
+        // the post-success growth floor), so without this gate an ENOSPC or
+        // unopenable compaction target would re-clone and re-serialize the
+        // whole registry under the writer lock after every record. Wait for
+        // bounded new growth first; a transient failure therefore recovers
+        // automatically, and the first attempt after the threshold was
+        // crossed is still immediate (no retry is pending yet).
+        if let Some(retry) = self.compaction_retry {
+            if self.record_count < retry.at_records && self.log_bytes < retry.at_bytes {
+                return false;
+            }
         }
         // Before the first compaction, honor the configured thresholds
         // exactly: a pre-existing oversized log must compact immediately.
@@ -934,6 +983,10 @@ impl Journal {
             )));
         }
         self.compactions = self.compactions.saturating_add(1);
+        // A successful attempt ends the failure streak, so a later unrelated
+        // failure starts its backoff from the prompt-retry step again.
+        self.compaction_failure_streak = 0;
+        self.compaction_retry = None;
         Ok(())
     }
 
@@ -973,13 +1026,32 @@ impl Journal {
             .map_err(io_err("failed to fsync journal directory after compaction"))
     }
 
-    /// Record a compaction failure and return the matching typed error.
+    /// Record a compaction failure, arm the bounded retry backoff and return
+    /// the matching typed error.
     fn record_compaction_failure(&mut self, detail: impl Into<String>) -> ApiError {
         let detail = detail.into();
         self.compaction_failures = self.compaction_failures.saturating_add(1);
         self.last_compaction_error = Some(detail.clone());
+        // The first failure retries after one record (so unblocking the
+        // target and performing the next append still recovers promptly), the
+        // next after two, then four, ... capped at 64 records or 64 MiB.
+        // Measuring growth from the current counters also survives a failed
+        // attempt that applied its snapshot before a directory-fsync failure
+        // reset those counters.
+        let shift = self
+            .compaction_failure_streak
+            .min(MAX_COMPACTION_RETRY_SHIFT);
+        let record_growth = 1u64 << shift;
+        let byte_growth = MIN_COMPACTION_BYTE_GROWTH.saturating_mul(record_growth);
+        self.compaction_failure_streak = self.compaction_failure_streak.saturating_add(1);
+        self.compaction_retry = Some(CompactionRetry {
+            at_records: self.record_count.saturating_add(record_growth),
+            at_bytes: self.log_bytes.saturating_add(byte_growth),
+        });
         tracing::warn!(
             compaction_failures = self.compaction_failures,
+            retry_at_records = self.compaction_retry.map(|retry| retry.at_records),
+            retry_at_bytes = self.compaction_retry.map(|retry| retry.at_bytes),
             detail = %detail,
             "journal compaction failed; the log is not being bounded"
         );
@@ -1105,7 +1177,7 @@ impl Journal {
         terminal.extend(unordered);
 
         let mut tombstones = self.tombstones.clone();
-        trim_tombstones(&mut tombstones, keep_tombstones);
+        tombstones.trim(keep_tombstones);
         let mut evicted = 0u64;
         let mut over = terminal.len().saturating_sub(keep_operations);
         if over > 0 {
@@ -1118,7 +1190,7 @@ impl Journal {
             while let Some(id) = terminal.pop_front() {
                 if over > 0 && !self.pinned_operations.contains_key(&id) {
                     operations.remove(&id);
-                    push_tombstone(&mut tombstones, fingerprint(&id), keep_tombstones);
+                    tombstones.push(fingerprint(&id), keep_tombstones);
                     evicted = evicted.saturating_add(1);
                     over -= 1;
                 } else {
@@ -1311,7 +1383,7 @@ struct CompactionPlan {
     snapshot: Snapshot,
     operations: HashMap<OperationId, OperationState>,
     terminal_order: VecDeque<OperationId>,
-    tombstones: VecDeque<u64>,
+    tombstones: TombstoneRing,
     evicted: u64,
 }
 
@@ -1325,17 +1397,87 @@ fn fingerprint(operation_id: &OperationId) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn push_tombstone(tombstones: &mut VecDeque<u64>, value: u64, capacity: usize) {
-    if capacity == 0 {
-        return;
-    }
-    tombstones.push_back(value);
-    trim_tombstones(tombstones, capacity);
+/// Bounded, oldest-first ring of evicted-operation fingerprints plus an O(1)
+/// membership index.
+///
+/// The ring (`order`) is what compaction serializes, so its order is the
+/// durable retention window. The index mirrors the ring so
+/// [`Journal::is_tombstoned`] never scans up to `max_tombstones` entries on a
+/// first-seen append or on every replayed record. Each fingerprint appears at
+/// most once: re-inserting an existing fingerprint refreshes it to the newest
+/// position, because the newest eviction is what the window must retain. That
+/// keeps both structures consistent when an operation is re-admitted after a
+/// provisional replay eviction and later evicted again.
+#[derive(Clone, Debug, Default)]
+struct TombstoneRing {
+    /// Fingerprints in eviction order, oldest first; the serialized order.
+    order: VecDeque<u64>,
+    /// Exactly the values in `order` (set membership is O(1)).
+    index: HashSet<u64>,
 }
 
-fn trim_tombstones(tombstones: &mut VecDeque<u64>, capacity: usize) {
-    while tombstones.len() > capacity {
-        tombstones.pop_front();
+impl TombstoneRing {
+    /// Build a ring from oldest-first fingerprints, applying `capacity` with
+    /// the same refresh-on-duplicate semantics as [`TombstoneRing::push`].
+    fn from_oldest_first(values: impl IntoIterator<Item = u64>, capacity: usize) -> Self {
+        let mut ring = Self::default();
+        for value in values {
+            ring.push(value, capacity);
+        }
+        ring
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn contains(&self, value: u64) -> bool {
+        self.index.contains(&value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &u64> {
+        self.order.iter()
+    }
+
+    /// Insert/fingerprint-refresh at the newest position, then trim to
+    /// `capacity`. A zero capacity retains nothing.
+    fn push(&mut self, value: u64, capacity: usize) {
+        if capacity == 0 {
+            return;
+        }
+        if self.index.contains(&value) {
+            if let Some(position) = self.order.iter().position(|stored| *stored == value) {
+                self.order.remove(position);
+            }
+        }
+        self.order.push_back(value);
+        self.index.insert(value);
+        self.trim(capacity);
+    }
+
+    /// Drop a fingerprint from both structures (runtime re-admission after a
+    /// provisional replay-window eviction). Returns whether it was present.
+    fn remove(&mut self, value: u64) -> bool {
+        if !self.index.remove(&value) {
+            return false;
+        }
+        if let Some(position) = self.order.iter().position(|stored| *stored == value) {
+            self.order.remove(position);
+        }
+        true
+    }
+
+    /// Keep only the newest `capacity` fingerprints.
+    fn trim(&mut self, capacity: usize) {
+        while self.order.len() > capacity {
+            if let Some(value) = self.order.pop_front() {
+                self.index.remove(&value);
+            }
+        }
     }
 }
 
@@ -1407,7 +1549,7 @@ fn replay(
     let mut replayed = Replayed {
         operations: HashMap::new(),
         terminal_order: VecDeque::new(),
-        tombstones: VecDeque::new(),
+        tombstones: TombstoneRing::default(),
         snapshot_tombstones: HashSet::new(),
         evicted_operations: 0,
         next_sequence: 1,
@@ -1499,7 +1641,7 @@ fn apply_record(
         JournalRecord::Intent(intent) => {
             if !replayed.operations.contains_key(&intent.operation_id) {
                 let fp = fingerprint(&intent.operation_id);
-                if replayed.tombstones.contains(&fp) {
+                if replayed.tombstones.contains(fp) {
                     if replayed.snapshot_tombstones.contains(&fp) {
                         return Err(ApiError::new(
                             ApiErrorCode::Internal,
@@ -1522,7 +1664,7 @@ fn apply_record(
                     // executed again. Durable snapshot tombstones are never
                     // cleared by this path (a collision that hits one is a
                     // fail-closed refusal).
-                    replayed.tombstones.retain(|stored| *stored != fp);
+                    replayed.tombstones.remove(fp);
                 }
             }
             let entry = replayed.operations.entry(intent.operation_id).or_default();
@@ -1533,7 +1675,7 @@ fn apply_record(
         JournalRecord::Outcome(outcome) => {
             if !replayed.operations.contains_key(&outcome.operation_id) {
                 let fp = fingerprint(&outcome.operation_id);
-                if replayed.tombstones.contains(&fp) {
+                if replayed.tombstones.contains(fp) {
                     if replayed.snapshot_tombstones.contains(&fp) {
                         return Err(ApiError::new(
                             ApiErrorCode::Internal,
@@ -1558,7 +1700,7 @@ fn apply_record(
                     // different provisional entry, which may then be admitted
                     // again and re-executed. Durable snapshot tombstones are
                     // never cleared.
-                    replayed.tombstones.retain(|stored| *stored != fp);
+                    replayed.tombstones.remove(fp);
                 }
             }
             let entry = replayed
@@ -1603,11 +1745,9 @@ fn apply_record(
                 break;
             };
             replayed.operations.remove(&id);
-            push_tombstone(
-                &mut replayed.tombstones,
-                fingerprint(&id),
-                retention.max_tombstones,
-            );
+            replayed
+                .tombstones
+                .push(fingerprint(&id), retention.max_tombstones);
             replayed.evicted_operations = replayed.evicted_operations.saturating_add(1);
             replayed.evicted_during_replay = true;
         }
@@ -1624,9 +1764,11 @@ fn apply_snapshot(
 ) -> Result<(), ApiError> {
     replayed.operations.clear();
     replayed.terminal_order.clear();
-    replayed.tombstones = snapshot.tombstones.into();
-    // Keep the newest fingerprints if the configured ring shrank.
-    trim_tombstones(&mut replayed.tombstones, retention.max_tombstones);
+    // Build the order + index together, keeping the newest fingerprints if
+    // the configured ring shrank and deduplicating any legacy snapshot that
+    // stored the same fingerprint twice.
+    replayed.tombstones =
+        TombstoneRing::from_oldest_first(snapshot.tombstones, retention.max_tombstones);
     replayed.snapshot_tombstones = replayed.tombstones.iter().copied().collect();
     replayed.evicted_operations = snapshot.evicted_operations;
 
@@ -2323,6 +2465,266 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_ring_deduplicates_duplicate_insertions_and_refreshes_their_position() {
+        let mut ring = TombstoneRing::default();
+        ring.push(7, 3);
+        ring.push(8, 3);
+        // A duplicate occupies exactly one slot and becomes the newest entry:
+        // the ring's order and its index must agree after every operation.
+        ring.push(7, 3);
+        assert_eq!(ring.len(), 2, "a duplicate must not consume two slots");
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![8, 7]);
+        assert!(ring.contains(7));
+        assert!(ring.contains(8));
+
+        ring.push(9, 3);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![8, 7, 9]);
+        // Inserting the oldest entry again refreshes it, so the current
+        // oldest (8) is the one evicted by the next new fingerprint.
+        ring.push(7, 3);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![8, 9, 7]);
+        ring.push(10, 3);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![9, 7, 10]);
+        assert!(!ring.contains(8));
+        assert!(ring.contains(9));
+        assert!(ring.contains(7));
+        assert!(ring.contains(10));
+        let unique: HashSet<u64> = ring.iter().copied().collect();
+        assert_eq!(unique.len(), ring.len(), "the ring stays duplicate-free");
+    }
+
+    #[test]
+    fn tombstone_ring_reinsertion_after_eviction_restores_only_the_newest_window() {
+        let mut ring = TombstoneRing::default();
+        ring.push(1, 2);
+        ring.push(2, 2);
+        ring.push(3, 2);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![2, 3]);
+        assert!(!ring.contains(1));
+
+        ring.push(1, 2);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![3, 1]);
+        assert!(!ring.contains(2));
+        assert!(ring.contains(1));
+        assert!(ring.contains(3));
+
+        // A trim below the current length drops from the oldest side and
+        // removes exactly the evicted values from the index too.
+        ring.trim(1);
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert!(!ring.contains(3));
+        assert!(ring.contains(1));
+        assert!(ring.remove(1));
+        assert!(!ring.remove(1));
+        assert!(ring.is_empty());
+        assert_eq!(ring.index.len(), 0);
+    }
+
+    #[test]
+    fn tombstone_membership_is_consistent_across_a_snapshot_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<OperationId> = (0..6)
+            .map(|n| op_id(&format!("op-roundtrip-{n}")))
+            .collect();
+        let retention = JournalRetention {
+            max_retained_operations: 1,
+            max_tombstones: 8,
+            max_log_records: 1_000,
+            max_log_bytes: None,
+        };
+        let mut journal = Journal::open_with_retention(dir.path(), retention).expect("open");
+        for (index, id) in ids.iter().enumerate() {
+            complete(
+                &mut journal,
+                id,
+                [u8::try_from(index + 1).expect("small"); 32],
+                serde_json::json!({"n": index}),
+            );
+        }
+        journal.compact().expect("compact");
+
+        let before: Vec<bool> = ids.iter().map(|id| journal.is_tombstoned(id)).collect();
+        assert_eq!(
+            before,
+            vec![true, true, true, true, true, false],
+            "only the newest terminal operation survives the window"
+        );
+        assert_eq!(
+            journal.tombstone_count(),
+            before.iter().filter(|present| **present).count(),
+            "is_tombstoned and the ring size agree"
+        );
+        let serialized: Vec<u64> = journal.tombstones.iter().copied().collect();
+        let unique: HashSet<u64> = serialized.iter().copied().collect();
+        assert_eq!(
+            serialized.len(),
+            unique.len(),
+            "the snapshot ring is unique"
+        );
+
+        drop(journal);
+        let reopened =
+            Journal::open_with_retention(dir.path(), retention).expect("snapshot reopen");
+        let after: Vec<bool> = ids.iter().map(|id| reopened.is_tombstoned(id)).collect();
+        assert_eq!(after, before, "snapshot restore rebuilds the index exactly");
+        assert_eq!(
+            reopened.tombstones.iter().copied().collect::<Vec<_>>(),
+            serialized,
+            "the oldest-first snapshot order round-trips unchanged"
+        );
+        assert_eq!(
+            reopened.tombstone_count(),
+            unique.len(),
+            "a restart does not introduce duplicate ring entries"
+        );
+        assert_eq!(
+            reopened.tombstones.index, unique,
+            "the membership index is rebuilt from the snapshot ring"
+        );
+    }
+
+    #[test]
+    fn a_legacy_snapshot_with_duplicate_tombstones_restores_a_unique_ring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = op_id("op-legacy-tombstone-a");
+        let b = op_id("op-legacy-tombstone-b");
+        let c = op_id("op-legacy-tombstone-c");
+        let absent = op_id("op-legacy-tombstone-absent");
+        let (fa, fb, fc) = (fingerprint(&a), fingerprint(&b), fingerprint(&c));
+        // A snapshot from a legacy/older producer with the same fingerprint
+        // twice. The duplicate is the newest entry, so restore must refresh it
+        // to the newest position rather than retaining two copies.
+        let snapshot = Envelope {
+            record_version: RECORD_VERSION,
+            record: JournalRecord::Snapshot(Snapshot {
+                operations: Vec::new(),
+                tombstones: vec![fa, fb, fc, fb],
+                evicted_operations: 3,
+            }),
+        };
+        let payload = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        std::fs::write(
+            dir.path().join(JOURNAL_LOG_FILE),
+            frame::encode(1, &payload).expect("encode snapshot"),
+        )
+        .expect("write snapshot log");
+
+        let retention = JournalRetention {
+            max_retained_operations: 8,
+            max_tombstones: 8,
+            max_log_records: 1_000_000,
+            max_log_bytes: None,
+        };
+        let journal =
+            Journal::open_with_retention(dir.path(), retention).expect("snapshot reopens");
+
+        let order: Vec<u64> = journal.tombstones.iter().copied().collect();
+        assert_eq!(
+            order,
+            vec![fa, fc, fb],
+            "the duplicate's newest occurrence wins"
+        );
+        assert_eq!(journal.tombstone_count(), 3);
+        let unique: HashSet<u64> = order.iter().copied().collect();
+        assert_eq!(order.len(), unique.len(), "restore deduplicated the ring");
+        assert_eq!(
+            journal.tombstones.index, unique,
+            "the index equals the serialized order set"
+        );
+        for id in [&a, &b, &c] {
+            assert!(
+                journal.is_tombstoned(id),
+                "a remaining fingerprint must not be lost: {}",
+                id.as_str()
+            );
+        }
+        assert!(!journal.is_tombstoned(&absent));
+    }
+
+    #[test]
+    fn is_tombstoned_matches_a_brute_force_reference_over_a_deterministic_sequence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+        let ids: Vec<OperationId> = (0..64)
+            .map(|index| op_id(&format!("op-random-tombstone-{index:02}")))
+            .collect();
+        // A deterministic LCG; the test must not depend on HashMap order or
+        // any randomness source.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut reference: VecDeque<u64> = VecDeque::new();
+        let mut capacity = 17usize;
+        let id_count = u64::try_from(ids.len()).expect("small id set");
+
+        for step in 0..2_000u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let id = &ids[usize::try_from(state % id_count).expect("fits usize")];
+            match (state >> 32) % 5 {
+                0 | 1 => {
+                    let fp = fingerprint(id);
+                    if let Some(position) = reference.iter().position(|stored| *stored == fp) {
+                        reference.remove(position);
+                    }
+                    reference.push_back(fp);
+                    while reference.len() > capacity {
+                        reference.pop_front();
+                    }
+                    journal.tombstones.push(fp, capacity);
+                }
+                2 => {
+                    let fp = fingerprint(id);
+                    if let Some(position) = reference.iter().position(|stored| *stored == fp) {
+                        reference.remove(position);
+                    }
+                    journal.tombstones.remove(fp);
+                }
+                3 => {
+                    capacity = usize::try_from((state >> 16) % 23).expect("fits usize") + 1;
+                    while reference.len() > capacity {
+                        reference.pop_front();
+                    }
+                    journal.tombstones.trim(capacity);
+                }
+                _ => {
+                    // Re-inserting a value already present exercises the
+                    // duplicate-refresh path (the reference applies the same
+                    // newest-position semantics).
+                    let fp = fingerprint(id);
+                    if let Some(position) = reference.iter().position(|stored| *stored == fp) {
+                        reference.remove(position);
+                    }
+                    reference.push_back(fp);
+                    while reference.len() > capacity {
+                        reference.pop_front();
+                    }
+                    journal.tombstones.push(fp, capacity);
+                }
+            }
+
+            let actual: Vec<u64> = journal.tombstones.iter().copied().collect();
+            let expected: Vec<u64> = reference.iter().copied().collect();
+            assert_eq!(actual, expected, "ring order diverged at step {step}");
+            assert_eq!(
+                journal.tombstones.index.len(),
+                expected.len(),
+                "index size diverged at step {step}"
+            );
+            for candidate in &ids {
+                let expected_member = reference
+                    .iter()
+                    .any(|stored| *stored == fingerprint(candidate));
+                assert_eq!(
+                    journal.is_tombstoned(candidate),
+                    expected_member,
+                    "is_tombstoned diverged at step {step} for {}",
+                    candidate.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bounded_replay_evicts_and_compacts_before_serving() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ids: Vec<OperationId> = (1..=6).map(|n| op_id(&format!("op-replay-{n}"))).collect();
@@ -2511,6 +2913,83 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(journal.compactions() >= 1, "the next attempt succeeds");
+    }
+
+    #[test]
+    fn a_persistently_failing_compaction_backs_off_and_recovers_after_growth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal =
+            Journal::open_with_retention(dir.path(), tight_retention()).expect("open");
+        std::fs::create_dir(dir.path().join("journal.log.compact")).expect("block compaction");
+
+        // The first threshold crossing is attempted immediately: one failure,
+        // not a silent delay until the backoff has elapsed.
+        complete(
+            &mut journal,
+            &op_id("op-backoff-one"),
+            [1; 32],
+            serde_json::json!({}),
+        );
+        complete(
+            &mut journal,
+            &op_id("op-backoff-two"),
+            [2; 32],
+            serde_json::json!({}),
+        );
+        assert_eq!(journal.compaction_failures(), 1);
+        assert_eq!(journal.compactions(), 0);
+
+        // Keep the target blocked for many completed operations (512
+        // appends). The retry gate must turn a would-be attempt per append
+        // into O(log n) attempts: 1, 2, 4, ... 64 records of growth.
+        for index in 0..256 {
+            complete(
+                &mut journal,
+                &op_id(&format!("op-backoff-blocked-{index:03}")),
+                [u8::try_from(index % 251).expect("small"); 32],
+                serde_json::json!({}),
+            );
+        }
+        let failures = journal.compaction_failures();
+        assert!(
+            failures > 1,
+            "a persistent failure must still be retried automatically"
+        );
+        assert!(
+            failures <= 20,
+            "512 appends must cause far fewer than one attempt each: {failures}"
+        );
+        assert!(
+            failures * 10 < 512,
+            "the attempt count must be bounded well below one per append: {failures}"
+        );
+        assert!(journal.last_compaction_error().is_some());
+        assert_eq!(journal.compactions(), 0);
+        // No failed compaction may fail or hide the already-durable append.
+        assert!(journal.lookup(&op_id("op-backoff-blocked-255")).is_some());
+
+        // Unblock without restarting. The capped backoff is at most 64
+        // records, so this growth crosses the pending retry threshold and the
+        // scheduled compaction succeeds.
+        std::fs::remove_dir(dir.path().join("journal.log.compact")).expect("unblock");
+        for index in 0..64 {
+            complete(
+                &mut journal,
+                &op_id(&format!("op-backoff-recovered-{index:03}")),
+                [u8::try_from(index % 251).expect("small"); 32],
+                serde_json::json!({}),
+            );
+        }
+        assert!(
+            journal.compactions() >= 1,
+            "compaction must recover without a restart (failures={failures}, last={:?})",
+            journal.last_compaction_error()
+        );
+        assert_eq!(
+            journal.compaction_failures(),
+            failures,
+            "a recovered compaction adds no new failure"
+        );
     }
 
     #[test]

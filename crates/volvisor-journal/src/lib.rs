@@ -54,17 +54,22 @@
 //! bounds: compaction evicts the oldest unpinned terminal operations and then
 //! shortens the tombstone ring until the encoded snapshot fits. In-flight and
 //! pinned operations are never evicted; if they alone exceed the frame limit,
-//! compaction fails closed and the next append retries. After a successful
-//! compaction the record and byte triggers require meaningful new growth
-//! before firing again, so a threshold below the snapshot's own size cannot
-//! rewrite it on every append.
+//! compaction fails closed and a later append retries after bounded new
+//! growth. After a successful compaction the record and byte triggers require
+//! meaningful new growth before firing again, so a threshold below the
+//! snapshot's own size cannot rewrite it on every append. A persistently
+//! failing compaction uses the same idea: the first failure retries after one
+//! record (so unblocking the target recovers promptly), then after 2, 4, ...
+//! records or MiB, capped at 64, so it is never attempted on every append.
 //!
 //! A retry of an operation evicted within the tombstone window returns
 //! `OPERATION_EXPIRED` (HTTP 410) instead of re-executing a possibly
-//! completed mutation. An operation evicted beyond the ring is
-//! indistinguishable from a new one; size the ring above the client retry
-//! horizon. An operation currently executing is pinned against eviction so a
-//! re-drive cannot lose its replacement outcome.
+//! completed mutation. The window is an ordered ring with a matching O(1)
+//! membership index, so first-seen appends and replay do not scan it. An
+//! operation evicted beyond the ring is indistinguishable from a new one;
+//! size the ring above the client retry horizon. An operation currently
+//! executing is pinned against eviction so a re-drive cannot lose its
+//! replacement outcome.
 //!
 //! [`Journal::open_with_records`] (the witness registry) folds the complete
 //! record history and therefore refuses a compacted journal instead of

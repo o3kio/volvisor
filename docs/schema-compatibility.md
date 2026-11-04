@@ -133,7 +133,10 @@ retention can therefore be lower than configured, but compaction always makes
 progress. In-flight intents and pinned operations are never evicted; if they
 alone exceed one frame, compaction fails closed (the failure **count** is
 exposed on `/metrics`; the detail is in the daemon log and
-`Journal::last_compaction_error`, and the next append retries). The witness registry
+`Journal::last_compaction_error`). A failed compaction is retried after bounded
+new growth — immediately after one record for the first failure, then with an
+exponential backoff capped at 64 records or 64 MiB of new log — so a
+persistently failing target is not re-serialized on every append. The witness registry
 folds the complete record history and therefore opts out of compaction: it
 refuses a compacted journal with a typed error rather than deriving authority
 state from a truncated prefix. `journal-v2-n1.log` is a version-1 log from
