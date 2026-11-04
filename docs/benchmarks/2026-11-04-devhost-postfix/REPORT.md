@@ -275,8 +275,8 @@ Both soaks recorded **0 attach errors and 0 attachment conflicts**; the
 operation mix is nearly identical (both ≈50 % inspect, ≈24 % list, ≈6.7 % each
 attach/report/detach), so the +351.1 % operation delta is a throughput/latency
 change, not a different acceptance mix: the pre-fix soak ran at 801.656 ops/s
-with p95 16.804 ms, the post-fix soak at 3616.49 ops/s with p95 3.410 ms
-(4.51×), consistent with the pre-fix run rewriting a growing 2.5 MB
+with p95 16.804 ms, the post-fix soak at 3616.49 ops/s (4.51× the ops/s) with
+p95 3.410 ms, consistent with the pre-fix run rewriting a growing 2.5 MB
 provider-state file per mutation. The comparison tool reports raw counts and
 per-minute normalisation; it does not apply a fixed-dataset correction. The
 sweep rows are the cleaner comparison, and their shape is unchanged: c8
