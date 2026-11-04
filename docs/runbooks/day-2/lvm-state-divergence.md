@@ -127,9 +127,11 @@ Four cross-cutting rules:
 ## A. Detect
 
 A failed persist surfaces as an `INTERNAL` 500 whose detail names the state
-path/temp-file write (since `a8c23d6`, `failed to write .../.volvisor-*`; the
-legacy `<state>.tmp` may still appear during upgrades), the failed
-rename/fsync, or an injected test fault. Look for the mutation's own wording:
+path/temp-file write (since `a8c23d6`, `failed to create .../.volvisor-*` for
+a temp-create failure and `failed to write .../.volvisor-*` for a write
+failure; the legacy `<state>.tmp` may still appear during upgrades), the
+failed rename/fsync, or an injected test fault. Look for the mutation's own
+wording:
 
 - create intent: `the create intent ... could not be made durable`
 - create command outcome unknown (runner error): `the lvcreate outcome is unknown`

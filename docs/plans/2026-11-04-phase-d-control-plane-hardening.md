@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path design (implementation staged)
+### D3 — #62 write-path hardening (slice 1 delivered; slice 2 next)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -176,13 +176,16 @@ options:
   drop in slice 1, and the failure-keep branches that rely on it are
   unchanged. Two intermediate temp shapes were never released:
   `f0e5237`'s `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s
-  lexical-path-hash namespace (orphaned by the canonical-identity hash
-  change). The final sweep recognizes neither, so both are
-  development-only leftovers that need manual removal. All existing
-  suites pass; two failure-injection rigs were
-  re-mechanized onto the injected `AfterTmpWrite` consult because unique
-  temp names removed the fixed `.tmp` path they used to block (see the
-  slice-1 acceptance note). Physical save counts are unchanged. **No
+  lexical-path-hash namespace. For an already-canonical spelling (the
+  common case) the final sweep still recognizes and removes the latter;
+  only a leftover created through a non-canonical spelling (symlink, `./`
+  or `..`) is orphaned by the canonical-identity hash change. The
+  `f0e5237` shape is genuinely never recognized. Those unrecognized
+  leftovers need manual removal. All existing suites pass; two
+  failure-injection rigs were re-mechanized onto the injected `AfterTmpWrite`
+  consult because unique temp names removed the fixed `.tmp` path they used
+  to block (see the slice-1 acceptance note). Physical save counts are
+  unchanged. **No
   throughput claim from slice 1.**
 - **Slice 2 is the release-the-lock change.** Attach/detach/report capture
   `(sequence, encoded bytes, snapshot)` under the lock, release it, and
@@ -238,7 +241,11 @@ the attach fencing contract. None is a shortcut for this slice.
   classification. Per-save `canonicalize()` calls remain inside the locked
   region; slice 2 inherits that note. A pathological state file named like
   its own temp is theoretically self-swept (a 2^-64 fixed point) but is
-  not practically reachable.
+  not practically reachable. The symlink test assumes a symlink-capable
+  `TMPDIR` and panics (not skips) where the filesystem refuses symlinks
+  (for example some FAT/NFS mounts); `d5.sh` Part B was not live-drilled at
+  this SHA in this environment, so its `.volvisor-` message assertion is
+  code-derived until the next drill.
 - Slice 2: deterministic tests for covered-failure success only when the
   durable file proves it; no resurrection after an error (the journal's
   terminal-replay rule); leader-kill wake-all; quiesced align on an
@@ -278,10 +285,10 @@ keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
 2. **D2 (read posture) — delivered.** Self-contained, tests and docs updated.
 3. **D5 (ledger) — delivered.**
 4. **D3 slice 1 (single-writer funnel) — delivered** (`f0e5237`,
-   `a8c23d6`, `a068947`). Semantic no-op: callers still hold the provider
-   state lock across every save; no coalescing; no wire/schema/durability
-   change; no throughput claim; all existing suites green and physical save
-   counts unchanged.
+   `a8c23d6`, `a068947`, `913c347`). Semantic no-op: callers still hold the
+   provider state lock across every save; no coalescing; no
+   wire/schema/durability change; no throughput claim; all existing suites
+   green and physical save counts unchanged.
 5. **D3 slice 2 (release the lock) — next.** The only batch that may claim a
    throughput change, and only with the new clean-tree measurement. #62 stays
    open until both land.

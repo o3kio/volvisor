@@ -185,8 +185,9 @@ This addendum records the Phase D batch delivered on branch `phase-a-scaling`
 after the Phase C addendum. It follows the
 [Phase D plan](../plans/2026-11-04-phase-d-control-plane-hardening.md).
 **It changes no gate verdict below.** Every item is logging, authentication
-posture, documentation or a staged design; none is a production-support,
-SLA, capacity, durability or hardware claim.
+posture, documentation or staged write-path hardening (slice 1 landed, no
+concurrency change); none is a production-support, SLA, capacity, durability
+or hardware claim.
 
 - **D1 — log volume (#64 residual).** The pre-dispatch `accepting <op>` lines
   and the successful provider-completion line moved from INFO to DEBUG; the
@@ -207,15 +208,22 @@ SLA, capacity, durability or hardware claim.
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
 - **D3 — #62 write path (slice 1 landed).** Slice 1 code is in the tree:
-  the single durable-writer funnel (`f0e5237`), the bounded,
-  canonical-path-hashed temp namespace plus startup sweep (`a8c23d6`), and
-  the per-state-path in-process writer gate (`a068947`). This is a semantic
-  no-op: callers still hold the provider state lock across every save, there
-  is no coalescing, no wire/schema/durability change, and **no throughput
-  claim**. The earlier post-fix c32 −4.1 % / c128 −2.6 % measurement
-  predates slice 1 and is not evidence for it. **#62 remains open**: slice 2
-  (release the lock) and a new clean-tree benchmark at the implementation
-  SHA are not done, so no gate verdict changes.
+  the single durable-writer funnel and initial startup sweep (`f0e5237`);
+  the bounded hashed temp namespace, hardened sweep and per-state-path
+  in-process writer gate (`a8c23d6`); canonical-path keying of the temp-name
+  hash (`a068947`); and test/doc-only evidence tightening (`913c347`). The
+  `a8c23d6` hash was lexical, so `a068947` is what makes a
+  symlink/`./`/`..` spelling share its predecessor's temp namespace. This is
+  a semantic no-op: callers still hold the provider state lock across every
+  save, there is no coalescing, no wire/schema/durability change, and **no
+  throughput claim**. The earlier
+  post-fix c32 −4.1 % / c128 −2.6 % measurement predates slice 1 and is not
+  evidence for it. **#62 remains open**: slice 2 (release the lock) and a new
+  clean-tree benchmark at the implementation SHA are not done, so no gate
+  verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
+  not re-drilled at this SHA here, so its `.volvisor-` message assertion is
+  code-derived until the next drill, and the symlink test panics rather than
+  skips where the temp filesystem refuses symlinks.
 - **D4 — ADR-0012.** Still `Proposed`; accepting it remains an authority
   decision, not an implementation task.
 

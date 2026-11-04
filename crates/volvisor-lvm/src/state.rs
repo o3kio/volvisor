@@ -43,10 +43,13 @@
 //!
 //! Two intermediate temp shapes were never released: `f0e5237`'s
 //! `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s lexical-path-hash
-//! namespace. The canonical-identity hash change orphans the latter, and
-//! the final sweep recognizes neither, so both are development-only
-//! leftovers that need manual removal. Do not broaden the sweep to accept
-//! either shape.
+//! namespace. For an already-canonical spelling (the common case) the
+//! final sweep still recognizes and removes the `a8c23d6` leftovers; only
+//! one created through a non-canonical spelling (symlink, `./` or `..`)
+//! is orphaned by the canonical-identity hash change. The `f0e5237` shape
+//! is genuinely never recognized. Those unrecognized leftovers need manual
+//! removal; do not broaden the sweep to add the `f0e5237` shape or the
+//! orphaned non-canonical `a8c23d6` spelling.
 //!
 //! This sweep is not cross-process writer exclusion. Cross-process
 //! exclusion is the journal flock; two daemons must not alias one state
@@ -1730,6 +1733,60 @@ mod tests {
     }
 
     #[test]
+    fn future_mtime_temp_is_never_swept() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let future = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+        let foreign_pid = u64::from(std::process::id()) + 1;
+        let hashed = temp_path_for(&path, foreign_pid, 1);
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&hashed, b"future foreign temp").expect("future hashed temp");
+        fs::write(&legacy, b"future legacy temp").expect("future legacy temp");
+        for candidate in [&hashed, &legacy] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(candidate)
+                .expect("open future temp")
+                .set_times(FileTimes::new().set_modified(future))
+                .expect("set future mtime");
+        }
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "a future mtime fails duration_since, so the sweep leaves it alone"
+        );
+        assert!(hashed.exists(), "a future hashed temp is never swept");
+        assert!(legacy.exists(), "a future legacy temp is never swept");
+    }
+
+    #[test]
+    fn same_pid_future_temp_is_still_swept() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let temp = temp_path_for(&path, u64::from(std::process::id()), 1);
+        fs::write(&temp, b"future same-pid temp").expect("future same-pid temp");
+        let future = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .expect("open future same-pid temp")
+            .set_times(FileTimes::new().set_modified(future))
+            .expect("set future mtime");
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            1,
+            "same-pid is pid reuse and is swept regardless of age"
+        );
+        assert!(!temp.exists(), "the future same-pid temp is swept");
+    }
+
+    #[test]
     fn fresh_legacy_temp_survives_a_sweep() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
@@ -1899,6 +1956,11 @@ mod tests {
         let missing_parent = dir.path().join("missing");
         let path = missing_parent.join("state.json");
         let mut state = sample_state();
+        let entries_before: BTreeSet<PathBuf> = fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
 
         let error = state
             .save_with_hooks(&path, Some(&StoreCrashHooks::new()))
@@ -1918,8 +1980,17 @@ mod tests {
             "the failed create must not create the parent or leave a temp there"
         );
         assert!(
-            stale_temp_paths(&path).is_empty(),
-            "the pre-create failure leaves no temp candidate for cleanup to remove"
+            !path.exists(),
+            "the failed create must not leave a state file"
+        );
+        let entries_after: BTreeSet<PathBuf> = fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            entries_after, entries_before,
+            "the failed temp create must leave no residue in the state parent"
         );
     }
 
