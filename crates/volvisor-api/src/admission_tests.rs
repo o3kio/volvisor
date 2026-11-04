@@ -29,7 +29,7 @@ use volvisor_types::request::{
 use volvisor_types::{ApiError, CapabilitySet, ProjectId, VolumeId};
 
 use crate::auth::{Credential, Role};
-use crate::{ApiConfig, AppState, SharedState, router_with_config};
+use crate::{ApiConfig, AppState, RouteTimeouts, SharedState, router_with_config};
 
 const ADMIN_TOKEN: &str = "admission-admin-token";
 const READER_A_TOKEN: &str = "admission-reader-a-token";
@@ -48,6 +48,7 @@ struct ControlledProvider {
     inner: FakeProvider,
     list: ListBehavior,
     create_delay: Duration,
+    inspect_delay: Duration,
     entered: Arc<Notify>,
 }
 
@@ -57,6 +58,7 @@ impl ControlledProvider {
             inner: FakeProvider::new(),
             list: ListBehavior::Normal,
             create_delay: Duration::ZERO,
+            inspect_delay: Duration::ZERO,
             entered: Arc::new(Notify::new()),
         }
     }
@@ -80,6 +82,21 @@ impl ControlledProvider {
             create_delay: delay,
             ..Self::new()
         }
+    }
+
+    fn with_list_and_inspect_delay(delay: Duration) -> Self {
+        Self {
+            list: ListBehavior::Delay(delay),
+            inspect_delay: delay,
+            ..Self::new()
+        }
+    }
+
+    async fn seed_volume(&self, id: &str) {
+        self.inner
+            .create_volume(&fixture_create_request(id, GIB))
+            .await
+            .expect("seed volume");
     }
 }
 
@@ -108,6 +125,9 @@ impl VolumeProvider for ControlledProvider {
     }
 
     async fn inspect_volume(&self, id: &VolumeId) -> Result<InspectVolumeResponse, ApiError> {
+        if !self.inspect_delay.is_zero() {
+            tokio::time::sleep(self.inspect_delay).await;
+        }
         self.inner.inspect_volume(id).await
     }
 
@@ -290,6 +310,51 @@ async fn head_request_is_bounded_like_get() {
 }
 
 #[tokio::test]
+async fn per_route_override_bounds_only_its_matched_path() {
+    // Both read routes are deliberately slower than the short list bound.
+    // The list route's override must fire while the inspect route, with a
+    // longer explicit bound, completes — the override is keyed by matched
+    // path, not global.
+    let provider = Arc::new(ControlledProvider::with_list_and_inspect_delay(
+        Duration::from_millis(250),
+    ));
+    provider.seed_volume("vol-bounded").await;
+    let (state, _dir) = setup(provider);
+    let config = ApiConfig {
+        read_timeout: Duration::from_secs(30),
+        route_timeouts: RouteTimeouts {
+            list_volumes: Some(Duration::from_millis(40)),
+            inspect_volume: Some(Duration::from_secs(5)),
+            ..RouteTimeouts::default()
+        },
+        ..base_config(1 << 20)
+    };
+    let app = router_with_config(state, &config);
+
+    let (status, _headers, body) =
+        send(&app, request(Method::GET, "/v2/volumes", ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
+    let message = body["message"].as_str().expect("typed message");
+    assert!(
+        message.contains("/v2/volumes") && message.contains("40ms"),
+        "the timeout names the route and the effective limit: {message}"
+    );
+
+    let (status, _headers, body) = send(
+        &app,
+        request(Method::GET, "/v2/volumes/vol-bounded", ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the inspect route has its own longer bound: {body}"
+    );
+    assert_eq!(body["volume_id"], json!("vol-bounded"));
+}
+
+#[tokio::test]
 async fn a_timed_out_read_releases_its_concurrency_permit() {
     // The read timeout drops the handler future; the permit guard must drop
     // with it, or the default cap would leak one slot per timeout until every
@@ -326,8 +391,15 @@ async fn journaled_mutation_is_not_aborted_by_the_read_timeout() {
         Duration::from_millis(120),
     ));
     let (state, _dir) = setup(provider);
+    // The tiny bound is set both as the default and as an override for the
+    // very matched path (`/v2/volumes`) the POST uses: even then, a
+    // mutating method must remain unbounded.
     let config = ApiConfig {
         read_timeout: Duration::from_millis(20),
+        route_timeouts: RouteTimeouts {
+            list_volumes: Some(Duration::from_millis(20)),
+            ..RouteTimeouts::default()
+        },
         ..base_config(1 << 20)
     };
     let app = router_with_config(state.clone(), &config);
@@ -518,6 +590,41 @@ async fn credential_denials_are_charged_to_the_anonymous_bucket() {
     let (legit, _headers, _body) =
         send(&app, request(Method::GET, "/v2/volumes", READER_A_TOKEN)).await;
     assert_eq!(legit, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_denials_are_charged_even_though_the_route_bypasses_admission() {
+    // `/metrics` is exempt from the concurrency cap and the post-auth rate
+    // limiter, but it still requires read auth when credentials are scoped.
+    // It must not become an unthrottled token oracle: the admission handle
+    // is installed before the exempt fast path so denials are charged.
+    let provider = Arc::new(ControlledProvider::new());
+    let (state, _dir) = setup_scoped(provider);
+    let config = ApiConfig {
+        rate_limit_per_second: 1,
+        rate_limit_burst: 1,
+        ..base_config(1 << 20)
+    };
+    let app = router_with_config(state, &config);
+
+    let (first, _headers, first_body) =
+        send(&app, request(Method::GET, "/metrics", "wrong-token")).await;
+    assert_eq!(first, StatusCode::UNAUTHORIZED, "{first_body}");
+
+    let (second, _headers, second_body) =
+        send(&app, request(Method::GET, "/metrics", "wrong-token")).await;
+    assert_eq!(
+        second,
+        StatusCode::TOO_MANY_REQUESTS,
+        "an exempt route must still charge credential denials: {second_body}"
+    );
+    assert_eq!(second_body["code"], json!("RATE_LIMITED"));
+
+    // The probes have no auth requirement, so they keep answering while the
+    // anonymous bucket is exhausted (liveness is not locked out).
+    let (health, _headers, _body) =
+        send(&app, request(Method::GET, "/healthz", "wrong-token")).await;
+    assert_eq!(health, StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------

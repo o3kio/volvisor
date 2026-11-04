@@ -29,10 +29,14 @@
 //!
 //! ## Audit
 //!
-//! Every request (except a successful liveness probe) produces one structured
-//! `kind = "audit"` event carrying the resolved principal and role, method,
-//! matched route, status/outcome and — when the operation reached the journal
-//! pipeline — its `operation_id`. Tokens are never included.
+//! Every request that completes the authorization layer (except a successful
+//! liveness probe) produces one structured `kind = "audit"` event carrying the
+//! resolved principal and role, method, matched route, status/outcome and —
+//! when the operation reached the journal pipeline — its `operation_id`.
+//! Tokens are never included. A read-only request cut by the admission timeout
+//! is dropped before the audit layer completes; it performs no mutation and is
+//! visible in the HTTP metrics (and the timeout warning log), not as an audit
+//! event.
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;

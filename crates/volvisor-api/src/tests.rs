@@ -15,13 +15,14 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use volvisor_journal::Journal;
+use volvisor_journal::{Journal, JournalRetention};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_create_request_in_project,
@@ -3489,6 +3490,10 @@ struct FakeHandoffSurface {
     targets: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
     /// Every replica verification the surface saw (assertion input).
     target_checks: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
+    /// Optional latency injected into the two read-only observation
+    /// seams (`handoff_eligibility` and `verify_target_replica`), used
+    /// by the admission-timeout tests to hold a bounded POST route.
+    observation_delay: std::sync::Mutex<Option<Duration>>,
 }
 
 impl FakeHandoffSurface {
@@ -3499,6 +3504,19 @@ impl FakeHandoffSurface {
             cleared: std::sync::Mutex::new(Vec::new()),
             targets: std::sync::Mutex::new(Vec::new()),
             target_checks: std::sync::Mutex::new(Vec::new()),
+            observation_delay: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Make both read-only observation seams sleep before answering.
+    fn set_observation_delay(&self, delay: Duration) {
+        *self.observation_delay.lock().expect("observation delay") = Some(delay);
+    }
+
+    async fn observe(&self) {
+        let delay = *self.observation_delay.lock().expect("observation delay");
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -3554,6 +3572,7 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         &self,
         vm_id: &str,
     ) -> Result<volvisor_provider::EligibilityReport, ApiError> {
+        self.observe().await;
         self.eligibility
             .lock()
             .expect("eligibility")
@@ -3646,6 +3665,7 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         volume_id: &volvisor_types::VolumeId,
         _expected_lineage: &[String],
     ) -> Result<(), ApiError> {
+        self.observe().await;
         self.target_checks
             .lock()
             .expect("target checks")
@@ -3718,6 +3738,38 @@ async fn check_mobility_reads_the_handoff_surface() {
     );
     // Read-only: no journal record for an eligibility answer.
     assert_eq!(journal_record_count(&state), 0);
+}
+
+#[tokio::test]
+async fn check_mobility_post_is_bounded_by_the_read_timeout() {
+    // `check-mobility` is a read-only POST: it must be bounded like a
+    // GET even though its method is `POST`, or a hung provider pins the
+    // connection indefinitely. This drives the real router/middleware.
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    handoff.set_observation_delay(Duration::from_millis(250));
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned())).with_handoff(handoff),
+    );
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(40),
+        ..ApiConfig::default()
+    };
+    let app = router_with_config(state, &config);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/vms/vm-c-1/check-mobility",
+            &json!({"target_host": "dst-host"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
 }
 
 /// The clear-cut-marker request body (no fencing proof — sufficient
@@ -4871,6 +4923,37 @@ async fn peer_verify_lineage_re_runs_the_replica_gate_read_only() {
         before,
         "the observation journals nothing"
     );
+}
+
+#[tokio::test]
+async fn verify_lineage_post_is_bounded_by_the_read_timeout() {
+    // The barrier-time lineage re-check is another read-only POST: a
+    // hung target-replica observation must be cut with the typed
+    // `504 REQUEST_TIMEOUT`, not held open indefinitely.
+    let kit = setup_peer();
+    kit.handoff
+        .set_observation_delay(Duration::from_millis(250));
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(40),
+        ..ApiConfig::default()
+    };
+    let app = router_with_config(kit.state.clone(), &config);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/verify-lineage",
+            &json!({
+                "migration_id": "mig-vl-timeout",
+                "volume_ids": ["vol-vl1"],
+                "expected_lineages": [["fake-lineage-vol-vl1"]],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
 }
 
 #[tokio::test]
@@ -6768,4 +6851,89 @@ fn crash_hooks_default_to_inert_and_fire_only_when_armed() {
     hooks.clear();
     hooks.consult(OP_CREATE_VOLUME, CrashPoint::BeforeOutcome);
     assert_eq!(fired.load(Ordering::SeqCst), 1, "cleared entries are inert");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #64: OPERATION_EXPIRED over the real HTTP surface
+// ---------------------------------------------------------------------------
+
+/// An operation evicted by the bounded journal retention window answers the
+/// typed `410 OPERATION_EXPIRED` and is never re-executed. This pins the
+/// end-to-end contract: `append_intent`'s fail-closed refusal propagates
+/// through [`ops::execute`] without falling through to the provider.
+#[tokio::test]
+async fn an_expired_operation_answers_410_and_is_never_re_executed() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open_with_retention(
+        dir.path(),
+        JournalRetention {
+            max_retained_operations: 1,
+            max_tombstones: 8,
+            max_log_records: 1_000,
+            max_log_bytes: None,
+        },
+    )
+    .expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let state = Arc::new(AppState::new(
+        provider,
+        Some(admin),
+        journal,
+        Some(TEST_TOKEN.to_owned()),
+    ));
+    let app = app(&state);
+
+    let first = serde_json::to_value(fixture_create_request("vol-expired-1", GIB))
+        .expect("serialize create fixture");
+    let (first_status, _) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &first)).await;
+    assert!(first_status.is_success(), "{first_status}");
+
+    // A second completed operation crosses the retention bound and evicts
+    // the first one from the registry (into the tombstone ring).
+    let second = serde_json::to_value(fixture_create_request("vol-expired-2", GIB))
+        .expect("serialize create fixture");
+    let (second_status, _) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &second)).await;
+    assert!(second_status.is_success(), "{second_status}");
+
+    // A retry of the evicted operation is a typed terminal refusal.
+    let (status, body) = send_json(&app, json_request(Method::POST, "/v2/volumes", &first)).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "OPERATION_EXPIRED");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retention window")),
+        "{body}"
+    );
+
+    // Exactly the two original creates executed; the refused retry never
+    // reached the provider.
+    let metrics = state.metrics.render();
+    assert!(
+        metrics.contains("operations_total{kind=\"create_volume\",outcome=\"success\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("operations_total{kind=\"create_volume\",outcome=\"expired\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("journal_append_failures_total{kind=\"create_volume\",stage=\"intent\"}"),
+        "an expired operation is a retention refusal, not a journal I/O failure: {metrics}"
+    );
+
+    // The pipeline's eviction pin is released on every exit path, including
+    // this fail-closed refusal.
+    assert_eq!(
+        state
+            .journal
+            .lock()
+            .expect("journal lock")
+            .pinned_operations(),
+        0,
+        "no operation may stay pinned after a request completes"
+    );
 }

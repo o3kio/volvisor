@@ -5,9 +5,12 @@
 //!
 //! A bounded request timeout must never silently abort journaled work. This
 //! module therefore bounds only **read-only** routes with a wall-clock
-//! timeout. Journaled mutations (every `POST`/`DELETE` that reaches
-//! [`crate::ops::execute`]) are admitted under the global concurrency cap
-//! and then run to completion inside the request: no execution timeout is
+//! timeout. Read-only is a property of the route, not the HTTP method: the
+//! read-only `POST /v2/vms/{vm_id}/check-mobility` and
+//! `POST /v2/internal/peer/verify-lineage` are bounded like `GET`/`HEAD`,
+//! while every journaled mutation (every `POST`/`DELETE` that reaches
+//! [`crate::ops::execute`]) is admitted under the global concurrency cap
+//! and then runs to completion inside the request: no execution timeout is
 //! imposed, because dropping the future after the journal intent would
 //! abandon a provider act whose outcome the journal has not recorded.
 //!
@@ -27,9 +30,11 @@
 //!    principal is resolved;
 //! 5. the body limit and the handler.
 //!
-//! `/healthz`, `/v2/healthz` and `/metrics` bypass both the concurrency cap
-//! and the rate limiter so probes and monitoring stay available while the
-//! server sheds load.
+//! `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass
+//! both the concurrency cap and the rate limiter so probes and monitoring
+//! stay available while the server sheds load. Their authentication denials
+//! still charge the anonymous rate-limit bucket (the `Admission` extension
+//! is installed before the exempt fast path).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -112,16 +117,28 @@ fn is_exempt(route: &str) -> bool {
 }
 
 /// The route's bound, if it is read-only. Journaled mutations deliberately
-/// return `None` (see the module docs).
+/// return `None` (see the module docs). A configured per-route override
+/// wins; any other read-only route falls back to the default
+/// [`ApiConfig::read_timeout`].
 fn read_timeout(config: &ApiConfig, route: &str, method: &Method) -> Option<Duration> {
     if is_exempt(route) {
         return None;
     }
-    if *method == Method::GET
-        || *method == Method::HEAD
-        || route == "/v2/vms/{vm_id}/check-mobility"
-    {
-        Some(config.read_timeout)
+    // Bound by route **and** method: the two read-only POSTs are
+    // observations, but any future journaled method registered on the
+    // same path must stay unbounded.
+    let read_only_post = *method == Method::POST
+        && matches!(
+            route,
+            "/v2/vms/{vm_id}/check-mobility" | "/v2/internal/peer/verify-lineage"
+        );
+    if *method == Method::GET || *method == Method::HEAD || read_only_post {
+        Some(
+            config
+                .route_timeouts
+                .override_for(route)
+                .unwrap_or(config.read_timeout),
+        )
     } else {
         None
     }
@@ -148,6 +165,13 @@ pub(crate) async fn guard(
     next: Next,
 ) -> Response {
     let route = route_of(&request);
+    let mut request = request;
+    // Install the admission handle before the exempt fast path: the
+    // authentication middleware uses it to charge a rejected credential to
+    // the anonymous bucket, and `/metrics` requires read auth when scoped
+    // credentials exist. Skipping this would leave that route as an
+    // unthrottled token oracle.
+    request.extensions_mut().insert(admission.clone());
     if is_exempt(&route) {
         return next.run(request).await;
     }
@@ -164,21 +188,26 @@ pub(crate) async fn guard(
     };
 
     let method = request.method().clone();
-    let mut request = request;
     request
         .extensions_mut()
         .insert(ListLimit(admission.inner.config.max_list_limit));
-    // The authentication middleware runs inside this layer and charges the
-    // anonymous bucket on a denial. It reaches the same limiter through this
-    // extension instead of duplicating the admission state.
-    request.extensions_mut().insert(admission.clone());
     let body = match read_timeout(&admission.inner.config, &route, &method) {
         Some(limit) => match tokio::time::timeout(limit, next.run(request)).await {
             Ok(response) => response,
-            Err(_elapsed) => error_response(&ApiError::new(
-                ApiErrorCode::RequestTimeout,
-                format!("read-only route {route} exceeded its {limit:?} timeout"),
-            )),
+            Err(_elapsed) => {
+                // No audit event can be emitted here: the timed-out future
+                // owns the authorization/audit layer and is dropped. Leave a
+                // structured warning so the incident is at least visible.
+                tracing::warn!(
+                    route = %route,
+                    limit = ?limit,
+                    "read-only request exceeded its admission timeout"
+                );
+                error_response(&ApiError::new(
+                    ApiErrorCode::RequestTimeout,
+                    format!("read-only route {route} exceeded its {limit:?} timeout"),
+                ))
+            }
         },
         None => next.run(request).await,
     };
@@ -314,6 +343,69 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_route_override_is_selected_and_the_default_applies_elsewhere() {
+        let config = ApiConfig {
+            read_timeout: Duration::from_secs(30),
+            route_timeouts: crate::config::RouteTimeouts {
+                list_volumes: Some(Duration::from_secs(2)),
+                check_mobility: Some(Duration::from_secs(7)),
+                verify_lineage: Some(Duration::from_secs(9)),
+                ..crate::config::RouteTimeouts::default()
+            },
+            ..ApiConfig::default()
+        };
+
+        assert_eq!(
+            read_timeout(&config, "/v2/volumes", &Method::GET),
+            Some(Duration::from_secs(2)),
+            "the matched-path override wins over the default"
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/vms/{vm_id}/check-mobility", &Method::POST),
+            Some(Duration::from_secs(7)),
+            "the read-only POST check-mobility route is overridable"
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/internal/peer/verify-lineage", &Method::POST),
+            Some(Duration::from_secs(9)),
+            "the read-only POST verify-lineage route is bounded and overridable"
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/capabilities", &Method::GET),
+            Some(Duration::from_secs(30)),
+            "a read-only route without an override falls back to the default"
+        );
+
+        // The same matched path is unbounded for a mutating method: the
+        // override must never leak onto the journaled operation.
+        assert_eq!(read_timeout(&config, "/v2/volumes", &Method::POST), None);
+        assert_eq!(
+            read_timeout(&config, "/v2/volumes/{volume_id}", &Method::DELETE),
+            None
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/vms/{vm_id}/check-mobility", &Method::GET),
+            Some(Duration::from_secs(7)),
+            "a GET on the path is still a read"
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/vms/{vm_id}/check-mobility", &Method::DELETE),
+            None,
+            "only the read-only POST is bounded, never a future mutation on the path"
+        );
+        assert_eq!(
+            read_timeout(&config, "/v2/internal/peer/verify-lineage", &Method::PUT),
+            None,
+            "only the read-only POST is bounded, never a future mutation on the path"
+        );
+        assert_eq!(
+            read_timeout(&config, "/healthz", &Method::GET),
+            None,
+            "exempt probes stay unbounded"
+        );
+    }
 
     #[test]
     fn disabled_rate_limiter_admits_everything() {

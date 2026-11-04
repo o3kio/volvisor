@@ -54,6 +54,10 @@ async fn journal_snapshot_off_worker(state: &SharedState) -> JournalSnapshot {
         Err(_) => JournalSnapshot {
             records: None,
             log_bytes: None,
+            compactions: None,
+            compaction_failures: None,
+            retained_operations: None,
+            tombstones: None,
             open: false,
         },
     }

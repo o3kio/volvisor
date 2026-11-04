@@ -324,9 +324,10 @@ Common errors:
 `STALE_GENERATION`, `WRITER_ALREADY_ACTIVE`, `UNKNOWN_FENCING_AUTHORITY`,
 `REPLICA_NOT_DURABLE`, `MIGRATION_UNSUPPORTED_LOCAL_STORAGE`,
 `MOVE_UNSUPPORTED_SCOPE`, `VMM_HANDOFF_UNSUPPORTED`, `OPERATION_IN_DOUBT`,
-`UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`, `RATE_LIMITED`, `OVERLOADED`, `REQUEST_TIMEOUT`, `PAYLOAD_TOO_LARGE`.
+`OPERATION_EXPIRED`, `UNSAFE_DATA_LOSS`, `CEPH_CLUSTER_UNHEALTHY`,
+`RATE_LIMITED`, `OVERLOADED`, `REQUEST_TIMEOUT`, `PAYLOAD_TOO_LARGE`.
 
-Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID. Operation ids and attachment ids carrying the reserved `derived:` prefix are refused typed before any journal write: the prefix is the engine's derived-identity namespace, unreachable from the consumer surface. The refusal is enforced at the routes whose surfaces key on these ids (operation ids on every mutating route; attachment ids on the attach route, whose provider keys attach idempotency by attachment id); other acceptors of an attachment id (the detach route's lookup key) fail closed at the provider.
+Mutations are idempotent by `operation_id` + exact immutable request hash. Reuse with different payload is conflict. Must be replay-safe after journaled intent, operation and response persistence; unknown commit outcome is an observable retriable state, not implicit retry with a new ID. The journal is bounded: a retry whose operation was evicted by retention answers `OPERATION_EXPIRED` (HTTP 410) instead of re-executing a possibly-completed mutation; the client must confirm the prior effect with a read and submit a new `operation_id`. Retention evicts the oldest terminal operations beyond the configured window, so an operation evicted past the retained fingerprint ring is indistinguishable from a new one; operators size that window above the client retry horizon. Operation ids and attachment ids carrying the reserved `derived:` prefix are refused typed before any journal write: the prefix is the engine's derived-identity namespace, unreachable from the consumer surface. The refusal is enforced at the routes whose surfaces key on these ids (operation ids on every mutating route; attachment ids on the attach route, whose provider keys attach idempotency by attachment id); other acceptors of an attachment id (the detach route's lookup key) fail closed at the provider.
 
 ## 8. Backend extension and security
 
@@ -460,8 +461,9 @@ Admission refusals use the common error shape and are **not journaled**:
 they occur before the handler reaches the journal, so they are safe to
 retry.
 
-The global concurrency cap, the single read timeout and the body limit are
-enabled by default. Per-principal rate limiting is **opt-in and disabled by
+The global concurrency cap, the read-only timeouts (a fallback plus
+optional per-route overrides) and the body limit are enabled by default.
+Per-principal rate limiting is **opt-in and disabled by
 default**, so an unmodified deployment's success path is unchanged; an
 operator enables it explicitly with a non-zero
 `admission.rate_limit_per_second` and burst.
@@ -474,9 +476,13 @@ operator enables it explicitly with a non-zero
 - `503 OVERLOADED` — the global in-flight concurrency cap stayed exhausted
   for the admission wait window. Carries `Retry-After` (seconds).
 - `504 REQUEST_TIMEOUT` — a **read-only** route exceeded its bounded
-  timeout. One configurable `read_timeout_secs` applies uniformly to every
-  read-only route; there are no distinct per-route timeout values. Journaled
-  mutations are deliberately not wrapped in this timeout.
+  timeout. `admission.read_timeout_secs` is the fallback for every read-only
+  route; optional `[admission.route_timeouts]` entries override it per
+  matched path (unknown or out-of-range keys are refused at startup). A
+  read-only route without an override keeps the fallback, so the default
+  behavior is uniform. Journaled mutations are deliberately not wrapped in
+  this timeout, even when a mutating method shares a matched path with an
+  overridden read route.
 - `413 PAYLOAD_TOO_LARGE` — the request body exceeded `max_body_bytes`.
   Enforced while reading, so a streamed/chunked body without
   `Content-Length` is bounded too; rejected before parsing and before any
@@ -522,7 +528,9 @@ wall-clock timeout only to read-only routes; it never drops a journaled
 mutation's future after the intent, because that would abandon an act whose
 outcome is not recorded. A client retry uses the **same `operation_id`** and
 byte-identical body: the journal replays a recorded outcome or answers
-`OPERATION_IN_DOUBT`. A client-side timeout or disconnect does not create
+`OPERATION_IN_DOUBT`; a retry whose operation fell outside the bounded
+retention window answers `OPERATION_EXPIRED` and is never re-executed. A
+client-side timeout or disconnect does not create
 server-side resumability. A resumable operation handle remains explicitly
 unimplemented; this section records the synchronous model instead of
 pretending otherwise.
