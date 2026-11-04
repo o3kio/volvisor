@@ -210,6 +210,12 @@ record after it. After the #58 fix, an uncommitted final save is compensated
 with a checked `lvremove` and the in-memory entry is rolled back. Six
 outcomes are possible, so still inspect before assuming anything:
 
+The two-save ordering postdates the D5 re-drill (`1863a7a`, PR #69), which
+exercised the single-save compensated path. On current code a fill-first
+ENOSPC surfaces at the **intent** save (no LV is ever created); the
+compensated final-save path below is covered by deterministic tests on
+current code, not by that drill.
+
 - **Intent-save failure (before `lvcreate`):** 500, old state byte-identical,
   GET 404, and **no LV was created**. If the intent save's rename did land,
   the durable intent is left for startup, which observes no intent-owned LV

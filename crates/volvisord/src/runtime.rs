@@ -390,7 +390,7 @@ fn spawn_move_retry_task(
 /// [`spawn_move_retry_task`]). Every outcome is a structured event,
 /// never a crash: a completed relocation, a re-drive, a durable
 /// COPYING roll, an `IN_DOUBT` park (warned — it wants an operator's
-/// eye), a terminal resolution (the rollback proof or a provably absent
+/// eye), a terminal resolution (the rollback proof or a verifiably absent
 /// LV), a dropped record, an unobservable world, a failed pass (typed)
 /// and a failed pass task (the join error) are all logged and retried on
 /// the next tick.
@@ -422,7 +422,8 @@ fn log_move_pass(
                     volume_id = %volume_id,
                     "PREPARING move could not be re-driven this pass (a foreign pvmove \
                      on the source, an unobservable scan, a record with no usable \
-                     source/target, or a start failure); retried next tick"
+                     source/target, a record changed under the lock, no durable anchor, \
+                     or a start failure); retried next tick"
                 );
             }
             for volume_id in &report.marked_copying {

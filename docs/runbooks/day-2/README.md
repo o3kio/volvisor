@@ -17,7 +17,9 @@ identical to merged `1863a7a` (PR #69). That re-drill covers the normal
 uncommitted-save state-ENOSPC path and re-confirms the journal path on the same
 single host; the
 cleanup-failure, carve-out, clear-save and unreadable-durable-reread tails were
-not fault-injected and remain test-covered. Bundle:
+not fault-injected and remain test-covered; the drill also predates #70's
+two-save create, so its compensated final-save path is test-covered on current
+code rather than drilled. Bundle:
 [`docs/evidence/day2/2026-11-03-d5-redrill/`](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 
 This page is the index. Each area page states **DRILLED**, **PARTIAL** or

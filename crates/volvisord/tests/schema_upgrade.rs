@@ -39,6 +39,9 @@ fn fixture_text(name: &str) -> &'static str {
         "lvm-state-v1-n1.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json")
         }
+        "lvm-state-v2-n1.json" => {
+            include_str!("../../../tests/fixtures/schema/lvm-state-v2-n1.json")
+        }
         "lvm-state-v1-tombstones.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v1-tombstones.json")
         }
@@ -304,6 +307,40 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
             .expect("preparation after upgrade")
             .grant_attempt,
         1
+    );
+}
+
+/// The v1-stamped N-1 file (the last released shape before schema v2)
+/// loads through the same store path and upgrades on its first write.
+/// The pre-versioning fixture above covers the older population; this
+/// pins the labelled N-1 boundary the compatibility matrix names.
+#[test]
+fn a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write(
+        dir.path(),
+        "lvm-state.json",
+        fixture_text("lvm-state-v2-n1.json").as_bytes(),
+    );
+    let mut state = LvmState::load(&path).expect("v1-stamped N-1 loads");
+    let id = volume_id("vol-upgrade-n1");
+    assert_eq!(
+        state
+            .volume(&id)
+            .expect("v1 volume preserved")
+            .entry
+            .generation,
+        7
+    );
+    assert_eq!(
+        state.move_record(&id).expect("v1 move record").state,
+        MoveVolumeBackingState::InDoubt
+    );
+    state.save(&path).expect("upgrade on write");
+    let text = fs::read_to_string(&path).expect("read upgraded state");
+    assert!(
+        text.contains("\"schema_version\": 2"),
+        "the first save stamps schema v2: {text}"
     );
 }
 

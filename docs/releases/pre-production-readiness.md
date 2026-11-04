@@ -153,7 +153,10 @@ report mapping every gate to evidence. Current status:
    by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
    `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
    `940722e`; the cleanup-failure, carve-out, clear-save and unreadable-reread
-   branches remain test-covered, not drilled. [#70](https://github.com/o3kio/volvisor/issues/70)
+   branches remain test-covered, not drilled, and the drill predates #70's
+   two-save create (a fill-first fault now hits the intent save; the
+   compensated final-save path is test-covered on current code).
+   [#70](https://github.com/o3kio/volvisor/issues/70)
    (grow/delete/move persist divergence, the kill-9 `lvcreate`→persist orphan
    window, and a real post-rename directory-fsync fault seam) is implemented
    and deterministically test-covered in this change (the runbook's status line

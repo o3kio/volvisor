@@ -158,7 +158,7 @@ current struct.
 | `tests/fixtures/schema/lvm-state-v1-n1.json` | LVM | `a8c0254` (consumer reporting, before retired ids) | attachment state/revision/generation, `vmm_disk_id`, evidence, move record |
 | `tests/fixtures/schema/lvm-state-v1-n2.json` | LVM N-2 | `fafb62e` (initial P1 format) | absent `requested_size_bytes` backfills from `size_bytes`; pre-P6 fields default |
 | `tests/fixtures/schema/lvm-state-v1-tombstones.json` | LVM | `c00bc3e` (tombstones, before version field) | `retired_attachment_ids` preserved |
-| `tests/fixtures/schema/lvm-state-v2-n1.json` | LVM v1 (N-1 for v2) | last released v1 shape, written by the pre-#70 binary at `ee739bc` from the `a8c0254` fixture | v1 attachment state/revision/evidence, move record, and empty intent maps; upgrade-on-write stamps v2 |
+| `tests/fixtures/schema/lvm-state-v2-n1.json` | LVM v1 (N-1 for v2) | last released v1 shape, written by the pre-#70 binary at `ee739bc` from the `a8c0254` fixture | v1 attachment state/revision/evidence, move record, and empty intent maps; upgrade-on-write stamps v2 (covered by the `volvisor-lvm` unit test and the daemon-store e2e `a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write`) |
 | `tests/fixtures/schema/ceph-state-v1-n1.json` | Ceph N-1 | `ab9cedd` (before `vmm_disk_id`) | attachment mapping, absent disk id is `None` |
 | `tests/fixtures/schema/drbd-state-v1-n1.json` | DRBD N-1 | `f686531` (before `vmm_disk_id`) | authority block, migration-cut marker, counters |
 | `tests/fixtures/schema/drbd-state-v1-n2.json` | DRBD N-2 | `97e6841` (initial P3 format) | defaulted authority/fence/migration/disk id |

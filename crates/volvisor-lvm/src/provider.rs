@@ -281,11 +281,11 @@ pub struct MoveReconcileReport {
     /// whose world verifiably shows the pre-move placement (the
     /// relocation did not happen; the source intact and serving).
     pub resolved_failed: Vec<VolumeId>,
-    /// Records resolved `FAILED` because the LV is **provably absent**
+    /// Records resolved `FAILED` because the LV is **verifiably absent**
     /// (a successful `lvs` query has no row for it). The move can never
     /// complete and no `pvmove` can be active; the settled record stops
-    /// fencing delete, and the volume pass marks the absent LV `Failed`
-    /// at the next startup.
+    /// fencing delete, and the volume is marked `Failed` in the same
+    /// durable save.
     pub resolved_absent: Vec<VolumeId>,
     /// Records parked `IN_DOUBT` at the unobservable-LV bound: the
     /// world could not be observed for `MOVE_OBSERVE_FAILURE_BOUND`
@@ -297,9 +297,12 @@ pub struct MoveReconcileReport {
     /// PREPARING records whose re-drive did not start this pass: the
     /// foreign-move scan could not clear the source (an out-of-band
     /// `pvmove` is active there, or the world could not be observed),
-    /// the record has no usable source/target, or the `pvmove` start
-    /// itself failed. The record stays PREPARING and is retried on the
-    /// next tick; surfaced so a persistent failure is not silent.
+    /// the record has no usable source/target, the record changed or
+    /// was superseded under the lock, no **durable** anchor exists
+    /// (memory-only, or the durable file could not be re-read), or the
+    /// `pvmove` start itself failed. The record stays PREPARING and is
+    /// retried on the next tick; surfaced so a persistent failure is
+    /// not silent.
     pub redrive_failed: Vec<VolumeId>,
     /// Records dropped (their volume no longer exists).
     pub dropped: Vec<VolumeId>,
@@ -1593,28 +1596,36 @@ impl LvmProvider {
             block_size,
             creation_payload: payload.to_owned(),
         };
-        state.insert_create_intent(req.volume_id.clone(), intent);
+        state.insert_create_intent(req.volume_id.clone(), intent.clone());
         if let Err(save_error) = self.persist(state) {
             state.remove_create_intent(&req.volume_id);
-            // Classify the failed save: the rename may have landed
-            // before the error (the post-rename carve-out), in which
-            // case the intent IS durable. No LV was created either
-            // way; startup observes the absent intent-owned LV and
-            // drops the stale intent.
-            let intent_durable = LvmState::load(&self.state_path)
-                .is_ok_and(|durable| durable.create_intent(&req.volume_id).is_some());
-            let note = if intent_durable {
-                format!(
+            // Classify the failed save in three ways: the rename may
+            // have landed (the post-rename carve-out), it may provably
+            // not have landed, or the re-read may itself fail. Never
+            // report a clean "not saved" (or drop the possibly-durable
+            // intent from memory) when the durable file could not be
+            // read. No LV was created on any path; startup observes no
+            // intent-owned LV and drops the intent.
+            let note = match LvmState::load(&self.state_path) {
+                Ok(durable) if durable.create_intent(&req.volume_id).is_some() => format!(
                     "the durable state did record the create intent for volume {}, but no LV \
                      was created; startup recovery observes no intent-owned LV and drops it",
                     req.volume_id
-                )
-            } else {
-                format!(
+                ),
+                Ok(_) => format!(
                     "the create intent for volume {} could not be made durable, so no LV was \
                      created",
                     req.volume_id
-                )
+                ),
+                Err(load_error) => {
+                    state.insert_create_intent(req.volume_id.clone(), intent);
+                    format!(
+                        "the create intent for volume {} could not be verified after the \
+                         failed save ({load_error}); treat it as possibly durable — no LV was \
+                         created, and startup recovery observes no intent-owned LV and drops it",
+                        req.volume_id
+                    )
+                }
             };
             return Err(ApiError::new(
                 save_error.code,
@@ -2031,6 +2042,45 @@ impl LvmProvider {
         }
     }
 
+    /// Classify a failed durable grow-intent save and never misreport it.
+    ///
+    /// The rename may have landed (the intent is durable), may provably
+    /// not have, or the re-read may itself fail. Never report a clean
+    /// "not saved" (or drop a possibly-durable intent) when the durable
+    /// file could not be read. No grow was attempted on any path, so
+    /// startup observes the LV still at its from-size and drops the
+    /// intent.
+    fn grow_intent_save_failure(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        grow_intent: GrowIntent,
+        save_error: &ApiError,
+    ) -> ApiError {
+        state.remove_grow_intent(volume_id);
+        let note = match LvmState::load(&self.state_path) {
+            Ok(durable) if durable.grow_intent(volume_id).is_some() => format!(
+                "the durable state did record the grow intent for volume {volume_id}, but no \
+                 grow was attempted; startup recovery observes the LV at its from-size and \
+                 drops the intent"
+            ),
+            Ok(_) => format!(
+                "the grow intent for volume {volume_id} could not be made durable, so no grow \
+                 was attempted"
+            ),
+            Err(load_error) => {
+                state.insert_grow_intent(volume_id.clone(), grow_intent);
+                format!(
+                    "the grow intent for volume {volume_id} could not be verified after the \
+                     failed save ({load_error}); treat it as possibly durable — no grow was \
+                     attempted, and startup recovery observes the LV at its from-size and \
+                     drops the intent"
+                )
+            }
+        };
+        ApiError::new(save_error.code, format!("{}; {note}", save_error.detail))
+    }
+
     /// Execute a grow that already passed the request/intent checks.
     ///
     /// Validates capacity (extent-rounded demand plus headroom), then
@@ -2075,38 +2125,19 @@ impl LvmProvider {
             // Durable-first: persist the intent before `lvextend`, so a
             // crash between the CLI's success and the volume-record
             // commit rolls the grow forward on restart.
-            state.insert_grow_intent(
-                volume_id.clone(),
-                GrowIntent {
-                    operation_id: req.operation_id.clone(),
-                    from_size_bytes: current_size,
-                    requested_size_bytes: req.new_size_bytes,
-                    expected_generation: current_generation,
-                },
-            );
+            let grow_intent = GrowIntent {
+                operation_id: req.operation_id.clone(),
+                from_size_bytes: current_size,
+                requested_size_bytes: req.new_size_bytes,
+                expected_generation: current_generation,
+            };
+            state.insert_grow_intent(volume_id.clone(), grow_intent.clone());
             if let Err(save_error) = self.persist(state) {
-                state.remove_grow_intent(volume_id);
-                // The rename may have landed before the error (the
-                // post-rename carve-out), so the intent may be
-                // durable even though this call did not grow. Startup
-                // observes the LV still at its from-size and drops it.
-                let intent_durable = LvmState::load(&self.state_path)
-                    .is_ok_and(|durable| durable.grow_intent(volume_id).is_some());
-                let note = if intent_durable {
-                    format!(
-                        "the durable state did record the grow intent for volume {volume_id}, \
-                         but no grow was attempted; startup recovery observes the LV at its \
-                         from-size and drops the intent"
-                    )
-                } else {
-                    format!(
-                        "the grow intent for volume {volume_id} could not be made durable, so \
-                         no grow was attempted"
-                    )
-                };
-                return Err(ApiError::new(
-                    save_error.code,
-                    format!("{}; {note}", save_error.detail),
+                return Err(self.grow_intent_save_failure(
+                    state,
+                    volume_id,
+                    grow_intent,
+                    &save_error,
                 ));
             }
         }
@@ -2886,7 +2917,7 @@ impl LvmProvider {
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
         let verification = match self.observe_lv(vg_name, lv_name) {
             Ok(Some(verification)) => verification,
-            // The LV is provably absent (a successful `lvs` with no
+            // The LV is verifiably absent (a successful `lvs` with no
             // row): not an unobservable world. The move can never
             // complete and no pvmove can be active, so resolve the
             // record terminally instead of parking it forever.
@@ -3734,6 +3765,19 @@ impl LvmProvider {
         // anywhere below leaves a durable fact to classify against.
         let (source_pv, record_for_drive) =
             self.journal_move_intent(volume_id, req, source_pv.as_deref())?;
+        // The scan above validated the admission snapshot's source. The
+        // journal re-read the record under the lock and may have driven
+        // a different source (a concurrent re-drive replaced the
+        // record); a `Preparing` record that is still unstarted must have
+        // its actual source scanned too. A safe refusal here is fine —
+        // never start over an unscanned source.
+        if record_for_drive.state == MoveVolumeBackingState::Preparing
+            && existing_record
+                .as_ref()
+                .is_some_and(|existing| existing.source_pv != source_pv)
+        {
+            self.guard_fresh_move_source(&vg_name, &source_pv)?;
+        }
 
         // Phase 4 — start (or resume) the pvmove, then journal
         // COPYING. Between the start and this save the record says
@@ -3847,7 +3891,7 @@ impl LvmProvider {
     /// - a verified relocation: the move already finished (the
     ///   re-attach race — there was nothing left to move) —
     ///   complete it;
-    /// - the LV provably absent: no `pvmove` can be active, so the
+    /// - the LV verifiably absent: no `pvmove` can be active, so the
     ///   record resolves `FAILED` terminally (never a permanent
     ///   `IN_DOUBT` fence);
     /// - the source freed without the target holding the extents:
@@ -3922,7 +3966,7 @@ impl LvmProvider {
     ///   it, a fresh operation re-attaches);
     /// - the observation fails → `IN_DOUBT` (an unobservable world,
     ///   never a guess);
-    /// - the LV is provably absent → the record resolves `FAILED`
+    /// - the LV is verifiably absent → the record resolves `FAILED`
     ///   terminally (no `pvmove` can be active on a missing LV);
     /// - the source is freed → [`Self::finish_complete`] (a fresh
     ///   verification observation before anything is freed);
@@ -4414,7 +4458,7 @@ impl LvmProvider {
         Ok(())
     }
 
-    /// Resolve a move record whose LV is **provably absent** (a
+    /// Resolve a move record whose LV is **verifiably absent** (a
     /// successful `lvs` query has no row for it) to the settled
     /// `FAILED` state.
     ///
@@ -4424,10 +4468,11 @@ impl LvmProvider {
     /// [`Self::move_blocks_delete`] refuses an unsettled move, yet no
     /// reconcile pass can ever observe a placement for an absent LV (it
     /// would park `IN_DOUBT` at the observation bound). `FAILED` is
-    /// settled: the startup volume pass marks the absent LV `Failed`,
-    /// and the operator's delete then completes with nothing to remove.
-    /// The detail states exactly what was proven — the LV is gone —
-    /// never that the relocation succeeded or the source was freed.
+    /// settled and the volume is marked `Failed` in the same durable
+    /// save (mirroring the startup volume pass), so a live delete then
+    /// completes with nothing to remove — no restart is needed. The
+    /// detail states exactly what was proven — the LV is gone — never
+    /// that the relocation succeeded or the source was freed.
     ///
     /// Never overwrites a `COMPLETE` record or a record superseded under
     /// the lock (the stale-snapshot discipline [`Self::finish_complete`]
@@ -4467,12 +4512,19 @@ impl LvmProvider {
                 stored.detail = Some(format!(
                     "the LV {vg_name}/{lv_name} is verifiably absent from a successful lvs \
                      query, so the move to {} can never complete and no pvmove is active; \
-                     the move is settled FAILED — the volume's data is gone (no LV was \
-                     removed by this resolution; the volume pass marks the absent LV \
-                     Failed at startup, after which a delete completes without a \
-                     destructive command)",
+                     the move is settled FAILED and the volume is marked Failed — its data \
+                     is gone (no LV was removed by this resolution; delete then completes \
+                     without a destructive command)",
                     record.target_pv
                 ));
+            }
+            // Mirror the startup volume pass in the same durable save: a
+            // volume whose LV is verifiably absent is `Failed`. Without
+            // this, a live delete would still refuse an absent LV on a
+            // volume left `Ready` until the next restart, even though the
+            // move record no longer fences it.
+            if let Some(volume) = state.volume_mut(volume_id) {
+                volume.runtime.state = VolumeLifecycle::Failed;
             }
             if let Err(save_error) = self.persist(&mut state) {
                 match LvmState::load(&self.state_path) {
