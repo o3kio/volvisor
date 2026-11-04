@@ -44,8 +44,7 @@ contains the decisions that must be indistinguishable across backends:
   `attachment_payload_matches`, `resolve_attachment_replay`);
 - single-writer admission (`ensure_no_active_attachment`);
 - a strictly increasing per-volume attachment generation as the detach/report
-  fence; `ensure_attachment_id_not_retired` remains available only as optional
-  defence in depth for a provider that retains an exact tombstone;
+  fence;
 - monotonic consumer-report application (`apply_attachment_report`).
 
 The core is pure: it performs no I/O and does not serialize records. Providers
@@ -85,8 +84,9 @@ delayed report from a retired instance is `STALE_GENERATION` against the new
 one even if the consumer reuses its id (ADR-0012). Do not hard-code `1`, and do
 not retain an unbounded per-id tombstone: an exact tombstone grows with every
 attach, and a fixed-size probabilistic one refuses fresh ids once it fills
-(issue #63). `ensure_attachment_id_not_retired` is optional defence in depth,
-never the fence.
+(issue #63). A re-attach of a consumed id must succeed as a new instance;
+`IDEMPOTENCY_CONFLICT` is only for a live instance with the same id and a
+different payload. A diagnostic tombstone must never gate attach.
 
 ## 3. Backend-specific behavior (do not generalize)
 
@@ -167,7 +167,7 @@ assert_eq!(volvisor_provider::conformance::assert_parity(provider).await, Ok(())
   same-id different-payload conflict, second-writer refusal, detach and delete
   fencing, `NOT_FOUND` after delete. The observed sequence must equal both the
   shared fixture and the in-memory reference provider.
-- **report/tombstone** (capability-conditional): providers advertising
+- **report/generation fence** (capability-conditional): providers advertising
   `attachment_state_report` must apply reports monotonically, answer
   equal/lower reports as no-ops, refuse stale generations, and record a
   strictly greater generation on a re-attach so a delayed report from the

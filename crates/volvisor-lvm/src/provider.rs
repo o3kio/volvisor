@@ -5493,7 +5493,7 @@ mod read_snapshot_tests {
         {
             let mut state = provider.lock_state().expect("writer guard");
             let runtime = &mut state.volume_mut(&volume_id).expect("volume").runtime;
-            for index in 0..10_000u32 {
+            for index in 0..100_000u32 {
                 runtime
                     .retired_attachments
                     .insert(&AttachmentId::new(format!("legacy-att-{index}")).expect("valid id"));

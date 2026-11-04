@@ -263,7 +263,7 @@ store/version matrix is [docs/schema-compatibility.md](docs/schema-compatibility
 | `<journal_dir>/journal.log` | Length-prefixed, CRC-checked intent/outcome/checkpoint frames; after compaction, one snapshot base frame plus later records | **Authoritative** for API idempotency and operation outcomes; replayed on startup; bounded by retention |
 | `<journal_dir>/journal.log.compact` | In-progress compaction snapshot (temporary) | Never authoritative; ignored after a crash and replaced by the next compaction |
 | `<journal_dir>/journal.lock` | `flock` target | Lock only; no durable state/schema |
-| `<journal_dir>/lvm-state.json` (or `lvm_state_path`) | LVM volume cross-references, attachments, device claims, move records, tombstones | **Authoritative** provider-local state; reconciled against LVs at startup |
+| `<journal_dir>/lvm-state.json` (or `lvm_state_path`) | LVM volume cross-references, attachments, device claims, move records, and the legacy decode-only attachment tombstone filter | **Authoritative** provider-local state; reconciled against LVs at startup |
 | `<journal_dir>/ceph-state.json` (or `ceph_state_path`) | RBD image cross-references and attachments | **Authoritative** provider-local state; reconciled against RBD at startup |
 | `<journal_dir>/drbd-state.json` (or `drbd_state_path`) | DRBD volume/resource cross-references, attachments, authority block, counters | **Authoritative** provider-local state; reconciled against DRBD/LVM at startup |
 | `<journal_dir>/migrations/<migration_id>.json` | Per-migration record, state history, cut write-ahead | **Authoritative** recoverable form of the handoff |

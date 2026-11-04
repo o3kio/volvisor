@@ -25,7 +25,7 @@
 //! compares decision classes against both the shared expected fixture and the
 //! in-memory reference provider. Attach replay additionally compares the
 //! response projection (generation, frontend and state), so a fabricated
-//! replay cannot pass on class alone. The report/tombstone branch is
+//! replay cannot pass on class alone. The report/generation-fence branch is
 //! capability-conditional: providers advertising
 //! [`Capability::AttachmentStateReport`] must implement the positive contract,
 //! and a provider without it must fail closed. `provider_conformance_tests!`
@@ -1168,6 +1168,9 @@ pub enum ParityOutcome {
     /// An identical attach replay returned a different projection than the
     /// recorded instance (a replay-fidelity failure, never a valid class).
     ReplayDiverged,
+    /// A re-attach did not record a generation strictly greater than the
+    /// retired instance (a broken attachment fence, never a valid class).
+    GenerationNotAdvanced,
     /// Attach succeeded.
     Attached,
     /// Detach succeeded.
@@ -1436,12 +1439,13 @@ pub async fn run_universal_parity(provider: &dyn VolumeProvider) -> Vec<ParitySt
     steps
 }
 
-/// The expected report/tombstone parity sequence.
+/// The expected report/attachment-generation parity sequence.
 ///
 /// Report-capable providers apply consumer reports monotonically, keep the
 /// attachment generation fixed across reports, answer repeated/lower reports
 /// as no-ops, refuse a stale generation, and record a strictly greater
-/// generation on re-attach. Providers that do not advertise
+/// generation on re-attach, so a delayed report from the retired generation
+/// is stale. Providers that do not advertise
 /// [`Capability::AttachmentStateReport`] must fail closed with `NOT_FOUND`
 /// instead of synthesizing evidence.
 #[must_use]
@@ -1459,6 +1463,8 @@ pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
             step("detach", Detached),
             step("report-after-detach", NotFound),
             step("reattach-new-generation", Attached),
+            step("reattach-generation-advanced", Attached),
+            step("report-retired-generation", Stale),
         ]
     } else {
         vec![
@@ -1472,7 +1478,7 @@ pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
     }
 }
 
-/// Run the report/tombstone parity sequence against `provider`.
+/// Run the report/attachment-generation parity sequence against `provider`.
 ///
 /// The driver branches on the advertised capability so the same fixture
 /// states the positive contract (fake/LVM) and the fail-closed contract
@@ -1631,11 +1637,36 @@ pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep>
             "parity-report-attachment",
             generation_after_detach,
         );
+        let reattached = provider.attach_volume(&create.volume_id, &reattach).await;
+        let reattached_generation = reattached
+            .as_ref()
+            .map_or(0, |response| response.attachment_generation);
         steps.push(step(
             "reattach-new-generation",
-            outcome(
-                provider.attach_volume(&create.volume_id, &reattach).await,
-                ParityOutcome::Attached,
+            outcome(reattached, ParityOutcome::Attached),
+        ));
+        steps.push(step(
+            "reattach-generation-advanced",
+            if reattached_generation > attachment_generation {
+                ParityOutcome::Attached
+            } else {
+                ParityOutcome::GenerationNotAdvanced
+            },
+        ));
+        steps.push(step(
+            "report-retired-generation",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
             ),
         ));
     } else {
@@ -1670,9 +1701,9 @@ pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep>
 /// Run the cross-provider parity suite against `provider`.
 ///
 /// Fails when the provider's decision classes diverge from either the shared
-/// expected fixture or the in-memory reference provider. The report/tombstone
-/// branch is capability-conditional: capable providers must match the positive
-/// contract, non-capable providers must fail closed.
+/// expected fixture or the in-memory reference provider. The
+/// report/generation-fence branch is capability-conditional: capable providers
+/// must match the positive contract, non-capable providers must fail closed.
 ///
 /// # Errors
 /// A description of the first divergent sequence.
@@ -1702,7 +1733,7 @@ pub async fn assert_parity(provider: &dyn VolumeProvider) -> Result<(), String> 
     let expected_reports = expected_report_parity(report_capable);
     if reports != expected_reports {
         return Err(format!(
-            "report/tombstone parity does not match the shared fixture:\n  expected: \
+            "report/generation-fence parity does not match the shared fixture:\n  expected: \
              {expected_reports:?}\n  provider: {reports:?}"
         ));
     }
@@ -1710,7 +1741,7 @@ pub async fn assert_parity(provider: &dyn VolumeProvider) -> Result<(), String> 
         let reference_reports = run_report_parity(&reference).await;
         if reports != reference_reports {
             return Err(format!(
-                "report/tombstone parity diverges from the reference provider:\n  reference: \
+                "report/generation-fence parity diverges from the reference provider:\n  reference: \
                  {reference_reports:?}\n  provider:  {reports:?}"
             ));
         }

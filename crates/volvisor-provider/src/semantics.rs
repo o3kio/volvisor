@@ -178,28 +178,6 @@ pub fn ensure_no_active_attachment(
     }
 }
 
-/// Refuse reuse of an attachment id the volume already consumed.
-///
-/// This is **optional defence in depth**, not the authoritative fence: a
-/// provider must fence delayed evidence with the strictly increasing
-/// [`ensure_expected_attachment_generation`] regardless. Retaining an exact
-/// tombstone forever is unbounded and a Bloom filter's false positives would
-/// refuse fresh ids (issue #63), so neither the LVM provider nor the
-/// conformance fake calls this in the ordinary path.
-///
-/// # Errors
-/// `IDEMPOTENCY_CONFLICT` when `retired` is true.
-pub fn ensure_attachment_id_not_retired(
-    retired: bool,
-    attachment_id: &AttachmentId,
-) -> Result<(), ApiError> {
-    if retired {
-        Err(ApiError::attachment_id_conflict(attachment_id))
-    } else {
-        Ok(())
-    }
-}
-
 /// Whether a recorded attachment is the exact instance an attach request
 /// names (a replay), including the volume it belongs to.
 #[must_use]
@@ -448,25 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn single_writer_and_tombstone_are_typed() {
+    fn single_writer_admission_is_typed() {
         let volume_id = VolumeId::new("vol-1").expect("valid volume id");
-        let attachment_id = AttachmentId::new("att-1").expect("valid attachment id");
         assert_eq!(ensure_no_active_attachment(false, &volume_id), Ok(()));
         assert_eq!(
             ensure_no_active_attachment(true, &volume_id)
                 .expect_err("writer active")
                 .code,
             ApiErrorCode::WriterAlreadyActive
-        );
-        assert_eq!(
-            ensure_attachment_id_not_retired(false, &attachment_id),
-            Ok(())
-        );
-        assert_eq!(
-            ensure_attachment_id_not_retired(true, &attachment_id)
-                .expect_err("retired id")
-                .code,
-            ApiErrorCode::IdempotencyConflict
         );
     }
 

@@ -201,14 +201,16 @@ volvisor records it verbatim and never promotes it to a provider-verified fact.
   increasing per-volume `attachment_generation` described above, so a delayed
   report or detach from a retired instance can never be attributed to a new
   one: an old generation is `STALE_GENERATION`, and an id that is not the
-  current instance is `NOT_FOUND`. A provider is **not required to retain an
-  unbounded tombstone of consumed ids**: doing so costs durable state and
-  processing proportional to the volume's lifetime attach count, and a
-  fixed-size probabilistic tombstone is unsound because its false positives
-  refuse fresh ids (observed as `IDEMPOTENCY_CONFLICT` on a churned volume in
-  issue #63). A provider that retains an exact tombstone MAY additionally
-  refuse a consumed id with `IDEMPOTENCY_CONFLICT` as defence in depth;
-  consumers must not depend on that refusal and must still mint fresh ids.
+  current instance is `NOT_FOUND`. A provider **MUST accept a re-attach of a
+  previously consumed id as a new instance with a strictly greater
+  generation** and **MUST NOT refuse the attach solely because the id was
+  consumed**: `IDEMPOTENCY_CONFLICT` is reserved for a replayed id whose
+  payload differs from the live instance (or another recorded conflict), not
+  for an id whose previous instance was detached. Retaining a diagnostic
+  tombstone is allowed, but it must not gate attach. An exact tombstone grows
+  without bound in the volume's lifetime attach count, and a fixed-size
+  probabilistic tombstone is unsound because its false positives refuse fresh
+  ids (observed as `IDEMPOTENCY_CONFLICT` on a churned volume in issue #63).
 - **Implementation subset (not a wider claim):** this revision is implemented
   by the `native-local` LVM provider and the conformance fake. `ceph-rbd` and
   `nearline-replicated` (DRBD) do not advertise `attachment_state_report` and

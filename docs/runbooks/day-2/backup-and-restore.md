@@ -218,13 +218,15 @@ from files written by current binaries. D1 expected and observed:
 }
 ```
 
-and `vol-d1-b` retains its pre-detach volume generation. The attachment-id
-tombstone filter is legacy (ADR-0012): new writes do not populate it, and the
-provider does not consult it. The surviving fence is the **strictly increasing
-per-volume `attachment_generation`**: re-attaching `att-d1-b` succeeds as a new
-instance with generation `3`, and a delayed report carrying the retired
-generation `1` returns HTTP 409 `STALE_GENERATION`. That is the behavioral
-check; do not assert the old `IDEMPOTENCY_CONFLICT` on id reuse.
+and `vol-d1-b` retains its post-detach volume generation (`3`, the generation
+recorded at the backup). The attachment-id tombstone filter is legacy
+(ADR-0012): new detach writes do not populate it, and the provider does not
+consult it. A legacy v1/v2 state file still imports its old vector at decode.
+The surviving fence is the **strictly increasing per-volume
+`attachment_generation`**: re-attaching `att-d1-b` succeeds as a new instance
+with generation `3`, and a delayed report carrying the retired generation `1`
+returns HTTP 409 `STALE_GENERATION`. That is the behavioral check; do not
+assert the old `IDEMPOTENCY_CONFLICT` on id reuse.
 
 ## C. Backend reconciliation (mandatory)
 

@@ -223,9 +223,10 @@ sha256sum "$JOURNAL/lvm-state.json"   # must match the pre-upgrade digest
 ```
 
 Expected during a correct rollback: the restored daemon starts cleanly, the
-backup's attachment state/revision/evidence and tombstones are present, and
-operations after the backup are absent (HTTP 404). Expected if you try to run
-the old binary against the newer directory: exit 1 with the typed
+backup's attachment state/revision/evidence and generation are present, any
+legacy tombstone filter from an older state file is intact but not consulted,
+and operations after the backup are absent (HTTP 404). Expected if you try to
+run the old binary against the newer directory: exit 1 with the typed
 `unsupported durable-state schema version` error.
 
 ## Pass condition

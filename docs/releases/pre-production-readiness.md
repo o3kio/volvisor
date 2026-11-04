@@ -75,8 +75,10 @@ production-support, SLA, zero-RPO, hardware or released-artifact claim.
   one host: old `8c2fc1a` (LVM schema 2) → new `aad1720` (schema 3) → typed old
   refusals → restore the whole v2 directory and serve the original volume with
   the old binary. D1 was re-run against the v3 bounded tombstone filter and
-  records the behavioral retired-id `409 IDEMPOTENCY_CONFLICT`; D2's
-  same-binary policy drill was corrected to schema v3. These are single-host,
+  records the behavioral retired-id `409 IDEMPOTENCY_CONFLICT` (pre-ADR-0012;
+  the current harness asserts the strictly increasing attachment-generation
+  fence instead). D2's same-binary policy drill was corrected to schema v3.
+  These are single-host,
   loop-LVM, debug-build results (D1/D2 used a dirty caller build); see
   [the bundle](../evidence/day2/2026-11-04-devhost-live/REPORT.md),
   [backup-and-restore](../runbooks/day-2/backup-and-restore.md) and
@@ -178,7 +180,7 @@ READY**.
 | [Tier V, CH v43.0.0](../evidence/tier-v/2026-10-10-devhost/) | recorded in bundle | One physical development host; simulated storage | The same scenarios on the older VMM; fail-closed grow-retry branch | Grow notification on v43, real-host durability |
 | [Transport/TLS same-host](../evidence/transport-tls/2026-11-02-devhost-netns/) | base `a6591d9`, dirty tree | One kernel; netns/veth peers | TLS/mTLS, untrusted-cert rejection, insecure-bind refusal, encrypted pcap, audit attribution | Cross-host witness/peer hop, live rotation, HSM/TPM |
 | [Day-2 drills, 2026-11-03](../evidence/day2/2026-11-03-devhost/REPORT.md) | `e551d26`, clean worktree | One host | D1/D4/D5/D6/D7 drilled; 181-entry manifest verifies | D2/D3 full paths, D8 host loss, live upgrade/rollback in that bundle, DRBD fencing, multi-host |
-| [Day-2 D1/D2, 2026-11-04](../evidence/day2/2026-11-04-devhost-live/REPORT.md) | old `8c2fc1a` / new `aad1720`, caller dirty with clean new build worktree | One host; loop LVM; debug builds | D1 v3 backup/restore with bounded tombstone filter and behavioral retired-id 409; real old→new v2→v3 upgrade, typed old refusals, byte-identical v2 restore and old-binary serve; same-binary v3 policy | Rolling multi-host or packaged upgrade, data path, D3 storage-side fencing, D8 host loss, production support |
+| [Day-2 D1/D2, 2026-11-04](../evidence/day2/2026-11-04-devhost-live/REPORT.md) | old `8c2fc1a` / new `aad1720`, caller dirty with clean new build worktree | One host; loop LVM; debug builds | D1 v3 backup/restore with bounded tombstone filter and behavioral retired-id 409 (pre-ADR-0012); real old→new v2→v3 upgrade, typed old refusals, byte-identical v2 restore and old-binary serve; same-binary v3 policy | Rolling multi-host or packaged upgrade, data path, D3 storage-side fencing, D8 host loss, production support |
 | [D5 post-fix re-drill](../evidence/day2/2026-11-03-d5-redrill/REPORT.md) | `1863a7a` product / `940722e` harness, clean worktree | One host; loop LVM; 256 KiB tmpfs ENOSPC | The normal uncommitted state-save path fails closed and converges: 500 with ENOSPC and the state `.tmp` path, byte-identical old state, LV compensated, 404 in the same process and after restart, terminal same-`operation_id` replay, new-`operation_id` 200/`Ready`, one LV for the new volume and two durable records total, no residue; journal path re-confirmed | The three non-injected tails (cleanup failure, post-rename carve-out, unreadable durable re-read), real disk/inode/thin-pool failure, multi-host, production readiness |
 | [Control-plane benchmarks](../benchmarks/2026-11-03-devhost/REPORT.md) | `e3aa365`, clean worktree | One host, loop-backed LVM, loopback HTTP | 1/8/32/128 sweep, 25-min soak, restart replay, 46-entry manifest verifies | Data path, real backends, 24 h soak, production capacity or SLA |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |

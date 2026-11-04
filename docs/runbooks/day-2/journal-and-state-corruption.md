@@ -186,8 +186,8 @@ curl -fsS --config ~/.volvisor-admin.curl \
   http://127.0.0.1:8080/v2/volumes | jq .
 ```
 
-Check the volumes you expect, their attachments' state/revision/evidence, and
-the tombstones. Re-send the last operation with its original `operation_id`
+Check the volumes you expect, their attachments' state/revision/evidence and
+attachment generation. Re-send the last operation with its original `operation_id`
 if the client is unsure; the journal's idempotency registry should replay it
 rather than create a second volume.
 

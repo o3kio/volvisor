@@ -119,7 +119,7 @@ raw records are in the
 
 | Area | Recorded verdict |
 |---|---|
-| Control-plane backup/restore with attachment state, revision and tombstones | **DRILLED** |
+| Control-plane backup/restore with attachment state and revision | **DRILLED** (2026-11-04 bundle, pre-ADR-0012; current harness asserts the attachment-generation fence) |
 | Schema compatibility, upgrade-on-write and future-version refusal | **DRILLED (single-host lab)** — real old-binary → new-binary upgrade and restore-based rollback; no rolling multi-host/package drill |
 | Lost/unreachable witness service | **PARTIAL** — storage-side DRBD fencing not run |
 | Torn journal tail and corrupt state file | **DRILLED** |

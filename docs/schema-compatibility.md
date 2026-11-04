@@ -29,13 +29,14 @@ are never a separate file. Schema v3 wrote the fixed-size
 `retired_attachment_filter` Bloom filter (issue #63); the schema-v1/v2
 `retired_attachment_ids` vector is still accepted on load and is imported
 into the filter. **Since ADR-0012 the filter is legacy decode-only**: the
-provider neither inserts into nor consults it, because its false positives
-refused fresh ids on a churned volume, and the strictly increasing
-per-volume attachment generation is the fence. The field is optional and is
-omitted while empty, so the serialized shape remains a valid v3 file and no
-schema bump is required. A v3 file written before ADR-0012 still carries its
-filter and loads without loss. The journal lock file (`journal.log`'s
-sibling `journal.lock`) carries no durable schema.
+provider never inserts into it from the attach/detach path and never consults
+it, because its false positives refused fresh ids on a churned volume, and the
+strictly increasing per-volume attachment generation is the fence. A legacy
+v1/v2 vector is still imported at decode, so an old file loads without loss.
+The field is optional and is omitted while empty, so the serialized shape
+remains a valid v3 file and no schema bump is required. A v3 file written
+before ADR-0012 still carries its filter and loads without loss. The journal
+lock file (`journal.log`'s sibling `journal.lock`) carries no durable schema.
 
 Out of scope for this policy (follow-up work; they need the same treatment
 before any format change): the grow-notification store
@@ -113,7 +114,8 @@ typed unsupported-version error. ADR-0012 later stopped using the filter as a
 refusal mechanism: it saturates under churn and then refuses fresh ids, and a
 strictly increasing attachment generation is a sound fence that needs no
 per-id state. The field stays decodable (and is re-serialized if a legacy file
-had one) but is never populated by new writes, so the v3 shape is unchanged.
+had one) but is never populated by the current attach/detach path; a legacy
+v1/v2 vector is still imported at decode. The v3 shape is unchanged.
 
 Issue [#64](https://github.com/o3kio/volvisor/issues/64) is journal
 `record_version` 2. Version 2 adds the `snapshot` record emitted by bounded
