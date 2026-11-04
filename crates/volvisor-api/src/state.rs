@@ -247,11 +247,21 @@ impl AppState {
                 log_bytes: std::fs::metadata(journal.log_path())
                     .ok()
                     .map(|metadata| metadata.len()),
+                compactions: Some(journal.compactions()),
+                compaction_failures: Some(journal.compaction_failures()),
+                retained_operations: Some(
+                    u64::try_from(journal.retained_operations()).unwrap_or(u64::MAX),
+                ),
+                tombstones: Some(u64::try_from(journal.tombstone_count()).unwrap_or(u64::MAX)),
                 open: true,
             },
             Err(_) => JournalSnapshot {
                 records: None,
                 log_bytes: None,
+                compactions: None,
+                compaction_failures: None,
+                retained_operations: None,
+                tombstones: None,
                 open: false,
             },
         }

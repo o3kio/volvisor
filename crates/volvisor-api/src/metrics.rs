@@ -65,6 +65,15 @@ pub struct JournalSnapshot {
     pub records: Option<u64>,
     /// Size of the journal log file in bytes, when it can be stat'ed.
     pub log_bytes: Option<u64>,
+    /// Successful compactions since open.
+    pub compactions: Option<u64>,
+    /// Failed compaction attempts since open. A persistently non-zero value
+    /// means the log is not being bounded.
+    pub compaction_failures: Option<u64>,
+    /// Terminal plus in-flight operations currently retained.
+    pub retained_operations: Option<u64>,
+    /// Exact tombstone fingerprints currently retained.
+    pub tombstones: Option<u64>,
     /// Whether the daemon still holds an open journal.
     pub open: bool,
 }
@@ -479,6 +488,37 @@ fn render_journal(out: &mut String, journal: JournalSnapshot) {
         out.push_str("# HELP journal_log_bytes Size of the journal log file in bytes.\n");
         out.push_str("# TYPE journal_log_bytes gauge\n");
         let _ = writeln!(out, "journal_log_bytes {bytes}");
+    }
+    if let Some(compactions) = journal.compactions {
+        out.push_str(
+            "# HELP journal_compactions_total Successful journal compactions since open.\n",
+        );
+        out.push_str("# TYPE journal_compactions_total counter\n");
+        let _ = writeln!(out, "journal_compactions_total {compactions}");
+    }
+    if let Some(failures) = journal.compaction_failures {
+        out.push_str(
+            "# HELP journal_compaction_failures_total Failed journal compaction attempts \
+             since open; a sustained increase means the log is not being bounded.\n",
+        );
+        out.push_str("# TYPE journal_compaction_failures_total counter\n");
+        let _ = writeln!(out, "journal_compaction_failures_total {failures}");
+    }
+    if let Some(retained) = journal.retained_operations {
+        out.push_str(
+            "# HELP journal_retained_operations Terminal plus in-flight operations retained \
+             in the idempotency registry.\n",
+        );
+        out.push_str("# TYPE journal_retained_operations gauge\n");
+        let _ = writeln!(out, "journal_retained_operations {retained}");
+    }
+    if let Some(tombstones) = journal.tombstones {
+        out.push_str(
+            "# HELP journal_tombstones Exact evicted-operation fingerprints in the tombstone \
+             ring.\n",
+        );
+        out.push_str("# TYPE journal_tombstones gauge\n");
+        let _ = writeln!(out, "journal_tombstones {tombstones}");
     }
 }
 

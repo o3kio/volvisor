@@ -80,6 +80,11 @@ pub enum ApiErrorCode {
     InvalidState,
     /// `operation_id` reused with a different request payload.
     IdempotencyConflict,
+    /// The operation was evicted from the bounded journal retention window.
+    /// Its recorded outcome is no longer available, so replaying it is
+    /// refused rather than re-executing a possibly-completed mutation
+    /// (fail closed; issue #64).
+    OperationExpired,
     /// The caller's identity is not permitted to perform this
     /// operation (witness invariant W8: a mutating witness call requires
     /// the host credential bound to the holder it asserts; the legacy
@@ -120,6 +125,7 @@ impl ApiErrorCode {
             Self::NotFound => "NOT_FOUND",
             Self::InvalidState => "INVALID_STATE",
             Self::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
+            Self::OperationExpired => "OPERATION_EXPIRED",
             Self::Forbidden => "FORBIDDEN",
             Self::Internal => "INTERNAL",
         }
@@ -135,6 +141,7 @@ impl ApiErrorCode {
             | Self::UnsafeDataLoss
             | Self::InvalidRequest => 400,
             Self::NotFound => 404,
+            Self::OperationExpired => 410,
             Self::Forbidden => 403,
             Self::RateLimited => 429,
             Self::RequestTimeout => 504,
@@ -220,6 +227,25 @@ impl ApiError {
         Self::new(
             ApiErrorCode::IdempotencyConflict,
             format!("operation_id {operation_id} reused with a different request payload"),
+        )
+    }
+
+    /// Convenience constructor for an operation evicted from the bounded
+    /// journal retention window (issue #64).
+    ///
+    /// Fail-closed: the recorded outcome is unavailable, so executing the
+    /// request again could duplicate a mutation. The client must confirm the
+    /// prior effect with a read (or an operator must audit the journal) and
+    /// only then submit a **new** operation id.
+    #[must_use]
+    pub fn operation_expired(operation_id: impl fmt::Display) -> Self {
+        Self::new(
+            ApiErrorCode::OperationExpired,
+            format!(
+                "operation_id {operation_id} is outside the journal retention window; its \
+                 recorded outcome is no longer available. Refusing to execute it again \
+                 (fail closed): confirm the prior effect, then submit a new operation_id"
+            ),
         )
     }
 
@@ -313,6 +339,7 @@ impl ApiError {
             "NOT_FOUND" => ApiErrorCode::NotFound,
             "INVALID_STATE" => ApiErrorCode::InvalidState,
             "IDEMPOTENCY_CONFLICT" => ApiErrorCode::IdempotencyConflict,
+            "OPERATION_EXPIRED" => ApiErrorCode::OperationExpired,
             "FORBIDDEN" => ApiErrorCode::Forbidden,
             "INTERNAL" => ApiErrorCode::Internal,
             other => {
@@ -376,6 +403,7 @@ mod tests {
             ApiErrorCode::Overloaded,
             ApiErrorCode::RequestTimeout,
             ApiErrorCode::PayloadTooLarge,
+            ApiErrorCode::OperationExpired,
             ApiErrorCode::Forbidden,
         ];
         for code in codes {
@@ -457,6 +485,7 @@ mod tests {
             ApiErrorCode::NotFound,
             ApiErrorCode::InvalidState,
             ApiErrorCode::IdempotencyConflict,
+            ApiErrorCode::OperationExpired,
             ApiErrorCode::Forbidden,
             ApiErrorCode::Internal,
         ];

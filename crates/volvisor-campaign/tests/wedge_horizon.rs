@@ -371,6 +371,17 @@ async fn journal_records(dir: &std::path::Path) -> Vec<JournalRecord> {
     loop {
         match Journal::open_with_records(dir) {
             Ok((_journal, records)) => return records,
+            // A compacted control-plane journal cannot yield the complete
+            // history this forensic helper counts. Fail fast with the real
+            // reason instead of polling the flock deadline.
+            Err(error) if error.detail.contains("compacted") => {
+                panic!(
+                    "the campaign's control-plane journal at {} compacted; the \
+                     full-history record counter cannot derive its count from a \
+                     snapshot: {error}",
+                    dir.display()
+                );
+            }
             Err(error) => {
                 assert!(
                     std::time::Instant::now() < deadline,

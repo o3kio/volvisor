@@ -26,6 +26,8 @@
 
 use volvisor_types::{ApiError, ApiErrorCode};
 
+use crate::io_err;
+
 /// Frame magic: ASCII `VJL1` ("volvisor journal log, format 1").
 pub(crate) const MAGIC: u32 = 0x564A_4C31;
 
@@ -36,7 +38,12 @@ const HEADER_LEN: usize = 4 + 8 + 4 + 4;
 pub(crate) const MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 
 /// A decoded frame borrowing its payload from the replay buffer.
+///
+/// `sequence`/`payload` are consumed by the test-only rollback walker and
+/// the fuzz-only chain helper; production replay streams via
+/// [`read_frame`], so they are allowed to be unread in a default build.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub(crate) struct RawFrame<'a> {
     /// Byte offset just past the frame (start of the next candidate frame).
     pub(crate) end: usize,
@@ -122,6 +129,81 @@ fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
 fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
     let raw: [u8; 8] = bytes.get(at..at + 8)?.try_into().ok()?;
     Some(u64::from_le_bytes(raw))
+}
+
+/// One frame read incrementally from a log stream (issue #64: replay no
+/// longer buffers the whole log in memory).
+#[derive(Debug)]
+pub(crate) struct StreamFrame {
+    /// Monotonic frame sequence number.
+    pub(crate) sequence: u64,
+    /// Frame payload (a serialized record envelope).
+    pub(crate) payload: Vec<u8>,
+    /// Total bytes consumed by this frame (header plus payload).
+    pub(crate) frame_len: usize,
+}
+
+/// Read the next frame from `reader`, requiring `expected_sequence`.
+///
+/// Returns `Ok(None)` at a clean end of file **or** at the first torn/corrupt
+/// frame; either way replay stops and truncates to the last good offset.
+/// Returns `Err` only for a real I/O failure, which must never be mistaken for
+/// a torn tail. Memory is bounded by [`MAX_PAYLOAD_LEN`] (one frame).
+pub(crate) fn read_frame<R: std::io::Read>(
+    reader: &mut R,
+    expected_sequence: u64,
+) -> Result<Option<StreamFrame>, ApiError> {
+    let mut header = [0u8; HEADER_LEN];
+    if !read_exact_or_torn(reader, &mut header)
+        .map_err(io_err("failed to read journal frame header"))?
+    {
+        return Ok(None);
+    }
+    let Some(magic) = le_u32(&header, 0) else {
+        return Ok(None);
+    };
+    if magic != MAGIC {
+        return Ok(None);
+    }
+    let Some(sequence) = le_u64(&header, 4) else {
+        return Ok(None);
+    };
+    if sequence != expected_sequence {
+        return Ok(None);
+    }
+    let (Some(len), Some(crc)) = (le_u32(&header, 12), le_u32(&header, 16)) else {
+        return Ok(None);
+    };
+    let Ok(payload_len) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Ok(None);
+    }
+    let mut payload = vec![0u8; payload_len];
+    if !read_exact_or_torn(reader, &mut payload)
+        .map_err(io_err("failed to read journal frame payload"))?
+    {
+        return Ok(None);
+    }
+    if crc32fast::hash(&payload) != crc {
+        return Ok(None);
+    }
+    Ok(Some(StreamFrame {
+        sequence,
+        payload,
+        frame_len: HEADER_LEN + payload_len,
+    }))
+}
+
+/// Read exactly `buf.len()` bytes; `Ok(false)` means the stream ended before
+/// the buffer was filled (a clean EOF at a boundary or a torn tail).
+fn read_exact_or_torn(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]

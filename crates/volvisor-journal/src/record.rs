@@ -16,7 +16,15 @@ use serde::{Deserialize, Serialize};
 use volvisor_types::OperationId;
 
 /// Current envelope/record format version.
-pub const RECORD_VERSION: u32 = 1;
+///
+/// Version 2 adds the [`Snapshot`] record and journal compaction (issue
+/// #64). Version 1 records are still accepted on replay (the N-1 shape; see
+/// `docs/schema-compatibility.md`), and an older binary refuses a version-2
+/// record with the typed unsupported-version error instead of guessing.
+pub const RECORD_VERSION: u32 = 2;
+
+/// The previous (N-1) record version still accepted on replay.
+pub const LEGACY_RECORD_VERSION_N1: u32 = 1;
 
 /// Durable intent to execute a privileged mutation (journal-before-mutate,
 /// AGENTS rule 8). Destructive provider actions may only run after this
@@ -72,6 +80,67 @@ pub struct Checkpoint {
     pub note: String,
 }
 
+/// One retained operation inside a compacted [`Snapshot`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotOperation {
+    /// Operation this entry belongs to (idempotency key).
+    pub operation_id: OperationId,
+    /// Immutable request hash, or `None` for an outcome-only operation (a
+    /// hand-crafted journal state; it continues to fail closed).
+    pub request_hash: Option<[u8; 32]>,
+    /// Recorded outcome, or `None` while the operation is still in flight.
+    /// In-flight intents are always retained by compaction.
+    pub outcome: Option<SnapshotOutcome>,
+}
+
+/// A recorded outcome inside a compacted [`Snapshot`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotOutcome {
+    /// Whether the mutation succeeded.
+    pub success: bool,
+    /// Response body (or error detail) replayed verbatim.
+    pub response: serde_json::Value,
+    /// Recorded HTTP status, when the outcome carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+/// Compaction snapshot written as the first (and initially only) frame of a
+/// rewritten journal log.
+///
+/// A snapshot replaces the older append-only prefix: it carries the bounded
+/// idempotency registry that survives compaction plus a bounded ring of
+/// **exact 64-bit fingerprints** of recently evicted terminal operations.
+/// The fingerprint is the first eight bytes of SHA-256 over the operation id
+/// (little-endian). A matching fingerprint means "possibly evicted": the
+/// journal refuses with `OPERATION_EXPIRED` even if the id actually collides,
+/// which is the fail-closed direction. An operation evicted before the ring's
+/// window is indistinguishable from an unknown operation by design; see the
+/// retention contract in `docs/schema-compatibility.md`.
+///
+/// Snapshots are only produced by the control-plane journal. A consumer that
+/// folds the full record history (the witness registry, opened with
+/// [`crate::Journal::open_with_records`]) refuses a snapshot rather than
+/// deriving authority state from a compacted prefix.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    /// Retained registry entries: terminal operations (oldest first up to
+    /// the retention bound) followed by every in-flight intent. Compaction
+    /// may retain fewer terminal operations than configured when the encoded
+    /// snapshot would otherwise exceed one frame.
+    pub operations: Vec<SnapshotOperation>,
+    /// Fingerprints of recently evicted terminal operations, oldest first.
+    /// The ring may be trimmed below its configured bound when a full ring
+    /// would not fit one frame.
+    pub tombstones: Vec<u64>,
+    /// Total number of operations evicted before this snapshot (diagnostic;
+    /// never used for control flow).
+    pub evicted_operations: u64,
+}
+
 /// One journaled record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
@@ -80,6 +149,8 @@ pub enum JournalRecord {
     Intent(Intent),
     /// Result of a mutation (written after the mutation).
     Outcome(Outcome),
+    /// Compaction snapshot: replaces all earlier records in the log.
+    Snapshot(Snapshot),
     /// Administrative checkpoint marker.
     Checkpoint(Checkpoint),
 }
@@ -176,5 +247,42 @@ mod tests {
     fn unknown_record_type_rejected() {
         let json = r#"{"record_type":"surprise"}"#;
         assert!(serde_json::from_str::<JournalRecord>(json).is_err());
+    }
+
+    #[test]
+    fn snapshot_round_trip_and_version_pin() {
+        assert_eq!(RECORD_VERSION, 2);
+        assert_eq!(LEGACY_RECORD_VERSION_N1, 1);
+        let record = JournalRecord::Snapshot(Snapshot {
+            operations: vec![
+                SnapshotOperation {
+                    operation_id: OperationId::new("op-terminal").expect("id"),
+                    request_hash: Some([4; 32]),
+                    outcome: Some(SnapshotOutcome {
+                        success: true,
+                        response: serde_json::json!({"ok": true}),
+                        http_status: Some(201),
+                    }),
+                },
+                SnapshotOperation {
+                    operation_id: OperationId::new("op-in-flight").expect("id"),
+                    request_hash: Some([5; 32]),
+                    outcome: None,
+                },
+            ],
+            tombstones: vec![0x0102_0304_0506_0708, u64::MAX],
+            evicted_operations: 42,
+        });
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains("\"record_type\":\"snapshot\""));
+        let back: JournalRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, record);
+        // A snapshot carrying an unknown field is rejected (never silently
+        // reduced), like every other record.
+        let with_extra = json.replace(
+            "\"evicted_operations\":42",
+            "\"evicted_operations\":42,\"surprise\":1",
+        );
+        assert!(serde_json::from_str::<JournalRecord>(&with_extra).is_err());
     }
 }
