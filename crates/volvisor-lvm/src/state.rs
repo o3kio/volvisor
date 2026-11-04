@@ -733,6 +733,49 @@ impl LvmState {
         path: &Path,
         crash: Option<&StoreCrashHooks>,
     ) -> Result<(), ApiError> {
+        let data = self.encode_for_save()?;
+        Self::save_encoded_with_hooks(&data, path, crash)
+    }
+
+    /// Encode the state for a durable save, advancing the schema version
+    /// to the version this build writes.
+    ///
+    /// Split out from [`Self::save_with_hooks`] so the provider's coalesced
+    /// writer can capture the exact bytes under its state lock and perform
+    /// the physical write later (Phase D D3 slice 2, #62). The encoding
+    /// shape is unchanged: compact JSON of the whole state.
+    pub(crate) fn encode_for_save(&mut self) -> Result<Vec<u8>, ApiError> {
+        // A successful open may have decoded an older file; every save
+        // writes the current version so an upgrade becomes durable on the
+        // first mutation (or the startup reconcile's first save).
+        self.schema_version = LVM_STATE_SCHEMA_VERSION;
+        // Issue #62: the state file is internal, whole-file rewritten and
+        // fsynced on every mutation. Compact JSON roughly halves the bytes
+        // written and fsynced versus pretty-printing, without changing the
+        // decoded shape or schema.
+        serde_json::to_vec(self).map_err(|e| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("failed to serialize provider state: {e}"),
+            )
+        })
+    }
+
+    /// Write already-encoded state bytes through the existing atomic save
+    /// sequence.
+    ///
+    /// This is the physical half of [`Self::save_with_hooks`]: one unique
+    /// bounded sibling temp, the four crash consults in their established
+    /// order, fsync, rename and directory fsync. It takes bytes rather than
+    /// `&mut self` so the provider's coalesced writer can commit a capture
+    /// it reserved earlier while another caller owns the state reference
+    /// (Phase D D3 slice 2, #62). The temp namespace, permissions, cleanup
+    /// and error strings are unchanged from slice 1.
+    pub(crate) fn save_encoded_with_hooks(
+        data: &[u8],
+        path: &Path,
+        crash: Option<&StoreCrashHooks>,
+    ) -> Result<(), ApiError> {
         let tmp_path = unique_sibling_tmp_path(path);
         // Register before `create_new` and keep the guard for the whole
         // attempt (including the error cleanup). A panic/unwind drops it
@@ -743,15 +786,15 @@ impl LvmState {
         // must never remove a file that already existed at the allocated
         // name (for example a stale file the startup sweep did not see).
         let mut created = false;
-        let result = self.save_to(&tmp_path, path, crash, &mut created);
+        let result = Self::save_encoded_to(data, &tmp_path, path, crash, &mut created);
         if result.is_err() && created {
             drop(fs::remove_file(&tmp_path));
         }
         result
     }
 
-    fn save_to(
-        &mut self,
+    fn save_encoded_to(
+        data: &[u8],
         tmp_path: &Path,
         path: &Path,
         crash: Option<&StoreCrashHooks>,
@@ -774,22 +817,12 @@ impl LvmState {
             }
             Ok(())
         };
-        // A successful open may have decoded an older file; every save
-        // writes the current version so an upgrade becomes durable on the
-        // first mutation (or the startup reconcile's first save).
-        self.schema_version = LVM_STATE_SCHEMA_VERSION;
-        // Issue #62: the state file is internal, whole-file rewritten and
-        // fsynced on every mutation. Compact JSON roughly halves the bytes
-        // written and fsynced versus pretty-printing, without changing the
-        // decoded shape or schema.
-        let data = serde_json::to_vec(self)
-            .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         // The unique temp name did not exist (create_new); this call now
         // owns it until the rename consumes it.
         *created = true;
-        file.write_all(&data)
+        file.write_all(data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
         consult(StoreSavePoint::AfterTmpWrite)?;
         file.sync_all()
@@ -1299,6 +1332,7 @@ fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use volvisor_types::crash::CRASH_PANIC_PREFIX;
 
     const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json");
     const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n2.json");
@@ -2060,6 +2094,40 @@ mod tests {
             4,
             "a pre-rename failure leaves the old file untouched"
         );
+    }
+
+    #[test]
+    fn every_store_save_crash_seam_fires_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        // Phase D D3 slice 2: the bytes-only writer must keep consulting
+        // all four save points in the established order.
+        for point in [
+            StoreSavePoint::AfterTmpWrite,
+            StoreSavePoint::AfterFsyncBeforeRename,
+            StoreSavePoint::AfterRename,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+        ] {
+            let hooks = StoreCrashHooks::new();
+            hooks.arm(STORE_LVM_STATE, point);
+            let mut state = sample_state();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = state.save_with_hooks(&path, Some(&hooks));
+            }))
+            .expect_err("an armed save point must fire");
+            let payload = payload
+                .downcast_ref::<String>()
+                .expect("the crash payload is the marked string");
+            assert!(
+                payload.starts_with(CRASH_PANIC_PREFIX),
+                "the seam at {point:?} must carry the filter prefix: {payload}"
+            );
+            // A killed save leaves its unique temp behind; clean it up so
+            // the next seam starts from the same directory shape.
+            for temp in stale_temp_paths(&path) {
+                let _ = fs::remove_file(temp);
+            }
+        }
     }
 
     #[test]

@@ -10,18 +10,34 @@
 //! are always verified against `lvs` output — a successful exit status
 //! alone is never trusted as evidence (honest reporting).
 //!
-//! # Single durable writer
+//! # Coalescing durable writer
 //!
 //! Every production save of the provider state — volume, move, admin
-//! claim/release and every compensation path — goes through one
-//! `DurableWriter` funnel (Phase D D3 slice 1, #62). In this slice the
-//! caller still holds the provider state lock across the save and its
-//! wait, so captures never overlap; the funnel adds the seam slice 2
-//! will use when callers release that lock before waiting. The writer
-//! uses a unique bounded `.volvisor-<hash>.<pid>.<sequence>.tmp` per
-//! physical write, so two writers can never truncate or delete each
-//! other's temp file, and providers on the same canonical state path
-//! share one gate in this process. The constructor sweeps stale sibling
+//! claim/release and every compensation path — goes through one writer
+//! (Phase D D3 slices 1–2, #62). A caller captures the exact bytes and
+//! snapshot and reserves a monotonic sequence **under** the provider state
+//! lock, so capture order equals sequence order. Attach, detach and an
+//! applied attachment report then release that lock before waiting for
+//! durability; synchronous mutations keep it and lead inline. One leader
+//! performs a single physical write of the latest pending capture and
+//! marks every covered sequence durable, so concurrent attach/detach/
+//! report saves coalesce instead of writing once per caller.
+//!
+//! Watermarks are permanent and per provider lineage: `durable_seq` and
+//! `failed_through` only advance, and a waiter resolves through them or
+//! the terminal poison — there is no transient barrier. On an unprovable
+//! write failure (readable-but-different or unreadable durable) every
+//! outstanding sequence fails and admission must re-align with the
+//! durable file; only a leader panic, abandonment or a poisoned mutex
+//! poisons the writer. The leader never takes the provider state lock.
+//!
+//! The physical-write gate is per canonical state path in this process,
+//! so two live providers aliasing one path serialize their writes while
+//! different paths proceed independently. Two live providers aliasing one
+//! path are **unsupported**: their sequence spaces are per lineage even
+//! though their gate is shared. Each write uses a unique bounded
+//! `.volvisor-<hash>.<pid>.<sequence>.tmp`, so writers can never truncate
+//! or delete each other's temp file. The constructor sweeps stale sibling
 //! temp files from a crashed save before it loads or writes state (see
 //! [`crate::state`]). Cross-process exclusion remains the journal flock;
 //! two daemons must not alias a custom `lvm_state_path`.
@@ -102,8 +118,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -350,9 +370,10 @@ pub struct LvmProvider {
     /// The state file's store-save crash seam (inert unless a rig
     /// arms it — the move fault rows' kill surface).
     store_crash: Arc<StoreCrashHooks>,
-    /// The single durable-writer funnel every production save uses
-    /// (Phase D D3 slice 1, #62).
-    writer: DurableWriter,
+    /// The coalescing durable writer every production save uses (Phase D
+    /// D3 slice 2, #62). Per provider lineage: a rig that drops and
+    /// rebuilds the provider after a crash gets a fresh sequence space.
+    writer: Arc<WriterCore>,
     /// The move drive's timing (production defaults; overridable for
     /// the deterministic fake world only).
     move_timing: MoveTiming,
@@ -362,46 +383,174 @@ pub struct LvmProvider {
     /// bound). In-memory and per-incarnation: it never persists, and
     /// a successful observation clears it.
     move_observe_failures: Mutex<BTreeMap<VolumeId, u32>>,
-    /// The writer view: every mutation runs under this mutex, which is
-    /// also held across the durable save. Readers do **not** take it.
+    /// The writer view: every mutation is admitted under this mutex.
+    /// Attach/detach/report capture and reserve under it, then release it
+    /// before waiting for durability; the synchronous multi-save paths
+    /// still hold it across their save. Readers do **not** take it.
     state: Mutex<LvmState>,
-    /// The last committed read view (issue #62). Published when a
-    /// writer guard is dropped, so `GET`/list/inspect never wait behind
-    /// another request's whole-file fsync or LVM CLI call. Readers clone
-    /// the `Arc` only; the lock is held for that clone, never for the
-    /// duration of a read.
-    read_snapshot: RwLock<Arc<LvmState>>,
+    /// The last committed read view (issue #62). Published by the writer
+    /// after durability (and by a lock-holding synchronous guard on drop),
+    /// so `GET`/list/inspect never wait behind another request's whole-file
+    /// fsync or LVM CLI call. Readers clone the `Arc` only; the lock is
+    /// held for that clone, never for the duration of a read.
+    read_snapshot: Arc<RwLock<Arc<LvmState>>>,
 }
 
-/// The single durable-writer funnel for the LVM state file.
+/// The detail of a physical-write gate poisoned by an earlier panic. The
+/// exact string is part of the slice-1 fail-closed evidence.
+const GATE_POISON_DETAIL: &str = "LVM provider durable writer lock poisoned by a previous failure";
+
+/// The detail of a writer poisoned by a leader panic, abandonment or a
+/// poisoned writer-state mutex.
+const WRITER_POISON_DETAIL: &str = "LVM provider durable writer poisoned by a previous failure";
+
+/// The detail returned when a capture is attempted before admission has
+/// re-aligned in-memory state with the durable file.
+const NEEDS_ALIGNMENT_DETAIL: &str =
+    "LVM provider durable writer requires admission alignment before another save";
+
+/// One reserved capture: the exact bytes and snapshot a caller wants
+/// durable, plus the monotonic sequence assigned under the provider state
+/// lock so capture order equals sequence order.
+struct Capture {
+    /// Encoded state bytes for this capture.
+    encoded: Arc<[u8]>,
+    /// In-memory snapshot this capture commits.
+    snapshot: Arc<LvmState>,
+}
+
+/// The coalescing writer's bookkeeping (Phase D D3 slice 2, #62).
 ///
-/// Phase D D3 slice 1 (#62): every production save enters through
-/// [`DurableWriter::save`], so there is one place that performs the
-/// physical write and one place slice 2 can change when callers release
-/// the state lock before waiting. Slice 1 deliberately keeps the caller's
-/// provider state lock held across the wait, so the gate is a semantic
-/// no-op beyond excluding a hypothetical second writer that did not hold
-/// the state lock.
+/// Watermarks are permanent and monotonic: a waiter resolves only when
+/// `durable_seq` covers it (success), `failed_through` covers it (the
+/// recorded failure), or the writer is poisoned (typed `INTERNAL`). There
+/// is no transient barrier flag.
+struct WriterState {
+    /// Next sequence to assign (starts at one).
+    next_seq: u64,
+    /// Captures awaiting a physical write, ordered by sequence.
+    pending: BTreeMap<u64, Capture>,
+    /// Highest sequence proven durable by a completed physical write.
+    durable_seq: u64,
+    /// Highest sequence published to the read view.
+    published_seq: u64,
+    /// Highest sequence that has been terminally failed.
+    failed_through: u64,
+    /// The failure recorded for `failed_through`.
+    failure: Option<(ApiErrorCode, String)>,
+    /// Whether a leader currently owns the physical write loop.
+    leader_active: bool,
+    /// A hard failure requires the next admission to re-align in-memory
+    /// state with the durable file before another capture is accepted.
+    needs_alignment: bool,
+    /// Terminal poison (leader panic, abandonment, or poisoned mutex).
+    poisoned: Option<String>,
+}
+
+impl Default for WriterState {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            pending: BTreeMap::new(),
+            durable_seq: 0,
+            published_seq: 0,
+            failed_through: 0,
+            failure: None,
+            leader_active: false,
+            needs_alignment: false,
+            poisoned: None,
+        }
+    }
+}
+
+/// The result of one physical write attempt, kept distinct from the
+/// panic payload so an armed crash seam can be re-raised in band.
+enum WriteOutcome {
+    /// The write completed.
+    Saved,
+    /// The write returned a typed error (possibly after the rename).
+    Failed(ApiError),
+    /// The write panicked (an armed crash seam).
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// RAII leadership guard: a leader that panics or is abandoned before
+/// clearing leadership poisons the writer and wakes/fails every waiter.
+struct LeaderToken {
+    /// The writer whose leadership this token owns.
+    core: Arc<WriterCore>,
+    /// Set once the leader has completed normally (or already poisoned).
+    armed: bool,
+}
+
+impl LeaderToken {
+    /// Disarm the token after the leader has resolved leadership.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaderToken {
+    fn drop(&mut self) {
+        if self.armed {
+            self.core.abandon_leader();
+        }
+    }
+}
+
+/// One caller's reservation. The leader owns a [`LeaderToken`]; a waiter
+/// resolves only through the permanent watermarks.
+pub(crate) struct Reservation {
+    /// The caller's reserved sequence.
+    seq: u64,
+    /// Whether this caller leads the physical write or waits.
+    role: ReservationRole,
+}
+
+/// The two reservation roles.
+enum ReservationRole {
+    /// This caller owns the physical write loop (RAII-guarded).
+    Leader(LeaderToken),
+    /// This caller waits for a watermark.
+    Waiter,
+}
+
+/// The coalescing durable writer for one provider lineage.
 ///
-/// The gate is **per canonical state path in this process**, not per
-/// provider instance: two `LvmProvider`s on the same state path share one
-/// `Arc<Mutex<()>>`, so a poisoned save is visible to both there, while
-/// different paths get independent gates. Cross-process exclusion is the
-/// journal flock, not this gate; two daemons must not alias a custom
-/// `lvm_state_path`.
+/// Phase D D3 slice 2 (#62): attach/detach/report reserve a sequence under
+/// the provider state lock, release it, and wait. The leader writes the
+/// latest pending capture once and marks every covered sequence durable.
 ///
-/// A panic in the save (including an armed crash seam) poisons both the
-/// state lock and this gate, matching the existing fail-closed writer
-/// behavior: later writers get a typed `INTERNAL` error instead of
-/// proceeding from an unknown state.
+/// The physical-write gate is **per canonical state path in this process**,
+/// so two live providers aliasing one state path serialize their writes,
+/// while different paths get independent gates. Watermarks and pending
+/// captures are **per provider lineage**, not shared across instances: a
+/// rig that drops the old provider on restart gets a fresh sequence space.
+/// Two live providers aliasing one state path are unsupported (cross-process
+/// exclusion remains the journal flock).
 ///
-/// The gate is a leaf with respect to the provider state lock: nothing
-/// acquires the state lock while holding it, and the only other locks a
-/// save takes inside it are the short-lived temp-registry and crash-hook
-/// mutexes, none of which acquires the gate.
-struct DurableWriter {
-    /// Serializes whole physical save attempts for one state path.
+/// Lock order is provider state lock, then this writer's state mutex. The
+/// leader loop never takes the provider state lock, so a synchronous waiter
+/// may hold it safely.
+struct WriterCore {
+    /// Canonical state file path.
+    path: PathBuf,
+    /// Per-canonical-path physical-write gate.
     gate: Arc<Mutex<()>>,
+    /// The store-save crash seam shared with the provider.
+    crash: Arc<StoreCrashHooks>,
+    /// The read view the leader publishes after durability.
+    read_snapshot: Arc<RwLock<Arc<LvmState>>>,
+    /// The writer watermark/pending bookkeeping.
+    state: Mutex<WriterState>,
+    /// Wakes synchronous waiters (permanent watermark checks).
+    wake: Condvar,
+    /// Wakes asynchronous waiters; subscribe-before-check prevents a lost
+    /// wake between the check and the await.
+    notify: tokio::sync::Notify,
+    /// Test-only count of physical write attempts (coalescing evidence).
+    #[cfg(test)]
+    physical_writes: AtomicUsize,
 }
 
 /// Process-wide gates keyed by canonical state-path identity. A `Weak`
@@ -409,58 +558,450 @@ struct DurableWriter {
 /// every lookup.
 static WRITER_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
-impl DurableWriter {
-    /// The writer gate shared by every provider on `path` in this
-    /// process (nothing armed; no writes performed).
-    fn new(path: &Path) -> Self {
+impl WriterCore {
+    /// Build the per-lineage writer around the provider's read view and
+    /// crash seam. The gate itself is shared per canonical state path.
+    fn new(
+        path: &Path,
+        crash: Arc<StoreCrashHooks>,
+        read_snapshot: Arc<RwLock<Arc<LvmState>>>,
+    ) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            gate: Self::gate_for(path),
+            crash,
+            read_snapshot,
+            state: Mutex::new(WriterState::default()),
+            wake: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            physical_writes: AtomicUsize::new(0),
+        }
+    }
+
+    /// The physical-write gate shared by every writer on `path` in this
+    /// process.
+    fn gate_for(path: &Path) -> Arc<Mutex<()>> {
         let identity = crate::state::canonical_state_identity(path);
         let mut gates = WRITER_GATES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         gates.retain(|_, gate| gate.strong_count() > 0);
-        let gate = gates
+        gates
             .get(&identity)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
                 let gate = Arc::new(Mutex::new(()));
                 gates.insert(identity, Arc::downgrade(&gate));
                 gate
-            });
-        Self { gate }
+            })
     }
 
-    /// Perform one durable save through the crash-hooked atomic writer.
-    ///
-    /// The caller must already hold the provider state lock (slice 1's
-    /// invariant). The gate guarantees that no second physical write can
-    /// overlap even if a future caller forgets.
-    fn save(
-        &self,
-        state: &mut LvmState,
-        path: &Path,
-        crash: &StoreCrashHooks,
-    ) -> Result<(), ApiError> {
-        let _gate = self.gate.lock().map_err(|_| {
-            ApiError::new(
+    /// Lock the writer bookkeeping, converting a poisoned mutex into the
+    /// terminal poison state (so waiters cannot park forever).
+    fn lock_writer(&self) -> MutexGuard<'_, WriterState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                if guard.poisoned.is_none() {
+                    guard.poisoned = Some(WRITER_POISON_DETAIL.to_owned());
+                }
+                guard.needs_alignment = true;
+                guard
+            }
+        }
+    }
+
+    /// Wake both waiter classes. Always call both: a notify with no
+    /// current async waiter is harmless because waiters subscribe before
+    /// re-checking the watermarks.
+    fn wake_all(&self) {
+        self.wake.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    /// Resolve one sequence against the permanent watermarks.
+    fn resolution(state: &WriterState, seq: u64) -> Option<Result<(), ApiError>> {
+        if state.durable_seq >= seq {
+            return Some(Ok(()));
+        }
+        if state.failed_through >= seq {
+            let (code, detail) = state.failure.clone().unwrap_or((
                 ApiErrorCode::Internal,
-                "LVM provider durable writer lock poisoned by a previous failure",
+                "LVM provider durable writer failed without a recorded cause".to_owned(),
+            ));
+            return Some(Err(ApiError::new(code, detail)));
+        }
+        if let Some(reason) = &state.poisoned {
+            return Some(Err(ApiError::new(ApiErrorCode::Internal, reason.clone())));
+        }
+        None
+    }
+
+    /// Reserve a sequence for one capture. Poison and admission
+    /// alignment are checked here, under the writer mutex, before the
+    /// caller releases the provider state lock.
+    fn reserve(
+        self: &Arc<Self>,
+        encoded: Arc<[u8]>,
+        snapshot: Arc<LvmState>,
+    ) -> Result<Reservation, ApiError> {
+        let mut state = self.lock_writer();
+        if let Some(reason) = &state.poisoned {
+            return Err(ApiError::new(ApiErrorCode::Internal, reason.clone()));
+        }
+        if state.needs_alignment {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                NEEDS_ALIGNMENT_DETAIL,
+            ));
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.pending.insert(seq, Capture { encoded, snapshot });
+        let role = if state.leader_active {
+            ReservationRole::Waiter
+        } else {
+            state.leader_active = true;
+            ReservationRole::Leader(LeaderToken {
+                core: Arc::clone(self),
+                armed: true,
+            })
+        };
+        Ok(Reservation { seq, role })
+    }
+
+    /// Wait synchronously for a permanent watermark.
+    fn wait_sync(&self, seq: u64) -> Result<(), ApiError> {
+        let mut state = self.lock_writer();
+        loop {
+            if let Some(result) = Self::resolution(&state, seq) {
+                return result;
+            }
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Wait asynchronously for a permanent watermark using
+    /// subscribe-before-check, so a wake between the check and the await
+    /// is never lost.
+    async fn wait_async(&self, seq: u64) -> Result<(), ApiError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.lock_writer();
+                if let Some(result) = Self::resolution(&state, seq) {
+                    return result;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Mark a sequence durable and publish its snapshot when it is newer
+    /// than the last published one.
+    fn mark_durable(&self, seq: u64, snapshot: &Arc<LvmState>) {
+        {
+            let mut state = self.lock_writer();
+            state.durable_seq = state.durable_seq.max(seq);
+            state.pending.retain(|pending_seq, _| *pending_seq > seq);
+        }
+        self.publish_if_newer(seq, snapshot);
+    }
+
+    /// Publish `snapshot` only when `seq` is newer than the published
+    /// sequence; a lower sequence never replaces a higher snapshot.
+    fn publish_if_newer(&self, seq: u64, snapshot: &Arc<LvmState>) {
+        let publish = {
+            let mut state = self.lock_writer();
+            if seq > state.published_seq {
+                state.published_seq = seq;
+                true
+            } else {
+                false
+            }
+        };
+        if publish {
+            match self.read_snapshot.write() {
+                Ok(mut current) => *current = Arc::clone(snapshot),
+                // A poisoned reader-view lock must not wedge every future
+                // read: recover the inner value (the snapshot holds no
+                // cross-field invariant that a panic could tear).
+                Err(poisoned) => *poisoned.into_inner() = Arc::clone(snapshot),
+            }
+        }
+    }
+
+    /// Poison the writer and fail every outstanding sequence. Used by the
+    /// RAII leadership guard when a leader is abandoned before resolving.
+    fn abandon_leader(&self) {
+        self.poison(WRITER_POISON_DETAIL);
+    }
+
+    /// Set the terminal poison, fail everything pending through the
+    /// permanent watermark, and wake all waiters.
+    fn poison(&self, detail: &str) {
+        {
+            let mut state = self.lock_writer();
+            let max_pending = state
+                .pending
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(state.failed_through);
+            state.failed_through = state.failed_through.max(max_pending);
+            state.pending.clear();
+            // Keep the first terminal poison: a later re-raise (for
+            // example `commit_async` observing the leader's panic join)
+            // must not replace the failure every waiter already sees.
+            if state.poisoned.is_none() {
+                state.poisoned = Some(detail.to_owned());
+                state.failure = Some((ApiErrorCode::Internal, detail.to_owned()));
+            }
+            state.needs_alignment = true;
+            state.leader_active = false;
+        }
+        self.wake_all();
+    }
+
+    /// Resolve the leader's own sequence after the pending queue is empty.
+    fn finish_leader(&self, own_seq: u64, own_error: Option<ApiError>) -> Result<(), ApiError> {
+        if let Some(error) = own_error {
+            return Err(error);
+        }
+        let state = self.lock_writer();
+        if let Some(result) = Self::resolution(&state, own_seq) {
+            return result;
+        }
+        // The leader's own capture was in `pending` before leadership
+        // began, so one of the watermarks above must resolve it.
+        Ok(())
+    }
+
+    /// The leader loop: take the latest pending capture, perform one
+    /// physical write under the per-path gate, then advance the watermark
+    /// or fail/poison.
+    ///
+    /// Must never take the provider state lock: a synchronous waiter may
+    /// hold it while this runs.
+    fn run_leader(&self, own_seq: u64, token: &mut LeaderToken) -> Result<(), ApiError> {
+        let mut own_error: Option<ApiError> = None;
+        loop {
+            if let Some(reason) = self.lock_writer().poisoned.clone() {
+                self.finish_poisoned(token);
+                return Err(ApiError::new(ApiErrorCode::Internal, reason));
+            }
+            let Some((seq, encoded, snapshot)) = self.latest_pending() else {
+                {
+                    self.lock_writer().leader_active = false;
+                }
+                self.wake_all();
+                token.disarm();
+                return self.finish_leader(own_seq, own_error);
+            };
+
+            #[cfg(test)]
+            self.physical_writes.fetch_add(1, Ordering::SeqCst);
+
+            let outcome = match self.write_pending(&encoded) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    token.disarm();
+                    return Err(error);
+                }
+            };
+            match outcome {
+                WriteOutcome::Saved => {
+                    self.mark_durable(seq, &snapshot);
+                    self.wake_all();
+                }
+                WriteOutcome::Failed(error) => {
+                    // The rename is the commit point. A readable durable
+                    // file that equals the attempted snapshot proves this
+                    // capture landed even though the save returned an
+                    // error (the `AfterRenameBeforeDirFsync` class).
+                    let landed =
+                        LvmState::load(&self.path).is_ok_and(|durable| durable == *snapshot);
+                    if landed {
+                        self.mark_durable(seq, &snapshot);
+                        // The leader caller still receives the original
+                        // save error, matching the single-save behavior.
+                        own_error.get_or_insert(error);
+                        self.wake_all();
+                        continue;
+                    }
+                    // Readable-but-different or unreadable: the capture
+                    // cannot be proven durable. Fail every outstanding
+                    // sequence, publish nothing, and require the next
+                    // admission to re-align. Never poison here: the
+                    // existing sync compensation tests classify these
+                    // strings per caller.
+                    self.fail_unproven(seq, &error);
+                    self.wake_all();
+                    token.disarm();
+                    return match own_error {
+                        Some(leader_error) => Err(leader_error),
+                        None => Err(error),
+                    };
+                }
+                WriteOutcome::Panicked(payload) => {
+                    self.fail_panicked(seq);
+                    self.wake_all();
+                    token.disarm();
+                    resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    /// The latest pending capture, with its sequence and snapshot.
+    fn latest_pending(&self) -> Option<(u64, Arc<[u8]>, Arc<LvmState>)> {
+        let state = self.lock_writer();
+        state.pending.iter().next_back().map(|(&seq, capture)| {
+            (
+                seq,
+                Arc::clone(&capture.encoded),
+                Arc::clone(&capture.snapshot),
             )
-        })?;
-        state.save_with_hooks(path, Some(crash))
+        })
+    }
+
+    /// One physical write under the per-path gate. A poisoned gate is a
+    /// terminal writer poison; the caller returns the typed error.
+    fn write_pending(&self, encoded: &[u8]) -> Result<WriteOutcome, ApiError> {
+        if let Ok(gate) = self.gate.lock() {
+            let outcome = match catch_unwind(AssertUnwindSafe(|| {
+                LvmState::save_encoded_with_hooks(encoded, &self.path, Some(&self.crash))
+            })) {
+                Ok(Ok(())) => WriteOutcome::Saved,
+                Ok(Err(error)) => WriteOutcome::Failed(error),
+                Err(payload) => WriteOutcome::Panicked(payload),
+            };
+            // Drop the gate before touching writer bookkeeping or
+            // re-raising a panic; the gate is a leaf.
+            drop(gate);
+            Ok(outcome)
+        } else {
+            // A poisoned physical-write gate is itself a terminal writer
+            // poison: no save can be serialized safely.
+            self.poison(GATE_POISON_DETAIL);
+            Err(ApiError::new(ApiErrorCode::Internal, GATE_POISON_DETAIL))
+        }
+    }
+
+    /// Clear leadership and fail every pending sequence after the writer
+    /// was already poisoned.
+    fn finish_poisoned(&self, token: &mut LeaderToken) {
+        self.lock_writer().leader_active = false;
+        self.wake_all();
+        token.disarm();
+    }
+
+    /// Record an unproven physical-write failure: cover every outstanding
+    /// sequence through the permanent failure watermark, publish nothing,
+    /// and require admission alignment. Never poison.
+    fn fail_unproven(&self, seq: u64, error: &ApiError) {
+        let mut state = self.lock_writer();
+        let max_seq = state
+            .pending
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(seq)
+            .max(seq);
+        state.failed_through = state.failed_through.max(max_seq);
+        state.pending.clear();
+        state.failure = Some((error.code, error.detail.clone()));
+        state.needs_alignment = true;
+        state.leader_active = false;
+    }
+
+    /// Record a leader panic: cover every outstanding sequence, poison the
+    /// writer, and require admission alignment before any restart.
+    fn fail_panicked(&self, seq: u64) {
+        let mut state = self.lock_writer();
+        let max_seq = state
+            .pending
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(seq)
+            .max(seq);
+        state.failed_through = state.failed_through.max(max_seq);
+        state.pending.clear();
+        state.failure = Some((ApiErrorCode::Internal, WRITER_POISON_DETAIL.to_owned()));
+        state.poisoned = Some(WRITER_POISON_DETAIL.to_owned());
+        state.needs_alignment = true;
+        state.leader_active = false;
+    }
+
+    /// Commit a reservation from an async caller: the leader runs its
+    /// blocking write loop on `spawn_blocking`; a waiter awaits the
+    /// permanent watermarks via `Notify` without pinning a worker.
+    async fn commit_async(self: &Arc<Self>, reservation: Reservation) -> Result<(), ApiError> {
+        match reservation.role {
+            ReservationRole::Leader(mut token) => {
+                let core = Arc::clone(self);
+                let own_seq = reservation.seq;
+                let joined = tokio::task::spawn_blocking(move || {
+                    let result = core.run_leader(own_seq, &mut token);
+                    token.disarm();
+                    result
+                })
+                .await;
+                match joined {
+                    Ok(result) => result,
+                    Err(join_error) => {
+                        let detail = if join_error.is_panic() {
+                            "LVM provider durable writer leader panicked"
+                        } else {
+                            "LVM provider durable writer leader task was cancelled"
+                        };
+                        self.poison(detail);
+                        if join_error.is_panic() {
+                            // Keep the armed-kill payload in band for the
+                            // campaign rigs.
+                            resume_unwind(join_error.into_panic());
+                        }
+                        Err(ApiError::new(ApiErrorCode::Internal, detail))
+                    }
+                }
+            }
+            ReservationRole::Waiter => self.wait_async(reservation.seq).await,
+        }
+    }
+
+    /// The admission alignment check (read under the provider state lock).
+    fn needs_alignment(&self) -> bool {
+        self.lock_writer().needs_alignment
+    }
+
+    /// Clear the alignment flag after `lock_state` has replaced the guard
+    /// with a readable durable file. No capture can be reserved between
+    /// the flag observation and this clear: `reserve` holds the same
+    /// mutex and refuses while the flag is set.
+    fn clear_needs_alignment(&self) {
+        self.lock_writer().needs_alignment = false;
     }
 }
 
 /// A writer view of [`LvmState`].
 ///
-/// On drop it publishes the resulting in-memory state as the new
-/// [`LvmProvider::read_snapshot`] if the guard was used mutably. This
-/// keeps the reader view exactly as consistent with in-memory state as
-/// the old design (where reads took the same mutex), without making
-/// reads wait for the writer's fsync.
+/// On drop it publishes the resulting in-memory state as the new read
+/// snapshot if the guard was used mutably. This keeps the reader view
+/// exactly as consistent with in-memory state as the old design (where
+/// reads took the same mutex), without making reads wait for the writer's
+/// fsync.
 pub(crate) struct StateGuard<'a> {
     guard: MutexGuard<'a, LvmState>,
-    snapshot: &'a RwLock<Arc<LvmState>>,
+    writer: &'a Arc<WriterCore>,
     dirty: bool,
 }
 
@@ -497,7 +1038,7 @@ impl StateGuard<'_> {
     /// either performs one save or classifies the durable file explicitly;
     /// a future multi-save caller must not use this method.
     pub(crate) fn revert(&mut self) {
-        let committed = match self.snapshot.read() {
+        let committed = match self.writer.read_snapshot.read() {
             Ok(current) => Arc::clone(&current),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
         };
@@ -505,28 +1046,32 @@ impl StateGuard<'_> {
         self.dirty = false;
     }
 
-    /// Reconcile a guard after its durable save returned an error.
+    /// Capture the current state and reserve a durable sequence without
+    /// publishing; the caller must drop this guard before it waits.
     ///
-    /// The save's commit point is the rename, and the caller cannot tell
-    /// from the error alone which side of it failed (the injected
-    /// `AfterRename*` seams deliberately fail after the rename). Compare
-    /// the state file with the pending in-memory state:
+    /// Phase D D3 slice 2 (#62): attach/detach/report use this to capture
+    /// `(sequence, encoded bytes, snapshot)` **under** the state lock, so
+    /// reservation order equals mutation order, then drop the guard and
+    /// wait for durability without holding the provider state lock.
+    /// Publication is the writer's job after the physical write; dropping
+    /// this guard does not publish.
     ///
-    /// - a matching file means the rename landed and this mutation IS the
-    ///   durable state, so keep it (and publish it on drop) — reverting
-    ///   would make reads older than the provider's own file;
-    /// - anything else (no file, a different state, or a re-read that
-    ///   itself failed) means the mutation cannot be **proven** durable,
-    ///   so it must not be published. An unreadable re-read is treated as
-    ///   unknown rather than as proof of a landed rename: the conservative
-    ///   direction can lose a durable mutation that the next save would
-    ///   then erase, but it never reports an uncommitted mutation as
-    ///   committed. The caller still returns the save error.
-    pub(crate) fn reconcile_failed_save(&mut self, path: &Path) {
-        let durable_matches = LvmState::load(path).is_ok_and(|durable| durable == *self.guard);
-        if !durable_matches {
-            self.revert();
-        }
+    /// On an encode or reservation error the guard suppresses publication
+    /// (the caller returns the typed error) and the next admission recovers
+    /// by aligning to the durable file.
+    pub(crate) fn capture_and_reserve(&mut self) -> Result<Reservation, ApiError> {
+        let encoded = match self.guard.encode_for_save() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.dirty = false;
+                return Err(error);
+            }
+        };
+        let snapshot = Arc::new(self.guard.clone());
+        let reserved = self.writer.reserve(Arc::from(encoded), snapshot);
+        // The writer publishes after durability; this guard must not.
+        self.dirty = false;
+        reserved
     }
 }
 
@@ -538,8 +1083,14 @@ impl Drop for StateGuard<'_> {
         if !self.dirty || std::thread::panicking() {
             return;
         }
+        // Drop-publication is kept for lock-holding synchronous callers.
+        // It cannot regress a writer-published snapshot: while this guard
+        // holds the state lock no later capture can be reserved, so its
+        // in-memory state is at least as new as every in-flight capture
+        // the writer could publish. The async capture path uses
+        // `capture_and_reserve` plus an explicit drop, which clears `dirty`.
         let published = Arc::new(self.guard.clone());
-        match self.snapshot.write() {
+        match self.writer.read_snapshot.write() {
             Ok(mut current) => *current = published,
             // A poisoned reader-view lock must not wedge every future
             // read: recover the inner value (the snapshot holds no
@@ -605,20 +1156,25 @@ impl LvmProvider {
         // a stale file; other files in the directory are never touched.
         crate::state::sweep_stale_temps(&state_path);
         let state = LvmState::load(&state_path)?;
-        let read_snapshot = Arc::new(state.clone());
-        let writer = DurableWriter::new(&state_path);
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
         let provider = Self {
             runner,
             state_path,
             sysfs_root,
             vg_prefix,
             expected_auth_token,
-            store_crash: Arc::new(StoreCrashHooks::new()),
+            store_crash,
             writer,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
-            read_snapshot: RwLock::new(read_snapshot),
+            read_snapshot,
         };
         // Startup reconciliation persists its result through the writer
         // guard, which publishes the post-reconcile reader view on drop.
@@ -643,16 +1199,67 @@ impl LvmProvider {
         &self.store_crash
     }
 
-    /// Persist the in-memory state through the single durable writer.
+    /// Persist the in-memory state through the coalescing durable writer.
     ///
     /// Every production mutation — volume, move, admin claim/release and
     /// every compensation path — routes through here, so the armed crash
     /// seam sees every commit boundary of the state file and no class
-    /// keeps a second direct-file path (Phase D D3 slice 1, #62). The
-    /// caller still holds the provider state lock across the save in this
-    /// slice.
+    /// keeps a second direct-file path (Phase D D3 slices 1–2, #62).
+    ///
+    /// The caller holds the provider state lock, so capture and sequence
+    /// reservation happen under it (capture order equals sequence order).
+    /// If another caller already leads, this call waits on the permanent
+    /// watermarks while still holding the lock; the leader never takes that
+    /// lock, so the wait cannot deadlock.
     pub(crate) fn persist(&self, state: &mut LvmState) -> Result<(), ApiError> {
-        self.writer.save(state, &self.state_path, &self.store_crash)
+        let encoded = state.encode_for_save()?;
+        let snapshot = Arc::new(state.clone());
+        let reservation = self.writer.reserve(Arc::from(encoded), snapshot)?;
+        match reservation.role {
+            ReservationRole::Leader(mut token) => {
+                self.writer.run_leader(reservation.seq, &mut token)
+            }
+            ReservationRole::Waiter => self.writer.wait_sync(reservation.seq),
+        }
+    }
+
+    /// Reconcile in-memory state after its durable save returned an error,
+    /// keeping the per-caller classification slice 1 had.
+    ///
+    /// A readable durable file that equals `state` means the mutation is
+    /// durable and memory is already aligned. Otherwise state returns to
+    /// the last published snapshot (today's behavior), never to an
+    /// arbitrary readable file: the caller still classifies its own save
+    /// error. The writer's `needs_alignment` flag clears only when the
+    /// resulting state is aligned to a readable durable file; an unreadable
+    /// file leaves it set so admission retries (fail-closed), and an
+    /// unaligned readable file leaves it set for the next `lock_state`.
+    ///
+    /// **Precondition: at most one successful durable save per guard.**
+    /// The published snapshot is updated on guard drop, not per save, so
+    /// reverting after a later failed save would also discard an earlier
+    /// successful save that is already durable. Every current caller either
+    /// performs one save or classifies the durable file explicitly; a
+    /// future multi-save caller must not use this method.
+    pub(crate) fn reconcile_failed_save(&self, state: &mut StateGuard<'_>) {
+        match LvmState::load(&self.state_path) {
+            Ok(durable) => {
+                if durable != **state {
+                    // Restore the last published view and suppress this
+                    // guard's publication, so a later leader snapshot is
+                    // never regressed. Callers still classify the error.
+                    state.revert();
+                }
+                if durable == **state {
+                    self.writer.clear_needs_alignment();
+                }
+            }
+            Err(_) => {
+                // Keep the existing per-caller classification: an
+                // unreadable re-read reverts and does not clear alignment.
+                state.revert();
+            }
+        }
     }
 
     /// Count one more consecutive world-observe failure for a move
@@ -677,19 +1284,40 @@ impl LvmProvider {
         }
     }
 
-    /// Lock the writer state, mapping poisoning to `INTERNAL`. The
-    /// returned guard publishes the resulting read snapshot when it is
-    /// dropped (if used mutably).
+    /// Lock the writer state, mapping poisoning to `INTERNAL`, and align
+    /// in-memory state with the durable file when a writer failure left
+    /// `needs_alignment` set.
+    ///
+    /// This is the only admission alignment point (Phase D D3 slice 2,
+    /// #62). The durable file is loaded under the provider state lock; a
+    /// successful load replaces the guard and clears the flag. An
+    /// unreadable file returns a typed `INTERNAL` and leaves the flag set,
+    /// so later admissions retry instead of serving state that may not
+    /// match disk.
     pub(crate) fn lock_state(&self) -> Result<StateGuard<'_>, ApiError> {
-        let guard = self.state.lock().map_err(|_| {
+        let mut guard = self.state.lock().map_err(|_| {
             ApiError::new(
                 ApiErrorCode::Internal,
                 "LVM provider state lock poisoned by a previous failure",
             )
         })?;
+        if self.writer.needs_alignment() {
+            let durable = LvmState::load(&self.state_path).map_err(|error| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "LVM provider requires admission alignment but the durable state \
+                         could not be read: {}",
+                        error.detail
+                    ),
+                )
+            })?;
+            *guard = durable;
+            self.writer.clear_needs_alignment();
+        }
         Ok(StateGuard {
             guard,
-            snapshot: &self.read_snapshot,
+            writer: &self.writer,
             dirty: false,
         })
     }
@@ -699,9 +1327,9 @@ impl LvmProvider {
     /// Clones the published `Arc` under a short read lock; the caller
     /// then reads without any provider-state lock, so a concurrent
     /// mutation's whole-file fsync or LVM CLI call cannot block it.
-    /// Publication happens when the writer guard drops (including
-    /// failure paths that deliberately keep an in-memory state, which
-    /// preserves the pre-#62 read behavior).
+    /// Publication happens after the writer proves a capture durable (or
+    /// when a lock-holding synchronous guard drops, preserving the
+    /// pre-#62 read behavior).
     pub(crate) fn state_snapshot(&self) -> Arc<LvmState> {
         match self.read_snapshot.read() {
             Ok(current) => Arc::clone(&current),
@@ -907,7 +1535,7 @@ impl LvmProvider {
     /// Neither failure ever masks the original save error.
     fn compensate_unpersisted_create(
         &self,
-        state: &mut LvmState,
+        state: &mut StateGuard<'_>,
         volume_id: &VolumeId,
         vg_name: &str,
         lv_name: &str,
@@ -920,11 +1548,23 @@ impl LvmProvider {
             return Self::create_already_durable_error(volume_id, vg_name, lv_name, save_error);
         }
 
+        // The failed final save may have left the writer requiring
+        // admission alignment. This caller's compensation is the next
+        // save in the same critical section, so reconcile here (never
+        // inside `persist`): adopt a landed save, otherwise revert, and
+        // leave the flag set when the durable file is unreadable.
+        if self.writer.needs_alignment() {
+            self.reconcile_failed_save(state);
+        }
+
         let removed = self
             .runner
             .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])
             .is_ok_and(|output| output.success);
         state.remove_volume(volume_id);
+        // Reconciliation may have restored the durable intent; the clear
+        // save below is what removes it durably.
+        state.remove_create_intent(volume_id);
         let mut detail = save_error.detail.clone();
         if !removed {
             detail.push_str(
@@ -1440,7 +2080,7 @@ impl LvmProvider {
         }
         if changed {
             if let Err(error) = self.persist(&mut state) {
-                state.reconcile_failed_save(&self.state_path);
+                self.reconcile_failed_save(&mut state);
                 return Err(error);
             }
         }
@@ -2039,7 +2679,7 @@ impl LvmProvider {
         Ok(inspect_response(&req.volume_id, &stored))
     }
 
-    fn attach_volume_inner(
+    async fn attach_volume_inner(
         &self,
         volume_id: &VolumeId,
         req: &AttachVolumeRequest,
@@ -2053,118 +2693,136 @@ impl LvmProvider {
             }
         }
         let mode = requested_mode(req.access_mode);
-        let mut state = self.lock_state()?;
-        // A durable pending delete owns this volume's fate: no new
-        // attachment may be granted while it is outstanding.
-        self.ensure_no_pending_delete(&state, volume_id)?;
+        // Everything that touches state lives in this block: the guard is
+        // dropped before the durability wait, so the provider state lock is
+        // never held across an `await`.
+        let (response, reservation) = {
+            let mut state = self.lock_state()?;
+            // A durable pending delete owns this volume's fate: no new
+            // attachment may be granted while it is outstanding.
+            self.ensure_no_pending_delete(&state, volume_id)?;
 
-        // Crash-replay idempotency: an attachment id that is already
-        // recorded replays the recorded response (even if the volume
-        // generation has since moved) and never fabricates a second
-        // attachment; the same id with a different payload conflicts.
-        let identity = AttachmentIdentity::from_request(volume_id, req, mode);
-        for (recorded_volume, stored) in state.volumes() {
-            if let Some(record) = stored.runtime.attachment.as_ref() {
-                if record.id == req.attachment_id {
-                    resolve_attachment_replay(recorded_volume, record, &identity)?;
-                    return Ok(attach_response(record, &stored.entry));
+            // Crash-replay idempotency: an attachment id that is already
+            // recorded replays the recorded response (even if the volume
+            // generation has since moved) and never fabricates a second
+            // attachment; the same id with a different payload conflicts.
+            let identity = AttachmentIdentity::from_request(volume_id, req, mode);
+            for (recorded_volume, stored) in state.volumes() {
+                if let Some(record) = stored.runtime.attachment.as_ref() {
+                    if record.id == req.attachment_id {
+                        resolve_attachment_replay(recorded_volume, record, &identity)?;
+                        return Ok(attach_response(record, &stored.entry));
+                    }
                 }
             }
-        }
 
-        let stored = state
-            .volume_mut(volume_id)
-            .ok_or_else(|| not_found(volume_id))?;
-        ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
-        ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
-        match stored.runtime.state {
-            VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
-            other => {
-                return Err(ApiError::new(
-                    ApiErrorCode::InvalidState,
-                    format!("attach requires a Ready volume, volume is {other:?}"),
-                ));
-            }
-        }
+            let response = {
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                ensure_expected_generation(
+                    req.expected_volume_generation,
+                    stored.entry.generation,
+                )?;
+                ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
+                match stored.runtime.state {
+                    VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
+                    other => {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidState,
+                            format!("attach requires a Ready volume, volume is {other:?}"),
+                        ));
+                    }
+                }
 
-        // The attachment generation is the detach/report fence and is
-        // strictly increasing per volume: it is the volume generation this
-        // attach consumed, never a constant `1`. A delayed report or detach
-        // from a retired instance therefore carries an older generation and
-        // is refused, even if a consumer reuses the attachment id.
-        let record = AttachmentRecord {
-            id: req.attachment_id.clone(),
-            vm_id: req.vm_id.clone(),
-            host_id: req.host_id.clone(),
-            generation: stored.entry.generation,
-            access_mode: mode,
-            vmm_disk_id: req.vmm_disk_id.clone(),
-            state: AttachmentState::Prepared,
-            state_revision: volvisor_types::domain::initial_state_revision(),
-            evidence: None,
-            reporter: None,
-            recorded_at_ms: None,
+                // The attachment generation is the detach/report fence and is
+                // strictly increasing per volume: it is the volume generation this
+                // attach consumed, never a constant `1`. A delayed report or detach
+                // from a retired instance therefore carries an older generation and
+                // is refused, even if a consumer reuses the attachment id.
+                let record = AttachmentRecord {
+                    id: req.attachment_id.clone(),
+                    vm_id: req.vm_id.clone(),
+                    host_id: req.host_id.clone(),
+                    generation: stored.entry.generation,
+                    access_mode: mode,
+                    vmm_disk_id: req.vmm_disk_id.clone(),
+                    state: AttachmentState::Prepared,
+                    state_revision: volvisor_types::domain::initial_state_revision(),
+                    evidence: None,
+                    reporter: None,
+                    recorded_at_ms: None,
+                };
+                stored.runtime.attachment = Some(record.clone());
+                stored.runtime.state = VolumeLifecycle::Attached;
+                stored.entry.generation += 1;
+                attach_response(&record, &stored.entry)
+            };
+            // Capture and reserve under the state lock; the guard drops at
+            // the end of this block, before the wait. A failure returns
+            // typed and the next admission aligns (the leader failure path
+            // never takes the provider state lock).
+            let reservation = state.capture_and_reserve()?;
+            (response, reservation)
         };
-        stored.runtime.attachment = Some(record.clone());
-        stored.runtime.state = VolumeLifecycle::Attached;
-        stored.entry.generation += 1;
-        let response = attach_response(&record, &stored.entry);
-        if let Err(error) = self.persist(&mut state) {
-            state.reconcile_failed_save(&self.state_path);
-            return Err(error);
-        }
+        self.writer.commit_async(reservation).await?;
         Ok(response)
     }
 
-    fn detach_volume_inner(
+    async fn detach_volume_inner(
         &self,
         volume_id: &VolumeId,
         attachment_id: &AttachmentId,
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         req.validate()?;
-        let mut state = self.lock_state()?;
-        let stored = state
-            .volume_mut(volume_id)
-            .ok_or_else(|| not_found(volume_id))?;
-        let Some(record) = stored.runtime.attachment.as_ref() else {
-            return Err(ApiError::not_found(format!(
-                "volume {volume_id} has no attachment"
-            )));
-        };
-        if record.id != *attachment_id {
-            return Err(ApiError::not_found(format!(
-                "attachment {attachment_id} is not attached to volume {volume_id}"
-            )));
-        }
-        ensure_expected_attachment_generation(
-            req.expected_attachment_generation,
-            record.generation,
-        )?;
-        // The drain proof (`vm_stopped_or_io_drained_proof`) is a
-        // type-mandatory attestation: authority is never released without
-        // one, though the provider cannot verify the claim itself
-        // (Volume API v2 section 3).
+        // The guard is confined to this block so it is dropped before the
+        // durability wait.
+        let (response, reservation) = {
+            let mut state = self.lock_state()?;
+            let response = {
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                let Some(record) = stored.runtime.attachment.as_ref() else {
+                    return Err(ApiError::not_found(format!(
+                        "volume {volume_id} has no attachment"
+                    )));
+                };
+                if record.id != *attachment_id {
+                    return Err(ApiError::not_found(format!(
+                        "attachment {attachment_id} is not attached to volume {volume_id}"
+                    )));
+                }
+                ensure_expected_attachment_generation(
+                    req.expected_attachment_generation,
+                    record.generation,
+                )?;
+                // The drain proof (`vm_stopped_or_io_drained_proof`) is a
+                // type-mandatory attestation: authority is never released without
+                // one, though the provider cannot verify the claim itself
+                // (Volume API v2 section 3).
 
-        // The retired id is not tombstoned: the strictly increasing
-        // attachment generation is the fence, so a delayed report for this
-        // instance is `STALE_GENERATION` against any later one. Bounding
-        // per-id state is what keeps a churned volume usable (issue #63).
-        stored.runtime.attachment = None;
-        if stored.runtime.state == VolumeLifecycle::Attached {
-            stored.runtime.state = VolumeLifecycle::Ready;
-        }
-        stored.entry.generation += 1;
-        stored.entry.data_epoch += 1;
-        let response = inspect_response(volume_id, stored);
-        if let Err(error) = self.persist(&mut state) {
-            state.reconcile_failed_save(&self.state_path);
-            return Err(error);
-        }
+                // The retired id is not tombstoned: the strictly increasing
+                // attachment generation is the fence, so a delayed report for this
+                // instance is `STALE_GENERATION` against any later one. Bounding
+                // per-id state is what keeps a churned volume usable (issue #63).
+                stored.runtime.attachment = None;
+                if stored.runtime.state == VolumeLifecycle::Attached {
+                    stored.runtime.state = VolumeLifecycle::Ready;
+                }
+                stored.entry.generation += 1;
+                stored.entry.data_epoch += 1;
+                inspect_response(volume_id, stored)
+            };
+            let reservation = state.capture_and_reserve()?;
+            (response, reservation)
+        };
+        self.writer.commit_async(reservation).await?;
         Ok(response)
     }
 
-    fn report_attachment_state_inner(
+    async fn report_attachment_state_inner(
         &self,
         volume_id: &VolumeId,
         req: &ReportAttachmentStateRequest,
@@ -2181,29 +2839,38 @@ impl LvmProvider {
                 req.attachment_id
             )));
         }
-        let mut state = self.lock_state()?;
-        let response = {
-            let stored = state
-                .volume_mut(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            let Some(record) = stored.runtime.attachment.as_mut() else {
-                return Err(ApiError::not_found(format!(
-                    "volume {volume_id} has no attachment"
-                )));
+        // The guard is confined to this block so it is dropped before the
+        // durability wait.
+        let (response, reservation) = {
+            let mut state = self.lock_state()?;
+            let response = {
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                let Some(record) = stored.runtime.attachment.as_mut() else {
+                    return Err(ApiError::not_found(format!(
+                        "volume {volume_id} has no attachment"
+                    )));
+                };
+                if record.id != req.attachment_id {
+                    return Err(ApiError::not_found(format!(
+                        "attachment {} is not attached to volume {volume_id}",
+                        req.attachment_id
+                    )));
+                }
+                apply_attachment_report(record, req, unix_ms_now())?
             };
-            if record.id != req.attachment_id {
-                return Err(ApiError::not_found(format!(
-                    "attachment {} is not attached to volume {volume_id}",
-                    req.attachment_id
-                )));
-            }
-            apply_attachment_report(record, req, unix_ms_now())?
+            // Preserve the no-op gate: a report that did not advance the
+            // recorded state performs no save (and reserves no sequence).
+            let reservation = if response.applied {
+                Some(state.capture_and_reserve()?)
+            } else {
+                None
+            };
+            (response, reservation)
         };
-        if response.applied {
-            if let Err(error) = self.persist(&mut state) {
-                state.reconcile_failed_save(&self.state_path);
-                return Err(error);
-            }
+        if let Some(reservation) = reservation {
+            self.writer.commit_async(reservation).await?;
         }
         Ok(response)
     }
@@ -3092,7 +3759,7 @@ impl LvmProvider {
     /// the world later proves completion.
     ///
     /// Parking is applied to the in-memory view before the save. If the
-    /// save fails, [`StateGuard::reconcile_failed_save`] keeps the parked
+    /// save fails, [`LvmProvider::reconcile_failed_save`] keeps the parked
     /// state only when the durable file proves the rename landed; when
     /// durability cannot be proven the in-memory park is reverted to the
     /// last committed snapshot. The caller receives the save error either
@@ -3151,7 +3818,7 @@ impl LvmProvider {
                 .map(|record| Self::move_response(&state, volume_id, record))
         };
         self.persist(&mut state).inspect_err(|_| {
-            state.reconcile_failed_save(&self.state_path);
+            self.reconcile_failed_save(&mut state);
         })?;
         response.ok_or_else(|| not_found(volume_id))
     }
@@ -4238,7 +4905,7 @@ impl LvmProvider {
             stored.detail = None;
         }
         self.persist(&mut state).inspect_err(|_| {
-            state.reconcile_failed_save(&self.state_path);
+            self.reconcile_failed_save(&mut state);
         })?;
         Ok(true)
     }
@@ -4498,7 +5165,7 @@ impl LvmProvider {
                             .map(|record| Self::move_response(&state, volume_id, record))
                     };
                     self.persist(&mut state).inspect_err(|_| {
-                        state.reconcile_failed_save(&self.state_path);
+                        self.reconcile_failed_save(&mut state);
                     })?;
                     return response.ok_or_else(|| not_found(volume_id));
                 }
@@ -4541,7 +5208,7 @@ impl LvmProvider {
         let mut state = self.lock_state()?;
         state.remove_move(volume_id);
         self.persist(&mut state).inspect_err(|_| {
-            state.reconcile_failed_save(&self.state_path);
+            self.reconcile_failed_save(&mut state);
         })?;
         self.clear_move_observe_failures(volume_id);
         report.dropped.push(volume_id.clone());
@@ -4788,7 +5455,7 @@ impl LvmProvider {
                     stored.detail = None;
                 }
                 self.persist(&mut state).inspect_err(|_| {
-                    state.reconcile_failed_save(&self.state_path);
+                    self.reconcile_failed_save(&mut state);
                 })?;
                 report.redriven.push(volume_id.clone());
             }
@@ -5131,7 +5798,7 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError> {
-        self.attach_volume_inner(volume_id, req)
+        self.attach_volume_inner(volume_id, req).await
     }
 
     async fn detach_volume(
@@ -5141,6 +5808,7 @@ impl VolumeProvider for LvmProvider {
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         self.detach_volume_inner(volume_id, attachment_id, req)
+            .await
     }
 
     async fn report_attachment_state(
@@ -5148,7 +5816,7 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &ReportAttachmentStateRequest,
     ) -> Result<ReportAttachmentStateResponse, ApiError> {
-        self.report_attachment_state_inner(volume_id, req)
+        self.report_attachment_state_inner(volume_id, req).await
     }
 
     async fn grow_volume(
@@ -5574,18 +6242,25 @@ mod read_snapshot_tests {
                 },
             },
         );
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
         let provider = LvmProvider {
             runner: Arc::new(volvisor_provider::FakeRunner::with_queue(Vec::new())),
-            writer: DurableWriter::new(&state_path),
+            writer,
             state_path,
             sysfs_root: dir.path().to_path_buf(),
             vg_prefix: "vg-volvisor".to_owned(),
             expected_auth_token: "test-token".to_owned(),
-            store_crash: Arc::new(StoreCrashHooks::new()),
+            store_crash,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state.clone()),
-            read_snapshot: RwLock::new(Arc::new(state)),
+            read_snapshot,
         };
         (Arc::new(provider), volume_id)
     }
@@ -5676,8 +6351,8 @@ mod read_snapshot_tests {
         );
     }
 
-    #[test]
-    fn a_failed_save_publishes_nothing_and_keeps_the_committed_ready_view() {
+    #[tokio::test]
+    async fn a_failed_save_publishes_nothing_and_keeps_the_committed_ready_view() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A regular file where the state directory should be makes every
         // save fail before the temporary file is even created.
@@ -5699,6 +6374,7 @@ mod read_snapshot_tests {
         };
         let error = provider
             .attach_volume_inner(&volume_id, &request)
+            .await
             .expect_err("the durable save must fail");
         assert_eq!(error.code, ApiErrorCode::Internal);
 
@@ -5712,8 +6388,8 @@ mod read_snapshot_tests {
         assert_eq!(stored.entry.generation, 1);
     }
 
-    #[test]
-    fn a_failed_save_after_the_rename_keeps_the_durable_attachment_published() {
+    #[tokio::test]
+    async fn a_failed_save_after_the_rename_keeps_the_durable_attachment_published() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (provider, volume_id) = seeded_provider(&dir);
         // The injected failure lands after the rename: the new state file
@@ -5736,6 +6412,7 @@ mod read_snapshot_tests {
         };
         let error = provider
             .attach_volume_inner(&volume_id, &request)
+            .await
             .expect_err("the directory fsync fails after the rename");
         assert_eq!(error.code, ApiErrorCode::Internal);
         assert!(
@@ -6084,37 +6761,364 @@ mod read_snapshot_tests {
             "the landed completion is untouched"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn capture_reservation_order_matches_state_lock_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let provider = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move {
+                let (seq, observed, reservation) = {
+                    let mut state = provider.lock_state().expect("writer guard");
+                    let id = VolumeId::new(format!("vol-order-{index}")).expect("valid id");
+                    state.insert_move(
+                        id,
+                        crate::state::MoveRecord {
+                            operation_id: volvisor_types::OperationId::new(format!(
+                                "op-order-{index}"
+                            ))
+                            .expect("valid id"),
+                            source_pv: format!("/dev/source-{index}"),
+                            target_pv: "/dev/target".to_owned(),
+                            state: MoveVolumeBackingState::Preparing,
+                            detail: None,
+                        },
+                    );
+                    let observed = state.moves().len();
+                    let reservation = state.capture_and_reserve().expect("capture");
+                    (reservation.seq, observed, reservation)
+                };
+                provider
+                    .writer
+                    .commit_async(reservation)
+                    .await
+                    .expect("commit");
+                (seq, observed)
+            }));
+        }
+        let mut observed = Vec::new();
+        for handle in handles {
+            observed.push(handle.await.expect("task"));
+        }
+        observed.sort_by_key(|(seq, _)| *seq);
+        for pair in observed.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "a later sequence must contain every earlier capture: {observed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn needs_alignment_blocks_captures_and_clears_after_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // Make the seeded state durable so admission has a baseline to
+        // align to after the injected failure.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-align").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-align").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the injected pre-rename failure is not durable");
+        assert!(
+            provider.writer.needs_alignment(),
+            "a hard failure requires admission alignment"
+        );
+
+        // New captures are refused until admission aligns.
+        let mut probe = LvmState::default();
+        let encoded = probe.encode_for_save().expect("encode probe");
+        let rejected = provider
+            .writer
+            .reserve(Arc::from(encoded), Arc::new(probe))
+            .err()
+            .expect("a capture before alignment must be refused");
+        assert!(
+            rejected.detail.contains(NEEDS_ALIGNMENT_DETAIL),
+            "{rejected}"
+        );
+
+        {
+            let state = provider.lock_state().expect("admission aligns");
+            assert!(!provider.writer.needs_alignment());
+            assert!(
+                state.volume(&volume_id).is_some(),
+                "admission loads the durable baseline"
+            );
+            assert!(
+                state
+                    .volume(&volume_id)
+                    .expect("volume")
+                    .runtime
+                    .attachment
+                    .is_none(),
+                "the failed attachment is not resurrected"
+            );
+        }
+
+        // The flag is clear, so the same attach now commits.
+        let attached = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect("the retry after alignment succeeds");
+        assert_eq!(attached.attachment_id, request.attachment_id);
+        assert_eq!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("attachment")
+                .id,
+            request.attachment_id
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_durable_file_fails_admission_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let (provider, volume_id) =
+            seeded_provider_with_state_path(&dir, blocker.join("state.json"));
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-unreadable").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-unreadable").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the save fails and the durable file is unreadable");
+        assert!(provider.writer.needs_alignment());
+        let error = provider
+            .lock_state()
+            .err()
+            .expect("admission must fail closed on an unreadable durable file");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("requires admission alignment"),
+            "{error}"
+        );
+        assert!(
+            provider.writer.needs_alignment(),
+            "an unreadable durable file leaves the flag set for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_readable_different_durable_file_is_adopted_at_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let mut durable = LvmState::default();
+        let foreign = VolumeId::new("vol-adopted").expect("valid id");
+        durable.insert_move(
+            foreign.clone(),
+            crate::state::MoveRecord {
+                operation_id: volvisor_types::OperationId::new("op-adopted").expect("valid id"),
+                source_pv: "/dev/sda".to_owned(),
+                target_pv: "/dev/sdb".to_owned(),
+                state: MoveVolumeBackingState::Preparing,
+                detail: None,
+            },
+        );
+        durable
+            .save(&provider.state_path)
+            .expect("write a different durable state");
+        {
+            provider.writer.lock_writer().needs_alignment = true;
+        }
+        {
+            let state = provider.lock_state().expect("admission adopts durable");
+            assert_eq!(
+                state.move_record(&foreign),
+                durable.move_record(&foreign),
+                "the guard is aligned to the readable durable file"
+            );
+            assert!(
+                !provider.writer.needs_alignment(),
+                "a successful readable alignment clears the flag"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_no_op_does_not_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let attach = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-report-attach").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-report").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let attached = provider
+            .attach_volume_inner(&volume_id, &attach)
+            .await
+            .expect("attach");
+        let report = ReportAttachmentStateRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-report").expect("valid id"),
+            attachment_id: attach.attachment_id.clone(),
+            expected_attachment_generation: attached.attachment_generation,
+            state: AttachmentState::Advertised,
+            evidence: AttachmentEvidence::VmmConfigured,
+            reporter: Some("rig".to_owned()),
+            detail: None,
+        };
+        let first = provider
+            .report_attachment_state_inner(&volume_id, &report)
+            .await
+            .expect("first report");
+        assert!(first.applied, "the first report advances the state");
+        let writes = provider.writer.physical_writes.load(Ordering::SeqCst);
+        let second = provider
+            .report_attachment_state_inner(&volume_id, &report)
+            .await
+            .expect("no-op report");
+        assert!(!second.applied, "the repeated report is a no-op");
+        assert_eq!(
+            provider.writer.physical_writes.load(Ordering::SeqCst),
+            writes,
+            "a no-op report must not perform a physical save"
+        );
+    }
 }
 
 #[cfg(test)]
 mod durable_writer_tests {
     use super::*;
+    use volvisor_types::crash::{CRASH_PANIC_PREFIX, StoreSavePoint};
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        hooks: Arc<StoreCrashHooks>,
+        read: Arc<RwLock<Arc<LvmState>>>,
+        core: Arc<WriterCore>,
+    }
+
+    fn core_for(
+        path: &Path,
+        hooks: Arc<StoreCrashHooks>,
+    ) -> (Arc<WriterCore>, Arc<RwLock<Arc<LvmState>>>) {
+        let read = Arc::new(RwLock::new(Arc::new(LvmState::default())));
+        let core = Arc::new(WriterCore::new(path, hooks, Arc::clone(&read)));
+        (core, read)
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let hooks = Arc::new(StoreCrashHooks::new());
+        let (core, read) = core_for(&path, Arc::clone(&hooks));
+        Fixture {
+            _dir: dir,
+            path,
+            hooks,
+            read,
+            core,
+        }
+    }
+
+    fn state_with_moves(count: usize) -> LvmState {
+        let mut state = LvmState::default();
+        for index in 0..count {
+            let id = VolumeId::new(format!("vol-{index}")).expect("valid id");
+            state.insert_move(
+                id,
+                crate::state::MoveRecord {
+                    operation_id: volvisor_types::OperationId::new(format!("op-{index}"))
+                        .expect("valid id"),
+                    source_pv: format!("/dev/source-{index}"),
+                    target_pv: "/dev/target".to_owned(),
+                    state: MoveVolumeBackingState::Preparing,
+                    detail: None,
+                },
+            );
+        }
+        state
+    }
+
+    fn capture(state: &LvmState) -> (Arc<[u8]>, Arc<LvmState>) {
+        let mut state = state.clone();
+        let encoded = state.encode_for_save().expect("encode test state");
+        (Arc::from(encoded), Arc::new(state))
+    }
+
+    fn expect_leader(reservation: Reservation) -> (u64, LeaderToken) {
+        let Reservation { seq, role } = reservation;
+        let token = match role {
+            ReservationRole::Leader(token) => Some(token),
+            ReservationRole::Waiter => None,
+        };
+        (seq, token.expect("the first reservation must lead"))
+    }
+
+    fn reserve(core: &Arc<WriterCore>, state: &LvmState) -> Reservation {
+        let (encoded, snapshot) = capture(state);
+        core.reserve(encoded, snapshot).expect("reserve")
+    }
 
     #[test]
-    fn writers_share_the_gate_only_for_the_same_state_path() {
+    fn writer_gates_are_shared_only_for_the_same_canonical_state_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_path = dir.path().join("state.json");
         let other_path = dir.path().join("other.json");
 
-        let first = DurableWriter::new(&state_path);
-        let same = DurableWriter::new(&state_path);
-        let different = DurableWriter::new(&other_path);
+        let first = WriterCore::gate_for(&state_path);
+        let same = WriterCore::gate_for(&state_path);
+        let different = WriterCore::gate_for(&other_path);
 
         assert!(
-            Arc::ptr_eq(&first.gate, &same.gate),
+            Arc::ptr_eq(&first, &same),
             "two writers on the same state path must share one gate"
         );
         assert!(
-            !Arc::ptr_eq(&first.gate, &different.gate),
+            !Arc::ptr_eq(&first, &different),
             "different state paths must not share a gate"
         );
 
         // The canonical parent makes lexically different spellings of
         // the same file share the gate too.
         let alias = dir.path().join(".").join("state.json");
-        let aliased = DurableWriter::new(&alias);
+        let aliased = WriterCore::gate_for(&alias);
         assert!(
-            Arc::ptr_eq(&first.gate, &aliased.gate),
+            Arc::ptr_eq(&first, &aliased),
             "the canonical state-path identity must alias the same gate"
         );
     }
@@ -6124,11 +7128,11 @@ mod durable_writer_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_path = dir.path().join("state.json");
 
-        let first = DurableWriter::new(&state_path);
-        let old = Arc::downgrade(&first.gate);
-        let same = DurableWriter::new(&state_path);
+        let first = WriterCore::gate_for(&state_path);
+        let old = Arc::downgrade(&first);
+        let same = WriterCore::gate_for(&state_path);
         assert!(
-            Arc::ptr_eq(&first.gate, &same.gate),
+            Arc::ptr_eq(&first, &same),
             "two live writers on the same path share one gate"
         );
 
@@ -6139,27 +7143,25 @@ mod durable_writer_tests {
             "the registry must not keep a strong reference to a dropped writer's gate"
         );
 
-        let fresh = DurableWriter::new(&state_path);
+        let fresh = WriterCore::gate_for(&state_path);
         assert!(
             old.upgrade().is_none(),
             "a fresh writer after every strong reference dropped gets a new gate"
         );
-        let mut state = LvmState::default();
-        fresh
-            .save(&mut state, &state_path, &StoreCrashHooks::new())
-            .expect("the fresh gate is unpoisoned and the save succeeds");
-        assert!(state_path.exists());
+        assert!(Arc::strong_count(&fresh) >= 1, "the fresh gate is usable");
     }
 
     #[test]
     #[allow(clippy::panic)] // the test must panic while holding the gate to poison it
-    fn a_poisoned_gate_blocks_the_same_path_but_not_another() {
+    fn a_poisoned_gate_fails_the_save_and_poisons_the_writer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_path = dir.path().join("state.json");
         let other_path = dir.path().join("other.json");
 
-        let first = DurableWriter::new(&state_path);
-        let gate = Arc::clone(&first.gate);
+        let (core, _read) = core_for(&state_path, Arc::new(StoreCrashHooks::new()));
+        // Poison this live writer's own gate: dropping every strong
+        // reference would retire the gate (and its poison) instead.
+        let gate = Arc::clone(&core.gate);
         let poisoned = std::thread::spawn(move || {
             let _guard = gate
                 .lock()
@@ -6169,32 +7171,238 @@ mod durable_writer_tests {
         .join();
         assert!(poisoned.is_err(), "the helper thread panicked as intended");
 
-        let same = DurableWriter::new(&state_path);
-        assert!(
-            Arc::ptr_eq(&first.gate, &same.gate),
-            "the poisoned gate is still the shared gate for this path"
-        );
-        let mut state = LvmState::default();
-        let error = same
-            .save(&mut state, &state_path, &StoreCrashHooks::new())
+        let reservation = reserve(&core, &state_with_moves(1));
+        let (seq, mut token) = expect_leader(reservation);
+        let error = core
+            .run_leader(seq, &mut token)
             .expect_err("a poisoned shared gate must fail the save");
         assert_eq!(error.code, ApiErrorCode::Internal);
         assert!(
-            error
-                .detail
-                .contains("LVM provider durable writer lock poisoned by a previous failure"),
+            error.detail.contains(GATE_POISON_DETAIL),
             "the typed INTERNAL error names the poisoned writer gate: {error}"
         );
-
-        let different = DurableWriter::new(&other_path);
         assert!(
-            !Arc::ptr_eq(&first.gate, &different.gate),
-            "a different path keeps an independent gate"
+            core.lock_writer().poisoned.is_some(),
+            "a poisoned gate is a terminal writer poison"
         );
-        let mut other_state = LvmState::default();
-        different
-            .save(&mut other_state, &other_path, &StoreCrashHooks::new())
+
+        let (other, _other_read) = core_for(&other_path, Arc::new(StoreCrashHooks::new()));
+        let reservation = reserve(&other, &state_with_moves(1));
+        let (seq, mut token) = expect_leader(reservation);
+        other
+            .run_leader(seq, &mut token)
             .expect("a different path's writer is unaffected by the poison");
         assert!(other_path.exists());
+    }
+
+    #[test]
+    fn n_pending_captures_coalesce_into_one_physical_write() {
+        let fx = fixture();
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let mut waiters = Vec::new();
+        for count in 2..=8 {
+            let reservation = reserve(&fx.core, &state_with_moves(count));
+            assert!(
+                matches!(&reservation.role, ReservationRole::Waiter),
+                "only the first reservation leads"
+            );
+            waiters.push(reservation.seq);
+        }
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect("the coalesced write succeeds");
+        assert_eq!(
+            fx.core.physical_writes.load(Ordering::SeqCst),
+            1,
+            "all pending captures are covered by one physical write"
+        );
+        for seq in waiters {
+            fx.core
+                .wait_sync(seq)
+                .expect("every covered waiter succeeds");
+        }
+        let durable = LvmState::load(&fx.path).expect("durable state");
+        assert_eq!(
+            durable,
+            state_with_moves(8),
+            "the latest capture is durable"
+        );
+    }
+
+    #[test]
+    fn a_landed_failure_answers_covered_waiters_with_success() {
+        let fx = fixture();
+        fx.hooks.arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the leader caller still sees its save error");
+        // The rename landed: seq 2 is durable and its waiter succeeds.
+        fx.core
+            .wait_sync(waiter.seq)
+            .expect("a proven-landed covered waiter succeeds");
+        let durable = LvmState::load(&fx.path).expect("durable state");
+        assert_eq!(
+            durable,
+            state_with_moves(2),
+            "the durable file contains the waiter's mutation"
+        );
+        let published = Arc::clone(&*fx.read.read().expect("read view"));
+        assert_eq!(*published, state_with_moves(2));
+        assert!(!fx.core.lock_writer().needs_alignment);
+    }
+
+    #[test]
+    fn an_unproven_failure_fails_every_waiter_and_publishes_nothing() {
+        let fx = fixture();
+        fx.hooks.arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        let error = fx
+            .core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the pre-rename failure is not durable");
+        assert!(error.detail.contains("AfterTmpWrite"), "{error}");
+        let waiter_error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("an uncovered waiter must fail, never succeed");
+        assert!(
+            waiter_error.detail.contains("AfterTmpWrite"),
+            "{waiter_error}"
+        );
+        assert!(
+            !fx.path.exists(),
+            "a failed pre-rename save publishes no durable state"
+        );
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            Arc::new(LvmState::default()),
+            "a failed capture is never published"
+        );
+        assert!(
+            fx.core.lock_writer().needs_alignment,
+            "the next admission must align to durable"
+        );
+        let (encoded, snapshot) = capture(&state_with_moves(3));
+        let rejected = fx
+            .core
+            .reserve(encoded, snapshot)
+            .err()
+            .expect("new captures are blocked until admission aligns");
+        assert!(
+            rejected.detail.contains(NEEDS_ALIGNMENT_DETAIL),
+            "{rejected}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_durable_file_fails_closed_without_poison() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let path = blocker.join("state.json");
+        let (core, read) = core_for(&path, Arc::new(StoreCrashHooks::new()));
+        let (leader_seq, mut token) = expect_leader(reserve(&core, &state_with_moves(1)));
+        let waiter = reserve(&core, &state_with_moves(2));
+        let error = core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the physical write and its classification both fail");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        let waiter_error = core
+            .wait_sync(waiter.seq)
+            .expect_err("an unreadable durable file fails every waiter");
+        assert_eq!(waiter_error.code, ApiErrorCode::Internal);
+        {
+            let state = core.lock_writer();
+            assert!(
+                state.poisoned.is_none(),
+                "an unreadable durable file must not poison the writer"
+            );
+            assert!(
+                state.needs_alignment,
+                "an unreadable durable file requires admission alignment"
+            );
+        }
+        assert_eq!(
+            *read.read().expect("read view"),
+            Arc::new(LvmState::default())
+        );
+    }
+
+    #[test]
+    fn a_leader_panic_wakes_every_waiter_and_poisons() {
+        let fx = fixture();
+        fx.hooks.arm(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterTmpWrite,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            fx.core.run_leader(leader_seq, &mut token)
+        }))
+        .expect_err("the armed crash seam must panic");
+        let payload = payload
+            .downcast_ref::<String>()
+            .expect("the crash payload is the marked string");
+        assert!(
+            payload.starts_with(CRASH_PANIC_PREFIX),
+            "the campaign rig must still see the in-band crash payload: {payload}"
+        );
+        let error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("a leader panic wakes waiters with a typed failure");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(error.detail.contains("durable writer poisoned"), "{error}");
+        assert!(
+            fx.core.lock_writer().poisoned.is_some(),
+            "a leader panic poisons the writer"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_leader_wakes_every_waiter_and_poisons() {
+        let fx = fixture();
+        let (leader_seq, token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        assert_eq!(leader_seq, 1);
+        drop(token);
+        let error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("an abandoned leader fails its waiters");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(fx.core.lock_writer().poisoned.is_some());
+    }
+
+    #[test]
+    fn a_lower_sequence_never_replaces_a_higher_published_snapshot() {
+        let fx = fixture();
+        let higher = Arc::new(state_with_moves(5));
+        let lower = Arc::new(state_with_moves(2));
+        fx.core.publish_if_newer(5, &higher);
+        fx.core.publish_if_newer(3, &lower);
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            higher,
+            "a lower sequence must never regress the published view"
+        );
+        fx.core.publish_if_newer(6, &lower);
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            lower,
+            "a newer sequence publishes"
+        );
     }
 }

@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 delivered; slice 2 next)
+### D3 — #62 write-path hardening (slice 1 delivered; slice 2 code landed, measurement pending)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -192,24 +192,28 @@ options:
 - **Slice 2 is the release-the-lock change.** Attach/detach/report capture
   `(sequence, encoded bytes, snapshot)` under the lock, release it, and
   wait. A leader writes the latest capture once and marks every covered
-  sequence durable. The win is one file `sync_all` plus one directory
-  `sync_all` for N covered waiters. Publication moves from `StateGuard`
-  drop to a post-durability, sequence-tagged snapshot; the failure-keep
-  branches that rely on drop-publication are migrated explicitly here.
+  sequence durable, so the intended work is one file `sync_all` plus one
+  directory `sync_all` for N covered waiters. For async captures,
+  publication is a post-durability, sequence-tagged snapshot; lock-holding
+  synchronous callers keep drop publication unless their caller reconciles
+  a failed save. No throughput claim follows from the design alone.
 - **Publication is post-durability and monotonic (slice 2).** The read
   view is sequence-tagged; a lower sequence never replaces a higher one. A
   failed uncovered sequence is never published.
 - **Capture monotonicity.** In-memory state is never rolled back between
   captures, so every later capture is a superset of every earlier one.
 - **Waiter resolution is guaranteed.** No waiter parks without a
-  barrier-guaranteed exit. A caller may be answered with an error only after
+  watermark-guaranteed exit. A caller may be answered with an error only after
   the pipeline proves that no pending capture contains its mutation.
-- **Failure barrier.** Stop accepting captures; drain or fail in-flight
-  leaders; reconcile each unresolved sequence against the durable file
-  (proven-landed → success-with-note; proven-absent → error; unreadable or
-  unprovable → poison); then align in-memory state exactly to the durable
-  file. Revert-to-snapshot is legal only at this quiesce point. Poison only
-  the unprovable case; a provably-not-durable failure keeps serving.
+- **Failure barrier (corrected by the slice-2 review below).** There is no
+  transient barrier and no quiesce. An unresolved sequence resolves only
+  through the permanent watermarks: `durable_seq` (success),
+  `failed_through` (the recorded failure), or terminal poison. A
+  readable-but-different or unreadable durable file fails every outstanding
+  sequence, sets `needs_alignment`, and publishes nothing; it does **not**
+  poison. Poison is reserved for a leader panic, leader abandonment or a
+  poisoned mutex. In-memory state is aligned only at `lock_state` or by a
+  caller's `reconcile_failed_save`, never inside `persist`.
 - **Leader panic wakes everyone.** A panic or armed kill sets a writer
   poison flag, wakes all waiters with a typed failure, and mirrors today's
   mutex-poison behavior. The rig must still observe kills at the same task
@@ -220,6 +224,83 @@ options:
   Concurrent rigs that assert exact save counts are audited and updated.
 - **Async-safe waiting.** Consume the wait on `spawn_blocking` or use an
   async-aware notification; do not pin tokio workers on a std condvar.
+
+#### Slice-2 design review (2026-11-04): NO-GO as first proposed
+
+A second independent review read the slice-2 proposal against the delivered
+slice-1 writer, the compensation paths and the crash rigs. It rejected the
+proposal as written. The proposal still mixed two commit models: it released
+the lock for some callers while leaving rollback, publication and failure
+classification on the single-save/`StateGuard` assumptions, and it treated
+"the leader wrote the latest capture" as sufficient without stating the
+sequence and watermark rules that make coverage sound. The blocking findings
+and the corrections that are now **hard requirements**:
+
+1. **Reservation order (critical).** A sequence reserved outside the provider
+   state lock can invert with a concurrent mutation, so a later sequence
+   could omit an earlier caller's mutation. Capture **and** reservation happen
+   under the provider state lock; reservation order must equal mutation order.
+2. **One sequence/watermark space (critical).** The leader's latest-write
+   coverage is sound only if every caller's capture joins one shared,
+   monotonic sequence and watermark space. Per-caller or per-call-type
+   counters are not acceptable.
+3. **Permanent watermarks, no transient barrier (critical).** A waiter may
+   resolve only when `durable_seq` covers it, `failed_through` covers it, or
+   the writer is terminally poisoned. A transient "barrier"/"in-flight" flag
+   can lose a wake or strand a waiter after the flag clears.
+4. **Alignment is admission, not persistence (critical).** Alignment may
+   happen only in `lock_state` or a caller's `reconcile_failed_save`, never
+   inside `persist`. A save must not change the state it is about to encode,
+   and a caller that already holds the lock must not silently re-read under
+   it.
+5. **No state lock in the leader failure path (critical).** A synchronous
+   waiter may hold the provider state lock while the leader classifies a
+   failure; if the leader takes that lock, it deadlocks. The leader never
+   takes the provider state lock, on success or failure.
+6. **Poison is terminal, divergence is not (critical).** Poisoning on every
+   unprovable save turns a recoverable, alignable divergence into a dead
+   provider. A readable-but-different or unreadable durable file fails every
+   outstanding sequence and sets `needs_alignment` **without** poisoning.
+   Poison only on leader panic/abandonment or a poisoned mutex (and on a
+   poisoned physical-write gate, which cannot be serialized safely).
+7. **Gate and lineage scope (high).** The physical-write gate is per
+   canonical state path in this process; watermarks and pending captures are
+   per provider lineage. Two live providers aliasing one state path are
+   unsupported, even though their gate is shared. Different paths must not
+   share watermarks.
+8. **Report no-op (high).** An attachment report saves only when
+   `response.applied`; a no-op report must not reserve a sequence, write, or
+   wake waiters.
+9. **One wake helper (high).** Wake both waiter classes from one helper
+   (`Condvar::notify_all` plus `tokio::sync::Notify::notify_waiters`). Async
+   waiters subscribe before re-checking the watermarks, so a wake between
+   the check and the await is not lost.
+10. **No pinned async worker (high).** The leader's blocking write loop runs
+    on `spawn_blocking`; a waiter awaits `Notify`, not a pinned tokio worker
+    or a std condvar on an executor thread.
+11. **Armed-kill payload stays in band (high).** A leader panic (including an
+    armed crash seam) is re-raised by `commit_async` with `resume_unwind`, so
+    the campaign rigs still observe the original payload. The writer is
+    poisoned and every waiter woken with a typed failure before the re-raise.
+12. **Leadership is RAII (high).** A `LeaderToken` disarms only on a resolved
+    leader; dropping an armed token (panic, cancellation, abandonment)
+    poisons the writer and wakes every waiter.
+
+**Delivery status of this change set.** The code implements the corrected
+design: `state.rs` splits encoding from the physical save so a capture can be
+written later without the state reference; `provider.rs` replaces the
+single-shot `DurableWriter` with a per-lineage coalescing writer and per-path
+gate; attach/detach/applied-report capture under the lock, drop it, and await
+durability; synchronous mutations still lead inline under the lock. The
+deterministic tests cover coalescing into one physical write, landed-failure
+success only when the durable file proves it, unproven failure without
+poison, unreadable durable fail-closed, monotonic publication, panic wake-all
+and armed-kill re-raise, abandonment, gate poisoning, capture order, admission
+alignment, and the report no-op. **There is no throughput claim:** the
+required clean-tree benchmark at the implementation SHA has not been run, so
+the measured-baseline claim in the section above is not updated by this
+change set. #62 stays open until that run exists, and all gate verdicts are
+unchanged.
 
 **Rejected alternatives.** Per-volume files need a multi-file commit for
 delete/move/create intent atomicity; an append-only WAL would rewrite every
@@ -252,10 +333,13 @@ the attach fencing contract. None is a shortcut for this slice.
   above as a residual.
 - Slice 2: deterministic tests for covered-failure success only when the
   durable file proves it; no resurrection after an error (the journal's
-  terminal-replay rule); leader-kill wake-all; quiesced align on an
-  uncovered failure; the post-durability publication window is tested;
-  monotonic publication; both fsyncs counted; every crash seam still
-  fires.
+  terminal-replay rule); leader-kill wake-all and armed-kill payload
+  re-raise; admission/`reconcile_failed_save` alignment on an uncovered
+  failure (never inside `persist`); the post-durability publication window;
+  monotonic publication; report no-op; every crash seam still fires. The
+  coalescing test counts one physical-write attempt for N waiting callers;
+  the state-layer seam test covers both fsync boundaries (no separate
+  fsync counter is added, so this is proof of execution, not a count).
 - A new clean-tree benchmark at the implementation SHA is published with
   the same comparator; no throughput claim before that run.
 - #62 stays open until the code and the measurement both exist.
@@ -294,7 +378,7 @@ keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
    provider state lock across every save; no coalescing; no
    wire/schema/durability change; no throughput claim; all existing suites
    green and physical save counts unchanged.
-5. **D3 slice 2 (release the lock) — next.** The only batch that may claim a
-   throughput change, and only with the new clean-tree measurement. #62 stays
-   open until both land.
+5. **D3 slice 2 (release the lock) — code landed; measurement pending.** The
+   only batch that may claim a throughput change, and only with the new
+   clean-tree measurement. #62 stays open until both land.
 6. D4 only when the accepting authority is recorded.

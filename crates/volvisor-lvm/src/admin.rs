@@ -177,7 +177,7 @@ impl LvmProvider {
             },
         );
         self.persist(&mut state).inspect_err(|_| {
-            state.reconcile_failed_save(&self.state_path);
+            self.reconcile_failed_save(&mut state);
         })?;
 
         Ok(Pool {
@@ -264,7 +264,7 @@ impl LvmProvider {
         // operator gets the exact manual remediation instead.
         state.remove_device(device_id);
         self.persist(&mut state).inspect_err(|_| {
-            state.reconcile_failed_save(&self.state_path);
+            self.reconcile_failed_save(&mut state);
         })?;
 
         let pvremove = self.runner.run("pvremove", &["--yes", &entry.path])?;
