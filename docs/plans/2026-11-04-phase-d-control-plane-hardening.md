@@ -296,11 +296,66 @@ deterministic tests cover coalescing into one physical write, landed-failure
 success only when the durable file proves it, unproven failure without
 poison, unreadable durable fail-closed, monotonic publication, panic wake-all
 and armed-kill re-raise, abandonment, gate poisoning, capture order, admission
-alignment, and the report no-op. **There is no throughput claim:** the
-required clean-tree benchmark at the implementation SHA has not been run, so
-the measured-baseline claim in the section above is not updated by this
-change set. #62 stays open until that run exists, and all gate verdicts are
-unchanged.
+alignment, and the report no-op. The post-implementation review below then
+found and fixed a critical leadership-handoff race and a high
+phantom-resurrection path; the tests now also cover the atomic handoff, the
+poisoned-refusal no-resurrection case, the async armed-kill re-raise and the
+post-durability publication window. Only the newest pending capture is
+retained; the monotonic snapshot supersedes earlier captures, so one write
+covers every earlier sequence while waiters resolve by watermarks. **There is
+no throughput claim:** the required clean-tree benchmark at the final
+slice-2 SHA has not been run, so the measured-baseline claim in the section
+above is not updated by this change set. #62 stays open until that run
+exists, and all gate verdicts are unchanged.
+
+#### Slice-2 implementation review (2026-11-04): NO-GO on `8220414`
+
+An adversarial review of the implemented slice-2 commit found two defects the
+green suite did not exercise, plus lower-severity items. The findings and
+their fixes in this change set:
+
+1. **Leadership handoff race (critical).** `run_leader` checked "no pending
+   capture" and cleared `leader_active` in two separate writer-lock critical
+   sections. A reservation between them enqueued itself as a waiter after the
+   leader had decided to exit, so the waiter could park forever; the
+   synchronous flavor waits while holding the provider state lock, which
+   deadlocks the mutation path. Fix: `leader_step` takes the no-pending
+   decision and the leadership release in one critical section, so a new
+   reservation either joins a leader that will write it or becomes the next
+   leader. A deterministic regression test holds a reservation at that exact
+   boundary.
+2. **Phantom resurrection after terminal poison (high).** `reserve` refused a
+   poisoned writer without requiring admission alignment. An async
+   attach/detach could then leave its failed in-memory mutation visible to a
+   same-id retry, which the idempotency replay answered as success while the
+   durable file had no attachment. Fix: a poisoned refusal sets
+   `needs_alignment`, and `capture_and_reserve` restores the last durable view
+   on any encode or reservation error. A test poisons the writer, drives two
+   same-id attaches, and checks the retry fails, the read view is aligned and
+   the durable file never contains the attachment.
+3. **Unproven leader success (low).** `finish_leader` returned `Ok(())` when
+   no watermark resolved its own sequence. It now fails closed with a typed
+   `INTERNAL` and requires admission alignment.
+4. **Memory amplification (low).** The writer retains only the newest pending
+   capture (with its sequence). In-memory state is monotonic, so the newest
+   snapshot is a superset and one write covers every earlier sequence; the
+   permanent watermarks resolve the earlier waiters. This bounds retained
+   capture memory to one encoded buffer plus one snapshot per provider
+   lineage.
+5. **Accepted residual: synchronous waiters block a runtime thread.** The
+   remaining synchronous `persist` callers (create/grow/delete/move/admin)
+   still hold the provider state lock and wait on a std `Condvar`. If such a
+   call runs on a tokio worker and loses leadership, that worker parks for the
+   leader's physical write. This is not a regression from slice 1 (those
+   callers previously performed the whole fsync on the worker);
+   attach/detach/report are async-safe on `spawn_blocking`/`Notify`.
+   Converting the multi-save compensation paths is a separate change.
+6. **Accepted residual: runtime-shutdown cancellation is terminal poison.** A
+   `spawn_blocking` `JoinError::is_cancelled` is treated as terminal poison.
+   It can only occur when the runtime is shutting down (the process is
+   ending), and it is the fail-closed choice; an abandoned leader token also
+   poisons by RAII.
+
 
 **Rejected alternatives.** Per-volume files need a multi-file commit for
 delete/move/create intent atomicity; an append-only WAL would rewrite every
@@ -332,11 +387,17 @@ the attach fencing contract. None is a shortcut for this slice.
   every adversarial-review finding is either closed or explicitly recorded
   above as a residual.
 - Slice 2: deterministic tests for covered-failure success only when the
-  durable file proves it; no resurrection after an error (the journal's
-  terminal-replay rule); leader-kill wake-all and armed-kill payload
-  re-raise; admission/`reconcile_failed_save` alignment on an uncovered
-  failure (never inside `persist`); the post-durability publication window;
-  monotonic publication; report no-op; every crash seam still fires. The
+  durable file proves it; no resurrection after an error, including a
+  poisoned refusal (the journal's terminal-replay rule); leader-kill wake-all
+  and armed-kill payload re-raise, including through async `commit_async`;
+  admission/`reconcile_failed_save` alignment on an uncovered failure (never
+  inside `persist`); the post-durability publication window (a reservation or
+  capture publishes nothing; only a proven write does); monotonic publication;
+  atomic leadership handoff (a reservation at the quiesce boundary becomes
+  the next leader, never a stranded waiter); report no-op; every crash seam
+  still fires. The writer retains only the newest pending capture: in-memory
+  state is monotonic, so one write of the newest snapshot covers every
+  earlier sequence, and waiters resolve by permanent watermarks. The
   coalescing test counts one physical-write attempt for N waiting callers;
   the state-layer seam test covers both fsync boundaries (no separate
   fsync counter is added, so this is proof of execution, not a count).

@@ -409,6 +409,12 @@ const WRITER_POISON_DETAIL: &str = "LVM provider durable writer poisoned by a pr
 const NEEDS_ALIGNMENT_DETAIL: &str =
     "LVM provider durable writer requires admission alignment before another save";
 
+/// The detail returned when a leader quiesces without a permanent
+/// watermark resolving its own capture. That is an internal invariant
+/// violation, so it fails closed instead of reporting an unproven success.
+const UNRESOLVED_LEADER_DETAIL: &str =
+    "LVM provider durable writer leader could not prove its save durable or failed";
+
 /// One reserved capture: the exact bytes and snapshot a caller wants
 /// durable, plus the monotonic sequence assigned under the provider state
 /// lock so capture order equals sequence order.
@@ -428,8 +434,12 @@ struct Capture {
 struct WriterState {
     /// Next sequence to assign (starts at one).
     next_seq: u64,
-    /// Captures awaiting a physical write, ordered by sequence.
-    pending: BTreeMap<u64, Capture>,
+    /// The newest capture awaiting a physical write. Older captures are
+    /// dropped: in-memory state is monotonic, so the newest snapshot is a
+    /// superset and one write of it covers every earlier sequence. Keeping
+    /// only the newest bounds retained memory to one encoded state plus one
+    /// snapshot regardless of how many callers coalesce.
+    latest: Option<(u64, Capture)>,
     /// Highest sequence proven durable by a completed physical write.
     durable_seq: u64,
     /// Highest sequence published to the read view.
@@ -451,7 +461,7 @@ impl Default for WriterState {
     fn default() -> Self {
         Self {
             next_seq: 1,
-            pending: BTreeMap::new(),
+            latest: None,
             durable_seq: 0,
             published_seq: 0,
             failed_through: 0,
@@ -472,6 +482,25 @@ enum WriteOutcome {
     Failed(ApiError),
     /// The write panicked (an armed crash seam).
     Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// One leader-loop decision, taken under a single writer-lock critical
+/// section so the no-pending-capture check and leadership release are
+/// atomic.
+enum LeaderStep {
+    /// The writer is terminally poisoned.
+    Poisoned(String),
+    /// Write the latest pending capture.
+    Write {
+        /// Sequence of the capture to write.
+        seq: u64,
+        /// Pre-encoded bytes of the latest capture.
+        encoded: Arc<[u8]>,
+        /// Snapshot the latest capture commits.
+        snapshot: Arc<LvmState>,
+    },
+    /// Nothing is pending: leadership has been released.
+    Quiesce,
 }
 
 /// RAII leadership guard: a leader that panics or is abandoned before
@@ -551,6 +580,11 @@ struct WriterCore {
     /// Test-only count of physical write attempts (coalescing evidence).
     #[cfg(test)]
     physical_writes: AtomicUsize,
+    /// Test-only hook that runs inside the leader's quiesce critical
+    /// section, so a regression test can hold a reservation at the exact
+    /// leadership-handoff boundary.
+    #[cfg(test)]
+    handoff_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Process-wide gates keyed by canonical state-path identity. A `Weak`
@@ -576,6 +610,8 @@ impl WriterCore {
             notify: tokio::sync::Notify::new(),
             #[cfg(test)]
             physical_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            handoff_hook: Mutex::new(None),
         }
     }
 
@@ -649,8 +685,14 @@ impl WriterCore {
         snapshot: Arc<LvmState>,
     ) -> Result<Reservation, ApiError> {
         let mut state = self.lock_writer();
-        if let Some(reason) = &state.poisoned {
-            return Err(ApiError::new(ApiErrorCode::Internal, reason.clone()));
+        if let Some(reason) = state.poisoned.clone() {
+            // A caller refused here may already hold an uncommitted
+            // in-memory mutation (async attach/detach mutate before they
+            // reserve). Force the next admission to re-align with the
+            // durable file so that mutation can never be replayed as a
+            // phantom success.
+            state.needs_alignment = true;
+            return Err(ApiError::new(ApiErrorCode::Internal, reason));
         }
         if state.needs_alignment {
             return Err(ApiError::new(
@@ -660,7 +702,7 @@ impl WriterCore {
         }
         let seq = state.next_seq;
         state.next_seq += 1;
-        state.pending.insert(seq, Capture { encoded, snapshot });
+        state.latest = Some((seq, Capture { encoded, snapshot }));
         let role = if state.leader_active {
             ReservationRole::Waiter
         } else {
@@ -711,7 +753,16 @@ impl WriterCore {
         {
             let mut state = self.lock_writer();
             state.durable_seq = state.durable_seq.max(seq);
-            state.pending.retain(|pending_seq, _| *pending_seq > seq);
+            // The written capture covers every sequence up to `seq`. Drop
+            // it if it is the one that was just written; keep a newer
+            // capture for the next loop iteration.
+            if state
+                .latest
+                .as_ref()
+                .is_some_and(|(latest_seq, _)| *latest_seq <= seq)
+            {
+                state.latest = None;
+            }
         }
         self.publish_if_newer(seq, snapshot);
     }
@@ -751,13 +802,11 @@ impl WriterCore {
         {
             let mut state = self.lock_writer();
             let max_pending = state
-                .pending
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or(state.failed_through);
+                .latest
+                .as_ref()
+                .map_or(state.failed_through, |(seq, _)| *seq);
             state.failed_through = state.failed_through.max(max_pending);
-            state.pending.clear();
+            state.latest = None;
             // Keep the first terminal poison: a later re-raise (for
             // example `commit_async` observing the leader's panic join)
             // must not replace the failure every waiter already sees.
@@ -780,9 +829,17 @@ impl WriterCore {
         if let Some(result) = Self::resolution(&state, own_seq) {
             return result;
         }
-        // The leader's own capture was in `pending` before leadership
-        // began, so one of the watermarks above must resolve it.
-        Ok(())
+        // The leader's own capture was reserved before leadership began,
+        // so one of the watermarks above must resolve it. If none does,
+        // the invariant is broken: never report success for a save whose
+        // durability is unproven. Fail closed and force the next
+        // admission to re-align.
+        drop(state);
+        self.require_alignment();
+        Err(ApiError::new(
+            ApiErrorCode::Internal,
+            UNRESOLVED_LEADER_DETAIL,
+        ))
     }
 
     /// The leader loop: take the latest pending capture, perform one
@@ -794,17 +851,21 @@ impl WriterCore {
     fn run_leader(&self, own_seq: u64, token: &mut LeaderToken) -> Result<(), ApiError> {
         let mut own_error: Option<ApiError> = None;
         loop {
-            if let Some(reason) = self.lock_writer().poisoned.clone() {
-                self.finish_poisoned(token);
-                return Err(ApiError::new(ApiErrorCode::Internal, reason));
-            }
-            let Some((seq, encoded, snapshot)) = self.latest_pending() else {
-                {
-                    self.lock_writer().leader_active = false;
+            let (seq, encoded, snapshot) = match self.leader_step() {
+                LeaderStep::Poisoned(reason) => {
+                    self.finish_poisoned(token);
+                    return Err(ApiError::new(ApiErrorCode::Internal, reason));
                 }
-                self.wake_all();
-                token.disarm();
-                return self.finish_leader(own_seq, own_error);
+                LeaderStep::Quiesce => {
+                    self.wake_all();
+                    token.disarm();
+                    return self.finish_leader(own_seq, own_error);
+                }
+                LeaderStep::Write {
+                    seq,
+                    encoded,
+                    snapshot,
+                } => (seq, encoded, snapshot),
             };
 
             #[cfg(test)]
@@ -861,16 +922,49 @@ impl WriterCore {
         }
     }
 
-    /// The latest pending capture, with its sequence and snapshot.
-    fn latest_pending(&self) -> Option<(u64, Arc<[u8]>, Arc<LvmState>)> {
-        let state = self.lock_writer();
-        state.pending.iter().next_back().map(|(&seq, capture)| {
+    /// Choose the leader's next step under one writer-lock critical
+    /// section.
+    ///
+    /// The no-pending-capture check and the leadership release must be atomic:
+    /// if they were separate, a reservation between them would observe
+    /// `leader_active == true`, enqueue itself as a waiter, and then wait
+    /// forever after this leader clears leadership and exits.
+    fn leader_step(&self) -> LeaderStep {
+        let mut state = self.lock_writer();
+        if let Some(reason) = state.poisoned.clone() {
+            return LeaderStep::Poisoned(reason);
+        }
+        let next = state.latest.as_ref().map(|(seq, capture)| {
             (
-                seq,
+                *seq,
                 Arc::clone(&capture.encoded),
                 Arc::clone(&capture.snapshot),
             )
-        })
+        });
+        if let Some((seq, encoded, snapshot)) = next {
+            LeaderStep::Write {
+                seq,
+                encoded,
+                snapshot,
+            }
+        } else {
+            // Test-only seam: run the probe while the writer mutex is
+            // held. A reservation attempted here must block until
+            // leadership is released atomically below; it can then
+            // only become the next leader, never a stranded waiter.
+            #[cfg(test)]
+            let hook = self
+                .handoff_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            state.leader_active = false;
+            LeaderStep::Quiesce
+        }
     }
 
     /// One physical write under the per-path gate. A poisoned gate is a
@@ -910,14 +1004,12 @@ impl WriterCore {
     fn fail_unproven(&self, seq: u64, error: &ApiError) {
         let mut state = self.lock_writer();
         let max_seq = state
-            .pending
-            .keys()
-            .next_back()
-            .copied()
-            .unwrap_or(seq)
+            .latest
+            .as_ref()
+            .map_or(seq, |(latest_seq, _)| *latest_seq)
             .max(seq);
         state.failed_through = state.failed_through.max(max_seq);
-        state.pending.clear();
+        state.latest = None;
         state.failure = Some((error.code, error.detail.clone()));
         state.needs_alignment = true;
         state.leader_active = false;
@@ -928,14 +1020,12 @@ impl WriterCore {
     fn fail_panicked(&self, seq: u64) {
         let mut state = self.lock_writer();
         let max_seq = state
-            .pending
-            .keys()
-            .next_back()
-            .copied()
-            .unwrap_or(seq)
+            .latest
+            .as_ref()
+            .map_or(seq, |(latest_seq, _)| *latest_seq)
             .max(seq);
         state.failed_through = state.failed_through.max(max_seq);
-        state.pending.clear();
+        state.latest = None;
         state.failure = Some((ApiErrorCode::Internal, WRITER_POISON_DETAIL.to_owned()));
         state.poisoned = Some(WRITER_POISON_DETAIL.to_owned());
         state.needs_alignment = true;
@@ -989,6 +1079,14 @@ impl WriterCore {
     /// mutex and refuses while the flag is set.
     fn clear_needs_alignment(&self) {
         self.lock_writer().needs_alignment = false;
+    }
+
+    /// Require the next admission to re-align in-memory state with the
+    /// durable file before accepting another capture. Used when a caller
+    /// may still hold an uncommitted mutation (a refused reservation or
+    /// an unproven leader result).
+    fn require_alignment(&self) {
+        self.lock_writer().needs_alignment = true;
     }
 }
 
@@ -1056,19 +1154,31 @@ impl StateGuard<'_> {
     /// Publication is the writer's job after the physical write; dropping
     /// this guard does not publish.
     ///
-    /// On an encode or reservation error the guard suppresses publication
-    /// (the caller returns the typed error) and the next admission recovers
-    /// by aligning to the durable file.
+    /// On an encode or reservation error the guard restores the last
+    /// durable view, suppresses publication, and forces the next admission
+    /// to align to the durable file. That is what prevents an uncommitted
+    /// in-memory mutation (for example an attach the caller saw fail) from
+    /// being replayed as a phantom success by a same-id retry.
     pub(crate) fn capture_and_reserve(&mut self) -> Result<Reservation, ApiError> {
         let encoded = match self.guard.encode_for_save() {
             Ok(encoded) => encoded,
             Err(error) => {
-                self.dirty = false;
+                self.revert();
+                self.writer.require_alignment();
                 return Err(error);
             }
         };
         let snapshot = Arc::new(self.guard.clone());
         let reserved = self.writer.reserve(Arc::from(encoded), snapshot);
+        if let Err(error) = reserved {
+            // A refused reservation (poison or a prior hard failure) must
+            // never leave this mutation where a later admission can see
+            // it. Restore the last published (durable) view and require
+            // admission alignment.
+            self.revert();
+            self.writer.require_alignment();
+            return Err(error);
+        }
         // The writer publishes after durability; this guard must not.
         self.dirty = false;
         reserved
@@ -6389,6 +6499,83 @@ mod read_snapshot_tests {
     }
 
     #[tokio::test]
+    async fn a_poison_refusal_never_resurrects_an_uncommitted_attachment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // Make the seeded volume durable so admission alignment has a
+        // baseline to restore after the poisoned capture is refused.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-poison").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-poison").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider.writer.poison(WRITER_POISON_DETAIL);
+
+        let first = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("a poisoned writer refuses the capture");
+        assert_eq!(first.code, ApiErrorCode::Internal);
+        assert!(first.detail.contains(WRITER_POISON_DETAIL), "{first}");
+        assert!(
+            provider.writer.needs_alignment(),
+            "a poison refusal must require the next admission to align"
+        );
+        assert!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the refused mutation is not published"
+        );
+
+        // A same-id retry must re-execute and fail again. If the refused
+        // mutation were still visible to admission, the idempotency replay
+        // would answer success from memory while the durable file has no
+        // attachment.
+        let retry = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("a retry must never replay a phantom in-memory success");
+        assert_eq!(retry.code, ApiErrorCode::Internal);
+        assert!(retry.detail.contains(WRITER_POISON_DETAIL), "{retry}");
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the durable file never contained the refused attachment"
+        );
+        assert!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the admission view is aligned to the durable file"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_save_after_the_rename_keeps_the_durable_attachment_published() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (provider, volume_id) = seeded_provider(&dir);
@@ -6441,6 +6628,51 @@ mod read_snapshot_tests {
                 .id,
             request.attachment_id,
             "a post-rename failure must not revert below the durable state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_async_re_raises_the_armed_kill_payload_in_band() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        provider.store_crash_hooks().arm(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-async-kill").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-async-kill").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let task_provider = Arc::clone(&provider);
+        let joined = tokio::spawn(async move {
+            task_provider
+                .attach_volume_inner(&volume_id, &request)
+                .await
+        })
+        .await;
+        let join_error = joined.expect_err("the armed kill must panic the caller task");
+        assert!(
+            join_error.is_panic(),
+            "the async leader must re-raise the panic, not return a typed error"
+        );
+        let payload = join_error.into_panic();
+        let text = payload
+            .downcast_ref::<String>()
+            .expect("the crash payload is the marked string");
+        assert!(
+            text.starts_with(volvisor_types::crash::CRASH_PANIC_PREFIX),
+            "the campaign rig must still see the in-band crash payload: {text}"
+        );
+        assert!(
+            provider.writer.lock_writer().poisoned.is_some(),
+            "the async leader panic poisons the writer"
         );
     }
 
@@ -7193,6 +7425,82 @@ mod durable_writer_tests {
             .run_leader(seq, &mut token)
             .expect("a different path's writer is unaffected by the poison");
         assert!(other_path.exists());
+    }
+
+    #[test]
+    fn leadership_handoff_is_atomic_with_the_empty_pending_check() {
+        let fx = fixture();
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *fx.core
+            .handoff_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            entered_tx.send(()).expect("signal the quiesce decision");
+            release_rx.recv().expect("wait for the reservation attempt");
+        }));
+        let core = Arc::clone(&fx.core);
+        let leader = std::thread::spawn(move || core.run_leader(leader_seq, &mut token));
+        entered_rx
+            .recv()
+            .expect("the leader must reach the quiesce decision");
+
+        // Attempt a reservation while the leader is inside the quiesce
+        // critical section. It blocks on the writer mutex; when it
+        // proceeds, leadership must already be released, so it becomes
+        // the next leader rather than a waiter with no leader.
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let core = Arc::clone(&fx.core);
+        let reserver = std::thread::spawn(move || {
+            attempt_tx.send(()).expect("signal the reservation attempt");
+            reserve(&core, &state_with_moves(2))
+        });
+        attempt_rx.recv().expect("the reserver is about to reserve");
+        release_tx
+            .send(())
+            .expect("release the quiesce critical section");
+
+        leader
+            .join()
+            .expect("leader thread")
+            .expect("the first leader resolves its save");
+        let reservation = reserver.join().expect("reserver thread");
+        let (seq, mut token) = expect_leader(reservation);
+        fx.core
+            .run_leader(seq, &mut token)
+            .expect("the next leader writes the reservation");
+        fx.core.wait_sync(seq).expect("the reservation is durable");
+        assert_eq!(
+            fx.core.physical_writes.load(Ordering::SeqCst),
+            2,
+            "both leaders performed exactly one physical write each"
+        );
+    }
+
+    #[test]
+    fn capture_does_not_publish_until_the_leader_proves_durability() {
+        let fx = fixture();
+        let initial = Arc::clone(&*fx.read.read().expect("read view"));
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            initial,
+            "reserving a capture must not publish it"
+        );
+        assert!(
+            !fx.path.exists(),
+            "no durable file exists before the leader writes"
+        );
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect("the physical write succeeds");
+        assert!(fx.path.exists(), "the leader writes before it publishes");
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            Arc::new(state_with_moves(1)),
+            "publication follows proven durability"
+        );
     }
 
     #[test]
