@@ -35,14 +35,18 @@
 //! pid component and is treated like a foreign writer: it is removed only
 //! when its mtime is older than that grace, because a fresh one may
 //! belong to an old binary during a rolling restart or to an operator's
-//! copy; non-regular entries are skipped. The real guarantee is therefore:
-//! active temps are never removed, stale same-pid temps are removed, and a
-//! foreign process's recent temp (or a fresh legacy temp) is left alone.
+//! copy; non-regular entries are skipped. A temp whose mtime is in the
+//! future is never swept (`duration_since` fails), which is the
+//! conservative fail-safe. The real guarantee is therefore: active temps
+//! are never removed, stale same-pid temps are removed, and a foreign
+//! process's recent temp (or a fresh legacy temp) is left alone.
 //!
-//! The intermediate `f0e5237` temp shape `<path>.<pid>.<sequence>.tmp`
-//! was never released; the final sweep does not recognize it, so any such
-//! test or development leftovers need manual removal. Do not broaden the
-//! sweep to accept it.
+//! Two intermediate temp shapes were never released: `f0e5237`'s
+//! `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s lexical-path-hash
+//! namespace. The canonical-identity hash change orphans the latter, and
+//! the final sweep recognizes neither, so both are development-only
+//! leftovers that need manual removal. Do not broaden the sweep to accept
+//! either shape.
 //!
 //! This sweep is not cross-process writer exclusion. Cross-process
 //! exclusion is the journal flock; two daemons must not alias one state
@@ -1550,6 +1554,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_shares_the_temp_namespace_and_a_leftover_is_swept() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real");
+        fs::create_dir(&real_parent).expect("real parent");
+        let link_parent = dir.path().join("link");
+        symlink(&real_parent, &link_parent).expect("symlinked parent");
+
+        let real = real_parent.join("state.json");
+        let via_link = link_parent.join("state.json");
+        assert_eq!(
+            state_hash(&real),
+            state_hash(&via_link),
+            "a symlinked parent spelling hashes to the real parent's identity"
+        );
+
+        let leftover = temp_path_for(&via_link, u64::from(std::process::id()), 1);
+        fs::write(&leftover, b"stale through the symlink").expect("stale via symlink");
+        assert_eq!(
+            sweep_stale_temps(&real),
+            1,
+            "the real spelling sweeps a leftover named through the symlink"
+        );
+        assert!(
+            !real_parent
+                .join(leftover.file_name().expect("temp name"))
+                .exists(),
+            "the leftover is gone from the real directory"
+        );
+    }
+
     #[test]
     fn temp_name_stays_bounded_for_a_long_state_name() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1852,6 +1890,36 @@ mod tests {
             stale_temp_paths(&path),
             vec![other_writer],
             "only the failed call's own temp was cleaned up"
+        );
+    }
+
+    #[test]
+    fn save_with_hooks_maps_a_missing_temp_parent_to_internal_without_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_parent = dir.path().join("missing");
+        let path = missing_parent.join("state.json");
+        let mut state = sample_state();
+
+        let error = state
+            .save_with_hooks(&path, Some(&StoreCrashHooks::new()))
+            .expect_err("a missing parent must fail the temp create before the write");
+
+        assert_eq!(
+            error.code,
+            ApiErrorCode::Internal,
+            "a pre-rename create failure is a typed INTERNAL: {error}"
+        );
+        assert!(
+            error.detail.contains("failed to create"),
+            "the error names the failed temp create: {error}"
+        );
+        assert!(
+            !missing_parent.exists(),
+            "the failed create must not create the parent or leave a temp there"
+        );
+        assert!(
+            stale_temp_paths(&path).is_empty(),
+            "the pre-create failure leaves no temp candidate for cleanup to remove"
         );
     }
 

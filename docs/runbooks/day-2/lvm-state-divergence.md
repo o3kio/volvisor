@@ -57,7 +57,9 @@ second atomic save. A save is `write a sibling temp file` → `fsync file` →
 `rename` → `fsync directory`; an error can therefore land on either side of
 the rename. Since `a8c23d6` the temp is
 `.volvisor-<16-hex>.<pid>.<seq>.tmp` in the state file's directory; the legacy
-`<state>.tmp` may still appear during upgrades. The two sides are:
+`<state>.tmp` may still appear during upgrades. A temp whose mtime is in the
+future is never swept (the conservative fail-safe), so a clock-skewed leftover
+needs manual removal. The two sides are:
 
 - **pre-rename:** the old durable file is intact, and the world step may or may
   not have run;

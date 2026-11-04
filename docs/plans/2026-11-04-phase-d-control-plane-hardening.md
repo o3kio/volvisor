@@ -160,9 +160,11 @@ options:
   (`.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, so it
   cannot exceed `NAME_MAX`) plus a startup sweep. The hash is over the
   canonical state-path identity (the canonicalized parent plus the file
-  name), the same identity the writer gate and in-flight registry use, so
-  a restart that spells the parent differently (symlink, `..`, `./`)
-  recognizes its predecessor's temps. The sweep never removes a temp
+  name). The writer gate keys on that identity; the in-flight registry
+  keys on the canonical identity of each temp path (the same
+  canonicalization scheme, a different key), so a restart that spells the
+  parent differently (symlink, `..`, `./`) recognizes its predecessor's
+  temps. The sweep never removes a temp
   registered in flight by this process, removes same-pid leftovers
   immediately, removes a foreign-pid temp only after a one-hour grace, and
   treats a regular legacy `<state>.tmp` like a foreign writer (it has no
@@ -172,10 +174,12 @@ options:
   cross-process exclusion remains the journal flock, so two daemons must
   not alias a custom `lvm_state_path`. Publication remains `StateGuard`
   drop in slice 1, and the failure-keep branches that rely on it are
-  unchanged. The intermediate `f0e5237` temp shape
-  `<path>.<pid>.<sequence>.tmp` was never released, so the final sweep
-  does not recognize it and any test/development leftovers need manual
-  removal. All existing suites pass; two failure-injection rigs were
+  unchanged. Two intermediate temp shapes were never released:
+  `f0e5237`'s `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s
+  lexical-path-hash namespace (orphaned by the canonical-identity hash
+  change). The final sweep recognizes neither, so both are
+  development-only leftovers that need manual removal. All existing
+  suites pass; two failure-injection rigs were
   re-mechanized onto the injected `AfterTmpWrite` consult because unique
   temp names removed the fixed `.tmp` path they used to block (see the
   slice-1 acceptance note). Physical save counts are unchanged. **No
@@ -227,9 +231,14 @@ the attach fencing contract. None is a shortcut for this slice.
   `create_owner_only` I/O failure (a missing parent and a directory
   target) and the forced `AfterTmpWrite` consult covers the provider
   classification; no save-count drift in single-writer rigs. Accepted
-  residual: no provider-end-to-end rig now drives a genuine EACCES/ENOSPC
-  on temp creation; the state-layer test plus the forced `AfterTmpWrite`
-  rig cover the classification.
+  residuals: no provider-end-to-end rig now drives a genuine EACCES/ENOSPC
+  on temp creation; the state-layer tests now cover the create-failure
+  mapping through `save_with_hooks` (a missing parent) and
+  `create_owner_only`, and the forced `AfterTmpWrite` rig covers
+  classification. Per-save `canonicalize()` calls remain inside the locked
+  region; slice 2 inherits that note. A pathological state file named like
+  its own temp is theoretically self-swept (a 2^-64 fixed point) but is
+  not practically reachable.
 - Slice 2: deterministic tests for covered-failure success only when the
   durable file proves it; no resurrection after an error (the journal's
   terminal-replay rule); leader-kill wake-all; quiesced align on an
@@ -251,8 +260,8 @@ batch does not self-accept it.
 
 Add a Phase D addendum to
 [pre-production-readiness.md](../releases/pre-production-readiness.md) that
-records D1/D2 as delivered, D3 as design-only, and keeps gates 1, 2 and 5
-NOT MET with gates 3 and 4 partial.
+records D1/D2 as delivered, D3 slice 1 as delivered with #62 open, and
+keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
 
 ## Out of scope
 
@@ -268,10 +277,12 @@ NOT MET with gates 3 and 4 partial.
 1. **D1 (log volume) — delivered.** Self-contained, no protocol change.
 2. **D2 (read posture) — delivered.** Self-contained, tests and docs updated.
 3. **D5 (ledger) — delivered.**
-4. **D3 slice 1 (single-writer funnel) — next batch.** Semantic no-op; no
-   throughput claim; all existing suites green and physical save counts
-   unchanged.
-5. **D3 slice 2 (release the lock) — after slice 1 is reviewed and green.**
-   The only batch that may claim a throughput change, and only with the new
-   clean-tree measurement.
+4. **D3 slice 1 (single-writer funnel) — delivered** (`f0e5237`,
+   `a8c23d6`, `a068947`). Semantic no-op: callers still hold the provider
+   state lock across every save; no coalescing; no wire/schema/durability
+   change; no throughput claim; all existing suites green and physical save
+   counts unchanged.
+5. **D3 slice 2 (release the lock) — next.** The only batch that may claim a
+   throughput change, and only with the new clean-tree measurement. #62 stays
+   open until both land.
 6. D4 only when the accepting authority is recorded.

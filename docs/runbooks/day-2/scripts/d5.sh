@@ -340,7 +340,7 @@ FAIL_MSG="$(jq -r '.message' "$FAIL_RESP")"
 assert_eq "$FAIL_CODE" "INTERNAL" "state save ENOSPC error code"
 assert_contains "$FAIL_MSG" "No space left on device" "state save ENOSPC message names the OS error"
 if [[ "$FAIL_MSG" == *".volvisor-"* ]]; then
-  assert_contains "$FAIL_MSG" ".volvisor-" "state save ENOSPC message names the hashed state temp path"
+  assert_contains "$FAIL_MSG" "${SFS}/.volvisor-" "state save ENOSPC message names the hashed state temp path in the state filesystem"
 else
   # Historical pre-a8c23d6 shape, kept so an old drill log can still be replayed.
   assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the legacy state tmp path"

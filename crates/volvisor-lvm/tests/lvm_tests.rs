@@ -653,14 +653,22 @@ async fn startup_sweeps_only_this_state_paths_stale_temps() {
             ))
     }
     fn state_path_hash(state_path: &std::path::Path) -> u64 {
-        // Mirrors `state::state_hash`: the hash is over the canonical
-        // state-path identity (canonicalized parent plus file name).
-        let identity = state_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .and_then(|parent| parent.canonicalize().ok())
-            .and_then(|parent| state_path.file_name().map(|name| parent.join(name)))
-            .unwrap_or_else(|| state_path.to_path_buf());
+        // Mirrors `state::canonical_state_identity` exactly, including the
+        // `.` parent fallback; the production helper is not visible to an
+        // integration test.
+        let identity = match state_path.file_name() {
+            Some(file_name) => {
+                let parent = state_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                parent.canonicalize().map_or_else(
+                    |_| state_path.to_path_buf(),
+                    |parent| parent.join(file_name),
+                )
+            }
+            None => state_path.to_path_buf(),
+        };
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;

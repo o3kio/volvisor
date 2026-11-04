@@ -206,13 +206,16 @@ SLA, capacity, durability or hardware claim.
   security posture change in an unreleased prototype; read clients using
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
-- **D3 — #62 write path.** Design only. The provider still holds one state
-  mutex across the whole-state rewrite and `fsync`; the post-fix c32 −4.1 %
-  and c128 −2.6 % results are unchanged in direction. The Phase D plan
-  records the leader-coalesced durable-writer design and the invariants it
-  must preserve; **no write-path code changed and #62 stays open**. A future
-  implementation needs the coalescing, failure/publication and crash-seam
-  tests named in the plan, plus a new clean-tree measurement.
+- **D3 — #62 write path (slice 1 landed).** Slice 1 code is in the tree:
+  the single durable-writer funnel (`f0e5237`), the bounded,
+  canonical-path-hashed temp namespace plus startup sweep (`a8c23d6`), and
+  the per-state-path in-process writer gate (`a068947`). This is a semantic
+  no-op: callers still hold the provider state lock across every save, there
+  is no coalescing, no wire/schema/durability change, and **no throughput
+  claim**. The earlier post-fix c32 −4.1 % / c128 −2.6 % measurement
+  predates slice 1 and is not evidence for it. **#62 remains open**: slice 2
+  (release the lock) and a new clean-tree benchmark at the implementation
+  SHA are not done, so no gate verdict changes.
 - **D4 — ADR-0012.** Still `Proposed`; accepting it remains an authority
   decision, not an implementation task.
 
