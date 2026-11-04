@@ -36,6 +36,13 @@ The implementation and its in-repo tests cover:
   `volvisor-witnessd` build from source, answer `--version`, validate their
   example configurations with `--check-config`, and have deb/rpm metadata
   plus systemd units.
+- **Evidence tooling that fails closed on its own claims**: committed JSON
+  traces are validated for structure, `operation_id` correlation and secret
+  hygiene by a normal test and script; the day-2 harness has a real
+  cross-binary D2 live drill plus a D2/D3/D8 prerequisite preflight; and a
+  stdlib-only flake-rate calculator evaluates the 14-night criterion from
+  campaign artifacts. These are automation and single-host lab tools, not
+  production evidence.
 - **Test evidence that is real within its tier**: the Tier S simulated fault
   campaign, and four bounded Tier V scenarios against real Cloud Hypervisor
   v51.1 on one physical development host (storage simulated). See
@@ -73,10 +80,13 @@ can mutate it, or that a volume is safe to use.
   hop. The legacy `admin_token`-only mode still leaves reads open; configure
   scoped credentials and TLS for any shared network. See the
   [security deployment guide](security/deployment.md).
-- **CHV is not pinned to a tagged Volvisor build.** CHV reports at most
-  `advertised` (never `active` without guest confirmation); the pin update
-  is [#48](https://github.com/o3kio/volvisor/issues/48) and waits for a
-  tagged release.
+- **CHV is not pinned to a tagged Volvisor build.** The Volvisor-side CAP
+  negotiation, attachment-state report route, consumer conformance test and
+  [integration guide](integrations/chv.md) are delivered. CHV reports at most
+  `advertised` (never `active` without guest confirmation); no CHV/Volvisor
+  pair is pinned, and the pin update
+  ([#48](https://github.com/o3kio/volvisor/issues/48)) waits for a tagged
+  release.
 - **Attached `native-local` volumes are not live-migratable.** The mobility
   surface is wired only for the `drbd` provider.
 - **There is no tag and no GitHub release.** v0.1.0 is a draft; the tag is
@@ -179,8 +189,10 @@ separately:
 - **Pre-production exit gate (milestone
   [#36](https://github.com/o3kio/volvisor/issues/36)):** still requires the
   real runs (#37/#38/#39 where claimed), cross-host transport validation
-  beyond #40's same-host capture, day-2 runbooks (#46), the CHV consumer
-  path and pin (#48), and the exit review. A distribution tag does not
+  beyond #40's same-host capture, day-2 runbooks and the remaining D3/D8
+  work (#46; D2 live is now drilled single-host), a tagged release plus the
+  CHV consumer path and pin (#48; the Volvisor-side contract and guide exist,
+  the pin does not), and the exit review. A distribution tag does not
   satisfy this gate.
 
 No tag or GitHub release may be created in this workstream.

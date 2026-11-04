@@ -54,6 +54,62 @@ verdict below.
   remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
   READY**.
 
+## Post-report addendum (2026-11-04) — Phase B readiness residuals
+
+This addendum records the Phase B "readiness residuals and evidence
+automation" batch delivered on branch `phase-a-scaling` after the 2026-11-03
+addendum. **It changes no gate verdict below.** Every item is implementation,
+test automation, documentation or single-host lab evidence; none is a
+production-support, SLA, zero-RPO, hardware or released-artifact claim.
+
+- **#44 observability:** committed traces are now validated structurally and
+  semantically by `crates/volvisor-api/tests/trace_evidence.rs` and
+  [`scripts/validate-traces.py`](../../scripts/validate-traces.py): one JSON
+  object per line, RFC 3339 timestamps, bounded span names, `operation_id`
+  correlation, and no test credential or secret-like field. The committed
+  `attach.jsonl` passes. The **real migration trace remains NOT RUN** — it
+  needs the DRBD/peer/real-VMM rig — and no simulated trace is committed. The
+  two deliberately omitted gauges and their reasons are documented in
+  [observability.md](../operations/observability.md).
+- **#46 day-2:** a real **cross-binary D2 live** drill now exists and passed on
+  one host: old `8c2fc1a` (LVM schema 2) → new `aad1720` (schema 3) → typed old
+  refusals → restore the whole v2 directory and serve the original volume with
+  the old binary. D1 was re-run against the v3 bounded tombstone filter and
+  records the behavioral retired-id `409 IDEMPOTENCY_CONFLICT`; D2's
+  same-binary policy drill was corrected to schema v3. These are single-host,
+  loop-LVM, debug-build results (D1/D2 used a dirty caller build); see
+  [the bundle](../evidence/day2/2026-11-04-devhost-live/REPORT.md),
+  [backup-and-restore](../runbooks/day-2/backup-and-restore.md) and
+  [upgrade-and-rollback](../runbooks/day-2/upgrade-and-rollback.md).
+  `preflight.sh` now reports D2/D3/D8 prerequisites, including the old build.
+  **D3 storage-side fencing remains NOT RUN** (no DRBD 9 module/peer/witness)
+  and **D8 total host loss remains NOT RUN** (no multi-host/BMC/oracle).
+- **#48 CHV:** the Volvisor side is delivered in-repo — capability negotiation,
+  attachment-state report behavior, a consumer conformance test
+  ([`chv_consumer.rs`](../../crates/volvisor-api/tests/chv_consumer.rs)), and an
+  [integration guide](../integrations/chv.md). **No CHV/Volvisor pair is
+  pinned** and CHV's ceiling remains `advertised`; a pin still requires a
+  signed, tagged Volvisor release (#47). `active`/`guest_confirmed` is not
+  implemented or claimed.
+- **#49 flake:** [`scripts/flake-rate.py`](../../scripts/flake-rate.py)
+  computes the observed rate and the 14-consecutive-night criterion from
+  `campaign-flake` JSONL artifacts; unit tests cover the criterion edge cases
+  and the campaign workflow reports the current run's rate. **No observed
+  flake rate is published and the 14-night criterion remains NOT MET** because
+  no nightly artifact history exists. New deterministic journal
+  compaction/pin interleaving tests landed as well.
+- **Validation:** `cargo fmt`, clippy, workspace tests, journal fault-feature
+  tests, rustdoc, the fuzz-workspace check, `bash -n` plus plain
+  `shellcheck -x` over the day-2 harness, the trace validator and its Python
+  unit tests, the flake unit tests and workflow YAML parsing run in the
+  batch's validation; the exact commands are in the
+  [Phase B plan](../plans/2026-11-04-phase-b-readiness-residuals.md).
+
+No gate becomes met. Gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
+remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
+READY**. No tag, GitHub release, push or pull request is created by this
+workstream.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |
@@ -61,8 +117,8 @@ verdict below.
 | 1 | **Evidence** — three physical hosts at an exact SHA with the fault matrix and a published bundle; Rook-cell GO/NO-GO; Ceph and DRBD suites in a gating rig | **NOT MET** | No three-physical-host campaign (#37), no Rook-cell execution (#38), no green Ceph/DRBD rig run (#39). Only single-host Tier V with simulated storage, single-host day-2 drills, and single-host loop-LVM benchmarks exist. |
 | 2 | **Release** — signed `v0.1.0` (or later) with deb/rpm, SHA256SUMS, install smoke, and a support matrix matching the evidence | **NOT MET** | No signing key on this host, no signed tag, no GitHub release, and no clean-host install from a tagged artifact (#47). The support matrix itself is accurate and makes only non-claims. |
 | 3 | **Security** — explicit transport/auth model for non-loopback deployment; authenticated/encrypted peer and witness traffic; scoped credentials and audit identity | **PARTIAL** | #40 landed native TLS/mTLS, HTTPS witness/peer clients, refusal of plain non-loopback HTTP without `allow_insecure`, scoped credentials, read authorization and audit attribution. The recorded capture is **same-host netns/veth only**; cross-host witness/peer hops, live rotation, and HSM/TPM are not run. Legacy `admin_token`-only mode still leaves reads open. |
-| 4 | **Operability** — backup/restore, upgrade/rollback, witness loss, and journal corruption drilled with recorded results | **PARTIAL** | D1 backup/restore, D4 journal corruption, D5 ENOSPC, D6 crash loop/lock and D7 restart-based credential rotation were drilled on one host. D2 upgrade/rollback is partial (schema policy only; no live binary transition). D3 witness loss is partial (service outage/restart only; no storage-side DRBD fencing). D8 total host loss is **not run**. |
-| 5 | **Consumer** — CHV negotiates the capability and reports `advertised` against a pinned release, never `active` without guest evidence | **NOT MET** | No CHV repository change and no pin update. A pin requires a tagged Volvisor release, which does not exist. CHV's ceiling remains `advertised`; no `active`/guest-confirmed behavior is claimed. |
+| 4 | **Operability** — backup/restore, upgrade/rollback, witness loss, and journal corruption drilled with recorded results | **PARTIAL** | D1 backup/restore, D4 journal corruption, D5 ENOSPC, D6 crash loop/lock and D7 restart-based credential rotation were drilled on one host. D2 now includes a real single-host cross-binary v2→v3 upgrade and restore-based rollback ([bundle](../evidence/day2/2026-11-04-devhost-live/REPORT.md)), but no rolling multi-host or packaged upgrade exists. D3 witness loss is partial (service outage/restart only; no storage-side DRBD fencing). D8 total host loss is **not run**. |
+| 5 | **Consumer** — CHV negotiates the capability and reports `advertised` against a pinned release, never `active` without guest evidence | **NOT MET** | The Volvisor-side CHV contract, conformance test and integration guide are delivered, but there is no CHV repository change and no pin update. A pin requires a tagged Volvisor release, which does not exist. CHV's ceiling remains `advertised`; no `active`/guest-confirmed behavior is claimed. |
 
 **Verdict:** the Wave 2 P1 hardening work landed, but the five-gate definition
 is unchanged and still requires P0 real-hardware, release and consumer work
@@ -77,7 +133,7 @@ pre-production, production-ready, or a release candidate.
 | #40 transport/auth | Landed | `ad9efb0` | Same-host capture; cross-host validation open |
 | #42 provider consolidation | Landed | `db04182` | Parity suite uses simulated Ceph/DRBD worlds; no real clusters |
 | #45 admission control | Landed | `0c853f3` | No resumable operation handle/long-poll (synchronous journaled mutations); read timeout is a fallback with optional per-route overrides; rate limiting is opt-in |
-| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 persist contracts are implemented and deterministically test-covered (not hardware-drilled), documented in `lvm-state-divergence.md` |
+| #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | At that merge: 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. Superseded by the 2026-11-04 addendum: D1 was re-run against the v3 tombstone filter and D2 live is now drilled single-host; D3 storage-side and D8 remain **not run**. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 persist contracts are implemented and deterministically test-covered (not hardware-drilled), documented in `lvm-state-divergence.md` |
 | #44 observability | Landed | `5017ea0`; [docs](../operations/observability.md) | State-save duration and lease/epoch gauges deliberately omitted; real migration trace **not run** |
 | #43 benchmarks | Landed | `575acfc`; [bundle](../benchmarks/2026-11-03-devhost/REPORT.md) | Single host, loop-backed LVM, control plane only; 25.0 min soak, **not 24 h**; no real Ceph/DRBD/physical-disk LVM |
 | #49 harness flake | Partial | `5037db9`; #49 slice in this change | LVM mid-move abort flake fixed; four fuzz targets, a committed seed corpus with deterministic regression tests, journal pin/compaction and retained-listener interleaving regressions, and bounded nightly fuzz/flake workflows are delivered. The **14 consecutive clean nightly campaign runs and published flake rate are still not recorded** |
@@ -121,7 +177,8 @@ READY**.
 | [Tier V, CH v51.1](../evidence/tier-v/2026-10-11-devhost-v51/) | `1762a9d` | One physical development host; storage below the VMM seam simulated | Four bounded VMM scenarios at recorded VMM version/SHA256 | Real media, real DRBD, multiple hosts, production durability |
 | [Tier V, CH v43.0.0](../evidence/tier-v/2026-10-10-devhost/) | recorded in bundle | One physical development host; simulated storage | The same scenarios on the older VMM; fail-closed grow-retry branch | Grow notification on v43, real-host durability |
 | [Transport/TLS same-host](../evidence/transport-tls/2026-11-02-devhost-netns/) | base `a6591d9`, dirty tree | One kernel; netns/veth peers | TLS/mTLS, untrusted-cert rejection, insecure-bind refusal, encrypted pcap, audit attribution | Cross-host witness/peer hop, live rotation, HSM/TPM |
-| [Day-2 drills](../evidence/day2/2026-11-03-devhost/REPORT.md) | `e551d26`, clean worktree | One host | D1/D4/D5/D6/D7 drilled; 181-entry manifest verifies | D2/D3 full paths, D8 host loss, live upgrade/rollback, DRBD fencing, multi-host |
+| [Day-2 drills, 2026-11-03](../evidence/day2/2026-11-03-devhost/REPORT.md) | `e551d26`, clean worktree | One host | D1/D4/D5/D6/D7 drilled; 181-entry manifest verifies | D2/D3 full paths, D8 host loss, live upgrade/rollback in that bundle, DRBD fencing, multi-host |
+| [Day-2 D1/D2, 2026-11-04](../evidence/day2/2026-11-04-devhost-live/REPORT.md) | old `8c2fc1a` / new `aad1720`, caller dirty with clean new build worktree | One host; loop LVM; debug builds | D1 v3 backup/restore with bounded tombstone filter and behavioral retired-id 409; real old→new v2→v3 upgrade, typed old refusals, byte-identical v2 restore and old-binary serve; same-binary v3 policy | Rolling multi-host or packaged upgrade, data path, D3 storage-side fencing, D8 host loss, production support |
 | [D5 post-fix re-drill](../evidence/day2/2026-11-03-d5-redrill/REPORT.md) | `1863a7a` product / `940722e` harness, clean worktree | One host; loop LVM; 256 KiB tmpfs ENOSPC | The normal uncommitted state-save path fails closed and converges: 500 with ENOSPC and the state `.tmp` path, byte-identical old state, LV compensated, 404 in the same process and after restart, terminal same-`operation_id` replay, new-`operation_id` 200/`Ready`, one LV for the new volume and two durable records total, no residue; journal path re-confirmed | The three non-injected tails (cleanup failure, post-rename carve-out, unreadable durable re-read), real disk/inode/thin-pool failure, multi-host, production readiness |
 | [Control-plane benchmarks](../benchmarks/2026-11-03-devhost/REPORT.md) | `e3aa365`, clean worktree | One host, loop-backed LVM, loopback HTTP | 1/8/32/128 sweep, 25-min soak, restart replay, 46-entry manifest verifies | Data path, real backends, 24 h soak, production capacity or SLA |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
@@ -164,21 +221,24 @@ report mapping every gate to evidence. Current status:
    configured; no tag or GitHub release exists; the documented local
    deb/rpm/container smoke predates Wave 2 and is not a tagged-artifact
    install.
-2. **#48 — CHV consumer path and pin.** Requires a tagged release first,
-   then a CHV-side capability negotiation, integration test, version matrix
-   and conscious pin update. CHV must stay at or below `advertised`.
+2. **#48 — CHV consumer path and pin.** The Volvisor-side contract,
+   conformance test and in-repo integration guide are delivered, but a pin
+   still requires a tagged release first, then a conscious CHV-side change
+   and pin update. CHV must stay at or below `advertised`.
 3. **#37 / #38 / #39 — real hardware and gating rig.** Three physical hosts,
    a fourth witness failure domain, a Rook-cell execution with C01–C14
    GO/NO-GO, and green Ceph/DRBD suites. None exists.
-4. **#46 — D8 host loss and the undrilled halves.** No second host, BMC or
-   fencing path; no live old→new binary upgrade/rollback; no storage-side
-   DRBD fencing.
+4. **#46 — D8 host loss and the remaining undrilled halves.** D2 live is now
+   drilled single-host (real old→new binary plus restore-based rollback), but
+   there is still no second host, BMC or fencing path; D3 storage-side DRBD
+   fencing and D8 total host loss are **not run**.
 5. **#43 — credible backend numbers and 24 h soak.** Single-host loop-LVM
    only; no real Ceph/DRBD/physical-disk numbers and no 24 h run.
 6. **#49 / #62 / #63 / #64 — open assurance and growth findings; #58 fixed.**
-   The #49 fuzz targets, corpus regression, deterministic interleaving tests
-   and nightly evidence collectors are delivered, but the **14-night
-   flake-rate criterion remains open**. The ENOSPC state-save leak is fixed
+   The #49 fuzz targets, corpus regression, deterministic interleaving tests,
+   nightly evidence collectors, a reproducible flake-rate calculator and its
+   workflow wiring are delivered, but the **14-night flake-rate criterion
+   remains open** and no observed rate is published. The ENOSPC state-save leak is fixed
    by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
    `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
    `940722e`; the cleanup-failure, carve-out, clear-save and unreadable-reread

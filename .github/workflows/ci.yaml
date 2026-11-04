@@ -58,12 +58,21 @@ jobs:
           shellcheck -x scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
             scripts/lib/real-backends-common.sh \
             scripts/bench/lib.sh scripts/bench/run-all.sh scripts/bench/publish.sh
+      - name: Validate the day-2 drill scripts
+        run: |
+          bash -n docs/runbooks/day-2/scripts/*.sh
+          shellcheck -x docs/runbooks/day-2/scripts/*.sh
       - name: Validate the release scope
         run: python3 scripts/release-scope.py check
+      - name: Validate the committed trace evidence
+        run: python3 scripts/validate-traces.py docs/operations/traces/*.jsonl
+      - name: Test the flake-rate report
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - name: Validate the release gate graph
         run: |
           ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f) }' \
-            .github/workflows/real-backends.yaml .github/workflows/release.yaml
+            .github/workflows/real-backends.yaml .github/workflows/release.yaml \
+            .github/workflows/campaign-flake.yaml
           ruby scripts/lib/check-release-graph.rb \
             .github/workflows/release.yaml .github/workflows/real-backends.yaml
 
