@@ -342,6 +342,22 @@ fn a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write() {
         text.contains("\"schema_version\": 2"),
         "the first save stamps schema v2: {text}"
     );
+
+    // The upgraded file round-trips: the v1 payload is preserved under
+    // the v2 envelope.
+    let reloaded = LvmState::load(&path).expect("reload upgraded state");
+    assert_eq!(
+        reloaded
+            .volume(&id)
+            .expect("volume after upgrade")
+            .entry
+            .generation,
+        7
+    );
+    assert_eq!(
+        reloaded.move_record(&id).expect("move after upgrade").state,
+        MoveVolumeBackingState::InDoubt
+    );
 }
 
 #[test]

@@ -911,6 +911,10 @@ async fn an_lv_removed_mid_supervision_resolves_the_move_failed() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+    assert!(
+        fixture.world.lock().expect("world").moves.contains_key(&lv),
+        "the move must start before the LV is removed out-of-band"
+    );
     // The LV is removed out-of-band while the drive supervises: the
     // next successful `lvs` has no row, which is a proven absence, not
     // an unobservable world. The drive must answer terminally instead
@@ -1298,8 +1302,9 @@ async fn an_absent_resolution_save_failure_before_rename_keeps_the_anchor() {
     let restarted = restart_with_a_live_copying_move(&fixture, volume);
 
     // The resolution's save fails before its rename: the durable
-    // `Copying` record remains the anchor and the in-memory resolution
-    // is rolled back to it.
+    // `Copying` record remains the anchor and the in-memory move record
+    // is restored to it. The volume stays `Failed` in memory because the
+    // absence was verified, while the durable volume is untouched.
     restarted.provider.store_crash_hooks().arm_save_failure(
         STORE_LVM_STATE,
         StoreSavePoint::AfterTmpWrite,
@@ -1320,16 +1325,28 @@ async fn an_absent_resolution_save_failure_before_rename_keeps_the_anchor() {
         "the durable anchor is not overwritten by a failed save"
     );
     assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Ready,
+        "the pre-rename failure leaves the durable volume state unchanged"
+    );
 
     // A later pass (no injected failure) resolves it terminally.
     let report = restarted.provider.move_reconcile_pass().expect("retry");
-    assert_eq!(report.resolved_absent, vec![id]);
+    assert_eq!(report.resolved_absent, vec![id.clone()]);
     let (record, generation) = recorded_move(&fixture.state_path, volume);
     assert_eq!(
         record.expect("record").state,
         MoveVolumeBackingState::Failed
     );
     assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Failed,
+        "the retry records the resolution and the volume Failed mark together"
+    );
 }
 
 #[tokio::test]

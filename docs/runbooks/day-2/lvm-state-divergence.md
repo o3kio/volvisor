@@ -3,8 +3,8 @@
 **Status: implemented for
 [#70](https://github.com/o3kio/volvisor/issues/70). The mutation boundaries in
 the contract table below are deterministically test-covered. A few
-defense-in-depth branches are covered by construction and the adjacent boundary
-tests rather than by a dedicated deterministic fault test: the move completion
+defense-in-depth branches are covered by construction rather than by a
+dedicated deterministic fault test: the move completion
 whose stored record is superseded under the lock, the move journal's
 re-validation of a same-target record under that lock, the create-compensation
 restore when the durable file proves a volume record survived an unreadable
@@ -74,7 +74,7 @@ unknown field. A state with a pending intent is therefore a supported v2
 file; see the
 [durable-state schema compatibility policy](../../schema-compatibility.md).
 The v1-stamped N-1 fixture is `tests/fixtures/schema/lvm-state-v2-n1.json`,
-loaded by the `volvisor-lvm` unit test and the daemon-store e2e
+loaded by the `volvisor-lvm` unit test and the daemon-store test
 `a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write`; the older
 pre-versioning fixture is `tests/fixtures/schema/lvm-state-v1-n1.json`.
 
@@ -89,7 +89,7 @@ counts. The tests in `crates/volvisor-lvm/tests/lvm_tests.rs` and
 | Mutation | Durable anchor written before the world step | World step | Pre-rename intent-save failure | Final-save failure, pre-rename | Final-save failure, post-rename (rename landed) | Startup recovery |
 |---|---|---|---|---|---|---|
 | **create** | `CreateIntent` (VG, id-derived LV name, requested size, project, block size, canonical payload) | `lvcreate` | No LV is created. If the rename did land, the durable intent may remain; startup drops it after observing no intent-owned LV. If the re-read is unknown, the intent is kept in memory as *possibly durable* for the same startup classification. | The LV exists but the volume record is not durable. The provider compensates with a **checked** `lvremove`, drops the in-memory entry and clears the intent. A failing `lvremove` names `manual lvremove <vg>/<lv>`. An unreadable durable re-read is treated as *not committed* (fail-closed) and the file is left for the operator. | The durable file contains this volume's record: keep the LV and the in-memory entry, do not compensate; the error says the record reached the state file. | If a volume record exists, the stale intent is dropped. Otherwise an intent-owned LV that is present and **at least** the requested size is adopted as generation 1, `Ready`. A smaller LV, a mismatched LV name, or an unobservable size **fails startup** rather than adopting the wrong geometry. An absent LV drops the intent. |
-| **grow** | `GrowIntent` (operation, from-size, requested size, expected generation) | `lvextend` | No `lvextend` runs. If the rename did land, the durable intent may remain; startup drops it after observing the LV still at the from-size. If the re-read is unknown, the intent is kept in memory as *possibly durable* for the same startup classification. | The LV is larger; the durable volume record still shows the old size. The in-memory view keeps the observed new size and bumped generation, and the durable grow intent stays for restart. **The LV is never shrunk** (data may already live in the new extents). | The durable file already contains the completed record and generation bump: keep it and report the error. | If the generation/from-size is stale, or the LV is absent, the intent is dropped (an absent LV is marked `Failed` by the volume pass). A durable delete intent at the current generation takes precedence: the grow intent is dropped and the delete proceeds, so a grow never bumps the generation and voids a later delete authorization. At or above the requested size: finalize from the observed size, bump the generation exactly once, drop the intent. Still at the from-size: drop the intent (the grow never landed). Any size strictly between: **fail startup** rather than guess. |
+| **grow** | `GrowIntent` (operation, from-size, requested size, expected generation) | `lvextend` | No `lvextend` runs. If the rename did land, the durable intent may remain; startup drops it after observing the LV still at the from-size. If the re-read is unknown, the intent is kept in memory as *possibly durable*; a retry re-establishes that anchor before `lvextend`, and startup drops a never-durable intent. | The LV is larger; the durable volume record still shows the old size. The in-memory view keeps the observed new size and bumped generation, and the durable grow intent stays for restart. **The LV is never shrunk** (data may already live in the new extents). | The durable file already contains the completed record and generation bump: keep it and report the error. | If the generation/from-size is stale, or the LV is absent, the intent is dropped (an absent LV is marked `Failed` by the volume pass). A durable delete intent at the current generation takes precedence: the grow intent is dropped and the delete proceeds, so a grow never bumps the generation and voids a later delete authorization. At or above the requested size: finalize from the observed size, bump the generation exactly once, drop the intent. Still at the from-size: drop the intent (the grow never landed). Any size strictly between: **fail startup** rather than guess. |
 | **delete** | `DeleteIntent` (operation, expected generation, erasure policy) | `blkdiscard` (ZeroDiscard) then `lvremove`; refused while an unsettled move record exists. If a destructive command fails, the durable intent is **kept**: the volume stays fenced against attach/grow/move (a `blkdiscard` may have partially erased or `lvremove` may have raced a move), and a retry or restart completes it. | No destructive command runs. If the rename did land, the durable intent remains; a retry or restart completes the authorized delete. | The LV may already be gone but the record is not removed; the in-memory record, delete intent and move record are restored; a retry completes it. | The durable file already contains the deletion (volume record, intent and move record removed): report the error, keep the in-memory result, and do not re-delete. | A stale-generation intent is dropped **without deleting** (never delete on a stale authorization). A volume already absent from the record drops the intent. A matching intent runs the recorded policy (`blkdiscard` when `ZeroDiscard`, then `lvremove`) and removes the record; if the LV is already absent, no destructive command runs and the observed absence is accepted as the terminal state (the record is removed, but the provider does not claim the erase command ran). Delete completion also clears any stale create/grow intent **and the settled move record** for the same id. The delete does **not** become a `Failed` volume. An attached or non-`Ready`/`Failed` volume with a pending delete **fails startup**, and a pending delete with an unsettled move **also fails startup**, rather than removing an LV a consumer may still use. If a destructive command fails during startup completion, startup fails loudly and leaves the LV and the durable authorization untouched (state is not rewritten); the next retry/restart completes it. |
 | **move — `PREPARING`** | `MoveRecord { state: Preparing }` | `pvmove` | No `pvmove` starts; the PREPARING record is the sole anchor and nothing durable exists to reconcile. The failure does not wedge the volume. | — (the same save is the anchor) | The durable file contains PREPARING; startup classifies it against the observed world. | A PREPARING record whose `pvmove` verifiably never started is re-driven by the retry reconcile; a started/relocated world is classified and completed only on verified relocation. A record whose LV is **verifiably absent** (a successful `lvs` with no row) resolves `FAILED` terminally — no `pvmove` can be active — so delete is never fenced forever. |
 | **move — `COPYING`/`COMPLETE`** | Prior durable record (`Preparing`/`Copying`) | `pvmove` completion | — | A `COPYING`-save failure keeps the prior durable record in memory (the anchor) so a retry/restart classifies the world rather than restarting blind. A `COMPLETE`-save failure restores the prior record and generation in memory when the re-read proves the durable file still says the prior state; startup completes on verified relocation with exactly one generation bump. | The durable file already holds the record this save wrote: for `COPYING`, keep the in-memory `Copying` record; for `COMPLETE`, keep the completion and the new generation. Report the error, never roll back against the durable file. | The completed record is not bumped again; a verified relocation completes a `Copying`/`IN_DOUBT` record; an unverifiable world parks `IN_DOUBT` instead of guessing. A `COPYING` **or** `COMPLETE` re-read that fails is treated as possibly durable: the just-saved record is kept in memory (for `COMPLETE`, with its bumped generation) so a later save cannot erase the anchor or regress the generation. |
@@ -227,6 +227,10 @@ lvs --noheadings -o lv_name,vg_name,lv_size
   ambiguous size. Do not retry blindly before the restart classifies it.
 - **Clear-save failure:** the durable grow intent remains and is kept in
   memory; a later save cannot erase it. Restart classifies it as above.
+- **Intent-save failure, unreadable re-read:** the intent is kept in memory
+  as *possibly durable*. A retry first proves or re-saves that anchor before
+  `lvextend`, so no grow runs without a confirmed durable intent; a restart
+  drops a never-durable intent after observing the LV at the from-size.
 - **Delete precedence at startup:** a durable delete intent at the volume's
   current generation wins. Startup drops the grow intent and completes the
   delete; the grow never bumps the generation and voids the delete.
@@ -300,6 +304,15 @@ lvs --noheadings -o lv_name,vg_name,lv_size
   terminally, logs the verified absence, and marks the volume `Failed` in the
   same durable save; delete is then the sanctioned exit (see the delete
   tail). The resolution removes no LV and frees no source.
+- **Absent-LV resolution save failure, pre-rename:** the durable prior record
+  remains the anchor and the in-memory move record is restored; retry the
+  reconcile pass (do not delete by hand). The in-memory volume stays `Failed`
+  because the absence was verified, but the restored unsettled move record
+  still fences delete until the retry succeeds.
+- **Absent-LV resolution save failure, post-rename:** the resolution and the
+  volume `Failed` mark are durable; the error says so and a retry is
+  idempotent. An unreadable re-read keeps the verified resolution as
+  *possibly durable* — a later save will not erase it.
 - **COPYING save failure, pre-rename:** the pvmove may be running and the
   durable record is the prior `Preparing` record (the anchor). Restart.
   Reconciliation observes the world: a verified relocation completes with one

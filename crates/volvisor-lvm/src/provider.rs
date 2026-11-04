@@ -2339,7 +2339,21 @@ impl LvmProvider {
             current_generation,
         )? {
             GrowResume::NoIntent => {}
-            GrowResume::Continue => intent_is_durable = true,
+            GrowResume::Continue => {
+                // The in-memory intent may be *possibly* durable: a
+                // failed intent save whose re-read was unreadable
+                // reinserted it. Never promote that to an anchor by
+                // inference — running `lvextend` without a confirmed
+                // durable intent reopens the crash window the
+                // durable-first save exists to close. Re-save unless
+                // the durable file verifiably holds this exact intent;
+                // an unreadable re-read also takes the safe re-save
+                // path (and fails closed if that save fails).
+                intent_is_durable = state.grow_intent(volume_id).is_some_and(|memory| {
+                    LvmState::load(&self.state_path)
+                        .is_ok_and(|durable| durable.grow_intent(volume_id) == Some(memory))
+                });
+            }
             GrowResume::Finalized(observed) => return Ok(respond(observed)),
         }
 
