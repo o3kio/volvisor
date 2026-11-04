@@ -112,6 +112,44 @@ scripts/bench/publish.sh \
 `REPORT.md` is authored by the operator from `summary/TABLES.md` and the raw
 records; the publish script does not invent a report.
 
+## Comparing two runs
+
+`compare.py` compares two completed run directories by their aggregate JSON
+records:
+
+```bash
+python3 scripts/bench/compare.py \
+  --before /tmp/opencode/volvisor-bench-BEFORE \
+  --after /tmp/opencode/volvisor-bench-AFTER \
+  --out /tmp/opencode/bench-comparison
+```
+
+It writes `comparison.csv` and `comparison.md` under `--out`. The Markdown
+report includes the two source SHAs and dirty flags from `ENVIRONMENT.txt`,
+the mixed 1/8/32/128 concurrency rows (ops/s, p95, read p95, write p95 and
+error rate), the soak resource table, and a derived "normalised per minute"
+section when the two soak durations differ. Add `--json` to also print a
+machine-readable summary to stdout.
+
+Every input directory must contain a valid `MANIFEST.sha256`; the tool
+verifies it before reading records, requires every `json/*.json` it is about
+to compare to be listed and verified, and refuses to write a report if any
+checksum, missing file or malformed entry fails. `--skip-manifest-check`
+exists only for tests/debugging. Use `sha256sum -c MANIFEST.sha256` to check a
+bundle independently.
+
+If the two runs contain different sets of recognised scenarios (for example a
+partial after-run), the tool still exits 0 but prints a warning to stderr and
+adds a prominent warning to the Markdown report. Each record's harness
+`status` is listed in the report; a `SETUP_FAILED` record is therefore visibly
+different from a merely omitted metric.
+
+Missing JSON values are rendered as `NOT RECORDED` in Markdown and left empty
+in CSV; they are never treated as zero. These comparisons remain single-host
+loop-LVM control-plane results: they are not production capacity, SLA,
+durability or data-path evidence, and dirty-worktree results cannot support a
+clean-SHA claim.
+
 ## Caveats
 
 - One host, one loop-backed VG, control plane only.
