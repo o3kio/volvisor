@@ -544,6 +544,25 @@ enum ReservationRole {
     Waiter,
 }
 
+/// One admission-gate decision, read atomically under the writer mutex.
+///
+/// An admission may only derive an answer from the in-memory state when
+/// this returns [`AdmissionGate::Ready`]: every reserved capture has then
+/// resolved, so the in-memory view is the durable view. The variants are
+/// checked in this order because a capture can coexist with
+/// `needs_alignment` (for example an encode failure while an older
+/// capture is still outstanding); that capture must resolve before the
+/// durable file is reloaded.
+enum AdmissionGate {
+    /// No capture is outstanding and no alignment is required.
+    Ready,
+    /// A capture is outstanding; wait for its permanent watermark.
+    Wait(u64),
+    /// No capture is outstanding, but a failure requires reloading the
+    /// durable file before this admission may proceed.
+    Align,
+}
+
 /// The coalescing durable writer for one provider lineage.
 ///
 /// Phase D D3 slice 2 (#62): attach/detach/report reserve a sequence under
@@ -1073,12 +1092,50 @@ impl WriterCore {
         self.lock_writer().needs_alignment
     }
 
+    /// Whether admission must reload the durable file now: a failure is
+    /// pending and no capture is outstanding.
+    ///
+    /// Alignment must never happen while a capture is outstanding: that
+    /// capture's snapshot may be newer than the durable file, so loading
+    /// the file first would point in-memory state below a snapshot that is
+    /// about to be published. The caller holds the provider state lock, so
+    /// no new capture can be reserved between this read and the clear.
+    fn needs_idle_alignment(&self) -> bool {
+        let state = self.lock_writer();
+        state.needs_alignment && state.latest.is_none()
+    }
+
+    /// The current admission gate, read atomically under the writer mutex.
+    ///
+    /// The caller must hold the provider state lock: that guarantees no
+    /// new capture can be reserved while the returned decision is acted
+    /// on. `Ready` therefore cannot be invalidated by a later failure,
+    /// because a failure requires an outstanding capture and there is
+    /// none.
+    fn admission_gate(&self) -> AdmissionGate {
+        let state = self.lock_writer();
+        if let Some((seq, _)) = state.latest.as_ref() {
+            AdmissionGate::Wait(*seq)
+        } else if state.needs_alignment {
+            AdmissionGate::Align
+        } else {
+            AdmissionGate::Ready
+        }
+    }
+
     /// Clear the alignment flag after `lock_state` has replaced the guard
     /// with a readable durable file. No capture can be reserved between
     /// the flag observation and this clear: `reserve` holds the same
     /// mutex and refuses while the flag is set.
+    ///
+    /// The clear is refused while a capture is still outstanding: the
+    /// durable file that was just loaded may predate that capture, so the
+    /// next admission must wait for the capture and align again.
     fn clear_needs_alignment(&self) {
-        self.lock_writer().needs_alignment = false;
+        let mut state = self.lock_writer();
+        if state.latest.is_none() {
+            state.needs_alignment = false;
+        }
     }
 
     /// Require the next admission to re-align in-memory state with the
@@ -1173,8 +1230,8 @@ impl StateGuard<'_> {
         if let Err(error) = reserved {
             // A refused reservation (poison or a prior hard failure) must
             // never leave this mutation where a later admission can see
-            // it. Restore the last published (durable) view and require
-            // admission alignment.
+            // it. Restore the last published view and require admission
+            // alignment.
             self.revert();
             self.writer.require_alignment();
             return Err(error);
@@ -1396,14 +1453,20 @@ impl LvmProvider {
 
     /// Lock the writer state, mapping poisoning to `INTERNAL`, and align
     /// in-memory state with the durable file when a writer failure left
-    /// `needs_alignment` set.
+    /// `needs_alignment` set and no capture is outstanding.
     ///
-    /// This is the only admission alignment point (Phase D D3 slice 2,
-    /// #62). The durable file is loaded under the provider state lock; a
-    /// successful load replaces the guard and clears the flag. An
-    /// unreadable file returns a typed `INTERNAL` and leaves the flag set,
-    /// so later admissions retry instead of serving state that may not
-    /// match disk.
+    /// This is the alignment point (Phase D D3 slice 2, #62). The durable
+    /// file is loaded under the provider state lock; a successful load
+    /// replaces the guard and clears the flag. An unreadable file returns a
+    /// typed `INTERNAL` and leaves the flag set, so later admissions retry
+    /// instead of serving state that may not match disk.
+    ///
+    /// Alignment is deliberately skipped while a capture is outstanding:
+    /// that capture's snapshot may be newer than the durable file. Callers
+    /// must consult [`WriterCore::admission_gate`] before deriving an
+    /// answer from the returned state; [`Self::lock_state_stable`] does
+    /// that for the synchronous callers, and the async
+    /// attach/detach/report admissions wait without holding this lock.
     pub(crate) fn lock_state(&self) -> Result<StateGuard<'_>, ApiError> {
         let mut guard = self.state.lock().map_err(|_| {
             ApiError::new(
@@ -1411,7 +1474,7 @@ impl LvmProvider {
                 "LVM provider state lock poisoned by a previous failure",
             )
         })?;
-        if self.writer.needs_alignment() {
+        if self.writer.needs_idle_alignment() {
             let durable = LvmState::load(&self.state_path).map_err(|error| {
                 ApiError::new(
                     ApiErrorCode::Internal,
@@ -1430,6 +1493,39 @@ impl LvmProvider {
             writer: &self.writer,
             dirty: false,
         })
+    }
+
+    /// Admission for synchronous callers: hold the provider state lock and
+    /// wait for every outstanding capture before returning a view that a
+    /// decision may rely on.
+    ///
+    /// The wait is synchronous, but it cannot deadlock: the leader never
+    /// takes the provider state lock, and holding that lock prevents any
+    /// new capture from being reserved, so the sequence being waited for
+    /// is already in flight. A covering failure resolves the wait, then
+    /// the loop re-enters [`Self::lock_state`] so the failure's durable
+    /// alignment replaces the uncommitted view before the caller decides
+    /// anything.
+    pub(crate) fn lock_state_stable(&self) -> Result<StateGuard<'_>, ApiError> {
+        loop {
+            let guard = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => return Ok(guard),
+                AdmissionGate::Align => {
+                    // `needs_alignment` was set after `lock_state` read
+                    // it; re-enter so the durable file is reloaded.
+                    drop(guard);
+                }
+                AdmissionGate::Wait(seq) => {
+                    // Resolve the covering capture, then re-enter and
+                    // check for a newer one (there cannot be one while
+                    // this guard holds the state lock, but the failure
+                    // path also needs the re-entry to align).
+                    let _ = self.writer.wait_sync(seq);
+                    drop(guard);
+                }
+            }
+        }
     }
 
     /// The committed read view (issue #62).
@@ -2161,7 +2257,7 @@ impl LvmProvider {
             Ok(rows) => Some(rows.into_iter().filter_map(|row| row.vg_name).collect()),
             Err(_) => None,
         };
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let mut changed = false;
 
         changed |= Self::apply_create_intents(&mut state, &present, &lv_sizes)?;
@@ -2718,7 +2814,7 @@ impl LvmProvider {
         check_policies(req)?;
 
         let payload = canonical_create_payload(req)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // A durable pending delete owns this volume id: even an
         // idempotent create replay must not report a doomed volume as
         // live. Retry the delete or restart to complete it; a create
@@ -2803,11 +2899,27 @@ impl LvmProvider {
             }
         }
         let mode = requested_mode(req.access_mode);
-        // Everything that touches state lives in this block: the guard is
+        // Everything that touches state lives in this loop: the guard is
         // dropped before the durability wait, so the provider state lock is
-        // never held across an `await`.
-        let (response, reservation) = {
+        // never held across an `await`. Admission first resolves any
+        // outstanding capture: a same-id attach replay must never answer
+        // success from a mutation whose durability is still unproven (the
+        // journal replays that success as terminal), and a failed covering
+        // capture must re-align to the durable file and re-execute.
+        let (response, reservation) = loop {
             let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    // The covering capture's failure is not this caller's
+                    // failure: re-enter admission, which reloads the
+                    // durable view and re-executes from it.
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
+            }
             // A durable pending delete owns this volume's fate: no new
             // attachment may be granted while it is outstanding.
             self.ensure_no_pending_delete(&state, volume_id)?;
@@ -2873,7 +2985,7 @@ impl LvmProvider {
             // typed and the next admission aligns (the leader failure path
             // never takes the provider state lock).
             let reservation = state.capture_and_reserve()?;
-            (response, reservation)
+            break (response, reservation);
         };
         self.writer.commit_async(reservation).await?;
         Ok(response)
@@ -2886,10 +2998,23 @@ impl LvmProvider {
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         req.validate()?;
-        // The guard is confined to this block so it is dropped before the
-        // durability wait.
-        let (response, reservation) = {
+        // The guard is confined to this loop so it is dropped before the
+        // durability wait. A not-found answer must not be derived from a
+        // detach whose durability is still unproven: a failed covering
+        // capture has to re-align and re-execute, or the journal would
+        // record a terminal absence for an attachment that is still
+        // durable.
+        let (response, reservation) = loop {
             let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
+            }
             let response = {
                 let stored = state
                     .volume_mut(volume_id)
@@ -2926,7 +3051,7 @@ impl LvmProvider {
                 inspect_response(volume_id, stored)
             };
             let reservation = state.capture_and_reserve()?;
-            (response, reservation)
+            break (response, reservation);
         };
         self.writer.commit_async(reservation).await?;
         Ok(response)
@@ -2949,10 +3074,21 @@ impl LvmProvider {
                 req.attachment_id
             )));
         }
-        // The guard is confined to this block so it is dropped before the
-        // durability wait.
-        let (response, reservation) = {
+        // The guard is confined to this loop so it is dropped before the
+        // durability wait. A not-found or no-op answer must not be derived
+        // from a covering capture that has not proven durable: on failure
+        // the loop re-aligns and re-executes.
+        let (response, reservation) = loop {
             let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
+            }
             let response = {
                 let stored = state
                     .volume_mut(volume_id)
@@ -2977,7 +3113,7 @@ impl LvmProvider {
             } else {
                 None
             };
-            (response, reservation)
+            break (response, reservation);
         };
         if let Some(reservation) = reservation {
             self.writer.commit_async(reservation).await?;
@@ -3297,7 +3433,7 @@ impl LvmProvider {
         if !self.capabilities().contains(Capability::Resize) {
             return Err(unsupported("the resize capability is not advertised"));
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // A durable pending delete owns this volume's fate: growing it
         // would race a delete authorization (and possibly resurrect a
         // half-discarded LV).
@@ -3607,7 +3743,7 @@ impl LvmProvider {
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let (stored_before, pending_intent) =
             Self::validate_delete_request(&state, volume_id, req)?;
         let vg_name = stored_before.entry.vg_name.clone();
@@ -3907,7 +4043,7 @@ impl LvmProvider {
         volume_id: &VolumeId,
         detail: String,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         if let Some(stored) = state.move_record(volume_id) {
             if matches!(
                 stored.state,
@@ -3999,7 +4135,7 @@ impl LvmProvider {
                 ),
             );
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // The completion snapshot may be stale: this caller verified the
         // world without the lock, and a delete (or a newer move) may
         // have removed/replaced the record in between. Never complete a
@@ -4528,7 +4664,7 @@ impl LvmProvider {
         req: &MoveVolumeBackingRequest,
         fallback_source: Option<&str>,
     ) -> Result<(String, crate::state::MoveRecord), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // Re-validate under the journal lock: admission ran before the
         // CLI observations (target/source/foreign-pvmove queries), and
         // a delete of this volume may have completed in that window.
@@ -4993,7 +5129,7 @@ impl LvmProvider {
         volume_id: &VolumeId,
         snapshot: &crate::state::MoveRecord,
     ) -> Result<bool, ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let Some(stored) = state.move_record(volume_id).cloned() else {
             return Ok(false);
         };
@@ -5035,7 +5171,7 @@ impl LvmProvider {
         req: &MoveVolumeBackingRequest,
         record_for_drive: &crate::state::MoveRecord,
     ) -> Result<(), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // The record may have moved on between the pvmove start and this
         // lock: a concurrent supervisor can complete the same move, or a
         // delete can drop it. Never regress a terminal record to
@@ -5177,7 +5313,7 @@ impl LvmProvider {
                 )
                 .map(Some);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let preparing = state
             .move_record(volume_id)
             .filter(|record| record.state == MoveVolumeBackingState::Preparing)
@@ -5250,7 +5386,7 @@ impl LvmProvider {
                     // the move between this pass's observation and the
                     // lock. Stamping the window detail onto a terminal
                     // record would misreport a resolved move.
-                    let mut state = self.lock_state()?;
+                    let mut state = self.lock_state_stable()?;
                     let still_copying = state.move_record(volume_id).is_some_and(|stored| {
                         stored.state == MoveVolumeBackingState::Copying
                             && stored.source_pv == record.source_pv
@@ -5307,7 +5443,7 @@ impl LvmProvider {
         report: &mut MoveReconcileReport,
     ) -> Result<Option<(String, String)>, ApiError> {
         let names = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .volume(volume_id)
                 .map(|stored| (stored.entry.vg_name.clone(), stored.entry.lv_name.clone()))
@@ -5315,7 +5451,7 @@ impl LvmProvider {
         if names.is_some() {
             return Ok(names);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         state.remove_move(volume_id);
         self.persist(&mut state).inspect_err(|_| {
             self.reconcile_failed_save(&mut state);
@@ -5345,7 +5481,7 @@ impl LvmProvider {
     fn reconcile_moves(&self, redrive: bool) -> Result<MoveReconcileReport, ApiError> {
         let mut report = MoveReconcileReport::default();
         let snapshot: Vec<(VolumeId, crate::state::MoveRecord)> = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .moves()
                 .iter()
@@ -5501,7 +5637,7 @@ impl LvmProvider {
         // completed, superseded, or dropped the record since the pass
         // took its snapshot.
         let current = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state.move_record(volume_id).cloned()
         };
         let Some(current) = current else {
@@ -5549,7 +5685,7 @@ impl LvmProvider {
         }
         match self.start_pvmove(vg_name, lv_name, &record.source_pv, &record.target_pv) {
             Ok(()) => {
-                let mut state = self.lock_state()?;
+                let mut state = self.lock_state_stable()?;
                 let still_matches = state.move_record(volume_id).is_some_and(|stored| {
                     stored.state == MoveVolumeBackingState::Preparing
                         && stored.source_pv == record.source_pv
@@ -5592,7 +5728,7 @@ impl LvmProvider {
     ) -> Result<(), ApiError> {
         let failures = self.bump_move_observe_failures(volume_id);
         let already_parked = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .move_record(volume_id)
                 .is_some_and(|record| record.state == MoveVolumeBackingState::InDoubt)
@@ -5645,7 +5781,7 @@ impl LvmProvider {
         record: &crate::state::MoveRecord,
         report: &mut MoveReconcileReport,
     ) -> Result<(), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let resolves = state.move_record(volume_id).is_some_and(|stored| {
             stored.state == MoveVolumeBackingState::InDoubt
                 && stored.source_pv == record.source_pv
@@ -5756,7 +5892,7 @@ impl LvmProvider {
         lv_name: &str,
         record: &crate::state::MoveRecord,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let Some(stored) = state.move_record(volume_id).cloned() else {
             return Err(not_found(volume_id));
         };
@@ -6673,6 +6809,136 @@ mod read_snapshot_tests {
         assert!(
             provider.writer.lock_writer().poisoned.is_some(),
             "the async leader panic poisons the writer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // The test deliberately holds the per-path write gate across awaits so
+    // the first attach's physical write cannot complete; the gate is a
+    // blocking leaf, not a lock the async code needs on this thread.
+    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_same_id_attach_replay_waits_for_durability_and_reexecutes_after_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // The seeded memory state must be durable first: a covering
+        // failure aligns the next admission back to this baseline.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-replay-window").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-replay-window").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+
+        // Hold the per-path physical-write gate so the first attach's save
+        // cannot complete until this test releases it, and make that first
+        // write fail before the rename. The re-executed write then
+        // succeeds.
+        let gate = WriterCore::gate_for(&provider.state_path);
+        let held = gate.lock().expect("hold the physical-write gate");
+        let writes_before = provider.writer.physical_writes.load(Ordering::SeqCst);
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+
+        let first_provider = Arc::clone(&provider);
+        let first_request = request.clone();
+        let first_volume = volume_id.clone();
+        let first = tokio::spawn(async move {
+            first_provider
+                .attach_volume_inner(&first_volume, &first_request)
+                .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while provider.writer.physical_writes.load(Ordering::SeqCst) <= writes_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first attach never reached its physical write"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The same-id replay arrives while the first capture is still
+        // unproven. It must not answer success from the uncommitted
+        // in-memory attachment.
+        let second_provider = Arc::clone(&provider);
+        let second_request = request.clone();
+        let second_volume = volume_id.clone();
+        let second = tokio::spawn(async move {
+            second_provider
+                .attach_volume_inner(&second_volume, &second_request)
+                .await
+        });
+
+        // It must park rather than answer, and it must not hold the
+        // provider state lock while it waits. Retry the lock probe so a
+        // brief admission critical section is not a false failure.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                !second.is_finished(),
+                "a same-id replay must wait for the covering capture's watermark"
+            );
+            if provider.state.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replay must not hold the provider state lock while it waits"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the first attachment is not durable while the write is held"
+        );
+
+        drop(held);
+        let first_result = first.await.expect("first attach task");
+        assert!(
+            first_result.is_err(),
+            "the injected pre-rename failure must reach the first caller"
+        );
+        let second_result = second
+            .await
+            .expect("second attach task")
+            .expect("the replay must re-execute after the failed covering capture");
+        assert_eq!(second_result.attachment_id, request.attachment_id);
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert_eq!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("the re-executed attach is durable")
+                .id,
+            request.attachment_id,
+            "a replay must never turn a failed save into a durable-lie"
+        );
+        assert_eq!(
+            provider.writer.physical_writes.load(Ordering::SeqCst),
+            writes_before + 2,
+            "one failed write and one successful re-execution"
         );
     }
 

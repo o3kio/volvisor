@@ -215,19 +215,27 @@ is a production-support, SLA, capacity, durability or hardware claim.
   evidence corrections (`913c347`, `aae0e09`, and the slice-1 review-evidence
   corrections through this loop). The `a8c23d6` hash was lexical, so
   `a068947` is what makes a symlink/`./`/`..` spelling share its predecessor's
-  temp namespace. No production behavior changed after `a068947`: everything
-  since is test/doc-only evidence correction. Slice 2 code
-  (`8220414`, with the review fixes in this change set) releases the provider
-  state lock for attach/detach/report and coalesces concurrent captures into
-  one physical save behind a per-lineage writer, with permanent watermarks,
-  admission alignment and RAII leadership. The post-implementation review
-  found and fixed a critical leadership-handoff race and a high
-  phantom-resurrection path; the tests now cover both. Synchronous
+  temp namespace. Between `a068947` and the slice-2 implementation
+  (`8220414`), no production behavior changed: those commits are
+  test/doc-only evidence correction. Slice 2 code
+  (`8220414`, plus the review-fix commits starting at `1184a27` and the
+  follow-up commit that carries this paragraph; the first carried the
+  leadership-handoff and poison fixes, the follow-up the admission window)
+  releases the provider state lock for attach/detach/report and coalesces
+  concurrent captures into one physical save behind a per-lineage writer,
+  with permanent watermarks, admission alignment and RAII leadership.
+  Admission now resolves an outstanding capture before deriving any replay,
+  not-found or no-op answer (async without holding the state lock,
+  synchronous via `lock_state_stable`), so a same-id replay can never be
+  journaled as a terminal success from uncommitted state. The
+  post-implementation reviews found and fixed a critical leadership-handoff
+  race, a high phantom-resurrection path and a high same-id replay window;
+  deterministic tests now cover all three. Synchronous
   create/grow/delete/move/admin still hold the lock and wait on a condvar
   (accepted residual; not a regression from slice 1). There is **no
-  throughput claim**: the required clean-tree benchmark at the final slice-2
-  SHA has not been run, so no gate verdict changes. **#62 remains open** until
-  that measurement exists. The earlier post-fix c32 −4.1 % / c128 −2.6 %
+  throughput claim**: the required clean-tree benchmark at the commit that
+  closes slice 2 (recorded with the measurement) has not been run, so no gate
+  verdict changes. **#62 remains open** until that measurement exists. The earlier post-fix c32 −4.1 % / c128 −2.6 %
   measurement predates slice 1 and is not evidence for either slice. No live
   evidence changed in this batch: `d5.sh` Part B was not re-drilled at this
   SHA here, so its `.volvisor-` message assertion is code-derived until the

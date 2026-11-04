@@ -80,7 +80,7 @@ impl LvmProvider {
     ) -> Result<Pool, ApiError> {
         request.validate()?;
         self.require_token(&request.authorization_token)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
 
         if state.device(device_id).is_some() {
             return Err(ApiError::new(
@@ -218,7 +218,7 @@ impl LvmProvider {
     ) -> Result<(), ApiError> {
         request.validate()?;
         self.require_token(&request.authorization_token)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
 
         let entry = state
             .device(device_id)

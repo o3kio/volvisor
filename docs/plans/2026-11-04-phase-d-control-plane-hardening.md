@@ -291,22 +291,26 @@ design: `state.rs` splits encoding from the physical save so a capture can be
 written later without the state reference; `provider.rs` replaces the
 single-shot `DurableWriter` with a per-lineage coalescing writer and per-path
 gate; attach/detach/applied-report capture under the lock, drop it, and await
-durability; synchronous mutations still lead inline under the lock. The
-deterministic tests cover coalescing into one physical write, landed-failure
-success only when the durable file proves it, unproven failure without
-poison, unreadable durable fail-closed, monotonic publication, panic wake-all
-and armed-kill re-raise, abandonment, gate poisoning, capture order, admission
-alignment, and the report no-op. The post-implementation review below then
-found and fixed a critical leadership-handoff race and a high
-phantom-resurrection path; the tests now also cover the atomic handoff, the
-poisoned-refusal no-resurrection case, the async armed-kill re-raise and the
-post-durability publication window. Only the newest pending capture is
-retained; the monotonic snapshot supersedes earlier captures, so one write
-covers every earlier sequence while waiters resolve by watermarks. **There is
-no throughput claim:** the required clean-tree benchmark at the final
-slice-2 SHA has not been run, so the measured-baseline claim in the section
-above is not updated by this change set. #62 stays open until that run
-exists, and all gate verdicts are unchanged.
+durability; synchronous mutations still lead inline under the lock. Admission
+is gated on the permanent watermarks: an async admission resolves an
+outstanding capture without holding the state lock, and a synchronous
+admission does the same while holding it, before it derives any replay,
+not-found or no-op answer. The deterministic tests cover coalescing into one
+physical write, landed-failure success only when the durable file proves it,
+unproven failure without poison, unreadable durable fail-closed, monotonic
+publication, panic wake-all and armed-kill re-raise, abandonment, gate
+poisoning, capture order, admission alignment, admission waiting across a
+pending-replay window, and the report no-op. The post-implementation review
+below then found and fixed a critical leadership-handoff race and a high
+phantom-resurrection path; the re-review of `1184a27` found and this change
+fixes a high same-id replay window and a consistency gap in synchronous
+admission. Only the newest pending capture is retained; the monotonic
+snapshot supersedes earlier captures, so one write covers every earlier
+sequence while waiters resolve by watermarks. **There is no throughput
+claim:** the required clean-tree benchmark at the commit that closes slice 2
+(recorded with the measurement) has not been run, so the measured-baseline
+claim in the section above is not updated by this change set. #62 stays open
+until that run exists, and all gate verdicts are unchanged.
 
 #### Slice-2 implementation review (2026-11-04): NO-GO on `8220414`
 
@@ -329,10 +333,10 @@ their fixes in this change set:
    attach/detach could then leave its failed in-memory mutation visible to a
    same-id retry, which the idempotency replay answered as success while the
    durable file had no attachment. Fix: a poisoned refusal sets
-   `needs_alignment`, and `capture_and_reserve` restores the last durable view
-   on any encode or reservation error. A test poisons the writer, drives two
-   same-id attaches, and checks the retry fails, the read view is aligned and
-   the durable file never contains the attachment.
+   `needs_alignment`, and `capture_and_reserve` restores the last published
+   (proven-durable) view on any encode or reservation error. A test poisons
+   the writer, drives two same-id attaches, and checks the retry fails, the
+   read view is aligned and the durable file never contains the attachment.
 3. **Unproven leader success (low).** `finish_leader` returned `Ok(())` when
    no watermark resolved its own sequence. It now fails closed with a typed
    `INTERNAL` and requires admission alignment.
@@ -355,6 +359,77 @@ their fixes in this change set:
    It can only occur when the runtime is shutting down (the process is
    ending), and it is the fail-closed choice; an abandoned leader token also
    poisons by RAII.
+
+#### Slice-2 re-review (2026-11-04): NO-GO on `1184a27`; findings fixed here
+
+A third independent review read the fix commit against the journal replay
+rules, the admission paths and the alignment code. It confirmed the four
+`1184a27` fixes were real and non-tautological, but found one high
+correctness window and one consistency gap the tests did not cover, plus
+three documentation/claim corrections. This change fixes all of them:
+
+1. **Same-id replay window (high).** Attach mutated in-memory state, reserved
+   under the state lock, then dropped the lock before durability. A second
+   caller with the same attachment id acquired the lock in that window, found
+   the attachment in the uncommitted in-memory view, and returned a success
+   replay. The journal replays a recorded success byte-for-byte, so if the
+   covering write then failed unproven the journal held a terminal success
+   for an attachment that was never durable. Detach and report had the
+   mirror image: a not-found or no-op answer could be derived from an
+   uncommitted removal or report.
+   Fix: every async admission first reads the writer's `AdmissionGate` under
+   the state lock. `Wait(seq)` drops the lock and awaits that capture's
+   permanent watermark without pinning a worker; `Align` re-enters
+   admission so the next `lock_state` reloads the durable file. A covering
+   failure is not this caller's failure: the loop re-aligns and re-executes,
+   so a detach/attach is retried from the durable view instead of answering
+   from the failed mutation. `Ready` cannot be invalidated afterwards,
+   because a new capture requires the state lock the admission still holds
+   and a failure requires an outstanding capture.
+2. **Sync admission could observe an uncommitted async mutation (high).**
+   Synchronous create/grow/delete/move/admin admission took `lock_state`
+   while an async attach/detach/report capture was pending. It could read an
+   uncommitted generation/attachment bump and make a terminal decision
+   (a stale-generation refusal, an idempotent replay, a delete fence) that
+   the later covering failure invalidated. Fix: synchronous admission now
+   uses `lock_state_stable`, which holds the state lock and waits on the
+   permanent watermarks before returning a view a decision may rely on. The
+   wait cannot deadlock: the leader never takes the state lock, and holding
+   it prevents a new capture from being reserved. This is the same
+   accepted-residual class as synchronous `persist` waiters.
+3. **Alignment vs. outstanding capture (high).** `lock_state` could reload
+   the durable file while a capture was still outstanding. That file
+   predates the capture's snapshot, so the reload could point in-memory state
+   below a snapshot that was about to be published (reachable when an encode
+   failure set `needs_alignment` while an older capture was pending).
+   Fix: alignment is skipped while `latest.is_some()`
+   (`needs_idle_alignment`), and `clear_needs_alignment` refuses to clear
+   while a capture is outstanding. The admission gate resolves the capture
+   first; only then does alignment reload the file that now includes (or
+   excludes) the resolved capture. The `latest`-only monotonicity claim
+   therefore holds even when `encode_for_save` fails: the failed mutation is
+   never allowed to hide an older in-flight snapshot.
+4. **Documentation truth (medium/low).** The readiness ledger claimed "no
+   production behavior changed after `a068947`: everything since is
+   test/doc-only evidence correction"; that is false once slice 2 landed. It
+   now scopes the statement to the interval between `a068947` and the
+   slice-2 implementation (`8220414`). The plan names `1184a27` as the first
+   review-fix commit instead of referring to an anonymous final SHA, and the
+   benchmark requirement now names the closing commit that will be recorded
+   with the measurement instead of leaving the SHA unidentified. The
+   `capture_and_reserve` text says "last published view" (what the code
+   restores), not "last durable view". The new admission-wait test is named
+   in the slice acceptance list.
+5. **Test for the replay window (evidence).** A deterministic test persists a
+   durable baseline, holds the per-path physical-write gate, arms a one-shot
+   pre-rename save failure, and starts the first attach. Once that attach is
+   blocked inside its physical write, it starts a same-id attach, proves the
+   replay has not finished and does not hold the provider state lock, and
+   proves the durable file still has no attachment. It then releases the
+   gate: the first write fails unproven, and the replay must re-align,
+   re-execute and make the attachment durable (exactly one failed and one
+   successful physical write). Without the gate loop the replay finishes
+   while the first write is still blocked, so the test is not tautological.
 
 
 **Rejected alternatives.** Per-volume files need a multi-file commit for
@@ -391,8 +466,15 @@ the attach fencing contract. None is a shortcut for this slice.
   poisoned refusal (the journal's terminal-replay rule); leader-kill wake-all
   and armed-kill payload re-raise, including through async `commit_async`;
   admission/`reconcile_failed_save` alignment on an uncovered failure (never
-  inside `persist`); the post-durability publication window (a reservation or
-  capture publishes nothing; only a proven write does); monotonic publication;
+  inside `persist`); admission never derives a replay, not-found or no-op
+  answer from an outstanding capture: the async paths await the permanent
+  watermark without holding the state lock and the synchronous paths use
+  `lock_state_stable`; the pending-replay window test holds the physical
+  write, proves a same-id replay is parked and the durable file has no
+  attachment, then fails the covering write and proves the replay
+  re-executes and makes the attachment durable; the post-durability
+  publication window (a reservation or capture publishes nothing; only a
+  proven write does); monotonic publication;
   atomic leadership handoff (a reservation at the quiesce boundary becomes
   the next leader, never a stranded waiter); report no-op; every crash seam
   still fires. The writer retains only the newest pending capture: in-memory
