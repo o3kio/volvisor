@@ -459,10 +459,11 @@ Measured results:
 - **Read/write split:** read p95 at c32 fell 179.332 → 1.188 ms and at c128
   1288.505 → 197.815 ms; write p95 rose 388.84 → 590.847 ms at c32 and
   1552.261 → 6330.548 ms at c128. Overall p50 fell (462.278 → 1.005 ms) while
-  overall p95 rose (1349.487 → 3553.448 ms). This is consistent with readers
-  no longer queueing behind the writer while synchronous `grow` still holds
-  the state lock across an LVM resize. The harness does not attribute delay;
-  the cause is an observation, not a proven diagnosis.
+  overall p95 rose (1349.487 → 3553.448 ms). Reads were already snapshot
+  reads at both SHAs; the split is consistent with async waiters no longer
+  pinning runtime workers while synchronous `grow` still holds the state lock
+  across an LVM resize. The harness does not attribute delay; the cause is an
+  observation, not a proven diagnosis.
 - **Soak:** 6,929,746 ops at 4619.824 ops/s versus 5,424,744 at 3616.49
   (+27.7 %), with the same recorded actual read ratio (0.7999), 0 HTTP
   errors and 0 attachment conflicts; the 77 network errors are client
@@ -586,7 +587,7 @@ gates 3 and 4 partial.
    green and physical save counts unchanged.
 5. **D3 slice 2 (release the lock) — delivered and measured at
    `c4b0b13`.** The clean-tree run is published: the mixed-sweep ceiling is
-   unchanged, the read path no longer queues behind the writer, and the
-   high-in-flight write tail is worse; no throughput-gain claim. #62 stays
-   open until explicitly instructed.
+   unchanged, read p95 falls sharply while write p95 rises at high in-flight,
+   and no throughput-gain is claimed. #62 stays open until explicitly
+   instructed.
 6. D4 only when the accepting authority is recorded.

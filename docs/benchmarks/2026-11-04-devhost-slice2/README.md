@@ -42,15 +42,16 @@ same 1/8/32/128 sweep as the Phase C baseline, not to establish capacity:
   **1845.526 / 3410.746 / 858.371 / 237.088 ops/s**, versus **1952.155 /
   3493.445 / 862.937 / 235.502** at `aab773b` (−5.5 / −2.4 / −0.5 / +0.7 %).
   This run does not support a throughput-gain claim.
-- **The read path no longer queues behind the writer.** Read p95 at c32 fell
-  from **179.332 ms** to **1.188 ms**, and at c128 from **1288.505 ms** to
-  **197.815 ms**.
+- **Read latency fell sharply.** Read p95 at c32 fell from **179.332 ms** to
+  **1.188 ms**, and at c128 from **1288.505 ms** to **197.815 ms**. Reads
+  were already snapshot reads; the improvement is consistent with async
+  waiters no longer pinning runtime workers, but the harness does not
+  attribute delay.
 - **The write tail got worse at high in-flight.** Write p95 at c32 rose from
   **388.84 ms** to **590.847 ms**, and at c128 from **1552.261 ms** to
   **6330.548 ms**. Synchronous `grow` still holds the state lock across the
-  LVM resize; readers now bypass that queue, so the tail concentrates on
-  writers. The harness does not attribute delay, so this is an observation,
-  not a proven cause.
+  LVM resize while async writers yield; the harness does not attribute the
+  delay, so this is an observation, not a proven cause.
 - **The shortened soak completed 6,929,746 ops at 4619.824 ops/s** with
   **0 HTTP errors and 0 attachment conflicts**; the 77 network errors are
   client reconnects at the planned restart. The post-fix baseline ran
@@ -77,7 +78,7 @@ These are findings, not fixes, and they are not production claims:
   regression fix; it may be the synchronous `grow`/state-lock residue, a
   coalescing/fairness effect, or the harness mix.
 - **RSS high-water is higher and remains unresolved.** RSS peaked at
-  **3,236,184 KiB** (≈3.01 GiB) and ended at 3,108,756 KiB, versus
+  **3,236,184 KiB** (≈3.09 GiB) and ended at 3,108,756 KiB, versus
   2,323,028 KiB / 1,950,048 KiB in the baseline. A leak is neither proven nor
   ruled out. No RSS cap or fix is claimed.
 - **The default INFO daemon log is unbounded.** The ~30-minute run produced

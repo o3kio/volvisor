@@ -40,9 +40,9 @@ Slice 2 changes only the provider write path:
   callers use `lock_state_stable`. This closes the same-id replay window
   where a journaled success could be derived from a write whose durability
   was still unproven.
-- Reads were already served from a published snapshot; this run therefore
-  measures the expected split between a read path that no longer queues
-  behind the writer and a write path that still serializes.
+- Reads were already served from a published snapshot and do not take the
+  provider state lock; this run therefore measures the resulting split
+  between reads served from that snapshot and writes that still serialize.
 
 Correctness evidence for this change is the test suite at `c4b0b13`, not
 this run. The harness can show behaviour and resource shape, not crash
@@ -97,19 +97,20 @@ Derived observations:
   is −5.5 %, c8 −2.4 %, c32 −0.5 % and c128 +0.7 %. This run does **not**
   establish a throughput gain from releasing the state lock; the differences
   are at or near single-run variance.
-- **The latency split changed in the direction the design predicts.** Read
-  p95 at c32 fell from 179.332 ms to 1.188 ms and at c128 from 1288.505 ms
-  to 197.815 ms, because reads no longer queue behind the provider writer.
-  Write p95 moved the other way: c32 388.84 → 590.847 ms and c128
-  1552.261 → 6330.548 ms. Overall p95 at c128 therefore rose
-  (1349.487 → 3553.448 ms) even though overall p50 fell
+- **The latency split changed.** Read p95 at c32 fell from 179.332 ms to
+  1.188 ms and at c128 from 1288.505 ms to 197.815 ms. Reads were already
+  snapshot reads at both SHAs; the improvement is consistent with async
+  waiters no longer pinning runtime workers across the fsync, but the harness
+  does not attribute delay. Write p95 moved the other way: c32
+  388.84 → 590.847 ms and c128 1552.261 → 6330.548 ms. Overall p95 at c128
+  therefore rose (1349.487 → 3553.448 ms) even though overall p50 fell
   (462.278 → 1.005 ms).
 - **Plausible cause (not proven by this harness):** each mixed worker
   periodically issues `grow`, which still holds the state lock across an LVM
-  resize (~200 ms median). Readers now bypass that queue, so the queue's tail
-  concentrates on writes. The harness does not attribute delay, so this is
-  an observation, not a measured cause and not a claim that a specific code
-  path is at fault.
+  resize (~200 ms median). Async writers yield their runtime worker while
+  writers that need the state lock still queue behind `grow`; the harness
+  does not isolate those effects. This is an observation, not a measured
+  cause and not a claim that a specific code path is at fault.
 - 8 in-flight is 1.85× the 1-in-flight throughput; 32 is 0.252× the
   8-in-flight throughput, and 128 is 0.276× the 32-in-flight throughput.
 - Throughput **falls** above 8 in-flight, as before. This is a control-plane
@@ -138,9 +139,9 @@ Exact values from [summary/micro.csv](summary/micro.csv).
 | capabilities | 100 | 0 | 0.091 | 0.107 | 0.104 | 0.131 | 0.137 | 0.181 |
 
 LVM command cost dominates create/delete/grow; attach/report/detach are state
-mutations at roughly 1.45 ms p50 (about 0.12 ms above the post-fix baseline,
-within single-run variance); inspect/list/capabilities are sub-millisecond
-p95 at this dataset.
+mutations at roughly 1.45 ms p50 (about 0.13–0.15 ms above the post-fix
+baseline, within single-run variance); inspect/list/capabilities are
+sub-millisecond p95 at this dataset.
 
 ## 6. Diagnostic probes
 
@@ -211,11 +212,13 @@ consistent with that hysteresis. The state file never exceeded **3,684 B**
 and ended at **3,401 B**; it does not grow with attachment history.
 
 **RSS is the open residual, and it is larger in this run.** RSS rose to a
-peak of **3,236,184 KiB (≈3.01 GiB)** and ended at 3,108,756 KiB, versus a
+peak of **3,236,184 KiB (≈3.09 GiB)** and ended at 3,108,756 KiB, versus a
 peak of 2,323,028 KiB and an end of 1,950,048 KiB in the post-fix baseline.
-The peak coincides with a post-compaction journal minimum in the timeline,
-which is consistent with allocator/compaction transients, but a leak is
-neither proven nor ruled out. No RSS cap or fix is claimed.
+The peak sample (elapsed 1390.956 s) is followed one second later by the
+journal's smallest value in the final five minutes (8,393,141 B at elapsed
+1391.958 s) with RSS still at its peak, which is consistent with
+allocator/compaction transients, but a leak is neither proven nor ruled out.
+No RSS cap or fix is claimed.
 
 ### Daemon log (operational finding)
 
@@ -289,10 +292,12 @@ single-run, non-fixed-dataset observation: the soak also grew RSS 65 % more,
 and no capacity or efficiency claim follows from it.
 
 **The mixed sweep is the cleaner comparison, and it shows no throughput
-ceiling change.** What changed is where the wait lands: reads no longer queue
-behind the provider writer, while writes still do, and the write tail at
-c32/c128 is worse in this run. That trade-off is the measured result of the
-slice, not evidence of a throughput win.
+ceiling change.** What changed is the latency composition: read p95 fell
+sharply while write p95 rose at c32/c128. Reads were already snapshot reads;
+the split is consistent with async writers yielding runtime workers while
+synchronous grow still holds the state lock, but the harness does not
+attribute it. That trade-off is the measured result of the slice, not
+evidence of a throughput win.
 
 ## 10. Caveats and NOT RUN
 
