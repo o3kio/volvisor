@@ -6,15 +6,33 @@
 //! groups. It is never exposed to tenants (the API surface derives all
 //! responses from it).
 //!
-//! Persistence is atomic: [`LvmState::save`] writes `<path>.tmp`, fsyncs
-//! the file, renames it over the target and fsyncs the parent directory,
-//! so a crash can never leave a torn or half-renamed state file. A missing
-//! file loads as an empty state (first start).
+//! Persistence is atomic: [`LvmState::save`] writes a unique sibling
+//! temp file, fsyncs it, renames it over the target and fsyncs the parent
+//! directory, so a crash can never leave a torn or half-renamed state
+//! file. A missing file loads as an empty state (first start).
+//!
+//! # Unique temp files and the startup sweep
+//!
+//! Every physical write uses its own temp name,
+//! `<path>.<pid>.<sequence>.tmp` (the sequence is a process-wide atomic
+//! counter). Two writers — even in the same process — therefore never
+//! share, truncate or delete each other's temp file, and a failed save
+//! removes only the temp path it allocated for that attempt.
+//!
+//! A process that died mid-save leaves its temp file behind. Because the
+//! process id may be reused after a restart, a new process sweeps the
+//! stale temps at startup (`sweep_stale_temps`, invoked by the provider
+//! constructor before it loads or writes state). The sweep only
+//! inspects the state file's own parent directory and only removes
+//! entries whose name is provably in this state path's temp namespace:
+//! the exact legacy `<path>.tmp` name, or `<path>.<digits>.<digits>.tmp`.
+//! Every other file is left untouched.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
@@ -657,11 +675,12 @@ impl LvmState {
     /// Persist the state atomically.
     ///
     /// Takes `&mut self` to mark the intent to persist a mutation: write
-    /// `<path>.tmp` (mode `0600` on unix — the state names devices and
-    /// volume placements, so it is owner-only), fsync, rename over
-    /// `path`, fsync the directory. If any step fails, the temporary
-    /// file is removed and an `INTERNAL` error is returned; the previous
-    /// state file remains intact.
+    /// a unique `<path>.<pid>.<sequence>.tmp` (mode `0600` on unix — the
+    /// state names devices and volume placements, so it is owner-only),
+    /// fsync, rename over `path`, fsync the directory. If any step
+    /// fails, the temp file this call allocated is removed and an
+    /// `INTERNAL` error is returned; the previous state file remains
+    /// intact and another writer's temp file is never touched.
     pub fn save(&mut self, path: &Path) -> Result<(), ApiError> {
         self.save_with_hooks(path, None)
     }
@@ -679,10 +698,13 @@ impl LvmState {
         path: &Path,
         crash: Option<&StoreCrashHooks>,
     ) -> Result<(), ApiError> {
-        let tmp_path = sibling_tmp_path(path);
-        let result = self.save_to(&tmp_path, path, crash);
-        if result.is_err() {
-            // Best-effort cleanup: never leave a stale .tmp behind.
+        let tmp_path = unique_sibling_tmp_path(path);
+        // Track whether this call actually created the temp file: cleanup
+        // must never remove a file that already existed at the allocated
+        // name (for example a stale file the startup sweep did not see).
+        let mut created = false;
+        let result = self.save_to(&tmp_path, path, crash, &mut created);
+        if result.is_err() && created {
             drop(fs::remove_file(&tmp_path));
         }
         result
@@ -693,6 +715,7 @@ impl LvmState {
         tmp_path: &Path,
         path: &Path,
         crash: Option<&StoreCrashHooks>,
+        created: &mut bool,
     ) -> Result<(), ApiError> {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
@@ -723,6 +746,9 @@ impl LvmState {
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
+        // The unique temp name did not exist (create_new); this call now
+        // owns it until the rename consumes it.
+        *created = true;
         file.write_all(&data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
         consult(StoreSavePoint::AfterTmpWrite)?;
@@ -735,6 +761,9 @@ impl LvmState {
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
+        // The rename consumed the temp; it is now the target file and
+        // must never be cleaned up as a temp on a later error.
+        *created = false;
         consult(StoreSavePoint::AfterRename)?;
         // The directory-fsync boundary: the rename has landed, so a
         // rig-injected failure here leaves the NEW file as the durable
@@ -909,37 +938,142 @@ impl LvmState {
     }
 }
 
-/// The `<path>.tmp` sibling used for atomic saves.
-fn sibling_tmp_path(path: &Path) -> PathBuf {
+/// The process-wide sequence for [`unique_sibling_tmp_path`].
+///
+/// The process id makes the name unique across live processes; the
+/// atomic sequence makes it unique across every write in this process,
+/// including concurrent writers. A stale file from a previous process
+/// with a recycled pid is removed by the startup sweep before this
+/// process writes.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh, collision-free temp path for one physical save of `path`.
+///
+/// The name is `<path>.<pid>.<sequence>.tmp`. Callers own the returned
+/// path for the duration of their save; no other writer can receive the
+/// same name.
+pub(crate) fn unique_sibling_tmp_path(path: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut os_name = path.as_os_str().to_owned();
-    os_name.push(".tmp");
+    os_name.push(format!(".{}.{sequence}.tmp", std::process::id()));
     PathBuf::from(os_name)
 }
 
-/// Create (or truncate) `path` for writing with owner-only permissions.
+/// The parent directory a state path's temp files live in.
+fn state_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Whether `candidate` is provably a temp file of the state at
+/// `state_file_name`.
 ///
-/// On unix the file is created with mode `0600`; other platforms fall
-/// back to the platform default for [`fs::File::create`].
+/// Accepts the exact legacy `<state>.tmp` name and this implementation's
+/// `<state>.<pid>.<sequence>.tmp` shape, where both numeric components
+/// are non-empty ASCII digits. Anything else — a different prefix, a
+/// non-numeric middle, extra components, or a different suffix — is not
+/// ours and is never removed.
+fn is_stale_temp_name(state_file_name: &str, candidate: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(state_file_name) else {
+        return false;
+    };
+    // The legacy fixed temp name (`<state>.tmp`) from before unique
+    // per-write names. It is always stale: this build never writes it.
+    if rest == ".tmp" {
+        return true;
+    }
+    let Some(core) = rest
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut components = core.split('.');
+    let (Some(pid), Some(sequence), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Every stale temp path belonging to `path` in its own parent
+/// directory, sorted for deterministic callers/tests.
+///
+/// The scan is deliberately shallow (one directory, no recursion) and
+/// name-gated by [`is_stale_temp_name`], so it never deletes an
+/// arbitrary file.
+pub(crate) fn stale_temp_paths(path: &Path) -> Vec<PathBuf> {
+    let Some(state_file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(state_parent(path)) else {
+        return Vec::new();
+    };
+    let mut stale: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| is_stale_temp_name(state_file_name, name))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    stale.sort();
+    stale
+}
+
+/// Remove stale sibling temp files left by a crashed save of `path`.
+///
+/// Best-effort by design: a state directory that cannot be read or a
+/// temp entry that cannot be removed (for example a directory with a
+/// temp-like name) is skipped, never an arbitrary recursive delete and
+/// never a startup failure. Returns the number of files removed.
+///
+/// The provider constructor calls this before loading or writing state,
+/// so a recycled pid cannot collide with a previous process's temp.
+pub(crate) fn sweep_stale_temps(path: &Path) -> usize {
+    stale_temp_paths(path)
+        .into_iter()
+        .filter(|candidate| fs::remove_file(candidate).is_ok())
+        .count()
+}
+
+/// Create `path` for writing with owner-only permissions.
+///
+/// The call uses `create_new`, so it never truncates an existing file:
+/// the caller's unique temp name is its own, and a pre-existing file at
+/// that name is not silently adopted or removed. On unix the file is
+/// created with mode `0600`; other platforms use the platform default
+/// creation mode.
 fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        fs::File::create(path)
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json");
     const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n2.json");
@@ -1131,13 +1265,108 @@ mod tests {
         let mut state = sample_state();
         state.save(&path).expect("save");
         assert!(path.exists());
-        assert!(!sibling_tmp_path(&path).exists(), "no .tmp residue");
+        assert!(
+            stale_temp_paths(&path).is_empty(),
+            "no temp-file residue after a successful save"
+        );
 
         // Overwriting an existing state also leaves no residue.
         state.save(&path).expect("save again");
-        assert!(!sibling_tmp_path(&path).exists());
+        assert_eq!(stale_temp_paths(&path), Vec::<PathBuf>::new());
         let reloaded = LvmState::load(&path).expect("reload");
         assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn unique_tmp_names_do_not_collide_across_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        // Two independent writers in the same process must never receive
+        // the same temp name, even when they generate concurrently.
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                (0..64)
+                    .map(|_| unique_sibling_tmp_path(&path))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let names: BTreeSet<PathBuf> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("writer thread"))
+            .collect();
+        assert_eq!(names.len(), 128, "every generated temp name is unique");
+        for name in names {
+            let file_name = name
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("name");
+            assert!(
+                is_stale_temp_name("state.json", file_name),
+                "the generated name is in this state path's temp namespace: {file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_this_state_paths_stale_temps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        let first = unique_sibling_tmp_path(&path);
+        let second = unique_sibling_tmp_path(&path);
+        fs::write(&first, b"stale").expect("first stale temp");
+        fs::write(&second, b"stale").expect("second stale temp");
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&legacy, b"legacy stale").expect("legacy temp");
+
+        // Files that are *not* provably this state's temp namespace.
+        let foreign = dir.path().join("other.json.123.456.tmp");
+        fs::write(&foreign, b"foreign").expect("foreign file");
+        let malformed = dir.path().join("state.json.notnumeric.tmp");
+        fs::write(&malformed, b"not ours").expect("malformed file");
+        let wrong_suffix = dir.path().join("state.json.123.456.tmp.bak");
+        fs::write(&wrong_suffix, b"wrong suffix").expect("wrong-suffix file");
+
+        assert_eq!(sweep_stale_temps(&path), 3);
+        assert!(!first.exists(), "the first unique temp is swept");
+        assert!(!second.exists(), "the second unique temp is swept");
+        assert!(!legacy.exists(), "the legacy fixed temp is swept");
+        assert!(foreign.exists(), "another state file's temp is untouched");
+        assert!(malformed.exists(), "a non-numeric middle is untouched");
+        assert!(wrong_suffix.exists(), "a non-.tmp suffix is untouched");
+    }
+
+    #[test]
+    fn a_failed_save_does_not_remove_another_writers_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let other_writer = unique_sibling_tmp_path(&path);
+        fs::write(&other_writer, b"another writer's in-flight temp").expect("foreign temp");
+
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite, 0);
+        let mut state = sample_state();
+        let err = state
+            .save_with_hooks(&path, Some(&hooks))
+            .expect_err("the armed save must fail");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+
+        assert!(
+            other_writer.exists(),
+            "a failed save removes only its own uniquely-named temp"
+        );
+        assert_eq!(
+            fs::read(&other_writer).expect("foreign temp content"),
+            b"another writer's in-flight temp"
+        );
+        assert_eq!(
+            stale_temp_paths(&path),
+            vec![other_writer],
+            "only the failed call's own temp was cleaned up"
+        );
     }
 
     #[test]
@@ -1169,8 +1398,8 @@ mod tests {
         assert!(err.detail.contains("injected state save failure"), "{err}");
         assert!(err.detail.contains("AfterRenameBeforeDirFsync"), "{err}");
         assert!(
-            !sibling_tmp_path(&path).exists(),
-            "no .tmp residue after the injected failure"
+            stale_temp_paths(&path).is_empty(),
+            "no temp-file residue after the injected failure"
         );
         let loaded = LvmState::load(&path).expect("load the post-rename state");
         assert_eq!(
@@ -1192,7 +1421,7 @@ mod tests {
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.detail.contains("injected state save failure"), "{err}");
         assert!(
-            !sibling_tmp_path(&path).exists(),
+            stale_temp_paths(&path).is_empty(),
             "the tmp cleanup removes the unrenamed file"
         );
         let loaded = LvmState::load(&path).expect("load the old state");
@@ -1226,8 +1455,8 @@ mod tests {
         state.save(&path).expect("save again");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        // A failed save never leaves a .tmp residue behind.
-        assert!(!sibling_tmp_path(&path).exists());
+        // A failed save never leaves a temp-file residue behind.
+        assert_eq!(stale_temp_paths(&path), Vec::<PathBuf>::new());
     }
 
     // -----------------------------------------------------------------

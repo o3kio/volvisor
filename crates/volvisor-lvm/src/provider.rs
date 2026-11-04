@@ -10,6 +10,19 @@
 //! are always verified against `lvs` output — a successful exit status
 //! alone is never trusted as evidence (honest reporting).
 //!
+//! # Single durable writer
+//!
+//! Every production save of the provider state — volume, move, admin
+//! claim/release and every compensation path — goes through one
+//! `DurableWriter` funnel (Phase D D3 slice 1, #62). In this slice the
+//! caller still holds the provider state lock across the save and its
+//! wait, so captures never overlap; the funnel adds the seam slice 2
+//! will use when callers release that lock before waiting. The writer
+//! uses a unique `<path>.<pid>.<sequence>.tmp` per physical write, so
+//! two writers can never truncate or delete each other's temp file. The
+//! constructor sweeps stale sibling temp files from a crashed save
+//! before it loads or writes state (see [`crate::state`]).
+//!
 //! # Durable mutation contracts
 //!
 //! Every privileged mutation journals a durable intent before the
@@ -334,6 +347,9 @@ pub struct LvmProvider {
     /// The state file's store-save crash seam (inert unless a rig
     /// arms it — the move fault rows' kill surface).
     store_crash: Arc<StoreCrashHooks>,
+    /// The single durable-writer funnel every production save uses
+    /// (Phase D D3 slice 1, #62).
+    writer: DurableWriter,
     /// The move drive's timing (production defaults; overridable for
     /// the deterministic fake world only).
     move_timing: MoveTiming,
@@ -352,6 +368,54 @@ pub struct LvmProvider {
     /// the `Arc` only; the lock is held for that clone, never for the
     /// duration of a read.
     read_snapshot: RwLock<Arc<LvmState>>,
+}
+
+/// The single durable-writer funnel for the LVM state file.
+///
+/// Phase D D3 slice 1 (#62): every production save enters through
+/// [`DurableWriter::save`], so there is one place that performs the
+/// physical write and one place slice 2 can change when callers release
+/// the state lock before waiting. Slice 1 deliberately keeps the caller's
+/// provider state lock held across the wait, so the gate is a semantic
+/// no-op beyond excluding a hypothetical second writer that did not hold
+/// the state lock.
+///
+/// A panic in the save (including an armed crash seam) poisons both the
+/// state lock and this gate, matching the existing fail-closed writer
+/// behavior: later writers get a typed `INTERNAL` error instead of
+/// proceeding from an unknown state.
+struct DurableWriter {
+    /// Serializes whole physical save attempts.
+    gate: Mutex<()>,
+}
+
+impl DurableWriter {
+    /// A fresh writer gate (nothing armed; no writes performed).
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+        }
+    }
+
+    /// Perform one durable save through the crash-hooked atomic writer.
+    ///
+    /// The caller must already hold the provider state lock (slice 1's
+    /// invariant). The gate guarantees that no second physical write can
+    /// overlap even if a future caller forgets.
+    fn save(
+        &self,
+        state: &mut LvmState,
+        path: &Path,
+        crash: &StoreCrashHooks,
+    ) -> Result<(), ApiError> {
+        let _gate = self.gate.lock().map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "LVM provider durable writer lock poisoned by a previous failure",
+            )
+        })?;
+        state.save_with_hooks(path, Some(crash))
+    }
 }
 
 /// A writer view of [`LvmState`].
@@ -502,6 +566,11 @@ impl LvmProvider {
         vg_prefix: String,
         expected_auth_token: String,
     ) -> Result<Self, ApiError> {
+        // Remove temps a crashed previous incarnation left in this state
+        // path's namespace before loading or writing. This runs before the
+        // writer can allocate a name, so a recycled pid cannot collide with
+        // a stale file; other files in the directory are never touched.
+        crate::state::sweep_stale_temps(&state_path);
         let state = LvmState::load(&state_path)?;
         let read_snapshot = Arc::new(state.clone());
         let provider = Self {
@@ -511,6 +580,7 @@ impl LvmProvider {
             vg_prefix,
             expected_auth_token,
             store_crash: Arc::new(StoreCrashHooks::new()),
+            writer: DurableWriter::new(),
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
@@ -539,12 +609,16 @@ impl LvmProvider {
         &self.store_crash
     }
 
-    /// Persist the in-memory state through the crash-hooked atomic
-    /// save (every internal mutation — volume, move and admin claim —
-    /// routes through here, so the armed seam sees every commit
-    /// boundary of the state file).
+    /// Persist the in-memory state through the single durable writer.
+    ///
+    /// Every production mutation — volume, move, admin claim/release and
+    /// every compensation path — routes through here, so the armed crash
+    /// seam sees every commit boundary of the state file and no class
+    /// keeps a second direct-file path (Phase D D3 slice 1, #62). The
+    /// caller still holds the provider state lock across the save in this
+    /// slice.
     pub(crate) fn persist(&self, state: &mut LvmState) -> Result<(), ApiError> {
-        state.save_with_hooks(&self.state_path, Some(&self.store_crash))
+        self.writer.save(state, &self.state_path, &self.store_crash)
     }
 
     /// Count one more consecutive world-observe failure for a move
@@ -5473,6 +5547,7 @@ mod read_snapshot_tests {
             vg_prefix: "vg-volvisor".to_owned(),
             expected_auth_token: "test-token".to_owned(),
             store_crash: Arc::new(StoreCrashHooks::new()),
+            writer: DurableWriter::new(),
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state.clone()),

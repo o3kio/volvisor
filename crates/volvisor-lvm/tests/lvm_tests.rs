@@ -560,11 +560,16 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
     let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
 
     // The durable-intent save succeeds; `lvcreate` then leaves the
-    // durable file unreadable and blocks the sibling `.tmp` path, so
-    // the final save fails and the compensation's clear-save fails too.
-    // The fail-closed re-read treats the unreadable durable state as
-    // "not committed": remove the freshly created (empty) LV and the
-    // in-memory entry, and leave the unreadable file for the operator.
+    // durable file unreadable and the test's persistent failure arm makes
+    // the final save and the compensation's clear-save fail too (unique
+    // temp names mean there is no fixed `.tmp` path to block). The
+    // fail-closed re-read treats the unreadable durable state as "not
+    // committed": remove the freshly created (empty) LV and the in-memory
+    // entry, and leave the unreadable file for the operator.
+    fixture
+        .provider
+        .store_crash_hooks()
+        .arm_save_failure_until_cleared(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite, 1);
     fixture.world.lock().expect("world").break_state_on_lvcreate = Some(fixture.state_path.clone());
 
     let err = fixture
@@ -576,7 +581,7 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
     // The save failure is the returned error; the failed re-read is only
     // the decision input and never replaces it. The failed clear-save is
     // reported as an appended note, not masked.
-    assert!(err.detail.contains("failed to create"), "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
     // The re-read failed, so the clear's outcome cannot be known: the
     // error says the intent is possibly durable (fail-closed), never
     // that it was definitely cleared or definitely remains.
@@ -607,10 +612,7 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
         "the unreadable durable file must be left for the operator"
     );
 
-    let mut tmp_name = fixture.state_path.clone().into_os_string();
-    tmp_name.push(".tmp");
-    let tmp_path = std::path::PathBuf::from(tmp_name);
-    fs::remove_dir(&tmp_path).expect("unblock the next save");
+    fixture.provider.store_crash_hooks().clear();
     fs::write(&fixture.state_path, &snapshot).expect("restore the durable state");
 
     let restarted = common::provider_from(&fixture.state_path, &fixture.world);
@@ -622,6 +624,36 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
     let report = restarted.reconcile_report().expect("report");
     assert!(report.missing_volumes.is_empty(), "{report:?}");
     assert!(report.foreign_lvs.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn startup_sweeps_only_this_state_paths_stale_temps() {
+    let fixture = fixture();
+    let parent = fixture.state_path.parent().expect("state parent");
+    let mut stale_name = fixture.state_path.clone().into_os_string();
+    stale_name.push(".999999.1.tmp");
+    let stale = std::path::PathBuf::from(stale_name);
+    fs::write(&stale, b"stale temp from a crashed save").expect("write stale temp");
+    let mut legacy_name = fixture.state_path.clone().into_os_string();
+    legacy_name.push(".tmp");
+    let legacy = std::path::PathBuf::from(legacy_name);
+    fs::write(&legacy, b"legacy fixed temp").expect("write legacy temp");
+
+    // Files that are not provably this state path's temp namespace.
+    let foreign = parent.join("other-state.json.123.456.tmp");
+    fs::write(&foreign, b"another state file's temp").expect("write foreign file");
+    let malformed = parent.join("state.json.notnumeric.tmp");
+    fs::write(&malformed, b"not a provider temp").expect("write malformed file");
+
+    let _restarted = common::provider_from(&fixture.state_path, &fixture.world);
+
+    assert!(!stale.exists(), "the stale unique temp is swept at startup");
+    assert!(
+        !legacy.exists(),
+        "the legacy fixed temp is swept at startup"
+    );
+    assert!(foreign.exists(), "another state file's temp survives");
+    assert!(malformed.exists(), "a non-numeric middle survives");
 }
 
 #[tokio::test]
@@ -2351,10 +2383,13 @@ async fn a_create_compensation_clear_failure_keeps_the_intent_in_memory() {
     let volume = "create-compensation-clear-fails";
     let id = volume_id(volume);
     let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
-    // `lvcreate` succeeds, then blocks the `.tmp` path: the final save
-    // fails pre-rename (the valid durable file still holds the intent)
-    // and the compensating clear save fails the same way.
-    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = Some(fixture.state_path.clone());
+    // `lvcreate` succeeds, then a persistent failure arm makes the final
+    // save fail pre-rename (the valid durable file still holds the
+    // intent) and the compensating clear save fail the same way.
+    fixture
+        .provider
+        .store_crash_hooks()
+        .arm_save_failure_until_cleared(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite, 1);
 
     let err = fixture
         .provider
@@ -2391,10 +2426,7 @@ async fn a_create_compensation_clear_failure_keeps_the_intent_in_memory() {
 
     // Unblock saves and drive a later successful mutation from the same
     // in-memory provider: the re-inserted intent must survive it.
-    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = None;
-    let mut tmp_name = fixture.state_path.clone().into_os_string();
-    tmp_name.push(".tmp");
-    std::fs::remove_dir(std::path::PathBuf::from(tmp_name)).expect("unblock the tmp path");
+    fixture.provider.store_crash_hooks().clear();
     fixture
         .provider
         .create_volume(&fixture_create_request("create-compensation-witness", GIB))
