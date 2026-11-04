@@ -208,6 +208,12 @@ fn with_bearer(mut request: Request<Body>, token: &str) -> Request<Body> {
     request
 }
 
+/// GET authenticated as the configured test admin: reads are protected
+/// whenever any credential is configured (including the legacy token).
+fn get(uri: &str) -> Request<Body> {
+    with_bearer(request(Method::GET, uri), TEST_TOKEN)
+}
+
 /// Raw broken-JSON request, authenticated as the test admin (auth must not
 /// mask body-level rejections in the malformed-body tests).
 fn broken_json_request(uri: &str, body: &'static str) -> Request<Body> {
@@ -278,7 +284,7 @@ async fn full_lifecycle_over_http() {
     assert_eq!(created["current_writer"], Value::Null);
 
     // Inspect round-trips the create response.
-    let (status, inspected) = send_json(&app, request(Method::GET, "/v2/volumes/vol-life")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-life")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inspected, created);
 
@@ -292,15 +298,11 @@ async fn full_lifecycle_over_http() {
     let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &other)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, listed_all) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed_all) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed_all["volumes"].as_array().map(Vec::len), Some(2));
 
-    let (status, listed_b) = send_json(
-        &app,
-        request(Method::GET, "/v2/volumes?project_id=project-b"),
-    )
-    .await;
+    let (status, listed_b) = send_json(&app, get("/v2/volumes?project_id=project-b")).await;
     assert_eq!(status, StatusCode::OK);
     let volumes_b = listed_b["volumes"].as_array().expect("volumes array");
     assert_eq!(
@@ -310,11 +312,8 @@ async fn full_lifecycle_over_http() {
     );
     assert_eq!(volumes_b[0]["volume_id"], json!("vol-life-b"));
 
-    let (status, listed_a) = send_json(
-        &app,
-        request(Method::GET, "/v2/volumes?project_id=conformance-project"),
-    )
-    .await;
+    let (status, listed_a) =
+        send_json(&app, get("/v2/volumes?project_id=conformance-project")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed_a["volumes"].as_array().map(Vec::len), Some(1));
     assert_eq!(listed_a["volumes"][0]["volume_id"], json!("vol-life"));
@@ -400,7 +399,7 @@ async fn full_lifecycle_over_http() {
     assert_eq!(deleted, json!({ "deleted": "vol-life" }));
 
     // Inspect after delete: typed NOT_FOUND.
-    let (status, missing) = send_json(&app, request(Method::GET, "/v2/volumes/vol-life")).await;
+    let (status, missing) = send_json(&app, get("/v2/volumes/vol-life")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], json!("NOT_FOUND"));
 }
@@ -424,7 +423,7 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(status, StatusCode::OK);
 
     // Inspect exposes the full per-attachment projection at prepared/1.
-    let (status, inspected) = send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-report")).await;
     assert_eq!(status, StatusCode::OK);
     let views = inspected["attachments"]
         .as_array()
@@ -528,8 +527,7 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(equal_body["recorded_at_ms"], active_body["recorded_at_ms"]);
 
     // Inspect re-projects the applied evidence verbatim.
-    let (status, after_report) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    let (status, after_report) = send_json(&app, get("/v2/volumes/vol-report")).await;
     assert_eq!(status, StatusCode::OK);
     let view = &after_report["attachments"][0];
     assert_eq!(view["state"], json!("active"));
@@ -1486,8 +1484,7 @@ async fn move_refuses_unqualified_providers_typed() {
 
     // The volume is untouched by the refusal: same generation, no
     // state change (the extents were never a party to it).
-    let (status, inspected) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-move-refuse")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-move-refuse")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inspected["generation"], json!(1));
 }
@@ -1767,7 +1764,7 @@ async fn concurrent_same_operation_id_creates_exactly_once() {
 
     // The final state shows exactly one volume.
     let app = app(&state);
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(1));
     assert_eq!(listed["volumes"][0]["volume_id"], json!("vol-concurrent"));
@@ -1865,7 +1862,7 @@ async fn concurrent_failed_operation_replays_status_compatible() {
 
     // No volume was created.
     let app = app(&state);
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(0));
 }
@@ -1930,7 +1927,7 @@ async fn outcome_append_failure_returns_truthful_success_then_fails_closed() {
     assert!(body.contains("vol-fault-outcome"));
 
     // The volume really exists (truthful success).
-    let (status, _) = send_json(&app, request(Method::GET, "/v2/volumes/vol-fault-outcome")).await;
+    let (status, _) = send_json(&app, get("/v2/volumes/vol-fault-outcome")).await;
     assert_eq!(status, StatusCode::OK);
 
     // A retry of the same operation cannot know the outcome: fail closed.
@@ -1959,8 +1956,7 @@ async fn intent_append_failure_prevents_the_provider_mutation() {
     assert_eq!(error["code"], json!("INTERNAL"));
 
     // No provider mutation happened and nothing was journaled.
-    let (status, missing) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-fault-intent")).await;
+    let (status, missing) = send_json(&app, get("/v2/volumes/vol-fault-intent")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], json!("NOT_FOUND"));
     assert_eq!(journal_record_count(&state), 0);
@@ -1994,13 +1990,26 @@ async fn mutations_require_the_admin_bearer_token_when_configured() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created["volume_id"], json!("vol-auth"));
 
-    // Read-only routes stay open in P0.
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    // The legacy token protects reads as well as mutations: an anonymous
+    // caller cannot enumerate volume metadata or scrape metrics.
+    for uri in ["/v2/volumes", "/v2/capabilities", "/metrics"] {
+        let (status, unauthorized) = send_json(&app, request(Method::GET, uri)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {uri}");
+        assert_eq!(unauthorized["code"], json!("UNAUTHORIZED"));
+    }
+    let (status, listed) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/volumes"), TEST_TOKEN),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(1));
-    let (status, health) = send_json(&app, request(Method::GET, "/healthz")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(health, json!({ "status": "ok" }));
+
+    // Probes stay public (readiness may legitimately be 503, never 401).
+    for uri in ["/healthz", "/v2/healthz", "/readyz", "/v2/readyz"] {
+        let (status, _) = send_json(&app, request(Method::GET, uri)).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "public probe {uri}");
+    }
 }
 
 /// No token configured: mutations (and the admin surface) fail closed; a
@@ -2753,7 +2762,7 @@ async fn invalid_volume_id_in_path_is_an_invalid_request() {
     let app = app(&state);
 
     // '!' is outside the ID charset.
-    let (status, body) = send_json(&app, request(Method::GET, "/v2/volumes/bad!id")).await;
+    let (status, body) = send_json(&app, get("/v2/volumes/bad!id")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 }
@@ -2793,8 +2802,7 @@ async fn malformed_bodies_are_typed_invalid_requests() {
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 
     // An invalid project_id query value is rejected, not ignored.
-    let (status, body) =
-        send_json(&app, request(Method::GET, "/v2/volumes?project_id=bad!id")).await;
+    let (status, body) = send_json(&app, get("/v2/volumes?project_id=bad!id")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 }
@@ -2808,7 +2816,7 @@ async fn capabilities_expose_the_provider_advertisement() {
     let (state, provider, _dir) = setup();
     let app = app(&state);
 
-    let (status, body) = send_json(&app, request(Method::GET, "/v2/capabilities")).await;
+    let (status, body) = send_json(&app, get("/v2/capabilities")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["provider"], json!(provider.name()));
     let advertised: Vec<String> = provider
@@ -2837,7 +2845,7 @@ async fn metrics_serve_prometheus_text() {
     let (state, _provider, _dir) = setup();
     let app = app(&state);
 
-    let (status, _) = send_json(&app, request(Method::GET, "/healthz")).await;
+    let (status, _) = send_json(&app, get("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
 
     // A param route must be labeled by its pattern, not the concrete path.
@@ -2845,10 +2853,10 @@ async fn metrics_serve_prometheus_text() {
         .expect("serialize create fixture");
     let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send_json(&app, request(Method::GET, "/v2/volumes/vol-metrics")).await;
+    let (status, _) = send_json(&app, get("/v2/volumes/vol-metrics")).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = send(&app, request(Method::GET, "/metrics")).await;
+    let (status, body) = send(&app, get("/metrics")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("# TYPE http_requests_total counter"));
     assert!(body.contains("# TYPE operations_total counter"));

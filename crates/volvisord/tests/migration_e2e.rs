@@ -994,9 +994,10 @@ async fn post_abort(addr: SocketAddr, mig: &str) -> (u16, String) {
     admin("POST", addr, &format!("/v2/migrations/{mig}/abort"), None).await
 }
 
-/// `GET /v2/migrations/{id}` on one daemon.
+/// `GET /v2/migrations/{id}` on one daemon, authenticated with the shared
+/// admin token because any configured credential protects reads.
 async fn get_migration(addr: SocketAddr, mig: &str) -> (u16, String) {
-    http("GET", addr, &format!("/v2/migrations/{mig}"), None, None).await
+    admin("GET", addr, &format!("/v2/migrations/{mig}"), None).await
 }
 
 /// Poll `GET /v2/migrations/{id}` (bounded, real timeout) until the

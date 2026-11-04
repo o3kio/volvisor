@@ -71,7 +71,7 @@ pub(crate) async fn create_volume(
 ) -> Result<Response, ApiErrorReply> {
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_CREATE_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %req.volume_id,
@@ -237,7 +237,7 @@ pub(crate) async fn attach_volume(
     ops::require_consumer_operation_id(&req.operation_id)?;
     ops::require_consumer_attachment_id(&req.attachment_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_ATTACH_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -274,7 +274,7 @@ pub(crate) async fn detach_volume(
     let req = wire.into_typed_request();
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_DETACH_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -315,7 +315,7 @@ pub(crate) async fn report_attachment_state(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_REPORT_ATTACHMENT_STATE,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -357,7 +357,7 @@ pub(crate) async fn grow_volume(
     let volume_id = parse_volume_id(&volume_id)?;
     req.validate_envelope()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_GROW_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -429,7 +429,7 @@ pub(crate) async fn move_volume_backing(
     let volume_id = parse_volume_id(&volume_id)?;
     req.validate_envelope()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_MOVE_VOLUME_BACKING,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -460,7 +460,7 @@ pub(crate) async fn delete_volume(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_DELETE_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -554,7 +554,7 @@ pub(crate) async fn claim_device(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_CLAIM_DEVICE,
         operation_id = %req.operation_id,
         device_id = %device_id,
@@ -591,7 +591,7 @@ pub(crate) async fn release_device(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_RELEASE_DEVICE,
         operation_id = %req.operation_id,
         device_id = %device_id,
@@ -645,7 +645,7 @@ pub(crate) async fn lend_device(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_LEND_DEVICE,
         operation_id = %req.operation_id,
         device_id = %device_id,
@@ -687,7 +687,7 @@ pub(crate) async fn reclaim_device(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_RECLAIM_DEVICE,
         operation_id = %req.operation_id,
         device_id = %device_id,
@@ -726,7 +726,7 @@ pub(crate) async fn resolve_quarantine(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let device_id = parse_device_id(&device_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_RESOLVE_QUARANTINE,
         operation_id = %req.operation_id,
         device_id = %device_id,
@@ -791,7 +791,7 @@ pub(crate) async fn adopt_volume(
     req.validate()?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_ADOPT_VOLUME,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -839,7 +839,7 @@ pub(crate) async fn clear_cut_marker(
     volvisor_types::validate_api_version(&req.api_version)?;
     ops::require_consumer_operation_id(&req.operation_id)?;
     let volume_id = parse_volume_id(&volume_id)?;
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_CLEAR_CUT_MARKER,
         operation_id = %req.operation_id,
         volume_id = %volume_id,
@@ -918,7 +918,7 @@ pub(crate) async fn prepare_migration(
     let operation_id = ops::mobility_operation_id(&req.migration_id, "prepare")?;
     let payload = to_json_value(&req)?;
     let hash = ops::mobility_request_hash("prepare", &payload);
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_MIGRATION_PREPARE,
         operation_id = %operation_id,
         migration_id = %req.migration_id,
@@ -966,7 +966,7 @@ pub(crate) async fn transfer_migration(
         vm_paused_and_io_drained_proof: req.vm_paused_and_io_drained_proof.clone(),
     })?;
     let hash = ops::mobility_request_hash("transfer", &payload);
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_MIGRATION_TRANSFER,
         operation_id = %operation_id,
         migration_id = %migration_id,
@@ -1028,7 +1028,7 @@ pub(crate) async fn abort_migration(
     let operation_id = ops::mobility_operation_id(&migration_id, "abort")?;
     let payload = serde_json::json!({ "migration_id": migration_id });
     let hash = ops::mobility_request_hash("abort", &payload);
-    tracing::info!(
+    tracing::debug!(
         kind = ops::OP_MIGRATION_ABORT,
         operation_id = %operation_id,
         migration_id = %migration_id,

@@ -587,14 +587,28 @@ where
     state
         .metrics
         .record_provider_operation(op_kind, outcome, elapsed);
-    tracing::info!(
-        parent: &provider_span,
-        kind = op_kind,
-        operation_id = %operation_id,
-        outcome,
-        elapsed_ms = %elapsed.as_millis(),
-        "provider call completed"
-    );
+    // Success is high-volume: the metrics histogram already carries the
+    // latency, so only a failure stays at INFO. The request audit line is
+    // unaffected (issue #64's log-volume residual).
+    if result.is_ok() {
+        tracing::debug!(
+            parent: &provider_span,
+            kind = op_kind,
+            operation_id = %operation_id,
+            outcome,
+            elapsed_ms = %elapsed.as_millis(),
+            "provider call completed"
+        );
+    } else {
+        tracing::info!(
+            parent: &provider_span,
+            kind = op_kind,
+            operation_id = %operation_id,
+            outcome,
+            elapsed_ms = %elapsed.as_millis(),
+            "provider call completed"
+        );
+    }
     finish_outcome(state, op_kind, &operation_id, result, success_status)
 }
 

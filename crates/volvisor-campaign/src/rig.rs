@@ -1568,9 +1568,10 @@ pub async fn get_volume(addr: SocketAddr, volume_id: &str) -> Reply {
     admin("GET", addr, &format!("/v2/volumes/{volume_id}"), None).await
 }
 
-/// `GET /v2/migrations/{id}` — the public observation route.
+/// `GET /v2/migrations/{id}` — the observation route, authenticated with
+/// the shared admin token because any configured credential protects reads.
 pub async fn get_migration(addr: SocketAddr, mig: &str) -> Reply {
-    http("GET", addr, &format!("/v2/migrations/{mig}"), None, None).await
+    admin("GET", addr, &format!("/v2/migrations/{mig}"), None).await
 }
 
 /// Poll `GET /v2/migrations/{id}` (bounded, real timeout) until the

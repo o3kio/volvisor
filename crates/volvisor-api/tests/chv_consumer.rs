@@ -53,6 +53,9 @@ fn request(method: Method, uri: &str) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(uri)
+        // Reads are protected whenever a credential is configured; the
+        // consumer test always presents the configured token.
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
         .body(Body::empty())
         .expect("build request")
 }

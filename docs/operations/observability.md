@@ -61,10 +61,10 @@ audit surfaces for semantic health.
 admission control (concurrency cap, rate limiter and read timeout), so probes
 and scraping keep working while load is shed. The four probe paths are
 public so an orchestrator can call them without credentials. `/metrics`
-requires read access when scoped credentials are configured; in the legacy
-admin-token-only or tokenless posture reads stay open, as documented in
-[security deployment](../security/deployment.md). Successful probes are not
-audited, matching the liveness behavior.
+requires read access whenever any credential is configured, including the
+legacy `admin_token`; only the tokenless posture leaves reads open, as
+documented in [security deployment](../security/deployment.md). Successful
+probes are not audited, matching the liveness behavior.
 
 ## Metric families
 
@@ -170,7 +170,20 @@ carry the caller's `operation_id` so one request can be followed across:
 - `witness_inspect` (field `volume_id`), `vmm_state` and `vmm_call` (VMM
   controller), and `peer_grant` (field `migration_id`) on the handoff path.
 
-The audit event, journal events and existing structured logs are unchanged.
+The audit event, journal events and failure logs remain at INFO. The
+pre-dispatch `accepting <op>` line and the successful provider-completion
+line are DEBUG: they duplicate the audit/metrics record and dominated the
+measured log volume (issue #64's residual). Set `RUST_LOG=debug` only while
+diagnosing; the default filter stays `info`.
+
+The daemon writes JSON logs to stdout. The packaged
+`volvisord.service` leaves capture to systemd/journald, which owns retention
+and rotation; the daemon does not claim an internal rotating file sink. A
+deployment that redirects stdout to a file must rotate it itself, for
+example with `logrotate` using `copytruncate` (the daemon keeps the fd open)
+and a bounded `rotate`/`maxsize`. The 2026-11-04 benchmark's 2.57 GB file was
+an unrotated stdout capture over ~30 minutes, not a journal or state file.
+
 A committed example for one create and one attach is in
 [`traces/attach.jsonl`](traces/attach.jsonl); see
 [`traces/README.md`](traces/README.md) for generation and the migration-trace

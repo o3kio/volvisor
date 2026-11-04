@@ -126,12 +126,18 @@ impl AuthPolicy {
         self
     }
 
-    /// Whether read routes require authentication: true exactly when scoped
-    /// credentials are configured. The legacy admin-token-only mode keeps
-    /// the documented P0 open-read compatibility posture.
+    /// Whether read routes require authentication: true whenever any
+    /// credential is configured, including the legacy top-level
+    /// `admin_token`. A tokenless daemon keeps the documented loopback-dev
+    /// open-read posture (and still fails closed for mutations).
+    ///
+    /// The legacy token already protects every mutation; leaving reads
+    /// anonymous exposed volume metadata to any caller that could reach the
+    /// listener. Closing that gap is a security posture change, not a new
+    /// capability.
     #[must_use]
     pub fn protect_reads(&self) -> bool {
-        !self.scoped.is_empty()
+        self.is_configured()
     }
 
     /// Whether any credential is configured at all.
@@ -487,16 +493,16 @@ mod tests {
             })
         );
         assert!(
-            !policy.protect_reads(),
-            "legacy mode keeps the P0 read posture"
+            policy.protect_reads(),
+            "the legacy admin token protects reads as well as mutations"
         );
     }
 
     #[test]
-    fn scoped_credentials_protect_reads() {
+    fn configured_credentials_protect_reads() {
         assert!(policy().protect_reads());
         assert!(!AuthPolicy::new(None).protect_reads());
-        assert!(!AuthPolicy::new(Some("legacy".to_owned())).protect_reads());
+        assert!(AuthPolicy::new(Some("legacy".to_owned())).protect_reads());
     }
 
     #[test]

@@ -179,13 +179,55 @@ remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
 READY**. No tag, GitHub release, push or pull request is created by this
 workstream.
 
+## Post-report addendum (2026-11-04) — Phase D control-plane hardening
+
+This addendum records the Phase D batch delivered on branch `phase-a-scaling`
+after the Phase C addendum. It follows the
+[Phase D plan](../plans/2026-11-04-phase-d-control-plane-hardening.md).
+**It changes no gate verdict below.** Every item is logging, authentication
+posture, documentation or a staged design; none is a production-support,
+SLA, capacity, durability or hardware claim.
+
+- **D1 — log volume (#64 residual).** The pre-dispatch `accepting <op>` lines
+  and the successful provider-completion line moved from INFO to DEBUG; the
+  request audit line, provider failures and journal events remain at INFO or
+  above. `docs/operations/observability.md` records the default filter, the
+  `RUST_LOG` override and the retention split: the packaged unit writes to
+  journald, which owns rotation, and a file-capturing deployment must rotate
+  its own stdout. The measured 2.57 GB file was an unrotated capture, not a
+  journal or state file. **No log-volume bound is claimed** and no
+  benchmark was re-run for this slice.
+- **D2 — read posture (gate 3 limitation).** `AuthPolicy::protect_reads`
+  now returns true whenever **any** credential is configured, including the
+  legacy top-level `admin_token`. Anonymous reads of volumes, capabilities,
+  metrics and migration inspection return `UNAUTHORIZED`; the four probe
+  paths stay public; a tokenless daemon keeps the documented open-read
+  loopback-dev posture and still fails closed for mutations. This is a
+  security posture change in an unreleased prototype; read clients using
+  only the legacy token must send it. The scoped-role matrix and tokenless
+  tests pass.
+- **D3 — #62 write path.** Design only. The provider still holds one state
+  mutex across the whole-state rewrite and `fsync`; the post-fix c32 −4.1 %
+  and c128 −2.6 % results are unchanged in direction. The Phase D plan
+  records the leader-coalesced durable-writer design and the invariants it
+  must preserve; **no write-path code changed and #62 stays open**. A future
+  implementation needs the coalescing, failure/publication and crash-seam
+  tests named in the plan, plus a new clean-tree measurement.
+- **D4 — ADR-0012.** Still `Proposed`; accepting it remains an authority
+  decision, not an implementation task.
+
+No gate becomes met. Gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
+remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
+READY**. No tag, GitHub release, push or pull request is created by this
+workstream.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |
 |---|---|---|---|
 | 1 | **Evidence** — three physical hosts at an exact SHA with the fault matrix and a published bundle; Rook-cell GO/NO-GO; Ceph and DRBD suites in a gating rig | **NOT MET** | No three-physical-host campaign (#37), no Rook-cell execution (#38), no green Ceph/DRBD rig run (#39). Only single-host Tier V with simulated storage, single-host day-2 drills, and single-host loop-LVM benchmarks exist. |
 | 2 | **Release** — signed `v0.1.0` (or later) with deb/rpm, SHA256SUMS, install smoke, and a support matrix matching the evidence | **NOT MET** | No signing key on this host, no signed tag, no GitHub release, and no clean-host install from a tagged artifact (#47). The support matrix itself is accurate and makes only non-claims. |
-| 3 | **Security** — explicit transport/auth model for non-loopback deployment; authenticated/encrypted peer and witness traffic; scoped credentials and audit identity | **PARTIAL** | #40 landed native TLS/mTLS, HTTPS witness/peer clients, refusal of plain non-loopback HTTP without `allow_insecure`, scoped credentials, read authorization and audit attribution. The recorded capture is **same-host netns/veth only**; cross-host witness/peer hops, live rotation, and HSM/TPM are not run. Legacy `admin_token`-only mode still leaves reads open. |
+| 3 | **Security** — explicit transport/auth model for non-loopback deployment; authenticated/encrypted peer and witness traffic; scoped credentials and audit identity | **PARTIAL** | #40 landed native TLS/mTLS, HTTPS witness/peer clients, refusal of plain non-loopback HTTP without `allow_insecure`, scoped credentials, read authorization and audit attribution. The recorded capture is **same-host netns/veth only**; cross-host witness/peer hops, live rotation, and HSM/TPM are not run. Reads now require any configured credential, including the legacy `admin_token`; only the tokenless posture leaves them open. |
 | 4 | **Operability** — backup/restore, upgrade/rollback, witness loss, and journal corruption drilled with recorded results | **PARTIAL** | D1 backup/restore, D4 journal corruption, D5 ENOSPC, D6 crash loop/lock and D7 restart-based credential rotation were drilled on one host. D2 now includes a real single-host cross-binary v2→v3 upgrade and restore-based rollback ([bundle](../evidence/day2/2026-11-04-devhost-live/REPORT.md)), but no rolling multi-host or packaged upgrade exists. D3 witness loss is partial (service outage/restart only; no storage-side DRBD fencing). D8 total host loss is **not run**. |
 | 5 | **Consumer** — CHV negotiates the capability and reports `advertised` against a pinned release, never `active` without guest evidence | **NOT MET** | The Volvisor-side CHV contract, conformance test and integration guide are delivered, but there is no CHV repository change and no pin update. A pin requires a tagged Volvisor release, which does not exist. CHV's ceiling remains `advertised`; no `active`/guest-confirmed behavior is claimed. |
 

@@ -52,7 +52,10 @@ The implementation and its in-repo tests cover:
   at `aab773b` records 0 HTTP errors and 0 attachment conflicts, a ~3 KB
   provider state file, and a bounded journal over a 25-minute soak. This is
   not the 24-hour soak and not capacity evidence; RSS high-water (≈2.22 GiB)
-  and the unbounded default INFO daemon log remain open findings.
+  and log retention remain open findings. The measured 2.57 GB file was an
+  unrotated stdout capture over ~30 minutes; per-request acceptance and
+  successful provider-completion lines are now DEBUG, while audit and
+  failures stay INFO.
 
 A `--check-config` pass proves the binary runs and accepts a configuration.
 It does **not** prove that the configured storage exists, that a provider
@@ -83,8 +86,9 @@ can mutate it, or that a volume is safe to use.
   `allow_insecure`, scoped admin/operator/read-only credentials, read
   authorization and audit attribution. The recorded capture is a same-host
   netns/veth pair, not a second physical host or a cross-host witness/peer
-  hop. The legacy `admin_token`-only mode still leaves reads open; configure
-  scoped credentials and TLS for any shared network. See the
+  hop. Any configured credential, including the legacy `admin_token`, now
+  protects reads; only a tokenless daemon leaves them open. Configure TLS and
+  scoped credentials for any shared network. See the
   [security deployment guide](security/deployment.md).
 - **CHV is not pinned to a tagged Volvisor build.** The Volvisor-side CAP
   negotiation, attachment-state report route, consumer conformance test and
