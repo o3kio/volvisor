@@ -23,8 +23,8 @@ use volvisor_handoff::{HandoffState, MigrationStore};
 use volvisor_journal::{IntentAppend, JOURNAL_LOG_FILE, Journal};
 use volvisor_lvm::state::LvmState;
 use volvisor_types::{
-    ApiErrorCode, AttachmentEvidence, AttachmentState, MigrationId, MoveVolumeBackingState,
-    VolumeId, VolumeLifecycle,
+    ApiErrorCode, AttachmentEvidence, AttachmentId, AttachmentState, MigrationId,
+    MoveVolumeBackingState, VolumeId, VolumeLifecycle,
 };
 
 fn fixture(name: &str) -> &'static [u8] {
@@ -41,6 +41,9 @@ fn fixture_text(name: &str) -> &'static str {
         }
         "lvm-state-v2-n1.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v2-n1.json")
+        }
+        "lvm-state-v3-n1.json" => {
+            include_str!("../../../tests/fixtures/schema/lvm-state-v3-n1.json")
         }
         "lvm-state-v1-tombstones.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v1-tombstones.json")
@@ -177,7 +180,7 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     assert!(
         fs::read_to_string(&lvm_path)
             .expect("read lvm")
-            .contains("\"schema_version\": 2")
+            .contains("\"schema_version\":3")
     );
     assert_eq!(LvmState::load(&lvm_path).expect("lvm reload"), lvm);
 
@@ -191,13 +194,14 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     let tombstone = tombstones
         .volume(&volume_id("vol-upgrade-tombstone"))
         .expect("tombstone volume");
-    let retired: Vec<&str> = tombstone
-        .runtime
-        .retired_attachment_ids
-        .iter()
-        .map(AsRef::as_ref)
-        .collect();
-    assert_eq!(retired, vec!["att-retired-oldest", "att-retired-newer"]);
+    for retired in ["att-retired-oldest", "att-retired-newer"] {
+        assert!(
+            tombstone.runtime.retired_attachments.maybe_contains(
+                &volvisor_types::AttachmentId::new(retired).expect("attachment id")
+            ),
+            "retired attachment id {retired} survived the integrated decode"
+        );
+    }
 
     // --- Ceph: the pre-`vmm_disk_id` record keeps its mapping.
     let mut ceph = CephState::load(&ceph_path).expect("ceph opens");
@@ -338,9 +342,13 @@ fn a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write() {
     );
     state.save(&path).expect("upgrade on write");
     let text = fs::read_to_string(&path).expect("read upgraded state");
+    let expected_version = format!(
+        "\"schema_version\":{}",
+        volvisor_lvm::state::LVM_STATE_SCHEMA_VERSION
+    );
     assert!(
-        text.contains("\"schema_version\": 2"),
-        "the first save stamps schema v2: {text}"
+        text.contains(&expected_version),
+        "the first save stamps the current schema version ({expected_version}): {text}"
     );
 
     // The upgraded file round-trips: the v1 payload is preserved under
@@ -360,16 +368,61 @@ fn a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write() {
     );
 }
 
+/// The v2-stamped N-1 file imports its legacy retired-id vector into the
+/// v3 filter and the first save writes v3 without the legacy vector.
+#[test]
+fn a_v2_stamped_n_minus_one_lvm_state_imports_tombstones_and_upgrades_on_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write(
+        dir.path(),
+        "lvm-state.json",
+        fixture_text("lvm-state-v3-n1.json").as_bytes(),
+    );
+    let mut state = LvmState::load(&path).expect("v2-stamped N-1 loads");
+    let id = volume_id("vol-upgrade-tombstone");
+    let volume = state.volume(&id).expect("v2 volume preserved");
+    for retired in ["att-retired-oldest", "att-retired-newer"] {
+        assert!(
+            volume
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new(retired).expect("valid id")),
+            "legacy retired id {retired} was imported into the filter"
+        );
+    }
+    state.save(&path).expect("upgrade on write");
+    let text = fs::read_to_string(&path).expect("read upgraded state");
+    let expected_version = format!(
+        "\"schema_version\":{}",
+        volvisor_lvm::state::LVM_STATE_SCHEMA_VERSION
+    );
+    assert!(
+        text.contains(&expected_version),
+        "the first save stamps the current schema version ({expected_version}): {text}"
+    );
+    assert!(
+        !text.contains("retired_attachment_ids"),
+        "the legacy vector is never written again: {text}"
+    );
+    assert!(
+        text.contains("retired_attachment_filter"),
+        "the imported tombstones are persisted in the v3 filter: {text}"
+    );
+}
+
 #[test]
 fn each_covered_store_refuses_a_newer_schema_on_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
 
     // A newer file carries an unknown field as well as the version: the
-    // version refusal must win (partial decode is forbidden).
+    // version refusal must win (partial decode is forbidden). The future
+    // version is derived from the current constant so the next bump cannot
+    // silently turn this into an unknown-field test.
+    let future_version = volvisor_lvm::state::LVM_STATE_SCHEMA_VERSION + 1;
     let future_lvm = fixture_text("lvm-state-v1-n1.json").replacen(
         '{',
-        "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
+        &format!("{{\n  \"schema_version\": {future_version},\n  \"future_field\": true,"),
         1,
     );
     let path = write(root, "lvm-state.json", future_lvm.as_bytes());

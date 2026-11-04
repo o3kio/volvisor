@@ -919,7 +919,7 @@ pub fn seed_volume(state_path: &std::path::Path, volume_id: &str, vg_name: &str,
             runtime: volvisor_lvm::state::VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
-                retired_attachment_ids: Vec::new(),
+                retired_attachments: volvisor_lvm::state::RetiredAttachmentFilter::default(),
             },
         },
     );

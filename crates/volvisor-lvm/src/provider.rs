@@ -85,8 +85,9 @@
 //! `PrototypeOnly`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -118,8 +119,8 @@ use volvisor_types::{
 
 use crate::report::{LvRow, VgRow};
 use crate::state::{
-    AttachmentRecord, CreateIntent, DeleteIntent, GrowIntent, LvmState, StoredVolume, VolumeEntry,
-    VolumeRuntime,
+    AttachmentRecord, CreateIntent, DeleteIntent, GrowIntent, LvmState, RetiredAttachmentFilter,
+    StoredVolume, VolumeEntry, VolumeRuntime,
 };
 use crate::{CommandOutput, CommandRunner};
 
@@ -342,7 +343,113 @@ pub struct LvmProvider {
     /// bound). In-memory and per-incarnation: it never persists, and
     /// a successful observation clears it.
     move_observe_failures: Mutex<BTreeMap<VolumeId, u32>>,
+    /// The writer view: every mutation runs under this mutex, which is
+    /// also held across the durable save. Readers do **not** take it.
     state: Mutex<LvmState>,
+    /// The last committed read view (issue #62). Published when a
+    /// writer guard is dropped, so `GET`/list/inspect never wait behind
+    /// another request's whole-file fsync or LVM CLI call. Readers clone
+    /// the `Arc` only; the lock is held for that clone, never for the
+    /// duration of a read.
+    read_snapshot: RwLock<Arc<LvmState>>,
+}
+
+/// A writer view of [`LvmState`].
+///
+/// On drop it publishes the resulting in-memory state as the new
+/// [`LvmProvider::read_snapshot`] if the guard was used mutably. This
+/// keeps the reader view exactly as consistent with in-memory state as
+/// the old design (where reads took the same mutex), without making
+/// reads wait for the writer's fsync.
+pub(crate) struct StateGuard<'a> {
+    guard: MutexGuard<'a, LvmState>,
+    snapshot: &'a RwLock<Arc<LvmState>>,
+    dirty: bool,
+}
+
+impl Deref for StateGuard<'_> {
+    type Target = LvmState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
+        &mut self.guard
+    }
+}
+
+impl StateGuard<'_> {
+    /// Discard this guard's in-memory mutation after a failed durable
+    /// save and suppress publication on drop.
+    ///
+    /// A failed save must never be observable as committed: without
+    /// this, a subsequent read would report the mutation the caller
+    /// just saw fail (and a same-id retry could replay it from memory
+    /// instead of re-executing the durable write). Restoring the last
+    /// published snapshot keeps reads and the provider's idempotency
+    /// view aligned with what is actually durable.
+    ///
+    /// **Precondition: at most one successful durable save per guard.**
+    /// The published snapshot is updated on guard drop, not per save, so
+    /// reverting after a later failed save would also discard an earlier
+    /// successful save that is already durable. Every current caller
+    /// either performs one save or classifies the durable file explicitly;
+    /// a future multi-save caller must not use this method.
+    pub(crate) fn revert(&mut self) {
+        let committed = match self.snapshot.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        *self.guard = (*committed).clone();
+        self.dirty = false;
+    }
+
+    /// Reconcile a guard after its durable save returned an error.
+    ///
+    /// The save's commit point is the rename, and the caller cannot tell
+    /// from the error alone which side of it failed (the injected
+    /// `AfterRename*` seams deliberately fail after the rename). Compare
+    /// the state file with the pending in-memory state:
+    ///
+    /// - a matching file means the rename landed and this mutation IS the
+    ///   durable state, so keep it (and publish it on drop) — reverting
+    ///   would make reads older than the provider's own file;
+    /// - anything else (no file, a different state, or a re-read that
+    ///   itself failed) means the mutation cannot be **proven** durable,
+    ///   so it must not be published. An unreadable re-read is treated as
+    ///   unknown rather than as proof of a landed rename: the conservative
+    ///   direction can lose a durable mutation that the next save would
+    ///   then erase, but it never reports an uncommitted mutation as
+    ///   committed. The caller still returns the save error.
+    pub(crate) fn reconcile_failed_save(&mut self, path: &Path) {
+        let durable_matches = LvmState::load(path).is_ok_and(|durable| durable == *self.guard);
+        if !durable_matches {
+            self.revert();
+        }
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // A panicking writer may have left a half-applied mutation; the
+        // mutex poisons (every later writer fails), and readers keep the
+        // last good snapshot instead of observing torn state.
+        if !self.dirty || std::thread::panicking() {
+            return;
+        }
+        let published = Arc::new(self.guard.clone());
+        match self.snapshot.write() {
+            Ok(mut current) => *current = published,
+            // A poisoned reader-view lock must not wedge every future
+            // read: recover the inner value (the snapshot holds no
+            // cross-field invariant that a panic could tear).
+            Err(poisoned) => *poisoned.into_inner() = published,
+        }
+    }
 }
 
 /// The phase-1 admission outcome for a move request.
@@ -396,6 +503,7 @@ impl LvmProvider {
         expected_auth_token: String,
     ) -> Result<Self, ApiError> {
         let state = LvmState::load(&state_path)?;
+        let read_snapshot = Arc::new(state.clone());
         let provider = Self {
             runner,
             state_path,
@@ -406,7 +514,10 @@ impl LvmProvider {
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
+            read_snapshot: RwLock::new(read_snapshot),
         };
+        // Startup reconciliation persists its result through the writer
+        // guard, which publishes the post-reconcile reader view on drop.
         provider.reconcile()?;
         Ok(provider)
     }
@@ -458,14 +569,36 @@ impl LvmProvider {
         }
     }
 
-    /// Lock the in-memory state, mapping poisoning to `INTERNAL`.
-    pub(crate) fn lock_state(&self) -> Result<MutexGuard<'_, LvmState>, ApiError> {
-        self.state.lock().map_err(|_| {
+    /// Lock the writer state, mapping poisoning to `INTERNAL`. The
+    /// returned guard publishes the resulting read snapshot when it is
+    /// dropped (if used mutably).
+    pub(crate) fn lock_state(&self) -> Result<StateGuard<'_>, ApiError> {
+        let guard = self.state.lock().map_err(|_| {
             ApiError::new(
                 ApiErrorCode::Internal,
                 "LVM provider state lock poisoned by a previous failure",
             )
+        })?;
+        Ok(StateGuard {
+            guard,
+            snapshot: &self.read_snapshot,
+            dirty: false,
         })
+    }
+
+    /// The committed read view (issue #62).
+    ///
+    /// Clones the published `Arc` under a short read lock; the caller
+    /// then reads without any provider-state lock, so a concurrent
+    /// mutation's whole-file fsync or LVM CLI call cannot block it.
+    /// Publication happens when the writer guard drops (including
+    /// failure paths that deliberately keep an in-memory state, which
+    /// preserves the pre-#62 read behavior).
+    pub(crate) fn state_snapshot(&self) -> Arc<LvmState> {
+        match self.read_snapshot.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
     }
 
     /// The attachment enumeration the daemon's grow-notification
@@ -481,7 +614,7 @@ impl LvmProvider {
     pub fn grow_attachment_facts(
         &self,
     ) -> Result<BTreeMap<VolumeId, volvisor_provider::AttachmentForGrow>, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         Ok(state
             .volumes()
             .iter()
@@ -920,7 +1053,7 @@ impl LvmProvider {
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
-                retired_attachment_ids: Vec::new(),
+                retired_attachments: RetiredAttachmentFilter::default(),
             },
         }
     }
@@ -1198,7 +1331,10 @@ impl LvmProvider {
             }
         }
         if changed {
-            self.persist(&mut state)?;
+            if let Err(error) = self.persist(&mut state) {
+                state.reconcile_failed_save(&self.state_path);
+                return Err(error);
+            }
         }
         drop(state);
         // Move records (P6-C): classify every record against the
@@ -1772,7 +1908,7 @@ impl LvmProvider {
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
-                retired_attachment_ids: Vec::new(),
+                retired_attachments: RetiredAttachmentFilter::default(),
             },
         };
         state.insert_volume(req.volume_id.clone(), stored.clone());
@@ -1834,8 +1970,8 @@ impl LvmProvider {
         ensure_attachment_id_not_retired(
             stored
                 .runtime
-                .retired_attachment_ids
-                .contains(&req.attachment_id),
+                .retired_attachments
+                .maybe_contains(&req.attachment_id),
             &req.attachment_id,
         )?;
         ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
@@ -1867,7 +2003,10 @@ impl LvmProvider {
         stored.runtime.state = VolumeLifecycle::Attached;
         stored.entry.generation += 1;
         let response = attach_response(&record, &stored.entry);
-        self.persist(&mut state)?;
+        if let Err(error) = self.persist(&mut state) {
+            state.reconcile_failed_save(&self.state_path);
+            return Err(error);
+        }
         Ok(response)
     }
 
@@ -1903,16 +2042,17 @@ impl LvmProvider {
 
         let retired_id = record.id.clone();
         stored.runtime.attachment = None;
-        if !stored.runtime.retired_attachment_ids.contains(&retired_id) {
-            stored.runtime.retired_attachment_ids.push(retired_id);
-        }
+        stored.runtime.retired_attachments.insert(&retired_id);
         if stored.runtime.state == VolumeLifecycle::Attached {
             stored.runtime.state = VolumeLifecycle::Ready;
         }
         stored.entry.generation += 1;
         stored.entry.data_epoch += 1;
         let response = inspect_response(volume_id, stored);
-        self.persist(&mut state)?;
+        if let Err(error) = self.persist(&mut state) {
+            state.reconcile_failed_save(&self.state_path);
+            return Err(error);
+        }
         Ok(response)
     }
 
@@ -1952,7 +2092,10 @@ impl LvmProvider {
             apply_attachment_report(record, req, unix_ms_now())?
         };
         if response.applied {
-            self.persist(&mut state)?;
+            if let Err(error) = self.persist(&mut state) {
+                state.reconcile_failed_save(&self.state_path);
+                return Err(error);
+            }
         }
         Ok(response)
     }
@@ -2840,29 +2983,40 @@ impl LvmProvider {
     /// queryable by the reconcile pass, which rolls it forward if
     /// the world later proves completion.
     ///
-    /// Parking is the conservative in-memory view: the record is set
-    /// `IN_DOUBT` even if the save below fails, and the caller receives
-    /// the save error rather than a success response. The **durable
-    /// file remains the anchor** in that case — the prior record when
-    /// the rename did not land, or the already-landed `IN_DOUBT` when
-    /// it did — and the daemon never memory-only-completes or
-    /// memory-only-resolves anything; startup reconcile re-parks the
-    /// record from the observed world. A persisted `IN_DOUBT` is
-    /// likewise rolled forward only by a verified completion.
+    /// Parking is applied to the in-memory view before the save. If the
+    /// save fails, [`StateGuard::reconcile_failed_save`] keeps the parked
+    /// state only when the durable file proves the rename landed; when
+    /// durability cannot be proven the in-memory park is reverted to the
+    /// last committed snapshot. The caller receives the save error either
+    /// way, never a success response. The **durable file remains the
+    /// anchor** — the prior record when the rename did not land, or the
+    /// already-landed `IN_DOUBT` when it did — and the daemon never
+    /// memory-only-completes or memory-only-resolves anything; startup
+    /// reconcile re-parks the record from the observed world. A persisted
+    /// `IN_DOUBT` is likewise rolled forward only by a verified
+    /// completion.
     ///
-    /// **A landed completion is never parked over.** Every caller
-    /// parks on a judgment made *before* this lock — a snapshot of
-    /// the record, or a world observation that may itself have
-    /// failed transiently — so the durable record is re-checked
-    /// under the lock, the same stale-snapshot discipline as
-    /// [`Self::finish_complete`]'s idempotency gate: a stored
-    /// `COMPLETE` record means the completion already landed
-    /// durably (this caller's snapshot predates it, or a concurrent
-    /// finish path won the race — including the case where this
-    /// caller's own verification observe failed transiently), and it
-    /// is answered as-is. Parking over it would resurrect the
-    /// resolved move to `IN_DOUBT`, and the next reconcile pass
-    /// would re-complete it and bump the generation a second time.
+    /// **A terminal record is never parked over.** Every caller parks
+    /// on a judgment made *before* this lock — a snapshot of the
+    /// record, or a world observation that may itself have failed
+    /// transiently — so the durable record is re-checked under the
+    /// lock, the same stale-snapshot discipline as
+    /// [`Self::finish_complete`]'s idempotency gate:
+    ///
+    /// - a stored `COMPLETE` means the completion already landed
+    ///   durably (this caller's snapshot predates it, or a concurrent
+    ///   finish path won the race — including the case where this
+    ///   caller's own verification observe failed transiently); parking
+    ///   over it would resurrect the resolved move to `IN_DOUBT`, and
+    ///   the next reconcile pass would re-complete it and bump the
+    ///   generation a second time;
+    /// - a stored `FAILED` is the reconciliation's settled rollback
+    ///   verdict (the extents verifiably sit on the source with no move
+    ///   active). Parking over it would re-erect the delete fence and
+    ///   destroy the resolution audit detail until the next pass
+    ///   re-resolved it.
+    ///
+    /// Both are answered as-is.
     fn park_in_doubt(
         &self,
         volume_id: &VolumeId,
@@ -2870,7 +3024,10 @@ impl LvmProvider {
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
         let mut state = self.lock_state()?;
         if let Some(stored) = state.move_record(volume_id) {
-            if stored.state == MoveVolumeBackingState::Complete {
+            if matches!(
+                stored.state,
+                MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed
+            ) {
                 return Ok(Self::move_response(&state, volume_id, stored));
             }
         }
@@ -2885,7 +3042,9 @@ impl LvmProvider {
                 .move_record(volume_id)
                 .map(|record| Self::move_response(&state, volume_id, record))
         };
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            state.reconcile_failed_save(&self.state_path);
+        })?;
         response.ok_or_else(|| not_found(volume_id))
     }
 
@@ -2993,6 +3152,14 @@ impl LvmProvider {
         if stored_record.state == MoveVolumeBackingState::Complete {
             return Ok(Self::move_response(&state, volume_id, &stored_record));
         }
+        // A stored `FAILED` is deliberately **not** a barrier on this
+        // path: unlike `park_in_doubt`, this caller holds a fresh world
+        // observation that proves the relocation. A `FAILED` verdict came
+        // from an earlier observation that proved the extents back on the
+        // source; contradictory observations mean the world moved again
+        // between them. The verified relocation is the authority here, so
+        // completing is a roll-forward, not a resurrection of an
+        // unresolved move.
         let previous_record = state.move_record(volume_id).cloned();
         let Some(stored) = state.volume_mut(volume_id) else {
             // The volume was deleted while the move ran. The delete
@@ -3144,7 +3311,7 @@ impl LvmProvider {
         volume_id: &VolumeId,
         req: &MoveVolumeBackingRequest,
     ) -> Result<MoveAdmission, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         self.ensure_no_pending_delete(&state, volume_id)?;
         let stored = state
             .volume(volume_id)
@@ -3219,19 +3386,7 @@ impl LvmProvider {
                         existing_record: Some(record.clone()),
                     })
                 }
-                MoveVolumeBackingState::InDoubt => Err(ApiError::new(
-                    ApiErrorCode::InvalidState,
-                    format!(
-                        "the volume's previous move (to {}) is IN_DOUBT{}; it parks \
-                         until reconciliation proves completion or an operator \
-                         resolves it",
-                        record.target_pv,
-                        record
-                            .detail
-                            .as_deref()
-                            .map_or_else(String::new, |detail| format!(": {detail}"))
-                    ),
-                )),
+                MoveVolumeBackingState::InDoubt => Err(Self::in_doubt_move_error(record)),
                 MoveVolumeBackingState::Failed => {
                     // A resolved failure is terminal for **that
                     // move** only: the reconcile proved the extents
@@ -3255,21 +3410,49 @@ impl LvmProvider {
                 // refuse typed rather than silently superseding a
                 // state the provider cannot even observe.
                 MoveVolumeBackingState::MirrorReady | MoveVolumeBackingState::Pivoted => {
-                    Err(ApiError::new(
-                        ApiErrorCode::Internal,
-                        format!(
-                            "the volume's move record holds {} — a mirror-path state the \
-                             same-VG extent move never writes; the record is foreign to \
-                             this provider's journal, refusing rather than superseding it",
-                            match record.state {
-                                MoveVolumeBackingState::MirrorReady => "MIRROR_READY",
-                                _ => "PIVOTED",
-                            }
-                        ),
-                    ))
+                    Err(Self::foreign_move_error(record))
                 }
             },
         }
+    }
+
+    /// The typed refusal for a parked (`IN_DOUBT`) move record.
+    ///
+    /// Used by both admission and the under-lock journal re-check so a
+    /// record parked between admission's published-snapshot read and the
+    /// writer lock cannot be silently superseded by a fresh drive.
+    fn in_doubt_move_error(record: &crate::state::MoveRecord) -> ApiError {
+        ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "the volume's previous move (to {}) is IN_DOUBT{}; it parks \
+                 until reconciliation proves completion or an operator \
+                 resolves it",
+                record.target_pv,
+                record
+                    .detail
+                    .as_deref()
+                    .map_or_else(String::new, |detail| format!(": {detail}"))
+            ),
+        )
+    }
+
+    /// The typed refusal for a mirror-path move record foreign to this
+    /// same-VG provider (reachable only through hand-edited/imported
+    /// state).
+    fn foreign_move_error(record: &crate::state::MoveRecord) -> ApiError {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!(
+                "the volume's move record holds {} — a mirror-path state the \
+                 same-VG extent move never writes; the record is foreign to \
+                 this provider's journal, refusing rather than superseding it",
+                match record.state {
+                    MoveVolumeBackingState::MirrorReady => "MIRROR_READY",
+                    _ => "PIVOTED",
+                }
+            ),
+        )
     }
 
     /// Phase 2a — qualify the request's named target against the
@@ -3355,7 +3538,7 @@ impl LvmProvider {
         // target's free space (LVM allocates whole extents; the
         // stored effective size is already extent-aligned).
         let lv_size = {
-            let state = self.lock_state()?;
+            let state = self.state_snapshot();
             state
                 .volume(volume_id)
                 .map(|stored| stored.entry.size_bytes)
@@ -3384,27 +3567,13 @@ impl LvmProvider {
         // One pvmove per source PV: LVM attaches a second scoped
         // pvmove to the first and IGNORES its arguments — a second
         // move from the same source would be a silent no-op, so it
-        // is refused typed instead.
-        let same_source = {
-            let state = self.lock_state()?;
-            state.moves().iter().any(|(other, record)| {
-                other != volume_id
-                    && record.source_pv == source
-                    && matches!(
-                        record.state,
-                        MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
-                    )
-            })
-        };
-        if same_source {
-            return Err(ApiError::new(
-                ApiErrorCode::InvalidState,
-                format!(
-                    "another volume is already evacuating source PV {source}; LVM \
-                     attaches a second scoped pvmove to the first and ignores its \
-                     arguments, so one move per source PV at a time"
-                ),
-            ));
+        // is refused typed instead. This is only the pre-CLI check;
+        // `journal_move_intent` re-runs it under the writer lock so a
+        // concurrent admission cannot slip in while this request's
+        // CLI observations are in flight.
+        {
+            let state = self.state_snapshot();
+            ensure_no_other_active_move_on_source(&state, volume_id, &source)?;
         }
         Ok(Some(source))
     }
@@ -3478,9 +3647,12 @@ impl LvmProvider {
         // Re-validate under the journal lock: admission ran before the
         // CLI observations (target/source/foreign-pvmove queries), and
         // a delete of this volume may have completed in that window.
-        // Inserting an anchor for a deleted (or deleted-and-recreated)
-        // volume would let a later retry redrive pvmove on a volume
-        // that never authorized this move.
+        // Inserting an anchor for a deleted volume would let a later retry
+        // redrive pvmove on a volume that never authorized this move. A
+        // delete-and-recreate is caught only when the recreated volume has
+        // a different generation; a same-id/same-generation ABA recreate is
+        // not distinguishable with the current fence (a per-incarnation
+        // nonce would be needed).
         let Some(stored) = state.volume(volume_id) else {
             return Err(not_found(volume_id));
         };
@@ -3535,6 +3707,13 @@ impl LvmProvider {
                 (record.source_pv.clone(), record.clone())
             }
             _ => {
+                // Admission read a published snapshot before this
+                // request's lock-free CLI observations. If the record was
+                // parked, completed, or replaced by a foreign record in
+                // that window, the `_` arm must not silently supersede it.
+                // Re-check under the writer lock, exactly as admission
+                // would.
+                Self::refuse_superseded_fresh_drive(&state, volume_id, req)?;
                 // A fresh drive always carries a source verified from
                 // the world. Admission may have decided to re-attach and
                 // the record then vanished/settled under a concurrent
@@ -3551,6 +3730,14 @@ impl LvmProvider {
                     ));
                 };
                 let source = source.to_owned();
+                // Re-check the one-move-per-source rule under the writer
+                // lock. Admission's check reads a published snapshot taken
+                // before this request's CLI observations; a concurrent move
+                // that journaled its anchor in that window would otherwise
+                // let two pvmoves start on one source PV, and LVM silently
+                // attaches the second to the first and ignores its
+                // arguments.
+                ensure_no_other_active_move_on_source(&state, volume_id, &source)?;
                 let record = crate::state::MoveRecord {
                     operation_id: req.operation_id.clone(),
                     source_pv: source.clone(),
@@ -3576,6 +3763,72 @@ impl LvmProvider {
             self.ensure_preparing_anchor_durable(&mut state, volume_id, &record)?;
         }
         Ok((source, record))
+    }
+
+    /// Refuse a fresh drive whose live move record changed after admission
+    /// into a state a fresh `PREPARING` record must not supersede.
+    ///
+    /// Admission reads a published snapshot before the caller's lock-free
+    /// CLI observations, so the durable record can move underneath it:
+    ///
+    /// - an `IN_DOUBT` park waits for reconciliation or an operator;
+    /// - `MIRROR_READY`/`PIVOTED` are foreign to this same-VG journal;
+    /// - the exact requested target may have completed (admission would
+    ///   answer idempotently; superseding it would run a no-op pvmove,
+    ///   bump the generation again, and transiently re-erect the delete
+    ///   fence).
+    ///
+    /// `Failed` (a settled rollback) and a different-target `Complete` (a
+    /// new move) remain valid fresh drives.
+    ///
+    /// In a live race the same-target completion also bumps the volume
+    /// generation in the same save, so the generation fence normally
+    /// refuses the stale request first. This branch still matters for
+    /// imported/hand-edited state where a terminal record and an unbumped
+    /// generation coexist, and it mirrors admission's idempotent answer.
+    fn refuse_superseded_fresh_drive(
+        state: &LvmState,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<(), ApiError> {
+        let Some(stored) = state.move_record(volume_id) else {
+            return Ok(());
+        };
+        match stored.state {
+            MoveVolumeBackingState::InDoubt => Err(Self::in_doubt_move_error(stored)),
+            MoveVolumeBackingState::MirrorReady | MoveVolumeBackingState::Pivoted => {
+                Err(Self::foreign_move_error(stored))
+            }
+            MoveVolumeBackingState::Complete if stored.target_pv == req.target_pool_id => {
+                Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the move for volume {volume_id} to {} completed while this request \
+                         was being admitted; retry to observe the completed record",
+                        stored.target_pv
+                    ),
+                ))
+            }
+            // The call site's outer match consumes active records before
+            // this helper; refuse explicitly rather than relying on that
+            // caller contract, so a future reuse cannot silently supersede
+            // a live move.
+            MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying => {
+                Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the move record for volume {volume_id} is active ({}); re-attach to it \
+                     rather than journaling a fresh drive",
+                        if stored.state == MoveVolumeBackingState::Preparing {
+                            "PREPARING"
+                        } else {
+                            "COPYING"
+                        }
+                    ),
+                ))
+            }
+            MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed => Ok(()),
+        }
     }
 
     /// Ensure a re-attached `Preparing` record has a **durable** anchor
@@ -3825,6 +4078,63 @@ impl LvmProvider {
             .await
     }
 
+    /// Whether a stored move record may still be rolled to `COPYING`.
+    ///
+    /// `COMPLETE` and `FAILED` are terminal facts about this placement:
+    /// regressing either would let the next reconcile pass re-classify
+    /// the move, re-complete it and bump the volume generation a second
+    /// time (or resurrect a resolved failure). `IN_DOUBT` is explicitly
+    /// not terminal — it rolls forward when the world proves completion.
+    fn move_record_may_regress_to_copying(record: &crate::state::MoveRecord) -> bool {
+        !matches!(
+            record.state,
+            MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed
+        )
+    }
+
+    /// Durably mark a live move `COPYING` only when the stored record
+    /// still matches this pass's snapshot placement and is still
+    /// rollable. Returns whether the stored record is the current live
+    /// move (whether or not a save was needed).
+    ///
+    /// The caller's `lvs` observation happened outside the state lock,
+    /// so a concurrent supervisor may have completed the move in
+    /// between. Writing `COPYING` unconditionally would overwrite the
+    /// landed `COMPLETE`, and the next pass would complete the move
+    /// again and bump the volume generation a second time. A record
+    /// that already says `COPYING` needs no rewrite.
+    fn mark_move_copying_if_current(
+        &self,
+        volume_id: &VolumeId,
+        snapshot: &crate::state::MoveRecord,
+    ) -> Result<bool, ApiError> {
+        let mut state = self.lock_state()?;
+        let Some(stored) = state.move_record(volume_id).cloned() else {
+            return Ok(false);
+        };
+        if stored.source_pv != snapshot.source_pv || stored.target_pv != snapshot.target_pv {
+            return Ok(false);
+        }
+        if !Self::move_record_may_regress_to_copying(&stored) {
+            return Ok(false);
+        }
+        // Already exactly the live classification: the durable anchor is
+        // correct, so do not rewrite it. Besides avoiding write
+        // amplification, an unnecessary save per pass would consume a
+        // crash-injection point intended for the completing save.
+        if stored.state == MoveVolumeBackingState::Copying {
+            return Ok(true);
+        }
+        if let Some(stored) = state.move_record_mut(volume_id) {
+            stored.state = MoveVolumeBackingState::Copying;
+            stored.detail = None;
+        }
+        self.persist(&mut state).inspect_err(|_| {
+            state.reconcile_failed_save(&self.state_path);
+        })?;
+        Ok(true)
+    }
+
     /// Persist the move's `COPYING` record after `pvmove` started, and
     /// classify a failed save against the durable file.
     ///
@@ -3841,6 +4151,41 @@ impl LvmProvider {
         record_for_drive: &crate::state::MoveRecord,
     ) -> Result<(), ApiError> {
         let mut state = self.lock_state()?;
+        // The record may have moved on between the pvmove start and this
+        // lock: a concurrent supervisor can complete the same move, or a
+        // delete can drop it. Never regress a terminal record to
+        // `COPYING`; answer the already-completed move instead, and
+        // refuse to clobber a superseded placement.
+        let Some(stored) = state.move_record(volume_id).cloned() else {
+            return Err(not_found(volume_id));
+        };
+        if stored.source_pv != record_for_drive.source_pv
+            || stored.target_pv != record_for_drive.target_pv
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the move record for volume {volume_id} was superseded while the pvmove \
+                     was starting; refusing to overwrite it with this drive's COPYING record"
+                ),
+            ));
+        }
+        if !Self::move_record_may_regress_to_copying(&stored) {
+            if stored.state == MoveVolumeBackingState::Complete {
+                // A concurrent supervisor already completed this exact
+                // move; the supervision below re-verifies the world and
+                // answers the stored record without a second bump.
+                return Ok(());
+            }
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the move record for volume {volume_id} already resolved as {:?} while \
+                     the pvmove was starting; refusing to regress it to COPYING",
+                    stored.state
+                ),
+            ));
+        }
         if let Some(record) = state.move_record_mut(volume_id) {
             record.state = MoveVolumeBackingState::Copying;
             record.operation_id = req.operation_id.clone();
@@ -4014,7 +4359,24 @@ impl LvmProvider {
                     // answer the honest state. The record stays
                     // COPYING; the daemon's retry reconcile completes
                     // it, and a fresh operation re-attaches.
+                    //
+                    // Re-check the live record under the lock: another
+                    // actor may have landed `COMPLETE`/`FAILED`/parked
+                    // the move between this pass's observation and the
+                    // lock. Stamping the window detail onto a terminal
+                    // record would misreport a resolved move.
                     let mut state = self.lock_state()?;
+                    let still_copying = state.move_record(volume_id).is_some_and(|stored| {
+                        stored.state == MoveVolumeBackingState::Copying
+                            && stored.source_pv == record.source_pv
+                            && stored.target_pv == record.target_pv
+                    });
+                    if !still_copying {
+                        return state
+                            .move_record(volume_id)
+                            .map(|stored| Self::move_response(&state, volume_id, stored))
+                            .ok_or_else(|| not_found(volume_id));
+                    }
                     let response = {
                         if let Some(record) = state.move_record_mut(volume_id) {
                             record.detail = Some(
@@ -4027,7 +4389,9 @@ impl LvmProvider {
                             .move_record(volume_id)
                             .map(|record| Self::move_response(&state, volume_id, record))
                     };
-                    self.persist(&mut state)?;
+                    self.persist(&mut state).inspect_err(|_| {
+                        state.reconcile_failed_save(&self.state_path);
+                    })?;
                     return response.ok_or_else(|| not_found(volume_id));
                 }
                 tokio::time::sleep(self.move_timing.poll_interval).await;
@@ -4068,7 +4432,9 @@ impl LvmProvider {
         }
         let mut state = self.lock_state()?;
         state.remove_move(volume_id);
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            state.reconcile_failed_save(&self.state_path);
+        })?;
         self.clear_move_observe_failures(volume_id);
         report.dropped.push(volume_id.clone());
         Ok(None)
@@ -4150,16 +4516,16 @@ impl LvmProvider {
             if observation.moving {
                 // The move is alive (whether this daemon started it
                 // or a previous incarnation did): the record must say
-                // so durably.
-                if record.state != MoveVolumeBackingState::Copying {
-                    let mut state = self.lock_state()?;
-                    if let Some(record) = state.move_record_mut(&volume_id) {
-                        record.state = MoveVolumeBackingState::Copying;
-                        record.detail = None;
-                    }
-                    self.persist(&mut state)?;
+                // so durably. The observation may still be stale — the
+                // pass snapshotted before it observed without the lock —
+                // so the live record is re-checked under the lock: a
+                // move that completed (or terminally failed) while this
+                // pass was observing must never be regressed to
+                // `COPYING`. Regressing a `COMPLETE` would let the next
+                // pass re-complete it and bump the generation again.
+                if self.mark_move_copying_if_current(&volume_id, &record)? {
+                    report.marked_copying.push(volume_id);
                 }
-                report.marked_copying.push(volume_id);
                 continue;
             }
             if observation.relocated_to(&record.source_pv, &record.target_pv) {
@@ -4313,7 +4679,9 @@ impl LvmProvider {
                     stored.state = MoveVolumeBackingState::Copying;
                     stored.detail = None;
                 }
-                self.persist(&mut state)?;
+                self.persist(&mut state).inspect_err(|_| {
+                    state.reconcile_failed_save(&self.state_path);
+                })?;
                 report.redriven.push(volume_id.clone());
             }
             Err(_) => report.redrive_failed.push(volume_id.clone()),
@@ -4630,7 +4998,7 @@ impl VolumeProvider for LvmProvider {
     }
 
     async fn inspect_volume(&self, id: &VolumeId) -> Result<InspectVolumeResponse, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         state
             .volume(id)
             .map(|stored| inspect_response(id, stored))
@@ -4641,7 +5009,7 @@ impl VolumeProvider for LvmProvider {
         &self,
         project: Option<&ProjectId>,
     ) -> Result<Vec<InspectVolumeResponse>, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         Ok(state
             .volumes()
             .iter()
@@ -4775,6 +5143,40 @@ pub(crate) fn command_failed(program: &str, output: &CommandOutput) -> ApiError 
         ApiErrorCode::Internal,
         format!("{program} failed: {}", output.stderr_excerpt()),
     )
+}
+
+/// Refuse a second active move on one source PV.
+///
+/// Verified LVM behavior: a scoped `pvmove` whose source PV already carries
+/// an active move attaches to it, ignores its arguments and exits 0 — a
+/// silent no-op. Callers run this against the freshest move records they
+/// have: admission against the published snapshot (pre-CLI) and
+/// `journal_move_intent` again under the writer lock (post-CLI), so a
+/// concurrent admission cannot widen the check-then-act window.
+fn ensure_no_other_active_move_on_source(
+    state: &LvmState,
+    volume_id: &VolumeId,
+    source: &str,
+) -> Result<(), ApiError> {
+    let occupied = state.moves().iter().any(|(other, record)| {
+        other != volume_id
+            && record.source_pv == source
+            && matches!(
+                record.state,
+                MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
+            )
+    });
+    if occupied {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "another volume is already evacuating source PV {source}; LVM attaches a \
+                 second scoped pvmove to the first and ignores its arguments, so one move \
+                 per source PV at a time"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// An `UNSUPPORTED_CLASS_OR_POLICY` rejection (fail-closed negotiation).
@@ -5024,5 +5426,509 @@ impl AttachmentStateRecord for AttachmentRecord {
         self.evidence = Some(evidence);
         self.reporter = reporter;
         self.recorded_at_ms = Some(recorded_at_ms);
+    }
+}
+
+#[cfg(test)]
+mod read_snapshot_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn seeded_provider(dir: &tempfile::TempDir) -> (Arc<LvmProvider>, VolumeId) {
+        seeded_provider_with_state_path(dir, dir.path().join("state.json"))
+    }
+
+    fn seeded_provider_with_state_path(
+        dir: &tempfile::TempDir,
+        state_path: std::path::PathBuf,
+    ) -> (Arc<LvmProvider>, VolumeId) {
+        let volume_id = VolumeId::new("vol-snapshot").expect("valid id");
+        let mut state = LvmState::default();
+        state.insert_volume(
+            volume_id.clone(),
+            StoredVolume {
+                entry: VolumeEntry {
+                    vg_name: "vg-1".to_owned(),
+                    lv_name: "vol-vol-snapshot-abcd1234".to_owned(),
+                    size_bytes: 1024,
+                    requested_size_bytes: 1024,
+                    generation: 1,
+                    data_epoch: 0,
+                    project_id: ProjectId::new("tenant-a").expect("valid id"),
+                    block_size: 4096,
+                    creation_payload: "{}".to_owned(),
+                },
+                runtime: VolumeRuntime {
+                    state: VolumeLifecycle::Ready,
+                    attachment: None,
+                    retired_attachments: RetiredAttachmentFilter::default(),
+                },
+            },
+        );
+        let provider = LvmProvider {
+            runner: Arc::new(volvisor_provider::FakeRunner::with_queue(Vec::new())),
+            state_path,
+            sysfs_root: dir.path().to_path_buf(),
+            vg_prefix: "vg-volvisor".to_owned(),
+            expected_auth_token: "test-token".to_owned(),
+            store_crash: Arc::new(StoreCrashHooks::new()),
+            move_timing: MoveTiming::default(),
+            move_observe_failures: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(state.clone()),
+            read_snapshot: RwLock::new(Arc::new(state)),
+        };
+        (Arc::new(provider), volume_id)
+    }
+
+    #[test]
+    fn reads_do_not_wait_for_the_writer_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let writer = provider.lock_state().expect("writer guard");
+
+        // A reader in another thread must get the published snapshot
+        // while the writer guard is held (the pre-#62 design took the
+        // same mutex and would block here).
+        let (tx, rx) = mpsc::channel();
+        let reader = Arc::clone(&provider);
+        std::thread::spawn(move || {
+            let count = reader.state_snapshot().volumes().len();
+            let _ = tx.send(count);
+        });
+        let count = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader must not block behind the writer");
+        assert_eq!(count, 1);
+        drop(writer);
+    }
+
+    #[test]
+    fn a_committed_writer_guard_publishes_the_new_read_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.volume_mut(&volume_id).expect("volume").runtime.state = VolumeLifecycle::Degraded;
+        }
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot
+                .volume(&volume_id)
+                .expect("volume in snapshot")
+                .runtime
+                .state,
+            VolumeLifecycle::Degraded,
+            "dropping a mutably-used writer guard publishes the new view"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_publishes_nothing_and_keeps_the_committed_ready_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file where the state directory should be makes every
+        // save fail before the temporary file is even created.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let (provider, volume_id) =
+            seeded_provider_with_state_path(&dir, blocker.join("state.json"));
+
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-failed-save").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-failed-save").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let error = provider
+            .attach_volume_inner(&volume_id, &request)
+            .expect_err("the durable save must fail");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+
+        // The failed mutation must not be observable as committed: a read
+        // still sees Ready with no attachment, and a same-id retry must
+        // re-execute rather than replay a phantom in-memory success.
+        let snapshot = provider.state_snapshot();
+        let stored = snapshot.volume(&volume_id).expect("volume");
+        assert_eq!(stored.runtime.state, VolumeLifecycle::Ready);
+        assert!(stored.runtime.attachment.is_none());
+        assert_eq!(stored.entry.generation, 1);
+    }
+
+    #[test]
+    fn a_failed_save_after_the_rename_keeps_the_durable_attachment_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // The injected failure lands after the rename: the new state file
+        // IS the durable state even though the save returns an error.
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-post-rename").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-post-rename").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let error = provider
+            .attach_volume_inner(&volume_id, &request)
+            .expect_err("the directory fsync fails after the rename");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("AfterRenameBeforeDirFsync"),
+            "{error}"
+        );
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_some(),
+            "the rename committed the attachment"
+        );
+        let snapshot = provider.state_snapshot();
+        let stored = snapshot.volume(&volume_id).expect("volume");
+        assert_eq!(
+            stored
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("the read view follows the durable file")
+                .id,
+            request.attachment_id,
+            "a post-rename failure must not revert below the durable state"
+        );
+    }
+
+    #[test]
+    fn persisting_a_copying_record_never_regresses_a_landed_completion() {
+        // A concurrent supervisor can complete the move between the
+        // pvmove start and this save. Regressing COMPLETE to COPYING
+        // would let the next reconcile pass complete it again and bump
+        // the volume generation a second time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let source = "/dev/pv-source";
+        let target = "/dev/pv-target";
+        let complete = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-complete").expect("valid id"),
+            source_pv: source.to_owned(),
+            target_pv: target.to_owned(),
+            state: MoveVolumeBackingState::Complete,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), complete);
+            provider.persist(&mut state).expect("seed the completion");
+        }
+
+        let prior = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            source_pv: source.to_owned(),
+            target_pv: target.to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            target_pool_id: target.to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        provider
+            .persist_copying_record(&volume_id, &request, &prior)
+            .expect("an already-complete move is answered, not regressed");
+
+        let snapshot = provider.state_snapshot();
+        let record = snapshot.move_record(&volume_id).expect("move record");
+        assert_eq!(
+            record.state,
+            MoveVolumeBackingState::Complete,
+            "the landed completion must never be regressed to COPYING"
+        );
+        assert_eq!(record.operation_id.as_str(), "op-complete");
+    }
+
+    #[test]
+    fn persisting_a_copying_record_refuses_a_superseded_placement() {
+        // The record was replaced by a newer move (different source or
+        // target) while this drive was starting its pvmove. Clobbering
+        // it would attach this drive's COPYING save to a move it did
+        // not start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let superseding = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-newer").expect("valid id"),
+            source_pv: "/dev/pv-other-source".to_owned(),
+            target_pv: "/dev/pv-other-target".to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), superseding.clone());
+            provider.persist(&mut state).expect("seed the newer move");
+        }
+
+        let prior = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            source_pv: "/dev/pv-source".to_owned(),
+            target_pv: "/dev/pv-target".to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            target_pool_id: "/dev/pv-target".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .persist_copying_record(&volume_id, &request, &prior)
+            .expect_err("a superseded placement is refused");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+
+        let snapshot = provider.state_snapshot();
+        let record = snapshot.move_record(&volume_id).expect("move record");
+        assert_eq!(record, &superseding, "the newer move is untouched");
+    }
+
+    #[test]
+    fn journaling_a_move_rechecks_the_one_move_per_source_rule_under_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let other_id = VolumeId::new("vol-other").expect("valid id");
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_volume(
+                other_id.clone(),
+                StoredVolume {
+                    entry: VolumeEntry {
+                        vg_name: "vg-1".to_owned(),
+                        lv_name: "vol-vol-other-abcd1234".to_owned(),
+                        size_bytes: 1024,
+                        requested_size_bytes: 1024,
+                        generation: 1,
+                        data_epoch: 0,
+                        project_id: ProjectId::new("tenant-a").expect("valid id"),
+                        block_size: 4096,
+                        creation_payload: "{}".to_owned(),
+                    },
+                    runtime: VolumeRuntime {
+                        state: VolumeLifecycle::Ready,
+                        attachment: None,
+                        retired_attachments: RetiredAttachmentFilter::default(),
+                    },
+                },
+            );
+            // The concurrent admission's anchor: a move on the same source
+            // PV committed by another request.
+            state.insert_move(
+                other_id,
+                crate::state::MoveRecord {
+                    operation_id: volvisor_types::OperationId::new("op-concurrent")
+                        .expect("valid id"),
+                    source_pv: "/dev/sda".to_owned(),
+                    target_pv: "/dev/sdc".to_owned(),
+                    state: MoveVolumeBackingState::Preparing,
+                    detail: None,
+                },
+            );
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-second-move").expect("valid id"),
+            target_pool_id: "/dev/sdb".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("the second move from one source PV must be refused");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error.detail.contains("one move per source PV"),
+            "the refusal names the LVM no-op hazard: {error}"
+        );
+    }
+
+    #[test]
+    fn parking_over_a_resolved_failure_answers_the_settled_record() {
+        // A concurrent reconcile may resolve an IN_DOUBT record FAILED
+        // between this caller's failed observation and its park. The
+        // settled verdict is durable truth: re-parking would resurrect
+        // the move to IN_DOUBT and destroy the resolution detail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let resolved = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-resolved").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::Failed,
+            detail: Some("resolved FAILED by reconciliation".to_owned()),
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), resolved.clone());
+        }
+
+        let response = provider
+            .park_in_doubt(&volume_id, "a late observation failure".to_owned())
+            .expect("a terminal record is answered, not parked over");
+        assert_eq!(response.state, MoveVolumeBackingState::Failed);
+        assert_eq!(response.source_pv, resolved.source_pv);
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&resolved),
+            "the settled FAILED record and its audit detail are untouched"
+        );
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_record_parked_after_admission() {
+        // Admission reads a published snapshot before this request's
+        // lock-free CLI observations. A prior move can park IN_DOUBT in
+        // that window; the fresh drive must not silently supersede the
+        // park (the contract says it waits for reconciliation or an
+        // operator).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let parked = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-parked").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::InDoubt,
+            detail: Some("the pvmove ended without relocating".to_owned()),
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), parked.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdc".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a parked record must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error.detail.contains("IN_DOUBT"),
+            "the refusal names the park contract: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&parked),
+            "the parked record is untouched"
+        );
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_foreign_mirror_record() {
+        // MIRROR_READY/PIVOTED are mirror-path states this same-VG
+        // implementation never writes; a record holding one is foreign
+        // and must be refused, not silently replaced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let foreign = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-foreign").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::MirrorReady,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), foreign.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdc".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a foreign record must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("MIRROR_READY"),
+            "the refusal names the foreign state: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(snapshot.move_record(&volume_id), Some(&foreign));
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_same_target_move_completed_after_admission() {
+        // A concurrent drive can complete the exact move this fresh
+        // request targets between admission's published-snapshot read
+        // and the writer lock. Superseding the landed COMPLETE with a
+        // fresh PREPARING would run a no-op pvmove, bump the generation
+        // again, and transiently re-erect the delete fence. The retry
+        // instead observes admission's idempotent answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let completed = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-completed").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::Complete,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), completed.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdb".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a landed same-target completion must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error
+                .detail
+                .contains("completed while this request was being admitted"),
+            "the refusal tells the caller to retry the idempotent answer: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&completed),
+            "the landed completion is untouched"
+        );
     }
 }

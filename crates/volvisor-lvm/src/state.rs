@@ -32,14 +32,230 @@ use volvisor_types::{
 /// missing `schema_version` decodes as
 /// [`volvisor_types::BASELINE_SCHEMA_VERSION`]). Version 2 adds the
 /// durable `pending_creates`/`pending_grows`/`pending_deletes` intent
-/// maps introduced for issue #70. Because that is an additive
-/// serialized-shape change, the version is bumped per the
-/// [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
-/// v1 files still load (the maps default empty) and are upgraded on
-/// the first successful save, while an older binary refuses a v2 file
-/// with the typed unsupported-version error instead of failing on an
-/// unknown field.
-pub const LVM_STATE_SCHEMA_VERSION: u32 = 2;
+/// maps introduced for issue #70. Version 3 replaces the unbounded
+/// `retired_attachment_ids` vector with the fixed-size
+/// [`RetiredAttachmentFilter`] introduced for issue #63. Because each
+/// is an additive serialized-shape change, the version is bumped per
+/// the [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
+/// older files still load (the intent maps default empty; the legacy
+/// retired-id vector is imported into the filter) and are upgraded on
+/// the first successful save, while an older binary refuses a newer
+/// file with the typed unsupported-version error instead of failing on
+/// an unknown field.
+pub const LVM_STATE_SCHEMA_VERSION: u32 = 3;
+
+/// Number of bits in one volume's retired-attachment tombstone filter.
+///
+/// One kibibyte per volume. The filter is only materialized once a
+/// volume has retired its first attachment id, so the common
+/// never-attached volume costs no bytes. See
+/// [`RetiredAttachmentFilter`] for the saturation/fail-closed
+/// trade-off.
+pub const RETIRED_ATTACHMENT_FILTER_BITS: usize = 8 * 1024;
+
+/// Number of double-hash probes per inserted attachment id.
+const RETIRED_ATTACHMENT_FILTER_HASHES: u64 = 7;
+
+/// Byte length of [`RETIRED_ATTACHMENT_FILTER_BITS`].
+const RETIRED_ATTACHMENT_FILTER_BYTES: usize = RETIRED_ATTACHMENT_FILTER_BITS / 8;
+
+/// Fixed-size, monotone tombstone filter for a volume's consumed
+/// attachment ids.
+///
+/// The stale-attachment contract (AGENTS rule 8) requires the provider
+/// to refuse an attachment id that a volume consumed earlier in its
+/// lifetime, so the history cannot be adversarially truncated or
+/// evicted. A plain cap/retention window would therefore be a
+/// correctness regression. This structure is the standard bounded
+/// alternative: a Bloom filter
+///
+/// - has **no false negatives** (a definitely-consumed id always
+///   matches), so a stale id is never accepted;
+/// - may have false positives, which are resolved in the fail-closed
+///   direction (a *new* id is refused as `IDEMPOTENCY_CONFLICT`);
+/// - never clears a bit, and is removed only together with its volume.
+///
+/// Bits are set from SHA-256 double hashing over the id's bytes, so the
+/// on-disk representation is stable across process restarts and
+/// architectures. `inserted` is the saturation metric: the store is
+/// bounded even after a pathological number of attachments, and the
+/// false-positive rate grows as the filter fills. The number of bits
+/// and probes are schema properties; changing either requires another
+/// schema bump.
+///
+/// The filter is serialized as an object holding the bit array as a
+/// lowercase hex string plus the insertion counter (not a JSON number
+/// array) so the whole-state file stays compact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredAttachmentFilter {
+    bits: Vec<u8>,
+    inserted: u64,
+}
+
+impl Default for RetiredAttachmentFilter {
+    fn default() -> Self {
+        Self {
+            bits: vec![0; RETIRED_ATTACHMENT_FILTER_BYTES],
+            inserted: 0,
+        }
+    }
+}
+
+impl RetiredAttachmentFilter {
+    /// Whether no id has ever been inserted (the compact on-disk shape).
+    ///
+    /// Requires both the counter and every bit to be clear. A state file
+    /// with set bits but a zero counter is not canonical, but treating it as
+    /// empty would omit the filter on the next save and silently lose
+    /// tombstones (a false negative for every lost id), so it is preserved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inserted == 0 && self.bits.iter().all(|byte| *byte == 0)
+    }
+
+    /// Number of attachment ids ever inserted (including duplicates).
+    #[must_use]
+    pub fn inserted(&self) -> u64 {
+        self.inserted
+    }
+
+    /// Fraction of filter bits currently set, in `0.0..=1.0`.
+    ///
+    /// Serialized alongside the bit array so an operator can inspect creep
+    /// toward saturation in the durable state file; a saturated filter keeps
+    /// refusing correctly (no false negatives), but every new id is also
+    /// refused (false positives). This revision exposes no metric or log
+    /// line for it.
+    // `RETIRED_ATTACHMENT_FILTER_BITS` is 8192, exactly representable in
+    // `f64`; the fraction is a diagnostic, never a control-flow input.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn saturation(&self) -> f64 {
+        let set: u32 = self.bits.iter().map(|byte| byte.count_ones()).sum();
+        f64::from(set) / RETIRED_ATTACHMENT_FILTER_BITS as f64
+    }
+
+    /// Record that `id` was consumed by this volume.
+    ///
+    /// Idempotent in the bit array: re-inserting the same id sets the same
+    /// bits and leaves [`RetiredAttachmentFilter::saturation`] unchanged;
+    /// the `inserted` counter still advances.
+    pub fn insert(&mut self, id: &AttachmentId) {
+        for index in filter_indices(id.as_str()) {
+            self.bits[index / 8] |= 1 << (index % 8);
+        }
+        self.inserted = self.inserted.saturating_add(1);
+    }
+
+    /// Whether `id` may have been consumed by this volume.
+    ///
+    /// `false` is definitive (never consumed). `true` is "consumed or a
+    /// false positive"; callers must refuse.
+    #[must_use]
+    pub fn maybe_contains(&self, id: &AttachmentId) -> bool {
+        filter_indices(id.as_str()).all(|index| self.bits[index / 8] & (1 << (index % 8)) != 0)
+    }
+}
+
+/// The double-hashed bit indices for one attachment id.
+fn filter_indices(id: &str) -> impl Iterator<Item = usize> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let mut first = [0u8; 8];
+    let mut second = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    second.copy_from_slice(&digest[8..16]);
+    let h1 = u64::from_le_bytes(first);
+    // An even stride would visit at most half the filter; force odd.
+    let h2 = u64::from_le_bytes(second) | 1;
+    (0..RETIRED_ATTACHMENT_FILTER_HASHES).map(move |probe| {
+        let index = h1.wrapping_add(probe.wrapping_mul(h2));
+        // `index % 8192` always fits `usize` on every supported target; the
+        // conversion cannot fail, and the fallback only keeps the helper
+        // panic-free without weakening the filter (a wrong-but-valid bit
+        // would add a fail-closed false positive).
+        usize::try_from(index % RETIRED_ATTACHMENT_FILTER_BITS as u64).unwrap_or_default()
+    })
+}
+
+impl Serialize for RetiredAttachmentFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RetiredAttachmentFilter", 2)?;
+        state.serialize_field("bits", &encode_hex(&self.bits))?;
+        state.serialize_field("inserted", &self.inserted)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredAttachmentFilterWire {
+    bits: String,
+    inserted: u64,
+}
+
+impl<'de> Deserialize<'de> for RetiredAttachmentFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let wire = RetiredAttachmentFilterWire::deserialize(deserializer)?;
+        // Reject a wrong-length `bits` string before allocating the
+        // decoded buffer: a corrupt file can otherwise make the decoder
+        // allocate proportional to an arbitrarily large hex field.
+        let expected_hex_len = RETIRED_ATTACHMENT_FILTER_BYTES * 2;
+        if wire.bits.len() != expected_hex_len {
+            return Err(D::Error::custom(format!(
+                "invalid retired-attachment filter: {} hex bytes, expected {}",
+                wire.bits.len(),
+                expected_hex_len
+            )));
+        }
+        let bits = decode_hex(&wire.bits).map_err(|detail| {
+            D::Error::custom(format!("invalid retired-attachment filter: {detail}"))
+        })?;
+        if bits.len() != RETIRED_ATTACHMENT_FILTER_BYTES {
+            return Err(D::Error::custom(format!(
+                "invalid retired-attachment filter: {} bytes, expected {}",
+                bits.len(),
+                RETIRED_ATTACHMENT_FILTER_BYTES
+            )));
+        }
+        Ok(Self {
+            bits,
+            inserted: wire.inserted,
+        })
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err("odd-length hex string".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    let raw = text.as_bytes();
+    for pair in raw.chunks_exact(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "non-hex character".to_owned())?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "non-hex character".to_owned())?;
+        // Two hex digits always fit a byte; the conversion cannot fail and
+        // the fallback only keeps the decoder panic-free. A corrupted byte
+        // is still rejected by the exact-length check above.
+        bytes.push(u8::try_from(high * 16 + low).unwrap_or_default());
+    }
+    Ok(bytes)
+}
 
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
@@ -119,18 +335,57 @@ impl<'de> Deserialize<'de> for VolumeEntry {
 }
 
 /// The mutable runtime portion of a stored volume.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VolumeRuntime {
     /// Current lifecycle state.
     pub state: VolumeLifecycle,
     /// The single recorded attachment, if any (single-writer P0 profile).
     pub attachment: Option<AttachmentRecord>,
-    /// Attachment ids this volume consumed earlier in its lifetime. A
-    /// report-capable provider refuses to reuse one: per-id evidence
-    /// (`state_revision`) must never be applied to a different instance.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired_attachment_ids: Vec<AttachmentId>,
+    /// Bounded tombstones for attachment ids this volume consumed
+    /// earlier in its lifetime. A report-capable provider refuses to
+    /// reuse one: per-id evidence (`state_revision`) must never be
+    /// applied to a different instance. Omitted while empty so a
+    /// never-attached volume stays compact.
+    #[serde(
+        rename = "retired_attachment_filter",
+        default,
+        skip_serializing_if = "RetiredAttachmentFilter::is_empty"
+    )]
+    pub retired_attachments: RetiredAttachmentFilter,
+}
+
+/// Wire shape for [`VolumeRuntime`].
+///
+/// `retired_attachment_ids` is the unbounded schema-v1/v2 vector: it is
+/// accepted on load (and folded into [`RetiredAttachmentFilter`]) but
+/// never written again. `retired_attachment_filter` is the schema-v3
+/// shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeRuntimeWire {
+    state: VolumeLifecycle,
+    attachment: Option<AttachmentRecord>,
+    #[serde(default)]
+    retired_attachment_ids: Vec<AttachmentId>,
+    #[serde(default)]
+    retired_attachment_filter: Option<RetiredAttachmentFilter>,
+}
+
+impl<'de> Deserialize<'de> for VolumeRuntime {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = VolumeRuntimeWire::deserialize(deserializer)?;
+        let mut retired_attachments = wire.retired_attachment_filter.unwrap_or_default();
+        // Import a legacy v1/v2 vector. Inserting into an existing
+        // filter as well is a safe superset (never a false negative).
+        for id in wire.retired_attachment_ids {
+            retired_attachments.insert(&id);
+        }
+        Ok(Self {
+            state: wire.state,
+            attachment: wire.attachment,
+            retired_attachments,
+        })
+    }
 }
 
 /// A volume as stored in provider state: durable entry + runtime.
@@ -462,7 +717,11 @@ impl LvmState {
         // writes the current version so an upgrade becomes durable on the
         // first mutation (or the startup reconcile's first save).
         self.schema_version = LVM_STATE_SCHEMA_VERSION;
-        let data = serde_json::to_vec_pretty(self)
+        // Issue #62: the state file is internal, whole-file rewritten and
+        // fsynced on every mutation. Compact JSON roughly halves the bytes
+        // written and fsynced versus pretty-printing, without changing the
+        // decoded shape or schema.
+        let data = serde_json::to_vec(self)
             .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
@@ -719,7 +978,7 @@ mod tests {
                 },
                 runtime: VolumeRuntime {
                     state: VolumeLifecycle::Ready,
-                    retired_attachment_ids: Vec::new(),
+                    retired_attachments: RetiredAttachmentFilter::default(),
                     attachment: Some(AttachmentRecord {
                         id: AttachmentId::new("att-1").expect("valid id"),
                         vm_id: "vm-1".to_owned(),
@@ -765,12 +1024,16 @@ mod tests {
         state.save(&path).expect("save");
         let text = fs::read_to_string(&path).expect("read state");
         assert!(
-            text.contains("\"schema_version\": 2"),
+            text.contains("\"schema_version\":3"),
             "the current schema version is stamped: {text}"
         );
         assert!(
             !text.contains("pending_creates"),
             "an empty state must not gain a create-intent map: {text}"
+        );
+        assert!(
+            !text.contains("retired_attachment_filter"),
+            "an empty state must not gain a retired-id filter: {text}"
         );
         assert!(
             !text.contains("pending_grows"),
@@ -996,9 +1259,9 @@ mod tests {
         );
         assert_eq!(attachment.reporter.as_deref(), Some("consumer-upgrade"));
         assert_eq!(attachment.recorded_at_ms, Some(1_700_000_000_123));
-        assert_eq!(
-            volume.runtime.retired_attachment_ids,
-            Vec::<AttachmentId>::new()
+        assert!(
+            volume.runtime.retired_attachments.is_empty(),
+            "a pre-tombstone file has no retired ids"
         );
 
         let device_id = DeviceId::new("dev-upgrade01").expect("valid id");
@@ -1042,9 +1305,9 @@ mod tests {
             state.delete_intents().is_empty(),
             "a pre-intent fixture has no delete intents"
         );
-        assert_eq!(
-            volume.runtime.retired_attachment_ids,
-            Vec::<AttachmentId>::new()
+        assert!(
+            volume.runtime.retired_attachments.is_empty(),
+            "a pre-tombstone file has no retired ids"
         );
         // The initial format had only the effective size; the requested
         // size backfills from it rather than defaulting to zero.
@@ -1058,17 +1321,166 @@ mod tests {
         let state = LvmState::load(&path).expect("tombstone state loads");
         let volume_id = VolumeId::new("vol-upgrade-tombstone").expect("valid id");
         let volume = state.volume(&volume_id).expect("volume preserved");
-        let retired: Vec<&str> = volume
-            .runtime
-            .retired_attachment_ids
-            .iter()
-            .map(AsRef::as_ref)
-            .collect();
-        assert_eq!(retired, vec!["att-retired-oldest", "att-retired-newer"]);
+        let filter = &volume.runtime.retired_attachments;
+        assert!(
+            filter.maybe_contains(&AttachmentId::new("att-retired-oldest").expect("id")),
+            "the legacy vector was imported into the filter"
+        );
+        assert!(
+            filter.maybe_contains(&AttachmentId::new("att-retired-newer").expect("id")),
+            "the legacy vector was imported into the filter"
+        );
+        assert!(
+            !filter.maybe_contains(&AttachmentId::new("att-never-used").expect("id")),
+            "an unused id does not match"
+        );
+        assert_eq!(filter.inserted(), 2);
     }
 
     #[test]
-    fn v2_n_minus_one_fixture_loads_and_upgrades_to_v2() {
+    fn retired_attachment_filter_has_no_false_negatives_and_is_bounded() {
+        let mut filter = RetiredAttachmentFilter::default();
+        assert!(filter.is_empty());
+        let ids: Vec<AttachmentId> = (0..2_000)
+            .map(|index| AttachmentId::new(format!("att-{index}")).expect("id"))
+            .collect();
+        for id in &ids {
+            filter.insert(id);
+        }
+        for id in &ids {
+            assert!(filter.maybe_contains(id), "no false negatives: {id}");
+        }
+        assert_eq!(filter.inserted(), 2_000);
+        assert!(filter.saturation() > 0.0 && filter.saturation() <= 1.0);
+        // Re-inserting is idempotent in the bit array (only the
+        // saturation counter advances).
+        let before = filter.saturation();
+        filter.insert(&ids[0]);
+        assert_eq!(filter.saturation(), before);
+
+        // The serialized form is a fixed-size hex string plus the
+        // saturation counter, independent of how many ids were added.
+        let json = serde_json::to_string(&filter).expect("serialize filter");
+        assert!(json.len() < 3_000, "bounded on disk: {} bytes", json.len());
+        let back: RetiredAttachmentFilter =
+            serde_json::from_str(&json).expect("deserialize filter");
+        assert_eq!(back, filter);
+        for id in &ids {
+            assert!(back.maybe_contains(id));
+        }
+    }
+
+    #[test]
+    fn malformed_retired_attachment_filter_is_rejected() {
+        let short = r#"{"bits":"00","inserted":1}"#;
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(short).is_err());
+        let non_hex = format!(
+            r#"{{"bits":"{}","inserted":1}}"#,
+            "zz".repeat(RETIRED_ATTACHMENT_FILTER_BYTES)
+        );
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(&non_hex).is_err());
+        let odd = format!(
+            r#"{{"bits":"{}","inserted":1}}"#,
+            "0".repeat(RETIRED_ATTACHMENT_FILTER_BYTES * 2 + 1)
+        );
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(&odd).is_err());
+    }
+
+    #[test]
+    fn a_legacy_vector_is_merged_into_an_existing_filter_without_false_negatives() {
+        // A hand-written or transitional file may carry both shapes. The
+        // merge must be a superset: neither the filter's ids nor the
+        // legacy vector's ids (duplicates included) may be lost.
+        let mut filter = RetiredAttachmentFilter::default();
+        let filtered = AttachmentId::new("att-already-filtered").expect("id");
+        filter.insert(&filtered);
+        let json = serde_json::json!({
+            "state": "Ready",
+            "attachment": null,
+            "retired_attachment_ids": ["att-legacy", "att-legacy"],
+            "retired_attachment_filter": filter,
+        });
+        let runtime: VolumeRuntime = serde_json::from_value(json).expect("both shapes decode");
+        assert!(runtime.retired_attachments.maybe_contains(&filtered));
+        assert!(
+            runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-legacy").expect("id"))
+        );
+        assert_eq!(runtime.retired_attachments.inserted(), 3);
+    }
+
+    #[test]
+    fn a_noncanonical_filter_with_set_bits_is_never_treated_as_empty() {
+        // Defense in depth: if a state file carries set bits but a zero
+        // counter, omitting the filter on the next save would drop real
+        // tombstones and create false negatives. It must be preserved.
+        let bits = format!("01{}", "00".repeat(RETIRED_ATTACHMENT_FILTER_BYTES - 1));
+        let json = format!(r#"{{"bits":"{bits}","inserted":0}}"#);
+        let filter: RetiredAttachmentFilter =
+            serde_json::from_str(&json).expect("noncanonical filter decodes");
+        assert!(!filter.is_empty());
+        let encoded = serde_json::to_string(&filter).expect("serialize");
+        assert!(encoded.contains("\"inserted\":0"));
+        assert!(encoded.len() > 2_000, "the bit array is preserved");
+    }
+
+    const V3_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v3-n1.json");
+
+    #[test]
+    fn v3_n_minus_one_fixture_imports_legacy_ids_and_upgrades_to_v3() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "lvm-state-v3-n1.json", V3_N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("v2 state loads in v3");
+        let volume_id = VolumeId::new("vol-upgrade-tombstone").expect("valid id");
+        let volume = state.volume(&volume_id).expect("v2 volume preserved");
+        assert_eq!(volume.entry.generation, 9);
+        assert!(
+            volume
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-oldest").expect("id")),
+            "the v2 retired-id vector was imported"
+        );
+        assert!(
+            volume
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-newer").expect("id"))
+        );
+
+        let target = dir.path().join("upgraded-v3.json");
+        state.save(&target).expect("upgrade-on-write");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\":3"),
+            "the first save stamps schema v3: {text}"
+        );
+        assert!(
+            !text.contains("retired_attachment_ids"),
+            "the legacy unbounded vector is never written again: {text}"
+        );
+        assert!(
+            text.contains("retired_attachment_filter"),
+            "the bounded filter is written: {text}"
+        );
+        let reloaded = LvmState::load(&target).expect("reload");
+        assert_eq!(
+            reloaded, state,
+            "no retired id is lost by the v2→v3 upgrade"
+        );
+        assert!(
+            reloaded
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-newer").expect("id"))
+        );
+    }
+
+    #[test]
+    fn v2_n_minus_one_fixture_loads_and_upgrades_to_v3() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = write_fixture(&dir, "lvm-state-v2-n1.json", V2_N1_FIXTURE);
         let mut state = LvmState::load(&source).expect("v1 state loads in v2");
@@ -1095,12 +1507,12 @@ mod tests {
             "a v1 file has no intent maps"
         );
 
-        let target = dir.path().join("upgraded-v2.json");
+        let target = dir.path().join("upgraded-v3.json");
         state.save(&target).expect("upgrade-on-write");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\": 2"),
-            "the first save stamps schema v2: {text}"
+            text.contains("\"schema_version\":3"),
+            "the first save stamps schema v3: {text}"
         );
         assert!(
             !text.contains("pending_creates")
@@ -1111,7 +1523,7 @@ mod tests {
         assert_eq!(
             LvmState::load(&target).expect("reload"),
             state,
-            "no durable field is lost by the v1→v2 upgrade"
+            "no durable field is lost by the v1→v3 upgrade"
         );
     }
 
@@ -1124,7 +1536,7 @@ mod tests {
         state.save(&target).expect("save");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\": 2"),
+            text.contains("\"schema_version\":3"),
             "upgrade-on-write stamps the current schema version: {text}"
         );
         assert_eq!(
@@ -1139,14 +1551,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let future = N1_FIXTURE.replacen(
             '{',
-            "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
+            "{\n  \"schema_version\": 4,\n  \"future_field\": true,",
             1,
         );
         let path = write_fixture(&dir, "future.json", &future);
         let err = LvmState::load(&path).expect_err("future version must be refused");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.is_unsupported_schema_version(), "{err}");
-        assert!(err.detail.contains("schema_version 3"), "{err}");
+        assert!(err.detail.contains("schema_version 4"), "{err}");
         assert_eq!(
             fs::read_to_string(&path).expect("read refused file"),
             future,
