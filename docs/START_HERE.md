@@ -47,6 +47,12 @@ The implementation and its in-repo tests cover:
   campaign, and four bounded Tier V scenarios against real Cloud Hypervisor
   v51.1 on one physical development host (storage simulated). See
   [the evidence index](../SUPPORT_MATRIX.md#evidence-index).
+- **Bounded state under attachment churn (single-host measurement)**: the
+  [2026-11-04 post-fix control-plane bundle](benchmarks/2026-11-04-devhost-postfix/REPORT.md)
+  at `aab773b` records 0 HTTP errors and 0 attachment conflicts, a ~3 KB
+  provider state file, and a bounded journal over a 25-minute soak. This is
+  not the 24-hour soak and not capacity evidence; RSS high-water (2.32 GiB)
+  and the unbounded default INFO daemon log remain open findings.
 
 A `--check-config` pass proves the binary runs and accepts a configuration.
 It does **not** prove that the configured storage exists, that a provider

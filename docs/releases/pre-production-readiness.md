@@ -112,6 +112,70 @@ remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
 READY**. No tag, GitHub release, push or pull request is created by this
 workstream.
 
+## Post-report addendum (2026-11-04) — Phase C state-substrate verification
+
+This addendum records the Phase C "state-substrate verification and
+hardening" batch delivered on branch `phase-a-scaling` after the Phase B
+addendum. It follows the [Phase C plan](../plans/2026-11-04-phase-c-state-substrate-verification.md).
+**It changes no gate verdict below.** Every item is code hardening,
+measurement automation, single-host lab measurement or documentation; none is
+a production-support, SLA, capacity, zero-RPO, hardware or released-artifact
+claim.
+
+- **C1 — compaction hardening (#64).** A persistently failing compaction now
+  backs off exponentially instead of deep-cloning and reserializing the whole
+  retained registry under the writer lock on every append, and tombstone
+  membership is an O(1) index instead of a linear ring scan. Deterministic
+  regressions cover attempt bounding and recovery, duplicate/refresh,
+  eviction/re-insertion, snapshot round-trip and brute-force membership
+  equivalence. This addresses the two cost defects the review found; **the
+  issue is not claimed closed**, because the RSS high-water and the separate
+  log-volume finding below remain open.
+- **C1b — attachment churn (ADR-0012, #63).** The fixed-size retired-id Bloom
+  filter saturated under churn and then refused every fresh attachment id with
+  `IDEMPOTENCY_CONFLICT`. A strictly increasing per-volume
+  `attachment_generation` is now the detach/report fence; the filter is legacy
+  decode-only and a legacy v1/v2 vector is still imported at load. The
+  [ADR-0012](../adr/0012-monotonic-attachment-generation-fence.md) header
+  records it as **Proposed, decision acceptance pending**; the contract
+  amendment is implemented, not an accepted-policy claim.
+- **C2 — comparison tooling.** `scripts/bench/compare.py` verifies both
+  `MANIFEST.sha256` files, reads the real aggregate shapes, refuses a
+  tampered/missing/mismatched run, and emits CSV/Markdown with explicit
+  `NOT RECORDED` and zero-baseline handling. Its 14 unit tests run in CI.
+- **C3 — post-fix measurement.** A clean-tree run at
+  `aab773b7b58448e41ba22b21372785b3c58e7381` (binary SHA256
+  `238895a42097fd06f33e30f941873b3a9ca82b623efaf2a60c6f375d2d1edf4a`)
+  completed with `BENCH_RC=0` and is published as the
+  [2026-11-04 post-fix bundle](../benchmarks/2026-11-04-devhost-postfix/REPORT.md)
+  with its [before/after comparison](../benchmarks/2026-11-04-devhost-postfix/comparison/comparison.md).
+  The pre-fix conflict storm is preserved only as a labelled
+  [invalid-run artifact](../benchmarks/2026-11-04-devhost-invalid-prefix/README.md).
+  Headline results: 5,424,744 soak ops at 3616.49 ops/s, **0 HTTP errors and
+  0 `IDEMPOTENCY_CONFLICT`** (70 client network errors at the deliberate
+  restart), state end **3,055 B** (max 3,675 B), journal max **75.5 MiB**
+  and end **28.0 MiB**, mid-soak restart healthy in **0.552 s** with 4/4
+  volumes. Against 2026-11-03, soak ops are +351.1 %, c1/c8 ops/s +17.2 %/
+  +52.3 %, c32/c128 −4.1 %/−2.6 %, soak journal end −89.7 % and state end
+  −99.88 %.
+- **Open residuals (not fixes).** RSS peaked at **2.32 GiB** and did not
+  return to its start value; the peak coincides with a post-compaction journal
+  minimum, which is consistent with allocator transients but proves neither a
+  leak nor its absence. The default INFO daemon log produced **2.57 GB** in
+  25 minutes with no rotation. Neither is a durable-state defect and neither
+  is claimed fixed. The run is one host, loop-LVM, control-plane only, and a
+  shortened **25-minute** soak; the 24-hour soak is **NOT RUN**. Issue **#62**
+  is not closed by this measurement.
+- **Validation:** `cargo fmt`, workspace tests, clippy and rustdoc with
+  `-D warnings`, the journal `test-faults` suite, `bash -n` and
+  `shellcheck -x` over the day-2 and bench scripts, and the comparator unit
+  tests pass at `aab773b`.
+
+No gate becomes met. Gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
+remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
+READY**. No tag, GitHub release, push or pull request is created by this
+workstream.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |

@@ -1,0 +1,15 @@
+listen = "127.0.0.1:43819"
+journal_dir = "/tmp/opencode/volvisor-bench-phasec-final-20261104/lab/journal"
+provider = "lvm"
+lvm_vg_prefix = "volvisor-bench"
+device_claim_token = "<redacted>"
+lvm_state_path = "/tmp/opencode/volvisor-bench-phasec-final-20261104/lab/lvm-state.json"
+admin_token = "<redacted>"
+
+[admission]
+read_timeout_secs = 30
+queue_timeout_secs = 5
+max_concurrent_requests = 256
+rate_limit_per_second = 0
+rate_limit_burst = 0
+max_list_limit = 1000

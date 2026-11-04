@@ -34,8 +34,8 @@ refuses it with `IDEMPOTENCY_CONFLICT`. This run recorded:
 | other errors | 117 client-side network errors at the deliberate restart |
 | total operations | 7,248,650 |
 | reported throughput | 4832.428 ops/s (invalid: dominated by refused attaches) |
-| provider state | ~11 KiB, but only because most attaches never happened |
-| journal | compacted between 19–25 MiB during this run |
+| provider state | first 11,556 B, last 10,953 B (max 12,091 B) — small because most attaches never happened |
+| journal | first 52,101,048 B, max 75,497,972 B, last 24,670,598 B (bounded by compaction) |
 
 Because 99.1 % of attach attempts were refused before exercising the intended
 path, the throughput and latency numbers describe a rejection storm, not the
