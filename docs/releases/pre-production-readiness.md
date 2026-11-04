@@ -207,8 +207,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
   security posture change in an unreleased prototype; read clients using
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
-- **D3 — #62 write path (slice 1 landed; slice 2 code landed, measurement
-  pending).** Slice 1 code is in the tree: the single durable-writer funnel
+- **D3 — #62 write path (slice 1 and slice 2 delivered; measured at
+  `c4b0b13`).** Slice 1 code is in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
   hardened sweep and per-state-path in-process writer gate (`a8c23d6`);
   canonical-path keying of the temp-name hash (`a068947`); and test/doc-only
@@ -218,12 +218,11 @@ is a production-support, SLA, capacity, durability or hardware claim.
   temp namespace. Between `a068947` and the slice-2 implementation
   (`8220414`), no production behavior changed: those commits are
   test/doc-only evidence correction. Slice 2 code
-  (`8220414`, plus the review-fix commits starting at `1184a27` and the
-  follow-up commit that carries this paragraph; the first carried the
-  leadership-handoff and poison fixes, the follow-up the admission window)
-  releases the provider state lock for attach/detach/report and coalesces
-  concurrent captures into one physical save behind a per-lineage writer,
-  with permanent watermarks, admission alignment and RAII leadership.
+  (`8220414`, plus the review-fix commits `1184a27` and `c4b0b13`; the first
+  carried the leadership-handoff and poison fixes, the second the admission
+  window) releases the provider state lock for attach/detach/report and
+  coalesces concurrent captures into one physical save behind a per-lineage
+  writer, with permanent watermarks, admission alignment and RAII leadership.
   Admission now resolves an outstanding capture before deriving any replay,
   not-found or no-op answer (async without holding the state lock,
   synchronous via `lock_state_stable`), so a same-id replay can never be
@@ -232,15 +231,22 @@ is a production-support, SLA, capacity, durability or hardware claim.
   race, a high phantom-resurrection path and a high same-id replay window;
   deterministic tests now cover all three. Synchronous
   create/grow/delete/move/admin still hold the lock and wait on a condvar
-  (accepted residual; not a regression from slice 1). There is **no
-  throughput claim**: the required clean-tree benchmark at the commit that
-  closes slice 2 (recorded with the measurement) has not been run, so no gate
-  verdict changes. **#62 remains open** until that measurement exists. The earlier post-fix c32 −4.1 % / c128 −2.6 %
-  measurement predates slice 1 and is not evidence for either slice. No live
-  evidence changed in this batch: `d5.sh` Part B was not re-drilled at this
-  SHA here, so its `.volvisor-` message assertion is code-derived until the
-  next drill, and the symlink test panics rather than skips where the temp
-  filesystem refuses symlinks.
+  (accepted residual; not a regression from slice 1). The clean-tree
+  benchmark at `c4b0b13` is published in the
+  [slice-2 bundle](../benchmarks/2026-11-04-devhost-slice2/REPORT.md)
+  (worktree clean; comparator `aab773b`). It records an unchanged
+  mixed-sweep ceiling (c1/c8/c32/c128 −5.5/−2.4/−0.5/+0.7 %) and a split
+  latency result: read p95 falls sharply at c32/c128 while write p95 rises
+  (c128 1552.261 → 6330.548 ms). The 25-minute soak recorded 6,929,746 ops
+  at 4619.824 ops/s versus 5,424,744 at 3616.49, but RSS delta also rose;
+  that is a single non-fixed-dataset observation, not a capacity claim. No
+  throughput-gain claim is made for either slice. The earlier post-fix c32
+  −4.1 % / c128 −2.6 % measurement predates slice 1 and is not evidence for
+  either slice. **#62 remains open** until explicitly instructed, and no gate
+  verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
+  not re-drilled at this SHA here, so its `.volvisor-` message assertion is
+  code-derived until the next drill, and the symlink test panics rather than
+  skips where the temp filesystem refuses symlinks.
 - **D4 — ADR-0012.** Still `Proposed`; accepting it remains an authority
   decision, not an implementation task.
 
@@ -320,6 +326,7 @@ READY**.
 | [Day-2 D1/D2, 2026-11-04](../evidence/day2/2026-11-04-devhost-live/REPORT.md) | old `8c2fc1a` / new `aad1720`, caller dirty with clean new build worktree | One host; loop LVM; debug builds | D1 v3 backup/restore with bounded tombstone filter and behavioral retired-id 409 (pre-ADR-0012); real old→new v2→v3 upgrade, typed old refusals, byte-identical v2 restore and old-binary serve; same-binary v3 policy | Rolling multi-host or packaged upgrade, data path, D3 storage-side fencing, D8 host loss, production support |
 | [D5 post-fix re-drill](../evidence/day2/2026-11-03-d5-redrill/REPORT.md) | `1863a7a` product / `940722e` harness, clean worktree | One host; loop LVM; 256 KiB tmpfs ENOSPC | The normal uncommitted state-save path fails closed and converges: 500 with ENOSPC and the state `.tmp` path, byte-identical old state, LV compensated, 404 in the same process and after restart, terminal same-`operation_id` replay, new-`operation_id` 200/`Ready`, one LV for the new volume and two durable records total, no residue; journal path re-confirmed | The three non-injected tails (cleanup failure, post-rename carve-out, unreadable durable re-read), real disk/inode/thin-pool failure, multi-host, production readiness |
 | [Control-plane benchmarks](../benchmarks/2026-11-03-devhost/REPORT.md) | `e3aa365`, clean worktree | One host, loop-backed LVM, loopback HTTP | 1/8/32/128 sweep, 25-min soak, restart replay, 46-entry manifest verifies | Data path, real backends, 24 h soak, production capacity or SLA |
+| [Control-plane benchmark, D3 slice 2, 2026-11-04](../benchmarks/2026-11-04-devhost-slice2/REPORT.md) | `c4b0b13`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the provider state lock; read/write latency split recorded; no throughput-gain claim | Data path, real backends, 24 h soak, production capacity/SLA, throughput improvement |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of

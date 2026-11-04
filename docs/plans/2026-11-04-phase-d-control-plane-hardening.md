@@ -97,14 +97,15 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 delivered; slice 2 code landed, measurement pending)
+### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; measured at `c4b0b13`)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
 (serialize, write tmp, `sync_all`, rename, directory `sync_all`). Reads were
 already decoupled by the committed snapshot, but writers still serialize on
 the fsync. The post-fix run shows c32 −4.1 % and c128 −2.6 % versus the
-pre-fix baseline; the ceiling is unchanged.
+pre-fix baseline; the ceiling is unchanged. The slice-2 run recorded below is
+the post-change measurement.
 
 **Why this is not a mechanical edit.** Releasing the lock before the save
 breaks two current invariants: a failed save must not be observable as
@@ -306,11 +307,14 @@ phantom-resurrection path; the re-review of `1184a27` found and this change
 fixes a high same-id replay window and a consistency gap in synchronous
 admission. Only the newest pending capture is retained; the monotonic
 snapshot supersedes earlier captures, so one write covers every earlier
-sequence while waiters resolve by watermarks. **There is no throughput
-claim:** the required clean-tree benchmark at the commit that closes slice 2
-(recorded with the measurement) has not been run, so the measured-baseline
-claim in the section above is not updated by this change set. #62 stays open
-until that run exists, and all gate verdicts are unchanged.
+sequence while waiters resolve by watermarks. **The required clean-tree
+benchmark has now run at `c4b0b13`** (2026-11-04T23:10:13Z–23:40:32Z, worktree
+clean, comparator `aab773b`); it is published as
+[2026-11-04-devhost-slice2](../benchmarks/2026-11-04-devhost-slice2/REPORT.md).
+The mixed ceiling is unchanged and the high-in-flight write tail is worse, so
+**this work makes no throughput-gain claim**; see the measurement section
+below. #62 stays open until explicitly instructed, and all gate verdicts are
+unchanged.
 
 #### Slice-2 implementation review (2026-11-04): NO-GO on `8220414`
 
@@ -432,12 +436,68 @@ three documentation/claim corrections. This change fixes all of them:
    while the first write is still blocked, so the test is not tautological.
 
 
+#### Slice-2 clean-tree measurement (2026-11-04): recorded at `c4b0b13`
+
+The required run is published as
+[2026-11-04-devhost-slice2](../benchmarks/2026-11-04-devhost-slice2/REPORT.md).
+Source `c4b0b1303594c494bb26d3643d952434eda8ec34`, worktree clean
+(`worktree_dirty: no`), binary `volvisord c4b0b13` SHA256
+`1f86136093792c161e85d9c8924bc965b635e54d157d975a9780a2d2ddc81bf6`, run
+window 2026-11-04T23:10:13Z–23:40:32Z, same harness shape (`--skip-build
+--sweep-seconds 30 --soak-minutes 25`). The comparator is the clean-tree
+`aab773b` [post-fix bundle](../benchmarks/2026-11-04-devhost-postfix/REPORT.md);
+both manifests verified. **No code or harness change was made after the
+measured SHA**; the documentation change that records this run is a
+follow-up commit.
+
+Measured results:
+
+- **Mixed sweep:** 1845.526 / 3410.746 / 858.371 / 237.088 ops/s at
+  1/8/32/128 in-flight, versus 1952.155 / 3493.445 / 862.937 / 235.502 at
+  `aab773b` (−5.5 / −2.4 / −0.5 / +0.7 %). The ceiling is unchanged, so no
+  throughput-gain claim is made.
+- **Read/write split:** read p95 at c32 fell 179.332 → 1.188 ms and at c128
+  1288.505 → 197.815 ms; write p95 rose 388.84 → 590.847 ms at c32 and
+  1552.261 → 6330.548 ms at c128. Overall p50 fell (462.278 → 1.005 ms) while
+  overall p95 rose (1349.487 → 3553.448 ms). This is consistent with readers
+  no longer queueing behind the writer while synchronous `grow` still holds
+  the state lock across an LVM resize. The harness does not attribute delay;
+  the cause is an observation, not a proven diagnosis.
+- **Soak:** 6,929,746 ops at 4619.824 ops/s versus 5,424,744 at 3616.49
+  (+27.7 %), with the same recorded actual read ratio (0.7999), 0 HTTP
+  errors and 0 attachment conflicts; the 77 network errors are client
+  reconnects at the planned restart. RSS delta was +2,943,816 KiB (peak
+  3,236,184 KiB) versus +1,780,896 KiB (peak 2,323,028 KiB). The soak is a
+  single non-fixed-dataset run: the rate is recorded, not claimed as a
+  capacity improvement.
+- **Bounded artifacts:** state ended at 3,401 B (max 3,684 B); journal ended
+  at 43,412,309 B (max 75,497,689 B). The mid-soak restart listed 4/4
+  volumes in 0.547 s with unchanged sizes.
+- **Diagnostic probes:** cap-32/128-in-flight shed 77 × `503` under its
+  configured 1 s queue timeout; the 50 req/s probe returned 896 × `429`.
+  These are diagnostic shapes, not the default-cap sweep.
+
+New residuals from this measurement:
+
+- **Write-tail attribution (open).** c32/c128 write p95 is worse than the
+  baseline while read p95 is much better and throughput is flat. The next
+  step is to attribute the stall (synchronous grow, coalescing/fairness, or
+  the harness mix) before any regression/fix claim.
+- **RSS high-water (open).** The peak rose to 3,236,184 KiB. A leak is
+  neither proven nor ruled out; no cap or fix is claimed.
+- **Post-poison alignment reload (accepted, low, pre-existing).** After
+  terminal poison, `lock_state` may still load the durable file before
+  `reserve` refuses. This is fail-closed and leftover work at worst; it is
+  left unchanged here so the measured code SHA stays frozen. No correctness
+  impact is claimed.
+- **24-hour soak (NOT RUN).** The run is 25 minutes with one restart.
+
 **Rejected alternatives.** Per-volume files need a multi-file commit for
 delete/move/create intent atomicity; an append-only WAL would rewrite every
 startup and reconciliation path; write-behind (ack before `fsync`) violates
 the attach fencing contract. None is a shortcut for this slice.
 
-**Acceptance for the eventual code slices (not this batch).**
+**Acceptance for the code slices.**
 
 - Slice 1: all existing workspace, journal-fault, conformance and campaign
   suites pass; a direct-save-vs-pending-capture interleaving is impossible
@@ -483,9 +543,11 @@ the attach fencing contract. None is a shortcut for this slice.
   coalescing test counts one physical-write attempt for N waiting callers;
   the state-layer seam test covers both fsync boundaries (no separate
   fsync counter is added, so this is proof of execution, not a count).
-- A new clean-tree benchmark at the implementation SHA is published with
-  the same comparator; no throughput claim before that run.
-- #62 stays open until the code and the measurement both exist.
+- The clean-tree benchmark at `c4b0b13` is published with the same comparator
+  ([bundle](../benchmarks/2026-11-04-devhost-slice2/REPORT.md)); the ceiling
+  is unchanged and the high-in-flight write tail is worse, so no
+  throughput-gain is claimed. Delivered.
+- #62 stays open until explicitly instructed.
 
 ### D4 — ADR-0012 acceptance
 
@@ -498,8 +560,9 @@ batch does not self-accept it.
 
 Add a Phase D addendum to
 [pre-production-readiness.md](../releases/pre-production-readiness.md) that
-records D1/D2 as delivered, D3 slice 1 as delivered with #62 open, and
-keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
+records D1/D2 as delivered, D3 slices 1 and 2 as delivered with the slice-2
+measurement recorded and #62 open, and keeps gates 1, 2 and 5 NOT MET with
+gates 3 and 4 partial.
 
 ## Out of scope
 
@@ -521,7 +584,9 @@ keeps gates 1, 2 and 5 NOT MET with gates 3 and 4 partial.
    provider state lock across every save; no coalescing; no
    wire/schema/durability change; no throughput claim; all existing suites
    green and physical save counts unchanged.
-5. **D3 slice 2 (release the lock) — code landed; measurement pending.** The
-   only batch that may claim a throughput change, and only with the new
-   clean-tree measurement. #62 stays open until both land.
+5. **D3 slice 2 (release the lock) — delivered and measured at
+   `c4b0b13`.** The clean-tree run is published: the mixed-sweep ceiling is
+   unchanged, the read path no longer queues behind the writer, and the
+   high-in-flight write tail is worse; no throughput-gain claim. #62 stays
+   open until explicitly instructed.
 6. D4 only when the accepting authority is recorded.
