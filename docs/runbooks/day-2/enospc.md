@@ -6,11 +6,16 @@ gap found by the drill
 ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed and merged in
 [PR #69](https://github.com/o3kio/volvisor/pull/69). D5 was re-drilled after
 the fix on one host (both parts: the journal path and the provider-state normal
-path). The
-cleanup-failure, post-rename carve-out and unreadable-durable-reread branches
-were not fault-injected by the re-drill; they are covered by the deterministic
-tests added in #69. See the
+path). The cleanup-failure, post-rename carve-out, clear-save and
+unreadable-durable-reread branches were not fault-injected by the re-drill;
+they are covered by the deterministic tests added in #69/#70. See the
 [post-fix re-drill bundle](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
+The create path now also persists a durable create intent **before**
+`lvcreate` ([#70](https://github.com/o3kio/volvisor/issues/70)), and
+grow/delete/move have their own durable anchors; the full per-mutation
+contracts and operator tails are in
+[lvm-state-divergence.md](lvm-state-divergence.md). This page keeps the ENOSPC
+procedure and the create-specific tails.
 
 - **Journal ENOSPC:** fail-closed. HTTP 500, no volume, torn append
   truncated on restart, retry succeeds after space is freed.
@@ -65,9 +70,10 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
   cleanup-failure tail. The normal uncommitted-save path was re-drilled
   post-fix at product `1863a7a` / harness `940722e`: the failed create stayed
   non-durable, the LV was compensated, and same-process plus post-restart GET
-  returned 404. The cleanup-failure, carve-out and indeterminate branches
-  were not fault-injected in that re-drill; they remain the four-outcome
-  procedure above and are covered by tests, not by an end-to-end drill.
+  returned 404. The cleanup-failure, carve-out, clear-save and indeterminate
+  branches were not fault-injected in that re-drill; they remain the
+  six-outcome procedure in section C below and are covered by tests, not
+  by an end-to-end drill.
 
 ## Preconditions
 
@@ -198,13 +204,24 @@ lvs --noheadings -o lv_name,vg_name,lv_size
 ## C. Provider-state filesystem ENOSPC
 
 The save is atomic up to the rename: a failure before it preserves the old
-`lvm-state.json` and removes the `.tmp`. `lvcreate` has already run. After the
-#58 fix, an uncommitted save is compensated with a checked `lvremove` and the
-in-memory entry is rolled back. Four outcomes are possible, so still inspect
-before assuming anything:
+`lvm-state.json` and removes the `.tmp`. Since #70 a create has **two** save
+boundaries — the durable create intent before `lvcreate`, then the volume
+record after it. After the #58 fix, an uncommitted final save is compensated
+with a checked `lvremove` and the in-memory entry is rolled back. Six
+outcomes are possible, so still inspect before assuming anything:
 
-- **Uncommitted save (normal):** 500, old state byte-identical, GET 404, no
-  LV for the failed volume id.
+- **Intent-save failure (before `lvcreate`):** 500, old state byte-identical,
+  GET 404, and **no LV was created**. If the intent save's rename did land,
+  the durable intent is left for startup, which observes no intent-owned LV
+  and drops it. Retry with a new `operation_id`; nothing ran.
+- **Uncommitted final save (normal):** 500, old state byte-identical, GET 404,
+  no LV for the failed volume id (the LV was compensated with `lvremove`).
+- **Clear-save failure (issue #70):** after a known command failure or a
+  compensated final save, the clear save that removes the durable create
+  intent also fails. The intent is kept in memory; startup classifies an
+  absent LV by dropping the intent and adopts a present LV only at or above
+  the requested size. See the create tail in
+  [lvm-state-divergence.md](lvm-state-divergence.md).
 - **Cleanup failure:** 500, GET 404, the LV remains, and the error detail
   names `manual lvremove <vg>/<lv>`. The in-memory entry is gone, so the LV
   is absent from provider state.
@@ -222,6 +239,12 @@ before assuming anything:
   runbook. Do not remove the LV until the state file is readable and proves
   the record absent.
 
+The two-save ordering postdates the D5 re-drill (`1863a7a`, PR #69), which
+exercised the single-save compensated path. On current code a fill-first
+ENOSPC surfaces at the **intent** save (no LV is ever created); the
+compensated final-save path above is covered by deterministic tests on
+current code, not by that drill.
+
 **Do not assume "HTTP 500" means "nothing happened."**
 
 1. Record what exists before touching anything:
@@ -238,12 +261,21 @@ cat /tmp/after-500.json
 
 Expected post-fix:
 
-- **normal:** the state hash and size are unchanged, `GET` returns 404, and
-  no LV named for `$VOLUME_ID` is present;
+- **intent-save failure:** the state hash and size are unchanged, `GET`
+  returns 404, and no LV named for `$VOLUME_ID` is present (`lvcreate` never
+  ran);
+- **normal (uncommitted final save):** the state hash and size are unchanged,
+  `GET` returns 404, and no LV named for `$VOLUME_ID` is present;
 - **carve-out:** `GET` returns 200, the LV is present, and the durable state
   contains the volume;
 - **cleanup failure:** `GET` returns 404 but the LV is present, and the 500
   detail names `manual lvremove <vg>/<lv>`;
+- **clear-save failure (issue #70):** a known command failure left a durable
+  intent that the clear save could not remove, or the compensating clear save
+  after a failed final save could not remove it. `GET` returns 404; the
+  intent is kept in memory. If the LV is absent, restart drops the intent; if
+  present, startup adopts it only at or above the requested size (see
+  [lvm-state-divergence.md](lvm-state-divergence.md));
 - **indeterminate:** `GET` returns 404 and the durable file could not be
   read; no LV exists, or the LV remains if the compensating `lvremove` also
   failed. Compare a backup before acting; a valid surviving record will load
@@ -266,14 +298,21 @@ systemctl start volvisord.service
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-3. Re-check the volume and LV against the four outcomes above:
+3. Re-check the volume and LV against the six outcomes above:
 
+   - **intent-save failure:** `GET` is still 404, no LV exists, and any
+     durable intent whose LV is absent is dropped at startup; nothing ran, so
+     a new `operation_id` retry is safe;
    - **normal:** `GET` is still 404 and no LV for the failed volume id exists;
    - **cleanup failure:** `GET` is 404 and the LV is still present — go to
      step 4;
    - **carve-out:** `GET` is 200, the LV is present, and the durable state
      contains the volume. Do not remove it; confirm it appears exactly once
      in `GET /v2/volumes`, then resume at step 5's carve-out bullet;
+   - **clear-save failure:** `GET` is 404. A retained create intent is
+     classified at startup: an absent LV drops it, a present LV is adopted
+     only at or above the requested size. Follow the create tail in
+     [lvm-state-divergence.md](lvm-state-divergence.md);
    - **indeterminate:** if the durable file still cannot be read, the daemon
      will not have started (the step-2 `healthz` check failed) — escalate
      with the state and LVM output. If it now reads: `GET` is 404 when no
@@ -303,8 +342,9 @@ record is missing from a stale backup is data loss.
 
 5. Retry only after space is restored:
 
-   - **normal or cleanup failure:** use a **new `operation_id`** with the
-     same payload. Reusing the failed `operation_id` does not re-execute:
+   - **intent-save failure, normal or cleanup failure:** use a **new
+     `operation_id`** with the same payload. Reusing the failed
+     `operation_id` does not re-execute:
      it replays the recorded failure when the journal had space to record
      the outcome (the separated layout), and fails closed as
      `OPERATION_IN_DOUBT` when the journal shares the full filesystem and
@@ -346,6 +386,9 @@ file, with or without the LV).
   200, the volume is verified rather than re-created and the same id does
   not re-execute (verbatim replay or `OPERATION_IN_DOUBT`); the operation is
   closed with a new `operation_id`.
+- State ENOSPC, intent-save failure: 500, old state file byte-identical,
+  GET 404, **no LV created**, and a retry with a new `operation_id` creates
+  exactly one volume.
 - State ENOSPC, normal: 500, old state file byte-identical, GET 404, no
   orphan LV, restart 404, and a retry with a new `operation_id` creates
   exactly one volume.

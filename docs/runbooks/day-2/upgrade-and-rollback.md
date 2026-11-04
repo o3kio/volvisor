@@ -131,10 +131,11 @@ curl -fsS --config ~/.volvisor-admin.curl \
 jq '.schema_version' /var/lib/volvisor/journal/lvm-state.json
 ```
 
-Expected at this schema: `1`. The first successful save is what rewrites the
-file; a mere restart may leave a pre-versioning file untouched.
+Expected at this schema: `2` (the pre-#70 v1 build wrote `1`). The first
+successful save is what rewrites the file; a mere restart may leave a
+pre-versioning file untouched.
 
-D2 observed exactly this after the first write:
+D2 observed exactly this after the first write on its v1 build:
 
 ```json
 {
@@ -152,10 +153,11 @@ D2 observed exactly this after the first write:
 }
 ```
 
-with `schema_version=1` and tombstones preserved as
-`["att-retired-oldest","att-retired-newer"]`. Those values came from the
-committed N-1 fixtures plus the tombstone fixture; they are the evidence that
-the upgrade did not drop attachment state or retired ids.
+with `schema_version=1` at that build (the current v2 build writes `2`) and
+tombstones preserved as `["att-retired-oldest","att-retired-newer"]`. Those
+values came from the committed N-1 fixtures plus the tombstone fixture; they
+are the evidence that the upgrade did not drop attachment state or retired
+ids.
 
 5. Exercise the real workload before considering the upgrade complete. Keep
    the pre-upgrade backup until then.
@@ -166,18 +168,19 @@ Never do this on a live directory. In a lab, a file declaring a newer version
 must be refused and left untouched:
 
 ```sh
-# lab only: copy, set schema_version 2, then start the old/supported binary
-jq '.schema_version = 2' lvm-state.json > lvm-state.v2.json
-mv lvm-state.v2.json lvm-state.json
+# lab only: copy, set schema_version 3 (one above the current v2), then start
+jq '.schema_version = 3' lvm-state.json > lvm-state.v3.json
+mv lvm-state.v3.json lvm-state.json
 /path/to/volvisord --config /path/to/volvisord.toml
 ```
 
-Expected (observed):
+Expected for the current v2 build (the D2 drill observed the same refusal on
+the then-current v1 build with `2` vs `1`):
 
 ```text
 Error: Config("lvm provider construction failed: INTERNAL: unsupported
 durable-state schema version: lvm state .../lvm-state.json declares
-schema_version 2, but this build supports at most 1; refusing to open it
+schema_version 3, but this build supports at most 2; refusing to open it
 partially (install a matching or newer build, or restore a pre-upgrade
 backup)")
 ```
@@ -224,7 +227,9 @@ from the N-1 and tombstone fixtures, created the matching LVs, started the
 daemon, performed one write, and observed `schema_version=1`,
 `state_revision=3`, and the two tombstones intact. It then set
 `schema_version=2`, saw exit 1 with the typed error and an unchanged hash,
-restored version 1, and started the same binary again.
+restored version 1, and started the same binary again. **This was the pre-#70
+v1 build; no v2 re-drill has been run.** The v2 compatibility tests and the
+`lvm-state-v2-n1.json` fixture cover the v1→v2 upgrade deterministically.
 
 **NOT RUN — REQUIRES a second Volvisor binary/tag.** The drill did not swap
 binaries, did not run an older build against a newer directory, and did not

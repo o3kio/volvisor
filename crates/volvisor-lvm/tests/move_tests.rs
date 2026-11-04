@@ -76,8 +76,11 @@ use volvisor_lvm::state::{LvmState, MoveRecord};
 use volvisor_provider::FakeRunner;
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{fixture_attach_request, fixture_create_request};
-use volvisor_types::request::MoveVolumeBackingRequest;
-use volvisor_types::{ApiErrorCode, MoveVolumeBackingState, OperationId, VolumeId};
+use volvisor_types::crash::{STORE_LVM_STATE, StoreSavePoint};
+use volvisor_types::request::{DeleteVolumeRequest, MoveVolumeBackingRequest};
+use volvisor_types::{
+    ApiErrorCode, ErasurePolicy, MoveVolumeBackingState, OperationId, VolumeId, VolumeLifecycle,
+};
 
 const MIB: u64 = 1 << 20;
 
@@ -106,6 +109,22 @@ fn move_request(
         target_pool_id: target.to_owned(),
         expected_generation,
         max_copy_bytes_per_sec: None,
+    }
+}
+
+/// A delete request with an explicit operation id and erasure policy
+/// (the move/delete interaction tests need Retain and distinct retry
+/// identities).
+fn delete_request_with(
+    operation_id: &str,
+    expected_generation: u64,
+    policy: ErasurePolicy,
+) -> DeleteVolumeRequest {
+    DeleteVolumeRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: OperationId::new(operation_id).expect("valid fixture operation id"),
+        expected_generation,
+        data_erasure_policy: policy,
     }
 }
 
@@ -140,6 +159,46 @@ fn placement_of(world: &std::sync::Mutex<common::FakeLvm>, volume: &str) -> Vec<
         .get(&lv_path(volume))
         .cloned()
         .unwrap_or_default()
+}
+
+/// Seed a `Copying` move and a held live mirror, then restart. The
+/// constructor's reconcile sees the move alive and leaves the durable
+/// record exactly as seeded.
+fn restart_holding_a_live_copying_move(fixture: &common::Fixture, volume: &str) -> common::Fixture {
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv_path(volume),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+    common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world))
+}
+
+/// The same restart, then remove the LV out-of-band so the world
+/// verifiably has no row for it.
+fn restart_with_a_live_copying_move(fixture: &common::Fixture, volume: &str) -> common::Fixture {
+    let lv = lv_path(volume);
+    let restarted = restart_holding_a_live_copying_move(fixture, volume);
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.lvs.remove(&lv);
+        world.lv_devices.remove(&lv);
+        world.moves.remove(&lv);
+    }
+    restarted
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +884,78 @@ async fn an_out_of_band_abort_mid_supervision_parks_in_doubt() {
 }
 
 #[tokio::test]
+async fn an_lv_removed_mid_supervision_resolves_the_move_failed() {
+    let fixture = long_window_move_fixture();
+    let volume = "vol-move-absent-mid-supervision";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    fixture.world.lock().expect("world").hold_moves = true;
+    let drive = tokio::spawn({
+        let provider = Arc::clone(&fixture.provider);
+        let id = id.clone();
+        async move {
+            provider
+                .move_volume_backing(&id, &move_request("op-move-absent-mid", MOVE_TARGET_PV, 1))
+                .await
+        }
+    });
+    for _ in 0..500 {
+        if fixture.world.lock().expect("world").moves.contains_key(&lv) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        fixture.world.lock().expect("world").moves.contains_key(&lv),
+        "the move must start before the LV is removed out-of-band"
+    );
+    // The LV is removed out-of-band while the drive supervises: the
+    // next successful `lvs` has no row, which is a proven absence, not
+    // an unobservable world. The drive must answer terminally instead
+    // of parking at the observation bound.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.lvs.remove(&lv);
+        world.lv_devices.remove(&lv);
+        world.moves.remove(&lv);
+    }
+
+    let response = drive
+        .await
+        .expect("join")
+        .expect("a terminal FAILED answer, never a park");
+    assert_eq!(response.state, MoveVolumeBackingState::Failed);
+    assert_eq!(response.generation, 1, "the generation never bumped");
+    assert!(
+        response
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("verifiably absent"),
+        "the answer states exactly what was proven: {:?}",
+        response.detail
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Failed
+    );
+    assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Failed,
+        "the proven absence marks the volume Failed in the same save"
+    );
+}
+
+#[tokio::test]
 async fn a_deceptive_completion_never_frees_the_source() {
     let fixture = move_fixture();
     let volume = "vol-move-deceptive";
@@ -997,6 +1128,420 @@ async fn a_crash_after_the_preparing_save_re_drives_on_the_retry_pass() {
         placement_of(&fixture.world, volume),
         vec![MOVE_TARGET_PV.to_owned()]
     );
+}
+
+#[tokio::test]
+async fn a_foreign_pvmove_on_the_source_skips_the_redrive_and_reports_it() {
+    let fixture = move_fixture();
+    let volume = "vol-move-redrive-foreign";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    // An out-of-band pvmove evacuates another LV of the VG off the same
+    // source PV. A scoped pvmove would attach to it and ignore its
+    // arguments, so the retry pass must not re-drive blindly.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let other = format!("{CLAIMED_VG}/vol-move-redrive-other-lv");
+        world.lvs.insert(other.clone(), 64 * MIB);
+        world
+            .lv_devices
+            .insert(other.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+        world.moves.insert(
+            other,
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: "/dev/pv-c".to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+    let report = restarted.provider.move_reconcile_pass().expect("pass");
+    assert_eq!(report.redriven, Vec::new());
+    assert_eq!(report.redrive_failed, vec![volume_id(volume)]);
+    assert_eq!(
+        pvmove_count(&restarted.runner),
+        0,
+        "no blind second pvmove started over the foreign move"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Preparing,
+        "the record stays PREPARING for the next tick"
+    );
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn a_verifiably_absent_lv_resolves_the_move_and_unblocks_delete() {
+    let fixture = move_fixture();
+    let volume = "vol-move-absent-lv";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+    let restarted = restart_holding_a_live_copying_move(&fixture, volume);
+    let (record, _) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Copying,
+        "the constructor classifies the live mirror"
+    );
+
+    // The LV is removed out-of-band: a successful `lvs` query simply
+    // has no row. That is a proven absence, not an unobservable world.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.lvs.remove(&lv);
+        world.lv_devices.remove(&lv);
+        world.moves.remove(&lv);
+    }
+    let report = restarted.provider.move_reconcile_pass().expect("pass");
+    assert_eq!(report.resolved_absent, vec![id.clone()]);
+    assert_eq!(
+        report.unobservable,
+        Vec::new(),
+        "a successful query with no row is not an unobservable world"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("record");
+    assert_eq!(record.state, MoveVolumeBackingState::Failed);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("verifiably absent"),
+        "the resolution states exactly what was proven: {:?}",
+        record.detail
+    );
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no LV was removed"),
+        "the resolution never claims it removed or freed anything: {:?}",
+        record.detail
+    );
+    assert_eq!(generation, 1, "a terminal resolution bumps nothing");
+
+    // The same durable save marks the volume Failed (mirroring the
+    // startup volume pass), so the sanctioned delete works without a
+    // restart and does not depend on a later process.
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Failed,
+        "the proven absence marks the volume Failed in the same save"
+    );
+
+    // The settled FAILED record no longer fences delete, and the LV is
+    // verifiably absent: delete completes with nothing to remove and
+    // clears the move record atomically. Make any stray `blkdiscard`
+    // fail loudly so the ZeroDiscard policy cannot pass vacuously.
+    restarted.world.lock().expect("world").fail_blkdiscard = true;
+    let before = restarted.runner.invocations().len();
+    restarted
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-absent-lv", 1, ErasurePolicy::ZeroDiscard),
+        )
+        .await
+        .expect("the absent-LV delete is the sanctioned exit");
+    assert!(
+        !restarted.runner.invocations()[before..]
+            .iter()
+            .any(|invocation| matches!(invocation.program.as_str(), "blkdiscard" | "lvremove")),
+        "an already-absent LV needs no destructive command"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none(), "the record is gone");
+    assert!(
+        durable.move_record(&id).is_none(),
+        "the move record is gone"
+    );
+
+    // A fresh start over the cleared durable state is clean.
+    let clean = common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+    assert_eq!(clean.provider.list_volumes(None).await.expect("list"), []);
+}
+
+#[tokio::test]
+async fn an_absent_resolution_save_failure_before_rename_keeps_the_anchor() {
+    let fixture = move_fixture();
+    let volume = "vol-move-absent-save-before";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let restarted = restart_with_a_live_copying_move(&fixture, volume);
+
+    // The resolution's save fails before its rename: the durable
+    // `Copying` record remains the anchor and the in-memory move record
+    // is restored to it. The volume stays `Failed` in memory because the
+    // absence was verified, while the durable volume is untouched.
+    restarted.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let error = restarted
+        .provider
+        .move_reconcile_pass()
+        .expect_err("the absent resolution's save failure surfaces");
+    assert!(
+        error.detail.contains("could not be recorded durably"),
+        "the error names the surviving durable anchor: {error}"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Copying,
+        "the durable anchor is not overwritten by a failed save"
+    );
+    assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Ready,
+        "the pre-rename failure leaves the durable volume state unchanged"
+    );
+
+    // A later pass (no injected failure) resolves it terminally.
+    let report = restarted.provider.move_reconcile_pass().expect("retry");
+    assert_eq!(report.resolved_absent, vec![id.clone()]);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Failed
+    );
+    assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Failed,
+        "the retry records the resolution and the volume Failed mark together"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_resolution_save_failure_after_rename_is_durable() {
+    let fixture = move_fixture();
+    let volume = "vol-move-absent-save-after";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let restarted = restart_with_a_live_copying_move(&fixture, volume);
+
+    // The rename landed before the directory-fsync failure: the
+    // resolution is durable even though the call reports an error, and
+    // the in-memory resolution is kept.
+    restarted.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let error = restarted
+        .provider
+        .move_reconcile_pass()
+        .expect_err("the post-rename save failure surfaces");
+    assert!(
+        error
+            .detail
+            .contains("already records the absent-LV resolution"),
+        "the error reports the landed resolution: {error}"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Failed
+    );
+    assert_eq!(generation, 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert_eq!(
+        durable.volume(&id).expect("volume").runtime.state,
+        VolumeLifecycle::Failed
+    );
+
+    // The resolution is idempotent: no second terminal report.
+    let report = restarted
+        .provider
+        .move_reconcile_pass()
+        .expect("idempotent");
+    assert_eq!(report.resolved_absent, Vec::new());
+}
+
+#[tokio::test]
+async fn a_re_attach_to_a_preparing_record_scans_for_a_foreign_pvmove_on_the_source() {
+    let fixture = move_fixture();
+    let volume = "vol-move-reattach-foreign";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    // An out-of-band pvmove evacuates another LV of the VG off the same
+    // source PV (held, so it stays observable). The journaled
+    // PREPARING move never started, so the re-attach must run the world
+    // scan a fresh start does — otherwise LVM would attach the scoped
+    // pvmove to the foreign move and ignore its arguments.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let other = format!("{CLAIMED_VG}/vol-move-reattach-other-lv");
+        world.lvs.insert(other.clone(), 64 * MIB);
+        world
+            .lv_devices
+            .insert(other.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+        world.moves.insert(
+            other,
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: "/dev/pv-c".to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+
+    let error = restarted
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-reattach-foreign", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the re-attach refuses to attach to a foreign move");
+    assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+    assert!(
+        error.detail.contains("foreign pvmove"),
+        "the refusal names the foreign move: {error}"
+    );
+    assert_eq!(
+        pvmove_count(&restarted.runner),
+        0,
+        "no pvmove ran against the foreign move"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Preparing,
+        "the refusal leaves the journaled anchor alone"
+    );
+    assert_eq!(generation, 1);
+}
+
+#[tokio::test]
+async fn a_re_attach_to_a_preparing_record_without_a_source_refuses_and_starts_nothing() {
+    let fixture = move_fixture();
+    let volume = "vol-move-reattach-no-source";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        "",
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+
+    let error = restarted
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-reattach-no-source", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("a source-less anchor can never drive a pvmove");
+    assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+    assert!(
+        error.detail.contains("no recorded source PV"),
+        "the refusal names the missing source: {error}"
+    );
+    assert_eq!(pvmove_count(&restarted.runner), 0);
+}
+
+#[tokio::test]
+async fn a_preparing_re_drive_with_an_unusable_record_reports_it_without_a_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-redrive-unusable";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    for (source, target) in [("", MOVE_TARGET_PV), (MOVE_SOURCE_PV, "")] {
+        seed_move(
+            &fixture.state_path,
+            volume,
+            source,
+            target,
+            MoveVolumeBackingState::Preparing,
+        );
+        let restarted =
+            common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+        let report = restarted.provider.move_reconcile_pass().expect("pass");
+        assert_eq!(report.redriven, Vec::new(), "source={source:?}");
+        assert_eq!(
+            report.redrive_failed,
+            vec![volume_id(volume)],
+            "source={source:?} target={target:?}"
+        );
+        assert_eq!(
+            pvmove_count(&restarted.runner),
+            0,
+            "source={source:?} target={target:?}: no pvmove may run"
+        );
+        let (record, generation) = recorded_move(&fixture.state_path, volume);
+        assert_eq!(
+            record.expect("record").state,
+            MoveVolumeBackingState::Preparing,
+            "source={source:?} target={target:?}: the malformed record is left for a human"
+        );
+        assert_eq!(generation, 1);
+    }
 }
 
 #[tokio::test]
@@ -1230,6 +1775,976 @@ async fn a_dropped_volume_loses_its_move_record() {
     let restarted = provider_from_with_timing(&state_path, &fixture.world, default_move_timing());
     let report = restarted.move_reconcile_pass().expect("pass");
     assert_eq!(report.dropped, Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// The persist points: injected store-save failures at the move's
+// commit boundaries. A fresh drive performs exactly three LVM-state
+// saves — PREPARING, COPYING, COMPLETE — so `skip` 0/1/2 targets save
+// 1/2/3 (different points neither consume nor decrement the arm).
+// ---------------------------------------------------------------------------
+
+/// The `PREPARING` save is the move's sole reconciliation anchor: if it
+/// cannot land, nothing durable exists to classify against, so the drive
+/// starts no `pvmove` at all. The failure is fail-closed and does not
+/// wedge the volume — a later normal move runs the whole sequence.
+#[tokio::test]
+async fn a_preparing_save_failure_starts_no_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-preparing";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The drive's first state save is the PREPARING anchor: skip = 0
+    // fails exactly there, before `pvmove` can start.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the PREPARING save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("PREPARING record could not be saved"),
+        "the error names the unsaved anchor: {error}"
+    );
+    assert!(
+        error.detail.contains("no pvmove was started"),
+        "the error states the fail-closed outcome: {error}"
+    );
+
+    // No durable anchor means no world mutation: no pvmove ran, no
+    // mirror is live, and the state file is exactly the pre-move shape.
+    assert!(
+        fixture.world.lock().expect("world").moves.is_empty(),
+        "the failed anchor must start no move"
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 0, "no pvmove invocation");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert!(record.is_none(), "the failed anchor left no record");
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+
+    // The failed save did not wedge the volume: the one-shot arm is
+    // consumed, and a fresh operation drives the whole move.
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the retry move completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the retry's record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The `PREPARING` save's rename can land even though the save reported an
+/// error at the directory-fsync boundary. The durable anchor then exists,
+/// so the in-memory record is kept and the error says so — but the call
+/// still starts no `pvmove`. A retry re-attaches to the durable anchor and
+/// drives the move to completion.
+#[tokio::test]
+async fn a_preparing_save_failure_after_rename_keeps_the_anchor_and_starts_no_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-preparing-rename";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // Fail the anchor save after its rename: the durable record exists
+    // even though the save returned an error.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the PREPARING save fails after its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("reached the durable state"),
+        "the error says the anchor landed: {error}"
+    );
+    assert!(
+        error.detail.contains("no pvmove was started"),
+        "the error states the fail-closed outcome: {error}"
+    );
+
+    // The anchor is durable and the in-memory record was kept, but no
+    // world mutation happened.
+    assert!(
+        fixture.world.lock().expect("world").moves.is_empty(),
+        "the failed anchor must start no move"
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 0, "no pvmove invocation");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the anchor's rename landed");
+    assert_eq!(record.state, MoveVolumeBackingState::Preparing);
+    assert_eq!(record.target_pv, MOVE_TARGET_PV);
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+
+    // The kept in-memory anchor lets the retry re-attach without a
+    // second PREPARING save, and the move completes with one bump.
+    let response = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-2", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect("the retry move completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the retry's record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The `COPYING` save follows the already-started `pvmove`: its failure
+/// cannot un-start the kernel-side move. The prior durable record
+/// (`PREPARING`) remains the anchor, and the next incarnation's startup
+/// reconcile observes the live mirror, lets it land, and verifies the
+/// completion with exactly one generation bump.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart narrative
+async fn a_copying_save_failure_keeps_the_anchor_and_startup_completes() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-copying";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 1 passes the PREPARING save and fails the COPYING save:
+    // the pvmove is already running, so the anchor stays PREPARING.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COPYING save fails");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the pvmove was started but its COPYING record could not be saved"),
+        "the error names the started-but-unrecorded move: {error}"
+    );
+    assert!(
+        error
+            .detail
+            .contains("the durable prior record is the anchor"),
+        "the error names the surviving anchor: {error}"
+    );
+
+    // The world started the move; the durable anchor still says
+    // PREPARING and the generation was never bumped. The fake world
+    // keeps the source placement until the move lands.
+    assert_eq!(
+        fixture.world.lock().expect("world").moves.len(),
+        1,
+        "the pvmove is live despite the failed COPYING save"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the durable anchor").state,
+        MoveVolumeBackingState::Preparing
+    );
+    assert_eq!(generation, 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    // The restart's constructor reconcile observes the world (the move
+    // lands across its two lvs queries) and completes the verified
+    // relocation: one bump, target placement, no live move.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "exactly one bump across the restart");
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert!(fixture.world.lock().expect("world").moves.is_empty());
+    // The constructor's reconcile runs with `redrive = false`, so it
+    // starts no pvmove; the re-issue answers the durable record. The
+    // single invocation under test is the first incarnation's.
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    // A same-target re-issue answers the completed record without
+    // another pvmove and without a second bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-after", MOVE_TARGET_PV, 2),
+        )
+        .await
+        .expect("the completed record answers");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (_, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1, "no new pvmove");
+}
+
+/// The `COMPLETE` save failing **before** its rename: the world already
+/// relocated, but the durable file still holds the prior `COPYING`
+/// record and generation. The in-memory provider restores that prior
+/// durable shape (never a completion against a prior record), and the
+/// restart's verified relocation completes it with one bump.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart narrative
+async fn a_complete_save_failure_recovers_with_one_bump() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-complete";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 2 passes the PREPARING and COPYING saves; the COMPLETE
+    // save fails after its tmp write, before the rename — the durable
+    // file still holds COPYING and generation 1.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        2,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COMPLETE save fails before its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the durable move record still says the prior state"),
+        "the error names the surviving prior record: {error}"
+    );
+    assert!(
+        error
+            .detail
+            .contains("reconciliation will complete the move"),
+        "the error names the recovery path: {error}"
+    );
+
+    // The world already relocated; the durable anchor has not.
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the prior record").state,
+        MoveVolumeBackingState::Copying
+    );
+    assert_eq!(generation, 1);
+
+    // The contract restores the prior durable shape in memory too: the
+    // provider never reports a completion against a prior durable
+    // record (no 200-until-restart).
+    let inspected = fixture
+        .provider
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the restored in-memory state");
+    assert_eq!(inspected.generation, 1);
+
+    // The restart proves the relocation and completes the record
+    // exactly once.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "exactly one bump");
+    let inspected = restarted
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the completed volume");
+    assert_eq!(inspected.generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+
+    // A same-target re-issue answers the completed record without
+    // another pvmove and without a second bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-after", MOVE_TARGET_PV, 2),
+        )
+        .await
+        .expect("the completed record answers");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    let (_, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+}
+
+/// The post-rename carve-out: the `COMPLETE` save's rename landed before
+/// the injected directory-fsync failure, so the **new** state is the
+/// durable truth. The in-memory completion is kept (never rolled back
+/// against a durable file that already has it), and a restart must not
+/// bump the generation again.
+#[tokio::test]
+async fn a_complete_save_failure_after_rename_is_the_carve_out() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-rename";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 2 passes the PREPARING and COPYING saves; the COMPLETE
+    // save fails at the directory-fsync boundary, after its rename.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        2,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COMPLETE save fails after its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("the durable state already records the completed move"),
+        "the error names the landed completion: {error}"
+    );
+    assert!(
+        error.detail.contains("volume generation 2"),
+        "the error names the landed generation: {error}"
+    );
+
+    // The rename is the commit: both the durable file and the
+    // in-memory view record the completion and generation 2.
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    let inspected = fixture
+        .provider
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect the kept in-memory completion");
+    assert_eq!(
+        inspected.generation, 2,
+        "the in-memory completion is kept, never rolled back"
+    );
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+
+    // A restart must not bump again: the completed record is a
+    // historical fact and the durable generation is already 2.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let inspected = restarted
+        .inspect_volume(&volume_id(volume))
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.generation, 2, "no second bump across the restart");
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the settled record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Delete and the move journal: an unsettled placement is never discarded,
+// and a settled record is cleared atomically with its volume
+// ---------------------------------------------------------------------------
+
+/// A delete must not touch an LV whose online move is still unsettled:
+/// `ZeroDiscard` would discard through both legs of a live pvmove
+/// mirror, and `lvremove` would refuse the moving LV after the discard
+/// had already run. The refusal is typed, runs no destructive command,
+/// and leaves both the LV and the durable record exactly as they were.
+///
+/// The `PREPARING` shape is the primary pin (a crash between the
+/// journal write and the pvmove start). The remaining unsettled states
+/// are driven through the same refusal: `COPYING` and `IN_DOUBT` are
+/// the states this provider actually writes, while `MIRROR_READY` and
+/// `PIVOTED` are mirrored here because the contract refuses every
+/// unsettled placement even though the same-VG path never writes them.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // the unsettled-state matrix
+async fn delete_refuses_an_unsettled_move_before_any_destructive_command() {
+    let fixture = move_fixture();
+    let volume = "vol-delete-unsettled";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    // PREPARING survives the startup classification: no pvmove is
+    // active and the extents sit on the source, so the constructor
+    // (redrive = false) leaves the journaled intent alone.
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+    let before = restarted.runner.invocations().len();
+    let error = restarted
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-preparing", 1, ErasurePolicy::Retain),
+        )
+        .await
+        .expect_err("an unsettled move refuses the delete");
+    assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+    assert!(
+        error.detail.contains("unsettled online move"),
+        "the refusal names the unsettled placement: {error}"
+    );
+    assert!(
+        !restarted.runner.invocations()[before..]
+            .iter()
+            .any(|invocation| matches!(invocation.program.as_str(), "blkdiscard" | "lvremove")),
+        "the refusal must run no destructive command"
+    );
+    assert!(
+        fixture.world.lock().expect("world").lvs.contains_key(&lv),
+        "the LV is untouched"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("the durable record survives the refusal");
+    assert_eq!(record.state, MoveVolumeBackingState::Preparing);
+    assert_eq!(generation, 1, "a refused delete bumps nothing");
+
+    // Every other unsettled state takes the same refusal. The world is
+    // arranged per state so the startup reconcile preserves the seeded
+    // record (a live held mirror for COPYING, a mixed placement for
+    // IN_DOUBT; MIRROR_READY/PIVOTED are left as-seeded).
+    for state in [
+        MoveVolumeBackingState::Copying,
+        MoveVolumeBackingState::MirrorReady,
+        MoveVolumeBackingState::Pivoted,
+        MoveVolumeBackingState::InDoubt,
+    ] {
+        {
+            let mut world = fixture.world.lock().expect("world");
+            world.moves.clear();
+            world.hold_moves = false;
+            world
+                .lv_devices
+                .insert(lv.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+            match state {
+                MoveVolumeBackingState::Copying => {
+                    world.moves.insert(
+                        lv.clone(),
+                        common::FakeMove {
+                            source: MOVE_SOURCE_PV.to_owned(),
+                            target: MOVE_TARGET_PV.to_owned(),
+                            percent: 0,
+                        },
+                    );
+                    world.hold_moves = true;
+                }
+                MoveVolumeBackingState::InDoubt => {
+                    world.lv_devices.insert(
+                        lv.clone(),
+                        vec![MOVE_SOURCE_PV.to_owned(), MOVE_TARGET_PV.to_owned()],
+                    );
+                }
+                _ => {}
+            }
+        }
+        seed_move(
+            &fixture.state_path,
+            volume,
+            MOVE_SOURCE_PV,
+            MOVE_TARGET_PV,
+            state,
+        );
+        let restarted =
+            common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+        let before = restarted.runner.invocations().len();
+        let error = restarted
+            .provider
+            .delete_volume(
+                &id,
+                &delete_request_with(&format!("op-delete-{state:?}"), 1, ErasurePolicy::Retain),
+            )
+            .await
+            .expect_err("an unsettled move refuses the delete");
+        assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+        assert!(
+            error.detail.contains("unsettled online move"),
+            "the {state:?} refusal names the unsettled placement: {error}"
+        );
+        assert!(
+            !restarted.runner.invocations()[before..]
+                .iter()
+                .any(|invocation| matches!(invocation.program.as_str(), "blkdiscard" | "lvremove")),
+            "the {state:?} refusal must run no destructive command"
+        );
+        assert!(
+            fixture.world.lock().expect("world").lvs.contains_key(&lv),
+            "the {state:?} refusal leaves the LV untouched"
+        );
+        let (record, generation) = recorded_move(&fixture.state_path, volume);
+        assert_eq!(
+            record
+                .expect("the durable record survives the refusal")
+                .state,
+            state,
+            "the refusal must not rewrite the {state:?} record"
+        );
+        assert_eq!(generation, 1, "a refused {state:?} delete bumps nothing");
+    }
+}
+
+/// Deleting a volume with a settled (`COMPLETE`) move removes the move
+/// record in the same atomic save. A same-id recreate then starts at
+/// generation 1 with a clean journal: the fresh move to the same target
+/// must actually run a pvmove. A stale `COMPLETE` record answering the
+/// request without a pvmove is exactly the bug this pins.
+#[tokio::test]
+async fn delete_with_a_settled_move_clears_the_move_record_and_prevents_a_false_complete() {
+    let fixture = move_fixture();
+    let volume = "vol-delete-settled-move";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    let completed = fixture
+        .provider
+        .move_volume_backing(&id, &move_request("op-move-1", MOVE_TARGET_PV, 1))
+        .await
+        .expect("the first move completes");
+    assert_eq!(completed.state, MoveVolumeBackingState::Complete);
+    assert_eq!(completed.generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-settled", 2, ErasurePolicy::Retain),
+        )
+        .await
+        .expect("a settled move does not block the delete");
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none(), "the volume record is gone");
+    assert!(
+        durable.delete_intent(&id).is_none(),
+        "the completed delete intent is gone"
+    );
+    assert!(
+        durable.move_record(&id).is_none(),
+        "the settled COMPLETE record must be removed with the volume, never inherited"
+    );
+    assert!(
+        !fixture.world.lock().expect("world").lvs.contains_key(&lv),
+        "the LV is removed"
+    );
+
+    // The same id and payload is a fresh volume: generation 1, and
+    // lvcreate places it back on the VG's first PV (the move source).
+    let recreated = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("recreate the same volume id");
+    assert_eq!(
+        recreated.generation, 1,
+        "a recreated volume starts a fresh generation history"
+    );
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()],
+        "lvcreate places the recreated LV on the VG's first PV"
+    );
+
+    // The same target is a real move for the recreated volume. A stale
+    // COMPLETE record answered without a pvmove would be the bug.
+    let before = pvmove_count(&fixture.runner);
+    let response = fixture
+        .provider
+        .move_volume_backing(&id, &move_request("op-move-2", MOVE_TARGET_PV, 1))
+        .await
+        .expect("the recreated volume moves");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    assert_eq!(
+        pvmove_count(&fixture.runner),
+        before + 1,
+        "a stale COMPLETE record would answer without running a pvmove"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the fresh record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()],
+        "the fresh move really relocated the recreated volume"
+    );
+}
+
+/// The final delete save fails before its rename: the durable file still
+/// holds the volume, the delete intent and the `COMPLETE` move record.
+/// The in-memory state is restored to that durable shape (the volume is
+/// still inspectable, and the same provider can complete the retry), and
+/// the error says the durable intent remains.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one failure/restore/retry narrative
+async fn a_delete_completion_save_failure_restores_the_move_record() {
+    let fixture = move_fixture();
+    let volume = "vol-delete-final-fail-move";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    let completed = fixture
+        .provider
+        .move_volume_backing(&id, &move_request("op-move-1", MOVE_TARGET_PV, 1))
+        .await
+        .expect("the move completes");
+    assert_eq!(completed.state, MoveVolumeBackingState::Complete);
+    assert_eq!(completed.generation, 2);
+
+    // Delete saves: (1) the durable delete intent, (2) the final
+    // volume/intent/move removal. Skip the first; fail the second
+    // after its tmp write but before its rename, so the durable file
+    // keeps the pre-delete shape.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    let error = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-final-fail", 2, ErasurePolicy::Retain),
+        )
+        .await
+        .expect_err("the final delete save fails before its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("durable delete intent"),
+        "the error names the surviving authorization: {error}"
+    );
+    assert!(
+        error.detail.contains("remains"),
+        "the error says the durable intent remains: {error}"
+    );
+
+    // The LV was already removed before the failed save; the durable
+    // state still authorizes completing the delete.
+    assert!(
+        !fixture.world.lock().expect("world").lvs.contains_key(&lv),
+        "the LV was removed before the completion save failed"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some(), "the volume is restored");
+    let intent = durable
+        .delete_intent(&id)
+        .expect("the durable delete intent remains");
+    assert_eq!(intent.expected_generation, 2);
+    assert_eq!(intent.erasure_policy, ErasurePolicy::Retain);
+    let record = durable
+        .move_record(&id)
+        .expect("the COMPLETE move record is restored");
+    assert_eq!(record.state, MoveVolumeBackingState::Complete);
+    assert_eq!(record.source_pv, MOVE_SOURCE_PV);
+    assert_eq!(record.target_pv, MOVE_TARGET_PV);
+
+    // The in-memory restore matches the durable file: inspect still
+    // answers, so the same provider can run the authorized retry.
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the restored volume is served");
+    assert_eq!(inspected.generation, 2);
+
+    // A retry with a new operation id (same generation/policy) is the
+    // authorized completion: volume, intent and move record all go.
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-final-fail-retry", 2, ErasurePolicy::Retain),
+        )
+        .await
+        .expect("the retry completes the delete");
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none(), "the volume record is gone");
+    assert!(
+        durable.delete_intent(&id).is_none(),
+        "the delete intent is gone"
+    );
+    assert!(
+        durable.move_record(&id).is_none(),
+        "the move record is gone"
+    );
+}
+
+/// Startup never completes a pending delete while the volume's move
+/// record is unsettled: the LV may be the source (or one leg) of an
+/// active pvmove, so discarding/removing it would operate on an
+/// unknown placement. Startup fails typed before any destructive
+/// command and before rewriting the durable file.
+#[tokio::test]
+async fn startup_refuses_to_complete_a_delete_with_an_unsettled_move() {
+    let fixture = move_fixture();
+    let volume = "vol-startup-delete-unsettled";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    common::seed_delete_intent(
+        &fixture.state_path,
+        volume,
+        "op-seeded-delete",
+        1,
+        ErasurePolicy::Retain,
+    );
+    let bytes_before = std::fs::read(&fixture.state_path).expect("read the seeded state");
+
+    let Err(error) = common::try_provider_from(&fixture.state_path, &fixture.world) else {
+        panic!("startup unexpectedly completed a delete over an unsettled move");
+    };
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error.detail.contains("cannot complete"),
+        "the refusal names the blocked delete: {error}"
+    );
+    assert!(
+        error.detail.contains("placement is unsettled"),
+        "the refusal names the unsettled placement: {error}"
+    );
+
+    // No destructive command ran and the durable file was not rewritten.
+    assert!(
+        fixture.world.lock().expect("world").lvs.contains_key(&lv),
+        "startup must not remove an LV during an unsettled move"
+    );
+    let bytes_after = std::fs::read(&fixture.state_path).expect("read the state after refusal");
+    assert_eq!(
+        bytes_before, bytes_after,
+        "startup fails before rewriting the durable state"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some(), "the volume survives");
+    let intent = durable
+        .delete_intent(&id)
+        .expect("the delete intent survives");
+    assert_eq!(intent.erasure_policy, ErasurePolicy::Retain);
+    let record = durable.move_record(&id).expect("the move record survives");
+    assert_eq!(record.state, MoveVolumeBackingState::Copying);
+}
+
+/// The `COPYING` save failing **after** its rename means the new
+/// `COPYING` record is the durable anchor, even though the call returns
+/// an error. The restart classifies from the world, lets the live move
+/// land, and verifies the completion with exactly one generation bump.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart narrative
+async fn a_copying_save_failure_after_rename_keeps_the_anchor_and_startup_completes() {
+    let fixture = move_fixture();
+    let volume = "vol-move-save-copying-rename";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // skip = 1 passes the PREPARING save and fails the COPYING save at
+    // the directory-fsync boundary, after its rename: the durable file
+    // already holds COPYING even though the call reports an error.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        1,
+    );
+    let error = fixture
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-1", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the COPYING save fails after its rename");
+    assert_eq!(error.code, ApiErrorCode::Internal, "{error}");
+    assert!(
+        error
+            .detail
+            .contains("its COPYING record reported a save error but reached the durable state"),
+        "the error names the landed COPYING record: {error}"
+    );
+    assert!(
+        error.detail.contains("durable COPYING anchor remains"),
+        "the error names the durable anchor: {error}"
+    );
+    assert!(
+        error.detail.contains("AfterRenameBeforeDirFsync"),
+        "the error identifies the post-rename failure boundary: {error}"
+    );
+
+    // The COPYING save's rename landed: the durable record is COPYING
+    // while the world still shows the live move at its source.
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the durable COPYING anchor").state,
+        MoveVolumeBackingState::Copying
+    );
+    assert_eq!(generation, 1);
+    assert_eq!(fixture.world.lock().expect("world").moves.len(), 1);
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_SOURCE_PV.to_owned()]
+    );
+    assert_eq!(pvmove_count(&fixture.runner), 1);
+
+    // The restart observes the live move, lets it land, and completes
+    // the verified relocation with exactly one bump and no new pvmove.
+    let restarted =
+        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the completed record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(
+        generation, 2,
+        "exactly one generation bump across the restart"
+    );
+    assert_eq!(
+        placement_of(&fixture.world, volume),
+        vec![MOVE_TARGET_PV.to_owned()]
+    );
+    assert!(fixture.world.lock().expect("world").moves.is_empty());
+    assert_eq!(pvmove_count(&fixture.runner), 1, "no re-drive pvmove");
+
+    // The completed record answers a same-target re-issue without a
+    // second move or bump.
+    let response = restarted
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-after", MOVE_TARGET_PV, 2),
+        )
+        .await
+        .expect("the completed record answers");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+    assert_eq!(pvmove_count(&fixture.runner), 1);
 }
 
 // ---------------------------------------------------------------------------

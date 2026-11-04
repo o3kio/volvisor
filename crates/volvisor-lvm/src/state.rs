@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
+use volvisor_types::request::ErasurePolicy;
 use volvisor_types::schema::{SchemaVersionProbe, ensure_supported_schema_version};
 use volvisor_types::{
     AccessMode, ApiError, ApiErrorCode, AttachmentEvidence, AttachmentId, AttachmentState,
@@ -27,10 +28,18 @@ use volvisor_types::{
 
 /// Current durable LVM-state schema version.
 ///
-/// The baseline is the pre-versioning format; adding the `schema_version`
-/// field itself does not bump it because historical files decode unchanged
-/// (missing version means [`volvisor_types::BASELINE_SCHEMA_VERSION`]).
-pub const LVM_STATE_SCHEMA_VERSION: u32 = 1;
+/// Version 1 is the baseline (including the pre-versioning format; a
+/// missing `schema_version` decodes as
+/// [`volvisor_types::BASELINE_SCHEMA_VERSION`]). Version 2 adds the
+/// durable `pending_creates`/`pending_grows`/`pending_deletes` intent
+/// maps introduced for issue #70. Because that is an additive
+/// serialized-shape change, the version is bumped per the
+/// [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
+/// v1 files still load (the maps default empty) and are upgraded on
+/// the first successful save, while an older binary refuses a v2 file
+/// with the typed unsupported-version error instead of failing on an
+/// unknown field.
+pub const LVM_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
@@ -234,6 +243,78 @@ pub struct MoveRecord {
     pub detail: Option<String>,
 }
 
+/// A durable intent for a create whose `lvcreate` may already have
+/// run (the kill-9 window between the CLI success and the volume
+/// record's commit).
+///
+/// Written and fsynced **before** `lvcreate`. If the daemon dies after
+/// the CLI created the LV but before the volume record is durable,
+/// startup recovery adopts the LV only when it is present and at
+/// least the recorded requested size; a missing LV drops the intent,
+/// and a smaller LV fails startup rather than adopting a wrong
+/// geometry. The payload and requested size are the idempotent-replay
+/// comparison for a retried create.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIntent {
+    /// Volume group the LV was created in.
+    pub vg_name: String,
+    /// Logical volume name (must equal the id-derived name).
+    pub lv_name: String,
+    /// The size the caller requested, in bytes (pre-extent-rounding).
+    pub requested_size_bytes: u64,
+    /// Owning tenant project.
+    pub project_id: ProjectId,
+    /// Logical block size in bytes.
+    pub block_size: u32,
+    /// Canonical creation payload with `operation_id` normalized out;
+    /// a retried create must match this and the requested size.
+    pub creation_payload: String,
+}
+
+/// A durable intent for an online grow between the capacity check and
+/// the final volume-record commit.
+///
+/// Written and fsynced **before** `lvextend`. Recovery rolls the grow
+/// forward: an LV at or above the requested size completes the record
+/// (generation bump) and an LV still at the from-size drops the
+/// intent (the grow never landed). An LV in between fails startup
+/// rather than guessing. The provider never shrinks an LV as
+/// compensation — data may already have been written into the new
+/// extents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrowIntent {
+    /// The operation that authorized the grow.
+    pub operation_id: OperationId,
+    /// The volume size before the grow, in bytes.
+    pub from_size_bytes: u64,
+    /// The size the grow requested, in bytes.
+    pub requested_size_bytes: u64,
+    /// The volume generation the grow was authorized against.
+    pub expected_generation: u64,
+}
+
+/// A durable intent for a delete between the non-destructive
+/// validation and the volume record's removal.
+///
+/// Written and fsynced **before** `blkdiscard`/`lvremove`. Recovery
+/// completes the delete when the stored generation still matches the
+/// authorization; a stale-generation intent is dropped without any
+/// deletion (never delete on a stale authorization). Foreign LVs are
+/// never touched — recovery only acts on the intent's own recorded
+/// volume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteIntent {
+    /// The operation that authorized the delete.
+    pub operation_id: OperationId,
+    /// The volume generation the delete was authorized against.
+    pub expected_generation: u64,
+    /// The erasure policy the delete must honor.
+    pub erasure_policy: ErasurePolicy,
+}
+
 /// The whole durable provider state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,6 +329,21 @@ pub struct LvmState {
     /// unchanged.
     #[serde(default)]
     moves: BTreeMap<VolumeId, MoveRecord>,
+    /// Durable create intents, keyed by volume. Added in schema v2;
+    /// defaulted so v1 files load unchanged and skipped when empty so
+    /// a state with no pending create serializes without the map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_creates: BTreeMap<VolumeId, CreateIntent>,
+    /// Durable grow intents, keyed by volume. Added in schema v2;
+    /// defaulted so v1 files load unchanged and skipped when empty so
+    /// a state with no pending grow serializes without the map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_grows: BTreeMap<VolumeId, GrowIntent>,
+    /// Durable delete intents, keyed by volume. Added in schema v2;
+    /// defaulted so v1 files load unchanged and skipped when empty so
+    /// a state with no pending delete serializes without the map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_deletes: BTreeMap<VolumeId, DeleteIntent>,
 }
 
 impl Default for LvmState {
@@ -257,6 +353,9 @@ impl Default for LvmState {
             volumes: BTreeMap::new(),
             devices: BTreeMap::new(),
             moves: BTreeMap::new(),
+            pending_creates: BTreeMap::new(),
+            pending_grows: BTreeMap::new(),
+            pending_deletes: BTreeMap::new(),
         }
     }
 }
@@ -316,10 +415,12 @@ impl LvmState {
 
     /// [`Self::save`] with the store-save crash seam armed: the
     /// boundaries (after the tmp content write, after its fsync,
-    /// after the rename) consult `crash` exactly like the grow
-    /// store's saves, so a rig can kill the daemon at any commit
-    /// split of a move-record mutation. The seam is inert unless the
-    /// rig armed this store's points.
+    /// after the rename, and after the rename before the directory
+    /// fsync) consult `crash` exactly like the grow store's saves, so
+    /// a rig can kill the daemon at any commit split of a
+    /// move-record mutation, or inject a non-kill save error at the
+    /// directory-fsync boundary. The seam is inert unless the rig
+    /// armed this store's points.
     pub fn save_with_hooks(
         &mut self,
         path: &Path,
@@ -343,10 +444,19 @@ impl LvmState {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
         let path_display = path.display();
-        let consult = |point: StoreSavePoint| {
+        let consult = |point: StoreSavePoint| -> Result<(), ApiError> {
             if let Some(crash) = crash {
+                // The kill seam first (it never returns), then the
+                // rig-only injected error, which makes the save return
+                // a typed error instead of dying.
                 crash.consult(STORE_LVM_STATE, point);
+                if crash.take_save_failure(STORE_LVM_STATE, point) {
+                    return Err(internal(format!(
+                        "injected state save failure for {STORE_LVM_STATE} at {point:?}"
+                    )));
+                }
             }
+            Ok(())
         };
         // A successful open may have decoded an older file; every save
         // writes the current version so an upgrade becomes durable on the
@@ -358,17 +468,21 @@ impl LvmState {
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
         file.write_all(&data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
-        consult(StoreSavePoint::AfterTmpWrite);
+        consult(StoreSavePoint::AfterTmpWrite)?;
         file.sync_all()
             .map_err(|e| internal(format!("failed to fsync {tmp_display}: {e}")))?;
         drop(file);
-        consult(StoreSavePoint::AfterFsyncBeforeRename);
+        consult(StoreSavePoint::AfterFsyncBeforeRename)?;
         fs::rename(tmp_path, path).map_err(|e| {
             internal(format!(
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
-        consult(StoreSavePoint::AfterRename);
+        consult(StoreSavePoint::AfterRename)?;
+        // The directory-fsync boundary: the rename has landed, so a
+        // rig-injected failure here leaves the NEW file as the durable
+        // state while still exercising the caller's error path.
+        consult(StoreSavePoint::AfterRenameBeforeDirFsync)?;
         // fsync the directory so the rename itself is durable.
         let dir = fs::File::open(
             path.parent()
@@ -462,6 +576,80 @@ impl LvmState {
     pub fn remove_move(&mut self, id: &VolumeId) -> Option<MoveRecord> {
         self.moves.remove(id)
     }
+
+    /// All pending create intents, ordered by volume identity.
+    #[must_use]
+    pub fn create_intents(&self) -> &BTreeMap<VolumeId, CreateIntent> {
+        &self.pending_creates
+    }
+
+    /// Look up one volume's pending create intent.
+    #[must_use]
+    pub fn create_intent(&self, id: &VolumeId) -> Option<&CreateIntent> {
+        self.pending_creates.get(id)
+    }
+
+    /// Insert or replace one volume's pending create intent.
+    pub fn insert_create_intent(
+        &mut self,
+        id: VolumeId,
+        intent: CreateIntent,
+    ) -> Option<CreateIntent> {
+        self.pending_creates.insert(id, intent)
+    }
+
+    /// Remove one volume's pending create intent.
+    pub fn remove_create_intent(&mut self, id: &VolumeId) -> Option<CreateIntent> {
+        self.pending_creates.remove(id)
+    }
+
+    /// All pending grow intents, ordered by volume identity.
+    #[must_use]
+    pub fn grow_intents(&self) -> &BTreeMap<VolumeId, GrowIntent> {
+        &self.pending_grows
+    }
+
+    /// Look up one volume's pending grow intent.
+    #[must_use]
+    pub fn grow_intent(&self, id: &VolumeId) -> Option<&GrowIntent> {
+        self.pending_grows.get(id)
+    }
+
+    /// Insert or replace one volume's pending grow intent.
+    pub fn insert_grow_intent(&mut self, id: VolumeId, intent: GrowIntent) -> Option<GrowIntent> {
+        self.pending_grows.insert(id, intent)
+    }
+
+    /// Remove one volume's pending grow intent.
+    pub fn remove_grow_intent(&mut self, id: &VolumeId) -> Option<GrowIntent> {
+        self.pending_grows.remove(id)
+    }
+
+    /// All pending delete intents, ordered by volume identity.
+    #[must_use]
+    pub fn delete_intents(&self) -> &BTreeMap<VolumeId, DeleteIntent> {
+        &self.pending_deletes
+    }
+
+    /// Look up one volume's pending delete intent.
+    #[must_use]
+    pub fn delete_intent(&self, id: &VolumeId) -> Option<&DeleteIntent> {
+        self.pending_deletes.get(id)
+    }
+
+    /// Insert or replace one volume's pending delete intent.
+    pub fn insert_delete_intent(
+        &mut self,
+        id: VolumeId,
+        intent: DeleteIntent,
+    ) -> Option<DeleteIntent> {
+        self.pending_deletes.insert(id, intent)
+    }
+
+    /// Remove one volume's pending delete intent.
+    pub fn remove_delete_intent(&mut self, id: &VolumeId) -> Option<DeleteIntent> {
+        self.pending_deletes.remove(id)
+    }
 }
 
 /// The `<path>.tmp` sibling used for atomic saves.
@@ -500,6 +688,9 @@ mod tests {
     const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n2.json");
     const TOMBSTONE_FIXTURE: &str =
         include_str!("../../../tests/fixtures/schema/lvm-state-v1-tombstones.json");
+    /// The last released v1 shape (written by the pre-#70 binary at
+    /// `ee739bc`) used as the N-1 fixture for schema v2.
+    const V2_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v2-n1.json");
 
     fn write_fixture(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
         let path = dir.path().join(name);
@@ -567,6 +758,102 @@ mod tests {
     }
 
     #[test]
+    fn empty_state_serializes_without_intent_maps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let mut state = LvmState::default();
+        state.save(&path).expect("save");
+        let text = fs::read_to_string(&path).expect("read state");
+        assert!(
+            text.contains("\"schema_version\": 2"),
+            "the current schema version is stamped: {text}"
+        );
+        assert!(
+            !text.contains("pending_creates"),
+            "an empty state must not gain a create-intent map: {text}"
+        );
+        assert!(
+            !text.contains("pending_grows"),
+            "an empty state must not gain a grow-intent map: {text}"
+        );
+        assert!(
+            !text.contains("pending_deletes"),
+            "an empty state must not gain a delete-intent map: {text}"
+        );
+        assert_eq!(LvmState::load(&path).expect("reload"), state);
+    }
+
+    #[test]
+    fn intent_maps_round_trip_losslessly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let volume_id = VolumeId::new("vol-intent").expect("valid id");
+        let mut state = sample_state();
+        state.insert_create_intent(
+            volume_id.clone(),
+            CreateIntent {
+                vg_name: "vg-1".to_owned(),
+                lv_name: "vol-intent".to_owned(),
+                requested_size_bytes: 2048,
+                project_id: ProjectId::new("tenant-a").expect("valid id"),
+                block_size: 4096,
+                creation_payload: "{\"class\":\"native-local\"}".to_owned(),
+            },
+        );
+        state.insert_grow_intent(
+            volume_id.clone(),
+            GrowIntent {
+                operation_id: OperationId::new("op-grow").expect("valid id"),
+                from_size_bytes: 1024,
+                requested_size_bytes: 4096,
+                expected_generation: 3,
+            },
+        );
+        state.insert_delete_intent(
+            volume_id.clone(),
+            DeleteIntent {
+                operation_id: OperationId::new("op-delete").expect("valid id"),
+                expected_generation: 3,
+                erasure_policy: ErasurePolicy::ZeroDiscard,
+            },
+        );
+        state.save(&path).expect("save");
+        let loaded = LvmState::load(&path).expect("load");
+        assert_eq!(loaded, state);
+        assert_eq!(
+            loaded
+                .create_intent(&volume_id)
+                .expect("create intent")
+                .requested_size_bytes,
+            2048
+        );
+        assert_eq!(
+            loaded
+                .grow_intent(&volume_id)
+                .expect("grow intent")
+                .expected_generation,
+            3
+        );
+        assert_eq!(
+            loaded
+                .delete_intent(&volume_id)
+                .expect("delete intent")
+                .erasure_policy,
+            ErasurePolicy::ZeroDiscard
+        );
+
+        // Removing every intent restores the compact shape.
+        state.remove_create_intent(&volume_id);
+        state.remove_grow_intent(&volume_id);
+        state.remove_delete_intent(&volume_id);
+        state.save(&path).expect("save cleared");
+        let text = fs::read_to_string(&path).expect("read state");
+        assert!(!text.contains("pending_creates"), "{text}");
+        assert!(!text.contains("pending_grows"), "{text}");
+        assert!(!text.contains("pending_deletes"), "{text}");
+    }
+
+    #[test]
     fn save_load_round_trip_is_lossless() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
@@ -590,6 +877,69 @@ mod tests {
         assert!(!sibling_tmp_path(&path).exists());
         let reloaded = LvmState::load(&path).expect("reload");
         assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn injected_save_failure_after_rename_keeps_new_state_and_before_rename_keeps_old() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let volume_id = VolumeId::new("vol-1").expect("valid id");
+        let hooks = StoreCrashHooks::new();
+        let mut state = sample_state();
+        state.save(&path).expect("initial save");
+
+        // Fail at the directory-fsync boundary, after the rename has
+        // landed: the save reports the injected error, but a reload
+        // must read the NEW state (the rename is the commit).
+        state
+            .volume_mut(&volume_id)
+            .expect("volume")
+            .entry
+            .generation = 4;
+        hooks.arm_save_failure(
+            STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let err = state
+            .save_with_hooks(&path, Some(&hooks))
+            .expect_err("the armed save must fail");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("injected state save failure"), "{err}");
+        assert!(err.detail.contains("AfterRenameBeforeDirFsync"), "{err}");
+        assert!(
+            !sibling_tmp_path(&path).exists(),
+            "no .tmp residue after the injected failure"
+        );
+        let loaded = LvmState::load(&path).expect("load the post-rename state");
+        assert_eq!(
+            loaded.volume(&volume_id).expect("volume").entry.generation,
+            4,
+            "the rename landed before the injected failure"
+        );
+
+        // A pre-rename failure leaves the OLD durable state readable.
+        state
+            .volume_mut(&volume_id)
+            .expect("volume")
+            .entry
+            .generation = 5;
+        hooks.arm_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterFsyncBeforeRename, 0);
+        let err = state
+            .save_with_hooks(&path, Some(&hooks))
+            .expect_err("the armed pre-rename save must fail");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("injected state save failure"), "{err}");
+        assert!(
+            !sibling_tmp_path(&path).exists(),
+            "the tmp cleanup removes the unrenamed file"
+        );
+        let loaded = LvmState::load(&path).expect("load the old state");
+        assert_eq!(
+            loaded.volume(&volume_id).expect("volume").entry.generation,
+            4,
+            "a pre-rename failure leaves the old file untouched"
+        );
     }
 
     #[test]
@@ -680,6 +1030,18 @@ mod tests {
         assert_eq!(attachment.reporter, None);
         assert_eq!(attachment.recorded_at_ms, None);
         assert!(state.moves().is_empty(), "pre-P6-C fixture has no moves");
+        assert!(
+            state.create_intents().is_empty(),
+            "a pre-intent fixture has no create intents"
+        );
+        assert!(
+            state.grow_intents().is_empty(),
+            "a pre-intent fixture has no grow intents"
+        );
+        assert!(
+            state.delete_intents().is_empty(),
+            "a pre-intent fixture has no delete intents"
+        );
         assert_eq!(
             volume.runtime.retired_attachment_ids,
             Vec::<AttachmentId>::new()
@@ -706,6 +1068,54 @@ mod tests {
     }
 
     #[test]
+    fn v2_n_minus_one_fixture_loads_and_upgrades_to_v2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "lvm-state-v2-n1.json", V2_N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("v1 state loads in v2");
+        let volume_id = VolumeId::new("vol-upgrade-n1").expect("valid id");
+        let volume = state.volume(&volume_id).expect("v1 volume preserved");
+        assert_eq!(volume.entry.generation, 7);
+        assert_eq!(
+            volume
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("v1 attachment")
+                .state_revision,
+            3
+        );
+        assert_eq!(
+            state.move_record(&volume_id).expect("v1 move record").state,
+            MoveVolumeBackingState::InDoubt
+        );
+        assert!(
+            state.create_intents().is_empty()
+                && state.grow_intents().is_empty()
+                && state.delete_intents().is_empty(),
+            "a v1 file has no intent maps"
+        );
+
+        let target = dir.path().join("upgraded-v2.json");
+        state.save(&target).expect("upgrade-on-write");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\": 2"),
+            "the first save stamps schema v2: {text}"
+        );
+        assert!(
+            !text.contains("pending_creates")
+                && !text.contains("pending_grows")
+                && !text.contains("pending_deletes"),
+            "empty intent maps stay omitted: {text}"
+        );
+        assert_eq!(
+            LvmState::load(&target).expect("reload"),
+            state,
+            "no durable field is lost by the v1→v2 upgrade"
+        );
+    }
+
+    #[test]
     fn old_fixture_upgrades_on_save_and_round_trips_losslessly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = write_fixture(&dir, "n1.json", N1_FIXTURE);
@@ -714,7 +1124,7 @@ mod tests {
         state.save(&target).expect("save");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\": 1"),
+            text.contains("\"schema_version\": 2"),
             "upgrade-on-write stamps the current schema version: {text}"
         );
         assert_eq!(
@@ -729,14 +1139,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let future = N1_FIXTURE.replacen(
             '{',
-            "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+            "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
             1,
         );
         let path = write_fixture(&dir, "future.json", &future);
         let err = LvmState::load(&path).expect_err("future version must be refused");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.is_unsupported_schema_version(), "{err}");
-        assert!(err.detail.contains("schema_version 2"), "{err}");
+        assert!(err.detail.contains("schema_version 3"), "{err}");
         assert_eq!(
             fs::read_to_string(&path).expect("read refused file"),
             future,

@@ -121,6 +121,13 @@ pub enum StoreSavePoint {
     /// state is what a reload sees (on the filesystems the campaign
     /// runs on, a completed rename is the commit).
     AfterRename,
+    /// After the rename, before the parent-directory fsync, for a
+    /// **non-kill** injected failure at the directory-fsync boundary
+    /// (see [`StoreCrashHooks::arm_save_failure`]). The rename has
+    /// already landed, so a reload sees the **new** state, but the
+    /// save site returns an error rather than panicking, exercising
+    /// the caller's error path.
+    AfterRenameBeforeDirFsync,
     /// Witness variant: after the mutation's durable intent append,
     /// before the in-memory apply — the replay re-derives the whole
     /// mutation from the journal.
@@ -149,16 +156,21 @@ pub struct StoreCrashHooks {
     witness_arm: Mutex<&'static str>,
     /// The rig's group-abort action, when registered.
     kill: Mutex<Option<KillSwitch>>,
+    /// The rig-only injected **error** arms, keyed by store id: the
+    /// target point and how many matching consults still pass before
+    /// the failure fires (see [`StoreCrashHooks::arm_save_failure`]).
+    failures: Mutex<BTreeMap<&'static str, (StoreSavePoint, usize)>>,
 }
 
 impl std::fmt::Debug for StoreCrashHooks {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The kill switch is opaque plumbing; everything observable
-        // is the armed table's shape.
+        // is the armed tables' shape.
         formatter
             .debug_struct("StoreCrashHooks")
             .field("armed", &*self.lock_armed())
             .field("witness_arm", &*self.lock_witness_arm())
+            .field("failures", &*self.lock_failures())
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +184,7 @@ impl StoreCrashHooks {
             armed: Mutex::new(BTreeMap::new()),
             witness_arm: Mutex::new(""),
             kill: Mutex::new(None),
+            failures: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -182,10 +195,11 @@ impl StoreCrashHooks {
         self.lock_armed().insert(store, point);
     }
 
-    /// Drop every armed entry without firing (scenario teardown).
-    /// **Rig only.**
+    /// Drop every armed entry — kill arms and injected-failure arms —
+    /// without firing (scenario teardown). **Rig only.**
     pub fn clear(&self) {
         self.lock_armed().clear();
+        self.lock_failures().clear();
     }
 
     /// Register the kill switch fired inside an armed point (the
@@ -267,6 +281,52 @@ impl StoreCrashHooks {
         *self.lock_witness_arm() = mutation_kind;
         self.arm(STORE_WITNESS_COMMIT, point);
     }
+
+    /// Arm `store`'s save to return an injected **error** at `point`
+    /// after passing `skip` matching consults. **Rig only**, inert by
+    /// default (the same trust class as [`StoreCrashHooks::arm`]).
+    ///
+    /// This is deliberately separate from the kill arm table: it never
+    /// fires the kill switch or panics, it makes the save site return
+    /// an error, so callers exercise their error paths while the
+    /// durable artifacts stay exactly as the boundary left them.
+    ///
+    /// `skip == 0` fails at the next matching consult; `skip == n`
+    /// passes `n` matching consults first. One shot — the firing
+    /// consult consumes the entry. A consult at a different point
+    /// neither consumes nor decrements the arm.
+    ///
+    /// Only the LVM provider state save consults this table today
+    /// (including the `AfterRenameBeforeDirFsync` point). Arming a
+    /// point for a store whose save does not consult it is inert, so a
+    /// rig must not treat a non-firing arm as evidence.
+    pub fn arm_save_failure(&self, store: &'static str, point: StoreSavePoint, skip: usize) {
+        self.lock_failures().insert(store, (point, skip));
+    }
+
+    /// Consult the injected-failure table at one save boundary of
+    /// `store`. Returns `true` exactly when an armed `(store, point)`
+    /// failure fires; that consult consumes the entry.
+    ///
+    /// A consult at a different point (or of an unarmed store) returns
+    /// `false` and leaves the arm untouched. Inert unless the
+    /// constructing rig called [`StoreCrashHooks::arm_save_failure`]
+    /// (the module's doc-gated trust class).
+    pub fn take_save_failure(&self, store: &'static str, point: StoreSavePoint) -> bool {
+        let mut failures = self.lock_failures();
+        let Some((armed_point, skip)) = failures.get_mut(store) else {
+            return false;
+        };
+        if *armed_point != point {
+            return false;
+        }
+        if *skip > 0 {
+            *skip -= 1;
+            return false;
+        }
+        failures.remove(store);
+        true
+    }
 }
 
 /// Lock helpers, recovering from a poison an earlier firing left
@@ -288,6 +348,11 @@ impl StoreCrashHooks {
     /// The kill switch slot's lock (same poison recovery).
     fn lock_kill(&self) -> MutexGuard<'_, Option<KillSwitch>> {
         self.kill.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The injected-failure table's lock (same poison recovery).
+    fn lock_failures(&self) -> MutexGuard<'_, BTreeMap<&'static str, (StoreSavePoint, usize)>> {
+        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -367,6 +432,100 @@ mod tests {
             );
         }))
         .expect("the fired entry must be consumed");
+    }
+
+    #[test]
+    fn failure_table_is_inert_by_default() {
+        let hooks = StoreCrashHooks::new();
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        assert!(
+            format!("{hooks:?}").contains("failures"),
+            "the debug shape includes the failure table"
+        );
+    }
+
+    #[test]
+    fn save_failure_skip_passes_that_many_matching_consults() {
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure(
+            STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            2,
+        );
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        assert!(
+            hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+    }
+
+    #[test]
+    fn save_failure_is_one_shot() {
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure(
+            STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        assert!(
+            hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync),
+            "the firing consult consumes the entry"
+        );
+    }
+
+    #[test]
+    fn save_failure_at_a_different_point_neither_fires_nor_decrements() {
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure(
+            STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            1,
+        );
+        // Any number of mis-pointed consults must not touch the arm.
+        for _ in 0..5 {
+            assert!(!hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRename));
+        }
+        // The first matching consult is still the skipped one.
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        assert!(
+            hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+    }
+
+    #[test]
+    fn clear_drops_kill_and_failure_arms() {
+        let hooks = StoreCrashHooks::new();
+        hooks.arm(STORE_DRBD_STATE, StoreSavePoint::AfterRename);
+        hooks.arm_save_failure(
+            STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        hooks.set_kill_switch(Arc::new(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        hooks.clear();
+        assert!(
+            !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync)
+        );
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hooks.consult(STORE_DRBD_STATE, StoreSavePoint::AfterRename);
+        }))
+        .expect("clear must drop the kill arm too");
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

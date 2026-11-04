@@ -65,18 +65,18 @@ EOF
 api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-new.json" 200 "$RUN/records/$TAG-create-new.resp.json"
 stop_pidfile "$TAG-daemon" TERM
 
-cap "after the first successful write the file carries schema_version 1" jq '.schema_version' "$STATE"
+cap "after the first successful write the file carries schema_version 2" jq '.schema_version' "$STATE"
 cap "the attachment state/revision survived the upgrade-on-write" jq '.volumes["vol-upgrade-n1"].runtime.attachment | {state,state_revision,evidence}' "$STATE"
 cap "the tombstones survived the upgrade-on-write" jq '.volumes["vol-upgrade-tombstone"].runtime.retired_attachment_ids' "$STATE"
-assert_eq "$(jq -r '.schema_version' "$STATE")" "1" "upgraded schema_version"
+assert_eq "$(jq -r '.schema_version' "$STATE")" "2" "upgraded schema_version"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state' "$STATE")" "active" "upgraded attachment state"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state_revision' "$STATE")" "3" "upgraded attachment state_revision"
 assert_eq "$(jq -r '.volumes["vol-upgrade-tombstone"].runtime.retired_attachment_ids | join(",")' "$STATE")" "att-retired-oldest,att-retired-newer" "upgraded tombstones"
 
-say "live refusal of a newer schema: set schema_version=2 and start the daemon"
-cp "$STATE" "$RUN/records/$TAG-state-v1.json"
-jq '.schema_version = 2' "$STATE" >"$RUN/records/$TAG-state-v2.tmp" && mv "$RUN/records/$TAG-state-v2.tmp" "$STATE"
-cp "$STATE" "$RUN/records/$TAG-state-v2.json"
+say "live refusal of a newer schema: set schema_version=3 and start the daemon"
+cp "$STATE" "$RUN/records/$TAG-state-supported.json"
+jq '.schema_version = 3' "$STATE" >"$RUN/records/$TAG-state-v3.tmp" && mv "$RUN/records/$TAG-state-v3.tmp" "$STATE"
+cp "$STATE" "$RUN/records/$TAG-state-v3.json"
 cap "future schema file checksum before startup" sha256sum "$STATE"
 set +e
 timeout 10s "$BIN/volvisord" --config "$CFG" >"$RUN/raw/$TAG-future.daemon.log" 2>&1
@@ -86,10 +86,10 @@ printf 'future-schema startup exit=%s\n' "$FUTURE_RC" | tee -a "$LOG"
 cap "future-schema daemon stderr" cat "$RUN/raw/$TAG-future.daemon.log"
 assert_eq "$FUTURE_RC" "1" "future schema startup exit status"
 assert_contains "$(cat "$RUN/raw/$TAG-future.daemon.log")" "unsupported durable-state schema version" "typed future-schema refusal"
-assert_eq "$(sha256sum "$STATE" | cut -d' ' -f1)" "$(sha256sum "$RUN/records/$TAG-state-v2.json" | cut -d' ' -f1)" "future schema file untouched"
+assert_eq "$(sha256sum "$STATE" | cut -d' ' -f1)" "$(sha256sum "$RUN/records/$TAG-state-v3.json" | cut -d' ' -f1)" "future schema file untouched"
 
 say "restore the supported schema and prove the same binary starts"
-cp "$RUN/records/$TAG-state-v1.json" "$STATE"
+cp "$RUN/records/$TAG-state-supported.json" "$STATE"
 start_volvisord "$TAG-daemon" "$CFG" "$PORT" || exit 1
 api_expect "$CURL" GET "$BASE/v2/volumes/vol-upgrade-n1" "" 200 "$RUN/records/$TAG-inspect-restored.json"
 cat "$RUN/records/$TAG-inspect-restored.json" | tee -a "$LOG"

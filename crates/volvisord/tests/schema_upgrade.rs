@@ -39,6 +39,9 @@ fn fixture_text(name: &str) -> &'static str {
         "lvm-state-v1-n1.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json")
         }
+        "lvm-state-v2-n1.json" => {
+            include_str!("../../../tests/fixtures/schema/lvm-state-v2-n1.json")
+        }
         "lvm-state-v1-tombstones.json" => {
             include_str!("../../../tests/fixtures/schema/lvm-state-v1-tombstones.json")
         }
@@ -174,7 +177,7 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     assert!(
         fs::read_to_string(&lvm_path)
             .expect("read lvm")
-            .contains("\"schema_version\": 1")
+            .contains("\"schema_version\": 2")
     );
     assert_eq!(LvmState::load(&lvm_path).expect("lvm reload"), lvm);
 
@@ -307,6 +310,56 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     );
 }
 
+/// The v1-stamped N-1 file (the last released shape before schema v2)
+/// loads through the same store path and upgrades on its first write.
+/// The pre-versioning fixture above covers the older population; this
+/// pins the labelled N-1 boundary the compatibility matrix names.
+#[test]
+fn a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write(
+        dir.path(),
+        "lvm-state.json",
+        fixture_text("lvm-state-v2-n1.json").as_bytes(),
+    );
+    let mut state = LvmState::load(&path).expect("v1-stamped N-1 loads");
+    let id = volume_id("vol-upgrade-n1");
+    assert_eq!(
+        state
+            .volume(&id)
+            .expect("v1 volume preserved")
+            .entry
+            .generation,
+        7
+    );
+    assert_eq!(
+        state.move_record(&id).expect("v1 move record").state,
+        MoveVolumeBackingState::InDoubt
+    );
+    state.save(&path).expect("upgrade on write");
+    let text = fs::read_to_string(&path).expect("read upgraded state");
+    assert!(
+        text.contains("\"schema_version\": 2"),
+        "the first save stamps schema v2: {text}"
+    );
+
+    // The upgraded file round-trips: the v1 payload is preserved under
+    // the v2 envelope.
+    let reloaded = LvmState::load(&path).expect("reload upgraded state");
+    assert_eq!(
+        reloaded
+            .volume(&id)
+            .expect("volume after upgrade")
+            .entry
+            .generation,
+        7
+    );
+    assert_eq!(
+        reloaded.move_record(&id).expect("move after upgrade").state,
+        MoveVolumeBackingState::InDoubt
+    );
+}
+
 #[test]
 fn each_covered_store_refuses_a_newer_schema_on_open() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -316,7 +369,7 @@ fn each_covered_store_refuses_a_newer_schema_on_open() {
     // version refusal must win (partial decode is forbidden).
     let future_lvm = fixture_text("lvm-state-v1-n1.json").replacen(
         '{',
-        "{\n  \"schema_version\": 2,\n  \"future_field\": true,",
+        "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
         1,
     );
     let path = write(root, "lvm-state.json", future_lvm.as_bytes());

@@ -12,6 +12,7 @@
 mod common;
 
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use common::{fixture, unclaimed_fixture};
 use volvisor_lvm::provider::lv_name_for;
@@ -21,9 +22,11 @@ use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
     fixture_grow_request, fixture_report_request,
 };
-use volvisor_types::request::ErasurePolicy;
+use volvisor_types::crash::{STORE_LVM_STATE, StoreSavePoint};
+use volvisor_types::request::{DeleteVolumeRequest, ErasurePolicy, MoveVolumeBackingRequest};
 use volvisor_types::{
-    ApiErrorCode, AttachmentEvidence, AttachmentState, DeviceId, VolumeId, VolumeLifecycle,
+    ApiErrorCode, AttachmentEvidence, AttachmentState, DeviceId, OperationId, VolumeId,
+    VolumeLifecycle,
 };
 
 const GIB: u64 = 1 << 30;
@@ -33,15 +36,46 @@ fn volume_id(raw: &str) -> VolumeId {
     VolumeId::new(raw).expect("valid fixture volume id")
 }
 
-/// Make the next state save fail before its rename while leaving the
-/// existing state file readable: a directory at the sibling `.tmp` path
-/// makes `create_owner_only` fail with `EISDIR`.
-fn block_next_state_save(state_path: &std::path::Path) -> std::path::PathBuf {
-    let mut tmp_name = state_path.to_path_buf().into_os_string();
-    tmp_name.push(".tmp");
-    let tmp_path = std::path::PathBuf::from(tmp_name);
-    fs::create_dir(&tmp_path).expect("blocking temp directory");
-    tmp_path
+/// A delete request with an explicit operation id and erasure policy
+/// (the durable-intent tests need distinct retry identities and
+/// `ZeroDiscard` for the strongest untouched-LV assertion).
+fn delete_request_with(
+    operation_id: &str,
+    expected_generation: u64,
+    policy: ErasurePolicy,
+) -> DeleteVolumeRequest {
+    DeleteVolumeRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: OperationId::new(operation_id).expect("valid fixture operation id"),
+        expected_generation,
+        data_erasure_policy: policy,
+    }
+}
+
+/// A seed-only startup world: the claimed pool plus a state file with
+/// the claim, ready for intent/volume seeding.
+fn seeded_world() -> (std::path::PathBuf, Arc<Mutex<common::FakeLvm>>) {
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
+    (state_path, world)
+}
+
+/// Construct a provider that must refuse startup, returning the typed
+/// error (the `Ok` provider is not `Debug`, so `expect_err` cannot be
+/// used directly; an unexpected success is surfaced as a sentinel error
+/// the caller's assertions reject).
+fn startup_error(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<common::FakeLvm>>,
+) -> volvisor_types::ApiError {
+    match common::try_provider_from(state_path, world) {
+        Err(error) => error,
+        Ok(_) => volvisor_types::ApiError::new(
+            ApiErrorCode::Internal,
+            "provider startup unexpectedly succeeded",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +268,7 @@ async fn create_verifies_the_lv_against_lvs_and_fails_honestly() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end failure/restart/retry narrative
 async fn create_save_failure_rolls_back_lv_and_memory_and_converges_across_restart() {
     let fixture = fixture();
     let id = volume_id("savefail-vol");
@@ -253,9 +288,15 @@ async fn create_save_failure_rolls_back_lv_and_memory_and_converges_across_resta
     let unrelated_lv = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&unrelated_id));
     let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
 
-    // The next save fails before its rename, but the existing state file
-    // stays readable (so the carve-out probe sees the unrelated volume).
-    let tmp_path = block_next_state_save(&fixture.state_path);
+    // The create's FIRST save (the durable intent) succeeds; the FINAL
+    // save (volume record + intent removal) fails before its rename, so
+    // the existing state file stays readable (the carve-out probe sees
+    // the unrelated volume). `skip = 1` passes the intent save's consult.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
 
     let err = fixture
         .provider
@@ -264,7 +305,7 @@ async fn create_save_failure_rolls_back_lv_and_memory_and_converges_across_resta
         .expect_err("create whose state save fails");
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
     // The original save failure is surfaced, not replaced by a generic one.
-    assert!(err.detail.contains("failed to create"), "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
 
     // No 200-until-restart: the in-memory entry was rolled back too, and
     // the unrelated volume is untouched.
@@ -308,9 +349,9 @@ async fn create_save_failure_rolls_back_lv_and_memory_and_converges_across_resta
         "the unrelated volume must never be compensated"
     );
 
-    // The old durable file survived byte-for-byte: the failed volume is
-    // absent, the unrelated volume and the claim are untouched.
-    fs::remove_dir(&tmp_path).expect("unblock the next save");
+    // The compensating clear-save restored the durable state
+    // byte-for-byte: the failed volume and its intent are absent, the
+    // unrelated volume and the claim are untouched.
     assert_eq!(
         fs::read(&fixture.state_path).expect("state after failure"),
         snapshot
@@ -368,7 +409,13 @@ async fn create_save_failure_with_a_failing_lvremove_surfaces_the_orphan() {
     let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
     fixture.world.lock().expect("world").fail_lvremove_for = vec![lv_path.clone()];
     let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
-    let tmp_path = block_next_state_save(&fixture.state_path);
+    // Pass the durable-intent save; fail the final save before its
+    // rename so the compensation path runs.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
 
     let err = fixture
         .provider
@@ -378,7 +425,7 @@ async fn create_save_failure_with_a_failing_lvremove_surfaces_the_orphan() {
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
     // The original save failure survives, and the cleanup failure is never
     // masked: the exact remediation and the operator-visible state are named.
-    assert!(err.detail.contains("failed to create"), "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
     assert!(err.detail.contains("manual lvremove"), "{err}");
     assert!(err.detail.contains(&lv_path), "{err}");
     assert!(err.detail.contains("absent from provider state"), "{err}");
@@ -399,8 +446,8 @@ async fn create_save_failure_with_a_failing_lvremove_surfaces_the_orphan() {
             .contains_key(&lv_path)
     );
 
-    // The durable file is unchanged: no volume was recorded.
-    fs::remove_dir(&tmp_path).expect("unblock the next save");
+    // The compensating clear-save restored the durable file: no volume
+    // and no create intent were recorded.
     assert_eq!(
         fs::read(&fixture.state_path).expect("state after failure"),
         snapshot
@@ -430,39 +477,41 @@ async fn create_save_failure_after_rename_is_honored_not_compensated() {
     let fixture = fixture();
     let id = volume_id("saverename-vol");
     let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
-    // Seed the durable file with the volume while the provider's
-    // in-memory state still predates it (the fixture was built first).
-    // The seed's payload differs from this create's canonical payload;
-    // that is deliberate: this test pins the branch decision (the record
-    // for THIS volume exists), not the post-restart replay of a record the
-    // failed save wrote. The real carve-out writes this create's own
-    // record, which is exactly what the same-incarnation retry below sees.
-    common::seed_volume(
-        &fixture.state_path,
-        "saverename-vol",
-        common::CLAIMED_VG,
-        GIB,
-    );
 
-    // Force the next save to fail before its rename while the durable
-    // file stays present: a directory at the sibling temp path makes
-    // create_owner_only fail with EISDIR.
-    let tmp_path = block_next_state_save(&fixture.state_path);
+    // The REAL post-rename window: the final save's rename lands, then
+    // the directory-fsync boundary returns an injected error (#70's
+    // non-kill seam). The durable file therefore contains this create's
+    // own volume record when compensation classifies it. `skip = 1`
+    // passes the preceding durable-intent save.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        1,
+    );
 
     let invocations_before = fixture.runner.invocations().len();
     let err = fixture
         .provider
         .create_volume(&fixture_create_request("saverename-vol", GIB))
         .await
-        .expect_err("create whose save fails after the durable record exists");
+        .expect_err("create whose final save fails after the rename");
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(err.detail.contains("AfterRenameBeforeDirFsync"), "{err}");
     assert!(
         err.detail.contains("durable state already contains"),
         "{err}"
     );
 
-    // The durable file already contained the volume: keep the LV, do not
-    // compensate, and keep serving the in-memory entry.
+    // The rename landed, so the durable file contains the volume record
+    // (and no create intent): keep the LV, do not compensate, and keep
+    // serving the in-memory entry.
+    let durable = LvmState::load(&fixture.state_path).expect("load durable state");
+    assert!(durable.volume(&id).is_some(), "the rename committed");
+    assert!(
+        durable.create_intent(&id).is_none(),
+        "the final save commits the record and drops the intent together"
+    );
     assert!(
         fixture
             .world
@@ -501,8 +550,6 @@ async fn create_save_failure_after_rename_is_honored_not_compensated() {
             .lvs
             .contains_key(&lv_path)
     );
-
-    fs::remove_dir(&tmp_path).expect("clean up the blocking temp directory");
 }
 
 #[tokio::test]
@@ -512,11 +559,13 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
     let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
     let snapshot = fs::read(&fixture.state_path).expect("state snapshot");
 
-    // The durable file exists but cannot be re-read at compensation time.
-    // The fail-closed direction treats that as "not committed": remove the
-    // freshly created (empty) LV and the in-memory entry.
-    fs::write(&fixture.state_path, b"{ not valid provider state").expect("corrupt the state file");
-    let tmp_path = block_next_state_save(&fixture.state_path);
+    // The durable-intent save succeeds; `lvcreate` then leaves the
+    // durable file unreadable and blocks the sibling `.tmp` path, so
+    // the final save fails and the compensation's clear-save fails too.
+    // The fail-closed re-read treats the unreadable durable state as
+    // "not committed": remove the freshly created (empty) LV and the
+    // in-memory entry, and leave the unreadable file for the operator.
+    fixture.world.lock().expect("world").break_state_on_lvcreate = Some(fixture.state_path.clone());
 
     let err = fixture
         .provider
@@ -525,8 +574,14 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
         .expect_err("create whose state save fails and durable re-read is unreadable");
     assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
     // The save failure is the returned error; the failed re-read is only
-    // the decision input and never replaces it.
+    // the decision input and never replaces it. The failed clear-save is
+    // reported as an appended note, not masked.
     assert!(err.detail.contains("failed to create"), "{err}");
+    // The re-read failed, so the clear's outcome cannot be known: the
+    // error says the intent is possibly durable (fail-closed), never
+    // that it was definitely cleared or definitely remains.
+    assert!(err.detail.contains("could not be verified"), "{err}");
+    assert!(err.detail.contains("possibly durable"), "{err}");
 
     let inspected = fixture
         .provider
@@ -552,6 +607,9 @@ async fn create_save_failure_with_an_unreadable_durable_file_still_compensates()
         "the unreadable durable file must be left for the operator"
     );
 
+    let mut tmp_name = fixture.state_path.clone().into_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
     fs::remove_dir(&tmp_path).expect("unblock the next save");
     fs::write(&fixture.state_path, &snapshot).expect("restore the durable state");
 
@@ -1853,4 +1911,1871 @@ async fn allocations_reduce_reported_free_and_delete_returns_it() {
         .create_volume(&fixture_create_request("free-derive-2", 4 * MIB))
         .await
         .expect("create succeeds after the space was returned");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #70: durable create/grow/delete intents across crash windows
+// ---------------------------------------------------------------------------
+
+// -- Create startup recovery ------------------------------------------------
+
+#[tokio::test]
+async fn create_intent_adopts_a_verified_lv_left_by_a_kill_window() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("intent-adopt");
+    common::seed_create_intent(
+        &state_path,
+        id.as_str(),
+        common::CLAIMED_VG,
+        GIB,
+        "seed-create",
+    );
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), GIB);
+
+    // The fixture retains the runner, so the construction's commands are
+    // assertable (the adoption path must be read-only verification).
+    let fixture = common::fixture_from_state(state_path, world);
+
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the intent-owned LV is adopted");
+    assert_eq!(inspected.state, VolumeLifecycle::Ready);
+    assert_eq!(inspected.generation, 1);
+    assert_eq!(inspected.provisioned_bytes, GIB);
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some(), "the volume record committed");
+    assert!(
+        durable.create_intent(&id).is_none(),
+        "adoption drops the create intent"
+    );
+
+    let destructive = fixture
+        .runner
+        .invocations()
+        .into_iter()
+        .filter(|invocation| invocation.program == "lvcreate" || invocation.program == "lvremove")
+        .count();
+    assert_eq!(
+        destructive, 0,
+        "startup adoption runs no destructive command"
+    );
+
+    let report = fixture.provider.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+    assert!(report.foreign_lvs.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn create_intent_is_dropped_when_the_intent_owned_lv_is_absent() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("intent-absent");
+    common::seed_create_intent(
+        &state_path,
+        id.as_str(),
+        common::CLAIMED_VG,
+        GIB,
+        "seed-create",
+    );
+
+    let provider = common::provider_from(&state_path, &world);
+    let err = provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("a dropped intent is not a volume");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+
+    let durable = LvmState::load(&state_path).expect("durable state");
+    assert!(durable.create_intent(&id).is_none());
+    assert!(durable.volume(&id).is_none());
+
+    // The dropped intent does not wedge a fresh create with the same id.
+    let created = provider
+        .create_volume(&fixture_create_request("intent-absent", GIB))
+        .await
+        .expect("fresh create after the intent was dropped");
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    assert!(world.lock().expect("world").lvs.contains_key(&format!(
+        "{}/{}",
+        common::CLAIMED_VG,
+        lv_name_for(&id)
+    )));
+}
+
+#[test]
+fn create_intent_with_an_undersized_lv_fails_startup() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("intent-undersized");
+    common::seed_create_intent(
+        &state_path,
+        id.as_str(),
+        common::CLAIMED_VG,
+        GIB,
+        "seed-create",
+    );
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), 64 * MIB);
+
+    let err = startup_error(&state_path, &world);
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("smaller than the requested"), "{err}");
+
+    // An intent that does not own its id-derived LV is refused typed too,
+    // before any geometry is trusted.
+    let (state_path, world) = seeded_world();
+    let id = volume_id("intent-wrong-name");
+    common::seed_create_intent(
+        &state_path,
+        id.as_str(),
+        common::CLAIMED_VG,
+        GIB,
+        "seed-create",
+    );
+    {
+        let mut state = LvmState::load(&state_path).expect("load state");
+        let mut intent = state
+            .create_intent(&id)
+            .cloned()
+            .expect("the seeded create intent");
+        intent.lv_name = "lv-not-derived-from-the-id".to_owned();
+        state.insert_create_intent(id.clone(), intent);
+        state.save(&state_path).expect("save the mismatched intent");
+    }
+    let err = startup_error(&state_path, &world);
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("does not own its LV"), "{err}");
+}
+
+/// The create-intent save fails before its rename (`AfterTmpWrite`):
+/// the durable file is byte-for-byte unchanged, no `lvcreate` runs, and
+/// the retry succeeds once the seam is consumed.
+#[tokio::test]
+async fn create_intent_save_failure_runs_no_lvcreate() {
+    let fixture = fixture();
+    let volume = "create-intent-nowrite";
+    let id = volume_id(volume);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let state_before = fs::read(&fixture.state_path).expect("state snapshot");
+    let invocations_before = fixture.runner.invocations().len();
+
+    // The create's first save is the durable intent; failing before the
+    // rename leaves the pre-create durable state in place.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("the create-intent save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvcreate"),
+        "a failed intent save must run no lvcreate"
+    );
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("state after the failed save"),
+        state_before,
+        "the failed save must not alter the durable file"
+    );
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("no volume is visible");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the fake world has no LV"
+    );
+
+    // The arm was consumed: the retry creates normally.
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("the retry creates");
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+}
+
+/// The create-intent save's rename lands before the injected failure:
+/// the durable intent is present even though no LV exists. Startup
+/// observes the absent intent-owned LV and drops it; a fresh create
+/// with the same id and payload then succeeds.
+#[tokio::test]
+async fn create_intent_save_failure_after_rename_is_dropped_on_restart() {
+    let fixture = fixture();
+    let volume = "create-intent-rename";
+    let id = volume_id(volume);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("the create-intent save fails after its rename");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(
+        err.detail
+            .contains("durable state did record the create intent"),
+        "the error names the durable intent left behind: {err}"
+    );
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvcreate"),
+        "the durable intent save precedes lvcreate"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the rename made the create intent durable"
+    );
+    assert!(durable.volume(&id).is_none());
+
+    // Startup observes no intent-owned LV: it drops the stale intent and
+    // never fabricates a volume.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("the absent intent-owned LV is not adopted");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.create_intents().is_empty(), "{durable:?}");
+    assert!(durable.volume(&id).is_none());
+
+    // The dropped intent does not wedge the same create.
+    let created = restarted
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("a fresh create with the same id and payload succeeds");
+    assert_eq!(created.volume_id, id);
+    assert_eq!(created.state, VolumeLifecycle::Ready);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+}
+
+/// A runner-level `lvcreate` failure has no exit status: the outcome is
+/// unknown, so the durable intent must be kept (never cleared) for
+/// startup recovery to classify the observed LV.
+#[tokio::test]
+async fn a_runner_error_keeps_the_create_intent_for_startup_recovery() {
+    let fixture = fixture();
+    let volume = "create-runner-error";
+    let id = volume_id(volume);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .fail_runner_for
+        .push("lvcreate".to_owned());
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("the runner fails without an exit status");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("outcome is unknown"), "{err}");
+    assert!(
+        err.detail.contains("durable create intent remains"),
+        "the error says the unknown outcome keeps the intent: {err}"
+    );
+
+    assert!(
+        fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvcreate"),
+        "the command was attempted"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "an unknown command outcome never clears the durable intent"
+    );
+    assert!(durable.volume(&id).is_none());
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+
+    // Startup observes no intent-owned LV and drops the intent.
+    fixture.world.lock().expect("world").fail_runner_for.clear();
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.create_intents().is_empty(), "{durable:?}");
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("no volume was fabricated");
+    assert_eq!(inspected.code, ApiErrorCode::NotFound);
+}
+
+/// A known `lvcreate` failure clears the intent, but when that clear
+/// save fails before its rename the durable intent survives. Memory
+/// must be put back to match the durable file so a later successful
+/// save cannot erase an authorization startup still has to classify.
+#[tokio::test]
+async fn a_create_clear_save_failure_keeps_the_intent_in_memory() {
+    let fixture = fixture();
+    let volume = "create-clear-save-fails";
+    let id = volume_id(volume);
+    fixture.world.lock().expect("world").fail_lvcreate = true;
+    // Save 0 is the durable intent; save 1 is the clear after the known
+    // command failure. Failing save 1 before its rename leaves the
+    // intent in the old durable file.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("lvcreate reports a known failure");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("lvcreate"), "{err}");
+    assert!(
+        err.detail.contains("could not be cleared durably"),
+        "the failed clear is reported honestly: {err}"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the pre-rename clear failure left the intent durable"
+    );
+
+    // A later successful mutation from the same in-memory provider must
+    // not erase the re-inserted intent.
+    fixture.world.lock().expect("world").fail_lvcreate = false;
+    fixture
+        .provider
+        .create_volume(&fixture_create_request("create-clear-save-witness", GIB))
+        .await
+        .expect("a second create saves the in-memory state");
+    let durable = LvmState::load(&fixture.state_path).expect("durable after the next save");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the re-inserted intent survived a later save"
+    );
+
+    // Startup drops it: no intent-owned LV exists.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.create_intents().is_empty(), "{durable:?}");
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("no volume was adopted");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+/// A create whose final save fails runs the checked compensation; when
+/// that compensation's clear save also fails **before its rename**, the
+/// durable file still holds the create intent. Memory must put it back,
+/// or the next successful save would erase the anchor and orphan an LV
+/// whose `lvremove` also failed.
+#[tokio::test]
+async fn a_create_compensation_clear_failure_keeps_the_intent_in_memory() {
+    let fixture = fixture();
+    let volume = "create-compensation-clear-fails";
+    let id = volume_id(volume);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    // `lvcreate` succeeds, then blocks the `.tmp` path: the final save
+    // fails pre-rename (the valid durable file still holds the intent)
+    // and the compensating clear save fails the same way.
+    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = Some(fixture.state_path.clone());
+
+    let err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("the final save and its compensating clear both fail");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail
+            .contains("durable create intent could not be cleared"),
+        "the failed clear is reported honestly: {err}"
+    );
+    assert!(
+        err.detail.contains("cleanup save failed"),
+        "the compensation save failure is reported: {err}"
+    );
+
+    // The checked compensation removed the LV and the durable file still
+    // holds the intent (the clear's rename did not land).
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the compensating lvremove removed the LV"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state is still readable");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the pre-rename clear failure left the intent durable"
+    );
+
+    // Unblock saves and drive a later successful mutation from the same
+    // in-memory provider: the re-inserted intent must survive it.
+    fixture.world.lock().expect("world").poison_tmp_on_lvcreate = None;
+    let mut tmp_name = fixture.state_path.clone().into_os_string();
+    tmp_name.push(".tmp");
+    std::fs::remove_dir(std::path::PathBuf::from(tmp_name)).expect("unblock the tmp path");
+    fixture
+        .provider
+        .create_volume(&fixture_create_request("create-compensation-witness", GIB))
+        .await
+        .expect("a second create saves the in-memory state");
+    let durable = LvmState::load(&fixture.state_path).expect("durable after the next save");
+    assert!(
+        durable.create_intent(&id).is_some(),
+        "the re-inserted create intent survived a later save"
+    );
+
+    // Startup observes no intent-owned LV and drops the intent.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.create_intents().is_empty(), "{durable:?}");
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("no volume was fabricated");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+// -- Grow -------------------------------------------------------------------
+
+#[tokio::test]
+async fn grow_intent_save_failure_means_no_lvextend() {
+    let fixture = fixture();
+    let volume = "grow-intent-fail";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("the grow intent save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(err.detail.contains("no grow was attempted"), "{err}");
+
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvextend"),
+        "a failed intent save must not reach lvextend"
+    );
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&lv_path),
+        Some(&GIB),
+        "the LV was not extended"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    let stored = durable.volume(&id).expect("the volume record");
+    assert_eq!(stored.entry.size_bytes, GIB);
+    assert_eq!(stored.entry.generation, 1);
+    assert!(durable.grow_intent(&id).is_none(), "no intent survived");
+
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("inspect unchanged");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, 1);
+
+    // The retry runs a fresh durable-first grow.
+    let grown = fixture
+        .provider
+        .grow_volume(&id, &fixture_grow_request(volume, 2 * GIB, 1))
+        .await
+        .expect("retry the grow");
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after retry");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, 2);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.grow_intent(&id).is_none());
+}
+
+/// The grow-intent save's rename lands before the injected failure: the
+/// durable intent is present even though no `lvextend` ran. Startup sees
+/// the LV still at its from-size and drops the intent without changing
+/// the volume.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash-window/restart narrative
+async fn grow_intent_save_failure_after_rename_is_dropped_on_restart() {
+    let fixture = fixture();
+    let volume = "grow-intent-rename";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    // The grow's first save is the durable intent; fail it after the
+    // rename landed. No destructive command has run yet.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("the grow-intent save fails after its rename");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(
+        err.detail
+            .contains("durable state did record the grow intent"),
+        "the error names the durable intent left behind: {err}"
+    );
+
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvextend"),
+        "a failed intent save must not reach lvextend"
+    );
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&lv_path),
+        Some(&GIB),
+        "the LV is still at the from-size"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.grow_intent(&id).is_some(),
+        "the rename made the grow intent durable"
+    );
+    let stored = durable.volume(&id).expect("the volume record");
+    assert_eq!(stored.entry.size_bytes, GIB);
+    assert_eq!(stored.entry.generation, created.generation);
+
+    // Startup observes the LV at its from-size and drops the intent; no
+    // size or generation change is invented.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.grow_intents().is_empty(), "{durable:?}");
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("the unchanged volume is served");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, created.generation);
+}
+
+/// A runner-level `lvextend` failure has no exit status: the outcome is
+/// unknown, so the durable grow intent must be kept for startup
+/// recovery to classify the observed size.
+#[tokio::test]
+async fn a_runner_error_keeps_the_grow_intent_for_startup_recovery() {
+    let fixture = fixture();
+    let volume = "grow-runner-error";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    fixture
+        .world
+        .lock()
+        .expect("world")
+        .fail_runner_for
+        .push("lvextend".to_owned());
+
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("the runner fails without an exit status");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("outcome is unknown"), "{err}");
+    assert!(
+        err.detail.contains("durable grow intent remains"),
+        "the error says the unknown outcome keeps the intent: {err}"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.grow_intent(&id).is_some(),
+        "an unknown command outcome never clears the durable intent"
+    );
+    let stored = durable.volume(&id).expect("the volume record");
+    assert_eq!(stored.entry.size_bytes, GIB);
+
+    // Startup observes the LV at its from-size and drops the intent.
+    fixture.world.lock().expect("world").fail_runner_for.clear();
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.grow_intents().is_empty(), "{durable:?}");
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("the unchanged volume is served");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, created.generation);
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&lv_path),
+        Some(&GIB),
+        "the LV was not extended"
+    );
+}
+
+/// A known `lvextend` failure clears the intent, but when that clear
+/// save fails before its rename the durable intent survives. Memory
+/// must be put back to match the durable file so a later successful
+/// save cannot erase an authorization startup still has to classify.
+#[tokio::test]
+async fn a_grow_clear_save_failure_keeps_the_intent_in_memory() {
+    let fixture = fixture();
+    let volume = "grow-clear-save-fails";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    fixture.world.lock().expect("world").fail_lvextend = true;
+    // Save 0 is the durable intent; save 1 is the clear after the known
+    // command failure. Failing save 1 before its rename leaves the
+    // intent in the old durable file.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("lvextend reports a known failure");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("lvextend"), "{err}");
+    assert!(
+        err.detail.contains("could not be cleared durably"),
+        "the failed clear is reported honestly: {err}"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.grow_intent(&id).is_some(),
+        "the pre-rename clear failure left the intent durable"
+    );
+
+    // A later successful mutation from the same in-memory provider must
+    // not erase the re-inserted intent.
+    fixture.world.lock().expect("world").fail_lvextend = false;
+    fixture
+        .provider
+        .create_volume(&fixture_create_request("grow-clear-save-witness", GIB))
+        .await
+        .expect("a second create saves the in-memory state");
+    let durable = LvmState::load(&fixture.state_path).expect("durable after the next save");
+    assert!(
+        durable.grow_intent(&id).is_some(),
+        "the re-inserted grow intent survived a later save"
+    );
+
+    // Startup sees the LV at its from-size and drops the intent.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.grow_intents().is_empty(), "{durable:?}");
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("the unchanged volume is served");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, created.generation);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash-window/restart/roll-forward narrative
+async fn grow_final_save_failure_rolls_forward_on_restart() {
+    let fixture = fixture();
+    let volume = "grow-final-fail";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    // `skip = 1` passes the grow-intent save and fails the final
+    // record save before its rename: the old durable state (volume at
+    // its from-size + the grow intent) survives.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("the final grow save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(err.detail.contains("was extended"), "{err}");
+    assert!(err.detail.contains("grow intent"), "{err}");
+
+    // The world really grew; the durable record did not.
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&lv_path),
+        Some(&(2 * GIB))
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    let stored = durable.volume(&id).expect("the durable volume");
+    assert_eq!(stored.entry.size_bytes, GIB);
+    assert_eq!(stored.entry.generation, 1);
+    let intent = durable.grow_intent(&id).expect("the durable grow intent");
+    assert_eq!(intent.from_size_bytes, GIB);
+    assert_eq!(intent.requested_size_bytes, 2 * GIB);
+    assert_eq!(intent.expected_generation, 1);
+
+    // The contract keeps the observed shape in memory: same-incarnation
+    // inspect reports the extended LV, never the stale durable size.
+    let observed = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("same-incarnation inspect");
+    assert_eq!(observed.provisioned_bytes, 2 * GIB);
+    assert_eq!(observed.generation, 2);
+
+    // Restart rolls the grow forward exactly once.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, 2);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.grow_intent(&id).is_none(), "the intent is consumed");
+    assert_eq!(
+        durable.volume(&id).expect("volume").entry.generation,
+        2,
+        "the restart bumped the generation exactly once"
+    );
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+    assert!(report.foreign_lvs.is_empty(), "{report:?}");
+
+    // The next grow fences on the rolled-forward generation.
+    let grown = restarted
+        .grow_volume(&id, &fixture_grow_request(volume, 3 * GIB, 2))
+        .await
+        .expect("grow to 3 GiB at generation 2");
+    assert_eq!(grown.effective_size_bytes, 3 * GIB);
+}
+
+/// The FINAL grow save's rename lands before the injected failure (the
+/// documented carve-out): the durable state already contains the grow,
+/// so memory keeps the observed completion and a restart neither bumps
+/// the generation again nor shrinks the LV.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash-window/restart narrative
+async fn grow_final_save_failure_after_rename_is_the_carve_out() {
+    let fixture = fixture();
+    let volume = "grow-final-rename";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    // Grow saves: (1) the durable intent, (2) the final record + intent
+    // removal. Skip the first; fail the second after its rename.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        1,
+    );
+    let err = fixture
+        .provider
+        .grow_volume(
+            &id,
+            &fixture_grow_request(volume, 2 * GIB, created.generation),
+        )
+        .await
+        .expect_err("the final grow save fails after its rename");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail
+            .contains("the durable state already contains the grow"),
+        "the carve-out names the committed grow: {err}"
+    );
+
+    // The rename landed: the durable record carries the new size and
+    // the bumped generation, with no grow intent left.
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    let stored = durable.volume(&id).expect("the durable volume");
+    assert_eq!(stored.entry.size_bytes, 2 * GIB);
+    assert_eq!(stored.entry.generation, created.generation + 1);
+    assert!(durable.grow_intent(&id).is_none(), "the intent is consumed");
+
+    // Memory keeps the observed completion (the LV was really extended).
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("same-incarnation inspect");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, created.generation + 1);
+
+    // A restart agrees and performs no further roll-forward.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let inspected = restarted
+        .inspect_volume(&id)
+        .await
+        .expect("inspect after restart");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, created.generation + 1);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    let stored = durable.volume(&id).expect("the durable volume");
+    assert_eq!(stored.entry.size_bytes, 2 * GIB);
+    assert_eq!(stored.entry.generation, created.generation + 1);
+    assert!(durable.grow_intent(&id).is_none());
+    assert_eq!(
+        fixture.world.lock().expect("world").lvs.get(&lv_path),
+        Some(&(2 * GIB)),
+        "the LV is never shrunk"
+    );
+}
+
+#[tokio::test]
+async fn grow_intent_roll_forward_at_startup() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("grow-roll-forward");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), 2 * GIB);
+    common::seed_grow_intent(&state_path, id.as_str(), "op-seeded-grow", GIB, 2 * GIB, 1);
+
+    let provider = common::provider_from(&state_path, &world);
+    let inspected = provider
+        .inspect_volume(&id)
+        .await
+        .expect("the volume rolled forward");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, 2);
+
+    let durable = LvmState::load(&state_path).expect("durable state");
+    assert!(durable.grow_intent(&id).is_none(), "the intent is consumed");
+}
+
+#[tokio::test]
+async fn grow_intent_is_dropped_when_the_lv_did_not_grow() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("grow-not-landed");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), GIB);
+    common::seed_grow_intent(&state_path, id.as_str(), "op-seeded-grow", GIB, 2 * GIB, 1);
+
+    let provider = common::provider_from(&state_path, &world);
+    let inspected = provider
+        .inspect_volume(&id)
+        .await
+        .expect("the volume is unchanged");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, 1);
+
+    let durable = LvmState::load(&state_path).expect("durable state");
+    assert!(
+        durable.grow_intent(&id).is_none(),
+        "an unlanded grow drops the intent"
+    );
+    assert_eq!(durable.volume(&id).expect("volume").entry.size_bytes, GIB);
+}
+
+#[test]
+fn grow_intent_with_ambiguous_geometry_fails_startup() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("grow-ambiguous");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    // Strictly between the from-size and the requested size.
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), 3 * GIB / 2);
+    common::seed_grow_intent(&state_path, id.as_str(), "op-seeded-grow", GIB, 2 * GIB, 1);
+
+    let err = startup_error(&state_path, &world);
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("ambiguous"), "{err}");
+}
+
+#[tokio::test]
+async fn grow_intent_with_a_stale_generation_is_dropped_at_startup() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("grow-stale-generation");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    // The LV was extended, but the intent's authorization (generation 9)
+    // is stale: it must be dropped, never rolled forward.
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), 2 * GIB);
+    common::seed_grow_intent(&state_path, id.as_str(), "op-seeded-grow", GIB, 2 * GIB, 9);
+
+    let provider = common::provider_from(&state_path, &world);
+    let inspected = provider
+        .inspect_volume(&id)
+        .await
+        .expect("the volume record is kept");
+    assert_eq!(inspected.provisioned_bytes, GIB);
+    assert_eq!(inspected.generation, 1);
+
+    let durable = LvmState::load(&state_path).expect("durable state");
+    assert!(durable.grow_intent(&id).is_none(), "the intent is dropped");
+    // The LV is never shrunk as compensation.
+    assert_eq!(
+        world.lock().expect("world").lvs.get(&format!(
+            "{}/{}",
+            common::CLAIMED_VG,
+            lv_name_for(&id)
+        )),
+        Some(&(2 * GIB))
+    );
+}
+
+/// A durable delete authorized at the volume's current generation is
+/// the later authority. Startup must not roll an older grow intent
+/// forward (which would bump the generation and silently void the
+/// delete, potentially presenting ZeroDiscard-erased data as live).
+#[tokio::test]
+async fn startup_delete_wins_over_a_prior_grow_intent() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("grow-then-delete");
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    // The dead incarnation extended the LV after journaling the grow but
+    // before saving the volume record...
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), 2 * GIB);
+    common::seed_grow_intent(&state_path, id.as_str(), "op-seeded-grow", GIB, 2 * GIB, 1);
+    // ...and a delete was later authorized at the still-current
+    // generation.
+    common::seed_delete_intent(
+        &state_path,
+        id.as_str(),
+        "op-seeded-delete",
+        1,
+        ErasurePolicy::ZeroDiscard,
+    );
+
+    let fixture = common::fixture_from_state(state_path, world);
+
+    // The delete completed at generation 1: the grow never bumped it.
+    let err = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the delete removed the volume");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(
+        durable.volume(&id).is_none(),
+        "the delete removed the record"
+    );
+    assert!(
+        durable.grow_intent(&id).is_none(),
+        "the superseded grow intent is dropped"
+    );
+    assert!(durable.delete_intent(&id).is_none());
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "startup ran the recorded delete"
+    );
+    let programs = fixture.runner.programs();
+    assert!(
+        programs.iter().any(|program| program == "blkdiscard"),
+        "{programs:?}"
+    );
+    assert!(
+        programs.iter().any(|program| program == "lvremove"),
+        "{programs:?}"
+    );
+}
+
+// -- Delete -----------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_intent_save_failure_leaves_the_volume_untouched() {
+    let fixture = fixture();
+    let volume = "delete-intent-fail";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        0,
+    );
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-intent-fail",
+                created.generation,
+                ErasurePolicy::ZeroDiscard,
+            ),
+        )
+        .await
+        .expect_err("the delete intent save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| {
+                invocation.program == "blkdiscard" || invocation.program == "lvremove"
+            }),
+        "a failed intent save must run no destructive command"
+    );
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the LV is untouched"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    assert!(durable.delete_intent(&id).is_none());
+
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the volume is still served");
+    assert_eq!(inspected.state, VolumeLifecycle::Ready);
+    assert_eq!(inspected.generation, 1);
+
+    // The retry completes with a fresh operation id.
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-intent-fail-retry",
+                created.generation,
+                ErasurePolicy::ZeroDiscard,
+            ),
+        )
+        .await
+        .expect("the retry completes");
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+    let err = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the volume is gone");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+/// A failed destructive delete command must not discard the durable
+/// authorization: the intent keeps fencing attach/create-replay/grow/
+/// move, and a retry or restart completes it.
+///
+/// The crash window here is a command failure (a failed `blkdiscard`)
+/// with a healthy durable intent save: the step may have partially
+/// erased the LV, so reporting the volume as fully usable would be
+/// dishonest.
+#[tokio::test]
+async fn delete_command_failure_keeps_the_pending_authorization_and_fences_new_authority() {
+    let fixture = fixture();
+    let volume = "delete-command-fail";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    fixture.world.lock().expect("world").fail_blkdiscard = true;
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-command-fail",
+                created.generation,
+                ErasurePolicy::ZeroDiscard,
+            ),
+        )
+        .await
+        .expect_err("the failed discard surfaces");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail.contains("remains authorized and pending"),
+        "the failed command keeps the authorization: {err}"
+    );
+
+    // The durable file still holds both the volume and the matching
+    // authorization; the destructive step never reached lvremove.
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    let intent = durable
+        .delete_intent(&id)
+        .expect("the pending delete stays authorized");
+    assert_eq!(intent.expected_generation, created.generation);
+    assert_eq!(intent.erasure_policy, ErasurePolicy::ZeroDiscard);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "a failed discard must not remove the LV"
+    );
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| invocation.program == "lvremove"),
+        "the failed discard never proceeds to lvremove"
+    );
+
+    // The pending delete is a fence, not a bookkeeping note: a new
+    // attachment is refused until the delete is completed.
+    let attach_err = fixture
+        .provider
+        .attach_volume(
+            &id,
+            &fixture_attach_request(volume, "att-delete-command-fail", created.generation),
+        )
+        .await
+        .expect_err("attach during the pending delete");
+    assert_eq!(attach_err.code, ApiErrorCode::InvalidState, "{attach_err}");
+    assert!(
+        attach_err.detail.contains("durable pending delete"),
+        "{attach_err}"
+    );
+
+    // A retry with a fresh operation id (the same generation/policy) is
+    // the completion path.
+    fixture.world.lock().expect("world").fail_blkdiscard = false;
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-command-fail-retry",
+                created.generation,
+                ErasurePolicy::ZeroDiscard,
+            ),
+        )
+        .await
+        .expect("the retry completes the authorized delete");
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+}
+
+/// A delete-intent save failure whose rename landed: the durable intent
+/// is present even though this call ran no destructive command. Memory
+/// must be re-inserted to match it (the fence survives), and the
+/// re-insertion must survive a *later* unrelated save rather than being
+/// silently overwritten.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash-window/fence/later-save/restart narrative
+async fn delete_intent_save_failure_after_rename_keeps_the_fence_and_completes_on_restart() {
+    let fixture = fixture();
+    let volume = "delete-intent-rename";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    let invocations_before = fixture.runner.invocations().len();
+
+    // The delete's FIRST save is the durable intent. The rename lands
+    // before the directory-fsync boundary fails, so the durable file
+    // authorizes a delete that this call never started.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        0,
+    );
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-intent-rename",
+                created.generation,
+                ErasurePolicy::ZeroDiscard,
+            ),
+        )
+        .await
+        .expect_err("the intent save fails after its rename");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail.contains("pending delete still fences"),
+        "the error names the surviving fence: {err}"
+    );
+    assert!(
+        !fixture.runner.invocations()[invocations_before..]
+            .iter()
+            .any(|invocation| {
+                invocation.program == "blkdiscard" || invocation.program == "lvremove"
+            }),
+        "a failed intent save runs no destructive command"
+    );
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    let intent = durable
+        .delete_intent(&id)
+        .expect("the landed rename made the intent durable");
+    assert_eq!(intent.expected_generation, created.generation);
+    assert_eq!(intent.erasure_policy, ErasurePolicy::ZeroDiscard);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the LV is untouched"
+    );
+
+    let attach_err = fixture
+        .provider
+        .attach_volume(
+            &id,
+            &fixture_attach_request(volume, "att-delete-intent-rename", created.generation),
+        )
+        .await
+        .expect_err("attach during the re-inserted pending delete");
+    assert_eq!(attach_err.code, ApiErrorCode::InvalidState, "{attach_err}");
+    assert!(
+        attach_err.detail.contains("durable pending delete"),
+        "{attach_err}"
+    );
+
+    // A later, unrelated create performs a REAL successful save. If the
+    // in-memory re-insertion were missing, that save would overwrite the
+    // durable file and erase the pending authorization.
+    let second = fixture
+        .provider
+        .create_volume(&fixture_create_request("delete-intent-rename-second", GIB))
+        .await
+        .expect("an unrelated create still saves");
+    let durable = LvmState::load(&fixture.state_path).expect("durable state after the save");
+    assert!(
+        durable.delete_intent(&id).is_some(),
+        "the in-memory re-inserted intent survived a later save"
+    );
+    assert!(durable.volume(&id).is_some());
+    assert!(durable.volume(&second.volume_id).is_some());
+
+    // Restart observes the durable authorization and completes it; the
+    // unrelated volume is left intact.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("startup completed the authorized delete");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+    let durable = LvmState::load(&fixture.state_path).expect("durable after restart");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+    assert!(durable.volume(&second.volume_id).is_some());
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    restarted
+        .inspect_volume(&second.volume_id)
+        .await
+        .expect("the unrelated volume is intact");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash-window/authority-fence/retry narrative
+async fn delete_final_save_failure_blocks_new_authority_and_completes_on_retry() {
+    let fixture = fixture();
+    let volume = "delete-final-fail";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    // `skip = 1` passes the delete-intent save and fails the final
+    // removal save before its rename: the durable intent survives while
+    // the LV may already be gone.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-final-fail",
+                created.generation,
+                ErasurePolicy::Retain,
+            ),
+        )
+        .await
+        .expect_err("the final delete save fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("injected state save failure"), "{err}");
+    assert!(err.detail.contains("durable delete intent"), "{err}");
+
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "the LV was already removed"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    let intent = durable
+        .delete_intent(&id)
+        .expect("the durable delete intent");
+    assert_eq!(intent.expected_generation, 1);
+    assert_eq!(intent.erasure_policy, ErasurePolicy::Retain);
+
+    // The contract restores the durable shape in memory: inspect still
+    // answers, while new authority is refused.
+    fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the restored durable shape is served");
+
+    let attach_err = fixture
+        .provider
+        .attach_volume(&id, &fixture_attach_request(volume, "att-pending", 1))
+        .await
+        .expect_err("attach during a pending delete");
+    assert_eq!(attach_err.code, ApiErrorCode::InvalidState, "{attach_err}");
+    assert!(
+        attach_err.detail.contains("durable pending delete"),
+        "{attach_err}"
+    );
+
+    let grow_err = fixture
+        .provider
+        .grow_volume(&id, &fixture_grow_request(volume, 2 * GIB, 1))
+        .await
+        .expect_err("grow during a pending delete");
+    assert_eq!(grow_err.code, ApiErrorCode::InvalidState, "{grow_err}");
+    assert!(
+        grow_err.detail.contains("durable pending delete"),
+        "{grow_err}"
+    );
+
+    // An idempotent create replay must not report the doomed volume as
+    // live either: it is the same authority family as attach/grow/move.
+    let create_err = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect_err("create replay during a pending delete");
+    assert_eq!(create_err.code, ApiErrorCode::InvalidState, "{create_err}");
+    assert!(
+        create_err.detail.contains("durable pending delete"),
+        "{create_err}"
+    );
+
+    let move_req = MoveVolumeBackingRequest {
+        api_version: volvisor_types::API_VERSION.to_owned(),
+        operation_id: OperationId::new("op-move-pending-delete").expect("valid operation id"),
+        target_pool_id: "/dev/pv-b".to_owned(),
+        expected_generation: 1,
+        max_copy_bytes_per_sec: None,
+    };
+    let move_err = fixture
+        .provider
+        .move_volume_backing(&id, &move_req)
+        .await
+        .expect_err("move during a pending delete");
+    assert_eq!(move_err.code, ApiErrorCode::InvalidState, "{move_err}");
+    assert!(
+        move_err.detail.contains("durable pending delete"),
+        "{move_err}"
+    );
+
+    // The retry is the completion path (the delete is allowed to retry).
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-final-fail-retry",
+                created.generation,
+                ErasurePolicy::Retain,
+            ),
+        )
+        .await
+        .expect("the retry completes the delete");
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+    let err = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the deleted volume is gone");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn delete_final_save_failure_is_completed_at_startup() {
+    let fixture = fixture();
+    let volume = "delete-startup-complete";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterTmpWrite,
+        1,
+    );
+    fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-startup-complete",
+                created.generation,
+                ErasurePolicy::Retain,
+            ),
+        )
+        .await
+        .expect_err("the final delete save fails");
+
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("recovery completed the delete");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none(), "the record is removed");
+    assert!(durable.delete_intent(&id).is_none());
+    assert!(
+        !durable
+            .volumes()
+            .values()
+            .any(|stored| stored.runtime.state == VolumeLifecycle::Failed),
+        "recovery removes the record; it never marks it Failed"
+    );
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn delete_startup_completion_runs_the_recorded_policy() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("delete-startup-policy");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), GIB);
+    common::seed_delete_intent(
+        &state_path,
+        id.as_str(),
+        "op-seeded-delete",
+        1,
+        ErasurePolicy::ZeroDiscard,
+    );
+
+    let fixture = common::fixture_from_state(state_path, world);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "startup ran the recorded lvremove"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+
+    let invocations = fixture.runner.invocations();
+    let device = format!("/dev/{lv_path}");
+    let discard_at = invocations
+        .iter()
+        .position(|invocation| {
+            invocation.program == "blkdiscard" && invocation.args.iter().any(|arg| arg == &device)
+        })
+        .expect("the recorded ZeroDiscard blkdiscard ran");
+    let remove_at = invocations
+        .iter()
+        .position(|invocation| {
+            invocation.program == "lvremove" && invocation.args.iter().any(|arg| arg == &lv_path)
+        })
+        .expect("the recorded lvremove ran");
+    assert!(
+        discard_at < remove_at,
+        "the recorded policy discards before removing"
+    );
+}
+
+/// A destructive command that fails during startup completion fails the
+/// startup and leaves both the LV and the durable authorization in
+/// place. Startup never serves a volume whose authorized delete is
+/// pending, and never rewrites the state as though the delete landed.
+#[test]
+fn startup_delete_command_failure_fails_startup_and_leaves_the_lv() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("delete-startup-command-fails");
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), GIB);
+    common::seed_delete_intent(
+        &state_path,
+        id.as_str(),
+        "op-seeded-delete",
+        1,
+        ErasurePolicy::Retain,
+    );
+    world
+        .lock()
+        .expect("world")
+        .fail_lvremove_for
+        .push(lv_path.clone());
+    let state_before = fs::read(&state_path).expect("state snapshot");
+
+    let err = startup_error(&state_path, &world);
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("could not complete"), "{err}");
+    assert!(
+        err.detail.contains("authorized delete is pending"),
+        "the failure names the pending authorization: {err}"
+    );
+
+    // The failed delete leaves the LV and the durable change untouched.
+    assert!(
+        world.lock().expect("world").lvs.contains_key(&lv_path),
+        "the failed delete did not remove the LV"
+    );
+    assert_eq!(
+        fs::read(&state_path).expect("state after the failed startup"),
+        state_before,
+        "startup does not rewrite state when the authorized delete fails"
+    );
+    let durable = LvmState::load(&state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    assert!(
+        durable.delete_intent(&id).is_some(),
+        "the authorization survives for the next retry/restart"
+    );
+}
+
+#[tokio::test]
+async fn delete_intent_with_a_stale_generation_is_dropped_without_deleting() {
+    let (state_path, world) = seeded_world();
+    let id = volume_id("delete-stale-generation");
+    common::seed_volume(&state_path, id.as_str(), common::CLAIMED_VG, GIB);
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&id), GIB);
+    common::seed_delete_intent(
+        &state_path,
+        id.as_str(),
+        "op-seeded-delete",
+        9,
+        ErasurePolicy::ZeroDiscard,
+    );
+
+    let fixture = common::fixture_from_state(state_path, world);
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    let inspected = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect("the stale-authorization volume is kept");
+    assert_eq!(inspected.generation, 1);
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path),
+        "a stale generation never deletes"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_some());
+    assert!(
+        durable.delete_intent(&id).is_none(),
+        "the intent is dropped"
+    );
+    assert!(
+        !fixture
+            .runner
+            .invocations()
+            .iter()
+            .any(|invocation| invocation.program == "lvremove"),
+        "no lvremove ran for a stale authorization"
+    );
+}
+
+#[tokio::test]
+async fn delete_intent_with_an_attached_volume_fails_startup() {
+    let fixture = fixture();
+    let volume = "delete-attached-guard";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let attached = fixture
+        .provider
+        .attach_volume(
+            &created.volume_id,
+            &fixture_attach_request(volume, "att-delete-guard", 1),
+        )
+        .await
+        .expect("attach");
+
+    // A delete intent must never coexist with an attachment; insert one
+    // directly at the current generation to pin the startup guard.
+    {
+        let mut state = LvmState::load(&fixture.state_path).expect("load state");
+        state.insert_delete_intent(
+            created.volume_id.clone(),
+            volvisor_lvm::state::DeleteIntent {
+                operation_id: OperationId::new("op-seeded-attached-delete")
+                    .expect("valid operation id"),
+                expected_generation: attached.volume_generation,
+                erasure_policy: ErasurePolicy::Retain,
+            },
+        );
+        state.save(&fixture.state_path).expect("save the intent");
+    }
+
+    let err = startup_error(&fixture.state_path, &fixture.world);
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail.contains("attachment") || err.detail.contains("attached"),
+        "{err}"
+    );
+    assert!(
+        fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&format!(
+                "{}/{}",
+                common::CLAIMED_VG,
+                lv_name_for(&created.volume_id)
+            )),
+        "startup refused instead of removing the attached LV"
+    );
+}
+
+#[tokio::test]
+async fn delete_post_rename_failure_is_the_carve_out() {
+    let fixture = fixture();
+    let volume = "delete-post-rename";
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, GIB))
+        .await
+        .expect("create");
+    let id = created.volume_id.clone();
+    let lv_path = format!("{}/{}", common::CLAIMED_VG, lv_name_for(&id));
+
+    // `skip = 1` passes the delete-intent save; the final save's rename
+    // lands before the directory-fsync boundary fails, so the NEW
+    // durable state (no volume, no intent) is the commit.
+    fixture.provider.store_crash_hooks().arm_save_failure(
+        STORE_LVM_STATE,
+        StoreSavePoint::AfterRenameBeforeDirFsync,
+        1,
+    );
+    let err = fixture
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with(
+                "op-delete-post-rename",
+                created.generation,
+                ErasurePolicy::Retain,
+            ),
+        )
+        .await
+        .expect_err("the directory-fsync boundary fails");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(
+        err.detail
+            .contains("durable state already records the deletion"),
+        "{err}"
+    );
+
+    assert!(
+        !fixture
+            .world
+            .lock()
+            .expect("world")
+            .lvs
+            .contains_key(&lv_path)
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none());
+    assert!(durable.delete_intent(&id).is_none());
+    let err = fixture
+        .provider
+        .inspect_volume(&id)
+        .await
+        .expect_err("the in-memory removal was kept");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+
+    // A restart is consistent with the committed deletion.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let err = restarted
+        .inspect_volume(&id)
+        .await
+        .expect_err("the restart agrees the volume is gone");
+    assert_eq!(err.code, ApiErrorCode::NotFound);
+    let report = restarted.reconcile_report().expect("report");
+    assert!(report.missing_volumes.is_empty(), "{report:?}");
+    assert!(report.foreign_lvs.is_empty(), "{report:?}");
 }
