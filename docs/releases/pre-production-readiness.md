@@ -36,8 +36,8 @@ verdict below.
   [`docs/evidence/day2/2026-11-03-d5-redrill/`](../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
   It proves the **normal uncommitted state-save path** fails closed and
   converges, and re-confirms the journal path. It does not fault-inject the
-  cleanup-failure, post-rename carve-out or unreadable-durable-reread branches;
-  those remain test-covered.
+  cleanup-failure, post-rename carve-out, clear-save or
+  unreadable-durable-reread branches; those remain test-covered.
 - [#70](https://github.com/o3kio/volvisor/issues/70) is addressed by the
   provider-state intent journaling in this change: durable-first
   create/grow/delete intents, startup adoption/roll-forward/completion, move
@@ -152,12 +152,13 @@ report mapping every gate to evidence. Current status:
    interleaving tests are not implemented. The ENOSPC state-save leak is fixed
    by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
    `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
-   `940722e`; the cleanup-failure, carve-out and unreadable-reread branches
-   remain test-covered, not drilled. [#70](https://github.com/o3kio/volvisor/issues/70)
+   `940722e`; the cleanup-failure, carve-out, clear-save and unreadable-reread
+   branches remain test-covered, not drilled. [#70](https://github.com/o3kio/volvisor/issues/70)
    (grow/delete/move persist divergence, the kill-9 `lvcreate`→persist orphan
    window, and a real post-rename directory-fsync fault seam) is implemented
-   and deterministically test-covered in this change; it is not
-   hardware-drilled. See
+   and deterministically test-covered in this change (the runbook's status line
+   names the few defense-in-depth branches covered by construction rather than
+   a dedicated fault test); it is not hardware-drilled. See
    [lvm-state-divergence.md](../runbooks/day-2/lvm-state-divergence.md). The
    measured lock/journal/retirement growth remains an open finding. No gate
    verdict changes, and none is a resolved production issue.

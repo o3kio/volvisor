@@ -16,8 +16,8 @@ D5 was **re-run post-fix** (both parts) at harness
 identical to merged `1863a7a` (PR #69). That re-drill covers the normal
 uncommitted-save state-ENOSPC path and re-confirms the journal path on the same
 single host; the
-cleanup-failure, carve-out and unreadable-durable-reread tails were not
-fault-injected and remain test-covered. Bundle:
+cleanup-failure, carve-out, clear-save and unreadable-durable-reread tails were
+not fault-injected and remain test-covered. Bundle:
 [`docs/evidence/day2/2026-11-03-d5-redrill/`](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 
 This page is the index. Each area page states **DRILLED**, **PARTIAL** or
@@ -157,7 +157,9 @@ It does not touch pre-existing VGs. Do not run it on a production host.
   ([#70](https://github.com/o3kio/volvisor/issues/70): grow/delete/move
   persist divergence, the kill-9 `lvcreate`→persist orphan window, and a real
   post-rename directory-fsync fault seam) is implemented and deterministically
-  test-covered; its contracts and operator tails are in
+  test-covered (the runbook status line names the few defense-in-depth branches
+  covered by construction rather than a dedicated fault test); its contracts
+  and operator tails are in
   [lvm-state-divergence.md](lvm-state-divergence.md). It is not
   hardware-drilled.
 - [#37](https://github.com/o3kio/volvisor/issues/37) — three-physical-host

@@ -281,6 +281,12 @@ pub struct MoveReconcileReport {
     /// whose world verifiably shows the pre-move placement (the
     /// relocation did not happen; the source intact and serving).
     pub resolved_failed: Vec<VolumeId>,
+    /// Records resolved `FAILED` because the LV is **provably absent**
+    /// (a successful `lvs` query has no row for it). The move can never
+    /// complete and no `pvmove` can be active; the settled record stops
+    /// fencing delete, and the volume pass marks the absent LV `Failed`
+    /// at the next startup.
+    pub resolved_absent: Vec<VolumeId>,
     /// Records parked `IN_DOUBT` at the unobservable-LV bound: the
     /// world could not be observed for `MOVE_OBSERVE_FAILURE_BOUND`
     /// consecutive passes, so the record surfaces instead of
@@ -347,6 +353,10 @@ enum MoveAdmission {
         vg_name: String,
         lv_name: String,
         existing_target: Option<String>,
+        /// The stored record this request re-attaches to (its state
+        /// and source direct the world scan and the start), `None`
+        /// for a fresh drive.
+        existing_record: Option<crate::state::MoveRecord>,
     },
 }
 
@@ -645,8 +655,12 @@ impl LvmProvider {
     /// least the requested size; otherwise a manual `lvremove` is
     /// required. When the clear's rename did not land (or its re-read is
     /// unknown) the removed intent is re-inserted in memory, so a later
-    /// successful save cannot erase the durable anchor. Neither failure
-    /// ever masks the original save error.
+    /// successful save cannot erase the durable anchor. If the clear's
+    /// re-read proves the durable file already holds this volume's record
+    /// (the final save's rename had landed even though the first re-read
+    /// failed), the volume is never erased from memory while its LV
+    /// remains: the durable record is restored and the volume is served.
+    /// Neither failure ever masks the original save error.
     fn compensate_unpersisted_create(
         &self,
         state: &mut LvmState,
@@ -654,22 +668,12 @@ impl LvmProvider {
         vg_name: &str,
         lv_name: &str,
         intent: Option<CreateIntent>,
-        save_error: ApiError,
+        save_error: &ApiError,
     ) -> ApiError {
         let committed = LvmState::load(&self.state_path)
             .is_ok_and(|durable| durable.volume(volume_id).is_some());
         if committed {
-            return ApiError::new(
-                save_error.code,
-                format!(
-                    "{}; the durable state already contains this volume's record, so volume \
-                     {volume_id} and its LV {vg_name}/{lv_name} were kept; the API serves the \
-                     volume, and a retry with a new operation_id and the same payload returns it \
-                     (reusing the failed operation_id replays the failure, or fails closed as \
-                     in-doubt when the journal could not record the outcome)",
-                    save_error.detail
-                ),
-            );
+            return Self::create_already_durable_error(volume_id, vg_name, lv_name, save_error);
         }
 
         let removed = self
@@ -677,7 +681,7 @@ impl LvmProvider {
             .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])
             .is_ok_and(|output| output.success);
         state.remove_volume(volume_id);
-        let mut detail = save_error.detail;
+        let mut detail = save_error.detail.clone();
         if !removed {
             detail.push_str(
                 "; in-memory state was rolled back but the LV could not be removed: manual \
@@ -716,29 +720,54 @@ impl LvmProvider {
                              left it in place) and remains durable: startup recovery will adopt the \
                              LV only if it is present and at least the requested size",
                         );
-                        if removed {
+                        Self::push_create_recovery_note(&mut detail, vg_name, lv_name, removed);
+                    }
+                    None => match durable.volume(volume_id).cloned() {
+                        None => {
+                            // The clear save's rename landed: neither
+                            // the intent nor the volume is durable, and
+                            // memory agrees.
                             detail.push_str(
-                                "; the LV was removed, so recovery will drop the intent once it \
-                                 observes no such LV",
+                                "; the compensating clear save reported an error but the \
+                                 durable state records neither the create intent nor this \
+                                 volume (the clear's rename landed), so the compensated \
+                                 state is durable",
                             );
-                        } else {
-                            detail.push_str("; otherwise manual lvremove ");
-                            detail.push_str(vg_name);
-                            detail.push('/');
-                            detail.push_str(lv_name);
-                            detail.push_str(" is required");
                         }
-                    }
-                    None => {
-                        // The clear save's rename landed: the intent is
-                        // gone and memory/durable agree on the
-                        // compensated state.
-                        detail.push_str(
-                            "; the compensating clear save reported an error but the durable \
-                             state no longer records the create intent (its rename landed), so the \
-                             compensated state is durable",
-                        );
-                    }
+                        Some(_durable_volume) if removed => {
+                            // The final save's rename had landed (the
+                            // initial re-read failed), so the durable
+                            // file still records the volume even though
+                            // the compensating `lvremove` removed its
+                            // LV. Never claim the compensated state is
+                            // durable; startup marks the LV-less record
+                            // Failed and a retry/restart converges.
+                            detail.push_str(
+                                "; the durable state still records this volume (the final \
+                                 save's rename had landed) even though the compensating \
+                                 lvremove removed its LV; the failed clear save left that \
+                                 record in place, so startup marks a volume with no LV \
+                                 Failed and a retry or restart converges — do not recreate \
+                                 the LV by hand",
+                            );
+                        }
+                        Some(durable_volume) => {
+                            // The LV is still present and the durable
+                            // file records the volume: the carve-out.
+                            // Restore the durable record in memory so a
+                            // later save cannot erase a volume the
+                            // durable file proves exists.
+                            state.insert_volume(volume_id.clone(), durable_volume);
+                            detail = format!(
+                                "{}; the durable state already contains this volume's record \
+                                 (the final save's rename had landed) and the LV \
+                                 {vg_name}/{lv_name} is still present, so the volume was kept: \
+                                 the API serves it, and a retry with a new operation_id and the \
+                                 same payload returns it",
+                                save_error.detail
+                            );
+                        }
+                    },
                 },
                 Err(load_error) => {
                     // Unknown: treat the intent as possibly durable and
@@ -756,18 +785,7 @@ impl LvmProvider {
                         ": treat it as possibly durable; startup recovery will adopt the LV \
                          only if it is present and at least the requested size",
                     );
-                    if removed {
-                        detail.push_str(
-                            "; the LV was removed, so recovery will drop the intent once it \
-                             observes no such LV",
-                        );
-                    } else {
-                        detail.push_str("; otherwise manual lvremove ");
-                        detail.push_str(vg_name);
-                        detail.push('/');
-                        detail.push_str(lv_name);
-                        detail.push_str(" is required");
-                    }
+                    Self::push_create_recovery_note(&mut detail, vg_name, lv_name, removed);
                 }
             }
             if let Some(intent) = reinsert {
@@ -777,6 +795,46 @@ impl LvmProvider {
             detail.push_str(&cleanup_note);
         }
         ApiError::new(save_error.code, detail)
+    }
+
+    /// The carve-out's already-durable answer: the final save's rename
+    /// landed, so the durable file (and the LV) agree the volume exists.
+    fn create_already_durable_error(
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        save_error: &ApiError,
+    ) -> ApiError {
+        ApiError::new(
+            save_error.code,
+            format!(
+                "{}; the durable state already contains this volume's record, so volume \
+                 {volume_id} and its LV {vg_name}/{lv_name} were kept; the API serves the \
+                 volume, and a retry with a new operation_id and the same payload returns it \
+                 (reusing the failed operation_id replays the failure, or fails closed as \
+                 in-doubt when the journal could not record the outcome)",
+                save_error.detail
+            ),
+        )
+    }
+
+    /// Append the create-intent recovery note for a failed compensating
+    /// clear save: either the LV was removed (recovery drops the intent
+    /// once it observes no such LV) or it remains and needs a manual
+    /// `lvremove`.
+    fn push_create_recovery_note(detail: &mut String, vg_name: &str, lv_name: &str, removed: bool) {
+        if removed {
+            detail.push_str(
+                "; the LV was removed, so recovery will drop the intent once it observes no \
+                 such LV",
+            );
+        } else {
+            detail.push_str("; otherwise manual lvremove ");
+            detail.push_str(vg_name);
+            detail.push('/');
+            detail.push_str(lv_name);
+            detail.push_str(" is required");
+        }
     }
 
     /// Refuse an operation that would grant new authority over a
@@ -1720,7 +1778,7 @@ impl LvmProvider {
                 &vg_name,
                 &lv_name,
                 create_intent,
-                save_error,
+                &save_error,
             ));
         }
         Ok(inspect_response(&req.volume_id, &stored))
@@ -2652,28 +2710,32 @@ impl LvmProvider {
     /// Observe one LV's move-relevant truth: whether a pvmove mirror
     /// segment is active and which devices back the LV.
     ///
-    /// `INTERNAL` when `lvs` fails or the LV is absent — the caller
-    /// decides what an unobservable world means (the drive parks
-    /// `IN_DOUBT`; the reconcile pass skips and retries).
-    fn observe_lv(&self, vg_name: &str, lv_name: &str) -> Result<MoveObservation, ApiError> {
+    /// `Ok(Some(_))` is the LV's row. `Ok(None)` is a **proven
+    /// absence**: the `lvs` query succeeded and no row names the LV —
+    /// a `pvmove` cannot be active on an LV that does not exist, so
+    /// the caller may resolve the record terminally instead of
+    /// spinning. `Err` is an unobservable world (`lvs` failed or its
+    /// output could not be parsed) — the caller decides what an
+    /// unknown means (the drive parks `IN_DOUBT`; the reconcile pass
+    /// skips and retries).
+    fn observe_lv(
+        &self,
+        vg_name: &str,
+        lv_name: &str,
+    ) -> Result<Option<MoveObservation>, ApiError> {
         let output = self.runner.run("lvs", move_lvs_args())?;
         if !output.success {
             return Err(command_failed("lvs", &output));
         }
         let rows: Vec<LvRow> = crate::report::parse_report(&output.stdout, "lv")?;
         let wanted = format!("{vg_name}/{lv_name}");
-        rows.into_iter()
+        Ok(rows
+            .into_iter()
             .find(|row| row.vg_slash_lv().as_deref() == Some(wanted.as_str()))
             .map(|row| MoveObservation {
                 moving: row.move_segment_active(),
                 devices: row.device_pvs().into_iter().map(str::to_owned).collect(),
-            })
-            .ok_or_else(|| {
-                ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!("LV {wanted} is not reported by lvs"),
-                )
-            })
+            }))
     }
 
     /// Start (or resume) the scoped pvmove. Verified LVM 2.03.x
@@ -2823,7 +2885,12 @@ impl LvmProvider {
         record: &crate::state::MoveRecord,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
         let verification = match self.observe_lv(vg_name, lv_name) {
-            Ok(verification) => verification,
+            Ok(Some(verification)) => verification,
+            // The LV is provably absent (a successful `lvs` with no
+            // row): not an unobservable world. The move can never
+            // complete and no pvmove can be active, so resolve the
+            // record terminally instead of parking it forever.
+            Ok(None) => return self.resolve_absent_move(volume_id, vg_name, lv_name, record),
             // The completion was observed but cannot be verified:
             // unknown, never a silent success.
             Err(e) => {
@@ -3061,6 +3128,7 @@ impl LvmProvider {
                 vg_name: names.0,
                 lv_name: names.1,
                 existing_target: None,
+                existing_record: None,
             }),
             Some(record) => match record.state {
                 MoveVolumeBackingState::Complete => {
@@ -3084,6 +3152,7 @@ impl LvmProvider {
                         vg_name: names.0,
                         lv_name: names.1,
                         existing_target: None,
+                        existing_record: None,
                     })
                 }
                 MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying => {
@@ -3102,6 +3171,7 @@ impl LvmProvider {
                         vg_name: names.0,
                         lv_name: names.1,
                         existing_target: Some(record.target_pv.clone()),
+                        existing_record: Some(record.clone()),
                     })
                 }
                 MoveVolumeBackingState::InDoubt => Err(ApiError::new(
@@ -3129,6 +3199,7 @@ impl LvmProvider {
                         vg_name: names.0,
                         lv_name: names.1,
                         existing_target: None,
+                        existing_record: None,
                     })
                 }
                 // `MIRROR_READY`/`PIVOTED` are mirror-path states
@@ -3338,10 +3409,14 @@ impl LvmProvider {
 
     /// Phase 3 — journal the move's `PREPARING` anchor.
     ///
-    /// A re-attach to an existing PREPARING/COPYING record saves
-    /// nothing (an unchanged state has no durable boundary to write;
-    /// the operation-id refresh lands with the COPYING save) and must
-    /// still target the same PV. A new record requires the verified
+    /// A re-attach to an existing `Copying` record saves nothing (an
+    /// unchanged state has no durable boundary to write; the
+    /// operation-id refresh lands with the COPYING save) and must still
+    /// target the same PV. A re-attach to a `Preparing` record first
+    /// ensures the anchor is durable (normally it already is after a
+    /// crash/retry; a memory-only anchor from a failed save whose
+    /// re-read was unknown is persisted now) — no `pvmove` may start
+    /// without a durable anchor. A new record requires the verified
     /// source from admission and must be persisted before `pvmove`
     /// starts: if that save fails the in-memory record is removed and
     /// the caller starts nothing (no durable anchor would mean a blind
@@ -3452,8 +3527,45 @@ impl LvmProvider {
                     &save_error,
                 ));
             }
+        } else if record.state == MoveVolumeBackingState::Preparing {
+            self.ensure_preparing_anchor_durable(&mut state, volume_id, &record)?;
         }
         Ok((source, record))
+    }
+
+    /// Ensure a re-attached `Preparing` record has a **durable** anchor
+    /// before `pvmove` starts.
+    ///
+    /// Normally the crash/retry anchor already is durable; persist only
+    /// when the re-read proves it is not (a memory-only anchor from a
+    /// failed save whose re-read was unknown, or an unreadable file).
+    /// Never start on an unknown anchor: a crash between the start and
+    /// the COPYING save would lose the only record of the move.
+    fn ensure_preparing_anchor_durable(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        record: &crate::state::MoveRecord,
+    ) -> Result<(), ApiError> {
+        let anchor_durable = LvmState::load(&self.state_path).is_ok_and(|durable| {
+            durable.move_record(volume_id).is_some_and(|stored| {
+                stored.state == MoveVolumeBackingState::Preparing
+                    && stored.source_pv == record.source_pv
+                    && stored.target_pv == record.target_pv
+            })
+        });
+        if anchor_durable {
+            return Ok(());
+        }
+        if let Err(save_error) = self.persist(state) {
+            return Err(self.classify_preparing_save_failure(
+                state,
+                volume_id,
+                record,
+                &save_error,
+            ));
+        }
+        Ok(())
     }
 
     /// Classify a failed `PREPARING`-anchor save after the record was
@@ -3550,20 +3662,31 @@ impl LvmProvider {
         // Phase 1 — qualify under the state lock. Nothing is
         // journaled and nothing in the world is touched until every
         // check passes.
-        let (vg_name, lv_name, existing_target) = match self.admit_move(volume_id, req)? {
-            MoveAdmission::Answered(response) => return Ok(response),
-            MoveAdmission::Drive {
-                vg_name,
-                lv_name,
-                existing_target,
-            } => (vg_name, lv_name, existing_target),
-        };
+        let (vg_name, lv_name, existing_target, existing_record) =
+            match self.admit_move(volume_id, req)? {
+                MoveAdmission::Answered(response) => return Ok(response),
+                MoveAdmission::Drive {
+                    vg_name,
+                    lv_name,
+                    existing_target,
+                    existing_record,
+                } => (vg_name, lv_name, existing_target, existing_record),
+            };
 
         // Phase 2 — observe the world (no lock held): the target
         // qualification first (the request's own named reference is
         // validated against the observed world), then the source
         // derivation.
-        let observation = self.observe_lv(&vg_name, &lv_name)?;
+        let observation = self.observe_lv(&vg_name, &lv_name)?.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "LV {vg_name}/{lv_name} is verifiably absent from a successful lvs \
+                     query; refusing to move a volume whose LV does not exist (restart \
+                     marks the volume Failed; its data is gone)"
+                ),
+            )
+        })?;
         if existing_target.is_none() && observation.moving {
             // A moving LV with no journaled record: someone else's
             // pvmove. Never touched, never adopted.
@@ -3588,10 +3711,22 @@ impl LvmProvider {
         // Phase 2c — the fresh-start world scan: the records-only
         // same-source guard cannot see an out-of-band move, so the
         // world itself must verifiably carry no active pvmove on the
-        // source PV before a fresh pvmove starts (a re-attach skips
-        // it: attaching to our own journaled move is the point).
+        // source PV before a fresh pvmove starts. A re-attach to a
+        // running (`Copying`) journaled move must skip the scan: its
+        // own hidden mirror row would be mistaken for a foreign move.
+        // A re-attach to a `Preparing` record is different — the
+        // pvmove verifiably never started when the LV is not observed
+        // moving, so the scan is both safe and required (otherwise an
+        // out-of-band move on the source would swallow the start).
         if let Some(source_pv) = source_pv.as_deref() {
             self.guard_fresh_move_source(&vg_name, source_pv)?;
+        } else if let Some(existing) = existing_record.as_ref() {
+            if existing.state == MoveVolumeBackingState::Preparing
+                && !observation.moving
+                && !existing.source_pv.is_empty()
+            {
+                self.guard_fresh_move_source(&vg_name, &existing.source_pv)?;
+            }
         }
 
         // Phase 3 — journal the intent. The record is the
@@ -3712,6 +3847,9 @@ impl LvmProvider {
     /// - a verified relocation: the move already finished (the
     ///   re-attach race — there was nothing left to move) —
     ///   complete it;
+    /// - the LV provably absent: no `pvmove` can be active, so the
+    ///   record resolves `FAILED` terminally (never a permanent
+    ///   `IN_DOUBT` fence);
     /// - the source freed without the target holding the extents:
     ///   an unknown placement — park `IN_DOUBT`;
     /// - a verifiably untouched world: drop a `PREPARING` record
@@ -3725,7 +3863,11 @@ impl LvmProvider {
         record: &crate::state::MoveRecord,
         error: ApiError,
     ) -> Result<Option<MoveVolumeBackingResponse>, ApiError> {
-        let observation = self.observe_lv(vg_name, lv_name)?;
+        let Some(observation) = self.observe_lv(vg_name, lv_name)? else {
+            return self
+                .resolve_absent_move(volume_id, vg_name, lv_name, record)
+                .map(Some);
+        };
         if observation.moving {
             return Ok(None);
         }
@@ -3780,6 +3922,8 @@ impl LvmProvider {
     ///   it, a fresh operation re-attaches);
     /// - the observation fails → `IN_DOUBT` (an unobservable world,
     ///   never a guess);
+    /// - the LV is provably absent → the record resolves `FAILED`
+    ///   terminally (no `pvmove` can be active on a missing LV);
     /// - the source is freed → [`Self::finish_complete`] (a fresh
     ///   verification observation before anything is freed);
     /// - the move ended without relocating → `IN_DOUBT` with the
@@ -3795,7 +3939,10 @@ impl LvmProvider {
         let deadline = Instant::now() + self.move_timing.supervision_window;
         loop {
             let observation = match self.observe_lv(vg_name, lv_name) {
-                Ok(observation) => observation,
+                Ok(Some(observation)) => observation,
+                Ok(None) => {
+                    return self.resolve_absent_move(volume_id, vg_name, lv_name, record);
+                }
                 Err(e) => {
                     return self.park_in_doubt(
                         volume_id,
@@ -3845,6 +3992,30 @@ impl LvmProvider {
         }
     }
 
+    /// Resolve a move's LV names, or drop the record when its volume is
+    /// gone (deleted under the move): nothing is left to move.
+    fn move_names_or_drop(
+        &self,
+        volume_id: &VolumeId,
+        report: &mut MoveReconcileReport,
+    ) -> Result<Option<(String, String)>, ApiError> {
+        let names = {
+            let state = self.lock_state()?;
+            state
+                .volume(volume_id)
+                .map(|stored| (stored.entry.vg_name.clone(), stored.entry.lv_name.clone()))
+        };
+        if names.is_some() {
+            return Ok(names);
+        }
+        let mut state = self.lock_state()?;
+        state.remove_move(volume_id);
+        self.persist(&mut state)?;
+        self.clear_move_observe_failures(volume_id);
+        report.dropped.push(volume_id.clone());
+        Ok(None)
+    }
+
     /// The move-records reconciliation: classify every record
     /// against the observed world and roll the durable state. This
     /// is the restart-and-retry heart of the crash model — the
@@ -3873,20 +4044,7 @@ impl LvmProvider {
                 .collect()
         };
         for (volume_id, record) in snapshot {
-            let names = {
-                let state = self.lock_state()?;
-                state
-                    .volume(&volume_id)
-                    .map(|stored| (stored.entry.vg_name.clone(), stored.entry.lv_name.clone()))
-            };
-            let Some((vg_name, lv_name)) = names else {
-                // The volume is gone (deleted under the move):
-                // nothing to move, drop the record.
-                let mut state = self.lock_state()?;
-                state.remove_move(&volume_id);
-                self.persist(&mut state)?;
-                self.clear_move_observe_failures(&volume_id);
-                report.dropped.push(volume_id);
+            let Some((vg_name, lv_name)) = self.move_names_or_drop(&volume_id, &mut report)? else {
                 continue;
             };
             if record.state == MoveVolumeBackingState::Complete {
@@ -3898,9 +4056,25 @@ impl LvmProvider {
                 continue;
             }
             let observation = match self.observe_lv(&vg_name, &lv_name) {
-                Ok(observation) => {
+                Ok(Some(observation)) => {
                     self.clear_move_observe_failures(&volume_id);
                     observation
+                }
+                Ok(None) => {
+                    // A successful `lvs` with no row for the LV is a
+                    // proven absence, not an unobservable world: no
+                    // pvmove can be active, the move can never
+                    // complete, and parking would fence delete
+                    // forever. Resolve the record terminally.
+                    let resolved =
+                        self.resolve_absent_move(&volume_id, &vg_name, &lv_name, &record)?;
+                    if resolved.state == MoveVolumeBackingState::Failed
+                        && record.state != MoveVolumeBackingState::Failed
+                    {
+                        report.resolved_absent.push(volume_id.clone());
+                    }
+                    self.clear_move_observe_failures(&volume_id);
+                    continue;
                 }
                 Err(error) => {
                     // Honest unknown — but never an unbounded one:
@@ -3983,13 +4157,25 @@ impl LvmProvider {
     /// Re-drive a PREPARING record whose `pvmove` verifiably never
     /// started.
     ///
-    /// A source-less record is malformed and must never reach `pvmove`.
+    /// The pass's snapshot may be stale and the in-memory anchor may be
+    /// memory-only (a failed PREPARING save whose re-read was unknown),
+    /// so the record is re-confirmed under the lock and against the
+    /// durable file before the world is touched: only a PREPARING record
+    /// for this exact source→target pair with a **durable** anchor may
+    /// be re-driven. A record that changed, vanished, or was never
+    /// durable is left untouched and reported (`redrive_failed`) — a
+    /// crash between the start and the COPYING save must never lose the
+    /// anchor. A source-less record is malformed and must never reach
+    /// `pvmove`.
+    ///
     /// A foreign move on the source (invisible to the records-only
     /// guard) would make a scoped `pvmove` attach to it and ignore its
     /// arguments, so the same world scan a fresh start performs runs
     /// first. Any refusal or start failure leaves the record PREPARING
     /// for the next tick and is reported (`redrive_failed`), never
-    /// swallowed; a successful start rolls the record to COPYING.
+    /// swallowed; a successful start rolls the record to COPYING only
+    /// while it still matches (a concurrent completion is never
+    /// overwritten).
     fn redrive_preparing_move(
         &self,
         volume_id: &VolumeId,
@@ -4002,6 +4188,49 @@ impl LvmProvider {
             report.redrive_failed.push(volume_id.clone());
             return Ok(());
         }
+        // Re-confirm the snapshot under the lock: another path may have
+        // completed, superseded, or dropped the record since the pass
+        // took its snapshot.
+        let current = {
+            let state = self.lock_state()?;
+            state.move_record(volume_id).cloned()
+        };
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.state != MoveVolumeBackingState::Preparing
+            || current.source_pv != record.source_pv
+            || current.target_pv != record.target_pv
+        {
+            // Superseded: the current record's owner classifies it.
+            return Ok(());
+        }
+        // The anchor must already be durable before a pvmove starts. A
+        // failed re-read is fail-closed; a durable record that moved on
+        // (a concurrent completion/roll) must never be overwritten from
+        // this stale snapshot.
+        let Ok(durable) = LvmState::load(&self.state_path) else {
+            report.redrive_failed.push(volume_id.clone());
+            return Ok(());
+        };
+        match durable.move_record(volume_id) {
+            None => {
+                // Provably memory-only: no re-drive (a crash
+                // between start and the COPYING save would lose
+                // the anchor). A restart drops it if it never
+                // landed; a consumer re-attach persists it first.
+                report.redrive_failed.push(volume_id.clone());
+                return Ok(());
+            }
+            Some(stored)
+                if stored.state == MoveVolumeBackingState::Preparing
+                    && stored.source_pv == record.source_pv
+                    && stored.target_pv == record.target_pv => {}
+            Some(_) => {
+                report.redrive_failed.push(volume_id.clone());
+                return Ok(());
+            }
+        }
         if self
             .guard_fresh_move_source(vg_name, &record.source_pv)
             .is_err()
@@ -4012,6 +4241,16 @@ impl LvmProvider {
         match self.start_pvmove(vg_name, lv_name, &record.source_pv, &record.target_pv) {
             Ok(()) => {
                 let mut state = self.lock_state()?;
+                let still_matches = state.move_record(volume_id).is_some_and(|stored| {
+                    stored.state == MoveVolumeBackingState::Preparing
+                        && stored.source_pv == record.source_pv
+                        && stored.target_pv == record.target_pv
+                });
+                if !still_matches {
+                    // A concurrent operation changed the record while
+                    // the pvmove was starting: never overwrite it.
+                    return Ok(());
+                }
                 if let Some(stored) = state.move_record_mut(volume_id) {
                     stored.state = MoveVolumeBackingState::Copying;
                     stored.detail = None;
@@ -4173,6 +4412,120 @@ impl LvmProvider {
             report.resolved_failed.push(volume_id.clone());
         }
         Ok(())
+    }
+
+    /// Resolve a move record whose LV is **provably absent** (a
+    /// successful `lvs` query has no row for it) to the settled
+    /// `FAILED` state.
+    ///
+    /// A `pvmove` cannot be active on an LV that does not exist, so the
+    /// move can never complete. Leaving the record
+    /// `PREPARING`/`COPYING`/`IN_DOUBT` would fence delete forever:
+    /// [`Self::move_blocks_delete`] refuses an unsettled move, yet no
+    /// reconcile pass can ever observe a placement for an absent LV (it
+    /// would park `IN_DOUBT` at the observation bound). `FAILED` is
+    /// settled: the startup volume pass marks the absent LV `Failed`,
+    /// and the operator's delete then completes with nothing to remove.
+    /// The detail states exactly what was proven — the LV is gone —
+    /// never that the relocation succeeded or the source was freed.
+    ///
+    /// Never overwrites a `COMPLETE` record or a record superseded under
+    /// the lock (the stale-snapshot discipline [`Self::finish_complete`]
+    /// uses); answering the stored truth is not a fresh completion. A
+    /// failed save is classified against a re-read: the rename may have
+    /// landed (keep the resolution), the file may prove the prior record
+    /// is still the anchor (restore it in memory), or the re-read may be
+    /// unknown (keep the resolution as possibly durable — never roll
+    /// back).
+    fn resolve_absent_move(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        record: &crate::state::MoveRecord,
+    ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        let mut state = self.lock_state()?;
+        let Some(stored) = state.move_record(volume_id).cloned() else {
+            return Err(not_found(volume_id));
+        };
+        if stored.state == MoveVolumeBackingState::Complete {
+            return Ok(Self::move_response(&state, volume_id, &stored));
+        }
+        if stored.source_pv != record.source_pv || stored.target_pv != record.target_pv {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the move record for volume {volume_id} was superseded while absence was \
+                     being classified; refusing to resolve a stale snapshot"
+                ),
+            ));
+        }
+        if stored.state != MoveVolumeBackingState::Failed {
+            let previous = stored.clone();
+            if let Some(stored) = state.move_record_mut(volume_id) {
+                stored.state = MoveVolumeBackingState::Failed;
+                stored.detail = Some(format!(
+                    "the LV {vg_name}/{lv_name} is verifiably absent from a successful lvs \
+                     query, so the move to {} can never complete and no pvmove is active; \
+                     the move is settled FAILED — the volume's data is gone (no LV was \
+                     removed by this resolution; the volume pass marks the absent LV \
+                     Failed at startup, after which a delete completes without a \
+                     destructive command)",
+                    record.target_pv
+                ));
+            }
+            if let Err(save_error) = self.persist(&mut state) {
+                match LvmState::load(&self.state_path) {
+                    Ok(durable) => {
+                        let committed = durable.move_record(volume_id).is_some_and(|stored| {
+                            stored.state == MoveVolumeBackingState::Failed
+                                && stored.source_pv == record.source_pv
+                                && stored.target_pv == record.target_pv
+                        });
+                        if !committed {
+                            state.insert_move(volume_id.clone(), previous);
+                        }
+                        return Err(ApiError::new(
+                            save_error.code,
+                            if committed {
+                                format!(
+                                    "{}; the durable state already records the absent-LV \
+                                     resolution of volume {volume_id} as FAILED, so the \
+                                     in-memory resolution was kept",
+                                    save_error.detail
+                                )
+                            } else {
+                                format!(
+                                    "{}; the absent-LV resolution of volume {volume_id} could \
+                                     not be recorded durably, so the durable move record \
+                                     remains the anchor (do not delete it by hand)",
+                                    save_error.detail
+                                )
+                            },
+                        ));
+                    }
+                    Err(load_error) => {
+                        // Unknown: the resolution's rename may have
+                        // landed. Keep the verified FAILED resolution in
+                        // memory as possibly durable (never roll back);
+                        // report it honestly.
+                        return Err(ApiError::new(
+                            save_error.code,
+                            format!(
+                                "{}; the absent-LV resolution's durable record could not be \
+                                 re-read ({load_error}), so treat the verified FAILED \
+                                 resolution of volume {volume_id} as possibly durable",
+                                save_error.detail
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        state
+            .move_record(volume_id)
+            .map(|stored| Self::move_response(&state, volume_id, stored))
+            .ok_or_else(|| not_found(volume_id))
     }
 
     /// One retry reconcile pass (the daemon's background task and

@@ -6,10 +6,9 @@ gap found by the drill
 ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed and merged in
 [PR #69](https://github.com/o3kio/volvisor/pull/69). D5 was re-drilled after
 the fix on one host (both parts: the journal path and the provider-state normal
-path). The
-cleanup-failure, post-rename carve-out and unreadable-durable-reread branches
-were not fault-injected by the re-drill; they are covered by the deterministic
-tests added in #69. See the
+path). The cleanup-failure, post-rename carve-out, clear-save and
+unreadable-durable-reread branches were not fault-injected by the re-drill;
+they are covered by the deterministic tests added in #69/#70. See the
 [post-fix re-drill bundle](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 The create path now also persists a durable create intent **before**
 `lvcreate` ([#70](https://github.com/o3kio/volvisor/issues/70)), and
@@ -73,8 +72,8 @@ need their own drills. The ENOSPC here is filesystem-level, injected with a
   non-durable, the LV was compensated, and same-process plus post-restart GET
   returned 404. The cleanup-failure, carve-out, clear-save and indeterminate
   branches were not fault-injected in that re-drill; they remain the
-  six-outcome procedure above and are covered by tests, not by an
-  end-to-end drill.
+  six-outcome procedure in section C below and are covered by tests, not
+  by an end-to-end drill.
 
 ## Preconditions
 
@@ -208,7 +207,7 @@ The save is atomic up to the rename: a failure before it preserves the old
 `lvm-state.json` and removes the `.tmp`. Since #70 a create has **two** save
 boundaries — the durable create intent before `lvcreate`, then the volume
 record after it. After the #58 fix, an uncommitted final save is compensated
-with a checked `lvremove` and the in-memory entry is rolled back. Five
+with a checked `lvremove` and the in-memory entry is rolled back. Six
 outcomes are possible, so still inspect before assuming anything:
 
 - **Intent-save failure (before `lvcreate`):** 500, old state byte-identical,
@@ -217,6 +216,12 @@ outcomes are possible, so still inspect before assuming anything:
   and drops it. Retry with a new `operation_id`; nothing ran.
 - **Uncommitted final save (normal):** 500, old state byte-identical, GET 404,
   no LV for the failed volume id (the LV was compensated with `lvremove`).
+- **Clear-save failure (issue #70):** after a known command failure or a
+  compensated final save, the clear save that removes the durable create
+  intent also fails. The intent is kept in memory; startup classifies an
+  absent LV by dropping the intent and adopts a present LV only at or above
+  the requested size. See the create tail in
+  [lvm-state-divergence.md](lvm-state-divergence.md).
 - **Cleanup failure:** 500, GET 404, the LV remains, and the error detail
   names `manual lvremove <vg>/<lv>`. The in-memory entry is gone, so the LV
   is absent from provider state.

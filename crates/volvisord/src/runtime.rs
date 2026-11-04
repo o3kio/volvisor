@@ -390,9 +390,10 @@ fn spawn_move_retry_task(
 /// [`spawn_move_retry_task`]). Every outcome is a structured event,
 /// never a crash: a completed relocation, a re-drive, a durable
 /// COPYING roll, an `IN_DOUBT` park (warned — it wants an operator's
-/// eye), a dropped record, an unobservable world, a failed pass
-/// (typed) and a failed pass task (the join error) are all logged
-/// and retried on the next tick.
+/// eye), a terminal resolution (the rollback proof or a provably absent
+/// LV), a dropped record, an unobservable world, a failed pass (typed)
+/// and a failed pass task (the join error) are all logged and retried on
+/// the next tick.
 fn log_move_pass(
     pass: Result<
         Result<volvisor_lvm::provider::MoveReconcileReport, ApiError>,
@@ -420,8 +421,8 @@ fn log_move_pass(
                     kind = "move_reconcile",
                     volume_id = %volume_id,
                     "PREPARING move could not be re-driven this pass (a foreign pvmove \
-                     on the source, an unobservable scan, or a start failure); retried \
-                     next tick"
+                     on the source, an unobservable scan, a record with no usable \
+                     source/target, or a start failure); retried next tick"
                 );
             }
             for volume_id in &report.marked_copying {
@@ -444,6 +445,15 @@ fn log_move_pass(
                     volume_id = %volume_id,
                     "parked IN_DOUBT resolved FAILED: the relocation verifiably did not \
                      happen (the extents back on the source, intact and serving)"
+                );
+            }
+            for volume_id in &report.resolved_absent {
+                tracing::warn!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "move record resolved FAILED: the LV is verifiably absent from lvs, so \
+                     the move can never complete and no pvmove is active; the volume pass \
+                     marks it Failed at the next startup (do not recreate the LV by hand)"
                 );
             }
             for volume_id in &report.parked_unobservable {

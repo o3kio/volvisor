@@ -1054,12 +1054,12 @@ async fn a_foreign_pvmove_on_the_source_skips_the_redrive_and_reports_it() {
     }
 
     let restarted =
-        provider_from_with_timing(&fixture.state_path, &fixture.world, default_move_timing());
-    let report = restarted.move_reconcile_pass().expect("pass");
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+    let report = restarted.provider.move_reconcile_pass().expect("pass");
     assert_eq!(report.redriven, Vec::new());
     assert_eq!(report.redrive_failed, vec![volume_id(volume)]);
     assert_eq!(
-        pvmove_count(&fixture.runner),
+        pvmove_count(&restarted.runner),
         0,
         "no blind second pvmove started over the foreign move"
     );
@@ -1074,6 +1074,260 @@ async fn a_foreign_pvmove_on_the_source_skips_the_redrive_and_reports_it() {
         placement_of(&fixture.world, volume),
         vec![MOVE_SOURCE_PV.to_owned()]
     );
+}
+
+#[tokio::test]
+async fn a_provably_absent_lv_resolves_the_move_and_unblocks_delete_after_restart() {
+    let fixture = move_fixture();
+    let volume = "vol-move-absent-lv";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    let id = volume_id(volume);
+    let lv = lv_path(volume);
+
+    // The dead incarnation's COPYING record and a live mirror, so the
+    // constructor's reconcile sees the move alive and leaves the record
+    // exactly as seeded.
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Copying,
+    );
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv.clone(),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+    let restarted = provider_from(&fixture.state_path, &fixture.world);
+    let (record, _) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Copying,
+        "the constructor classifies the live mirror"
+    );
+
+    // The LV is removed out-of-band: a successful `lvs` query simply
+    // has no row. That is a proven absence, not an unobservable world.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.lvs.remove(&lv);
+        world.lv_devices.remove(&lv);
+        world.moves.remove(&lv);
+    }
+    let report = restarted.move_reconcile_pass().expect("pass");
+    assert_eq!(report.resolved_absent, vec![id.clone()]);
+    assert_eq!(
+        report.unobservable,
+        Vec::new(),
+        "a successful query with no row is not an unobservable world"
+    );
+    assert_eq!(report.parked_unobservable, Vec::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    let record = record.expect("record");
+    assert_eq!(record.state, MoveVolumeBackingState::Failed);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("verifiably absent"),
+        "the resolution states exactly what was proven: {:?}",
+        record.detail
+    );
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no LV was removed"),
+        "the resolution never claims it removed or freed anything: {:?}",
+        record.detail
+    );
+    assert_eq!(generation, 1, "a terminal resolution bumps nothing");
+
+    // The settled FAILED record no longer fences delete. The startup
+    // volume pass marks the absent LV Failed; delete then completes
+    // with nothing to remove and clears the move record atomically.
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+    let before = restarted.runner.invocations().len();
+    restarted
+        .provider
+        .delete_volume(
+            &id,
+            &delete_request_with("op-delete-absent-lv", 1, ErasurePolicy::Retain),
+        )
+        .await
+        .expect("the absent-LV delete is the sanctioned exit");
+    assert!(
+        !restarted.runner.invocations()[before..]
+            .iter()
+            .any(|invocation| matches!(invocation.program.as_str(), "blkdiscard" | "lvremove")),
+        "an already-absent LV needs no destructive command"
+    );
+    let durable = LvmState::load(&fixture.state_path).expect("durable state");
+    assert!(durable.volume(&id).is_none(), "the record is gone");
+    assert!(
+        durable.move_record(&id).is_none(),
+        "the move record is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_re_attach_to_a_preparing_record_scans_for_a_foreign_pvmove_on_the_source() {
+    let fixture = move_fixture();
+    let volume = "vol-move-reattach-foreign";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    // An out-of-band pvmove evacuates another LV of the VG off the same
+    // source PV (held, so it stays observable). The journaled
+    // PREPARING move never started, so the re-attach must run the world
+    // scan a fresh start does — otherwise LVM would attach the scoped
+    // pvmove to the foreign move and ignore its arguments.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        let other = format!("{CLAIMED_VG}/vol-move-reattach-other-lv");
+        world.lvs.insert(other.clone(), 64 * MIB);
+        world
+            .lv_devices
+            .insert(other.clone(), vec![MOVE_SOURCE_PV.to_owned()]);
+        world.moves.insert(
+            other,
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: "/dev/pv-c".to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+
+    let error = restarted
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-reattach-foreign", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("the re-attach refuses to attach to a foreign move");
+    assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+    assert!(
+        error.detail.contains("foreign pvmove"),
+        "the refusal names the foreign move: {error}"
+    );
+    assert_eq!(
+        pvmove_count(&restarted.runner),
+        0,
+        "no pvmove ran against the foreign move"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("record").state,
+        MoveVolumeBackingState::Preparing,
+        "the refusal leaves the journaled anchor alone"
+    );
+    assert_eq!(generation, 1);
+}
+
+#[tokio::test]
+async fn a_re_attach_to_a_preparing_record_without_a_source_refuses_and_starts_nothing() {
+    let fixture = move_fixture();
+    let volume = "vol-move-reattach-no-source";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+    seed_move(
+        &fixture.state_path,
+        volume,
+        "",
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    let restarted =
+        common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+
+    let error = restarted
+        .provider
+        .move_volume_backing(
+            &volume_id(volume),
+            &move_request("op-move-reattach-no-source", MOVE_TARGET_PV, 1),
+        )
+        .await
+        .expect_err("a source-less anchor can never drive a pvmove");
+    assert_eq!(error.code, ApiErrorCode::InvalidState, "{error}");
+    assert!(
+        error.detail.contains("no recorded source PV"),
+        "the refusal names the missing source: {error}"
+    );
+    assert_eq!(pvmove_count(&restarted.runner), 0);
+}
+
+#[tokio::test]
+async fn a_preparing_re_drive_with_an_unusable_record_reports_it_without_a_pvmove() {
+    let fixture = move_fixture();
+    let volume = "vol-move-redrive-unusable";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    for (source, target) in [("", MOVE_TARGET_PV), (MOVE_SOURCE_PV, "")] {
+        seed_move(
+            &fixture.state_path,
+            volume,
+            source,
+            target,
+            MoveVolumeBackingState::Preparing,
+        );
+        let restarted =
+            common::fixture_from_state(fixture.state_path.clone(), Arc::clone(&fixture.world));
+        let report = restarted.provider.move_reconcile_pass().expect("pass");
+        assert_eq!(report.redriven, Vec::new(), "source={source:?}");
+        assert_eq!(
+            report.redrive_failed,
+            vec![volume_id(volume)],
+            "source={source:?} target={target:?}"
+        );
+        assert_eq!(
+            pvmove_count(&restarted.runner),
+            0,
+            "source={source:?} target={target:?}: no pvmove may run"
+        );
+        let (record, generation) = recorded_move(&fixture.state_path, volume);
+        assert_eq!(
+            record.expect("record").state,
+            MoveVolumeBackingState::Preparing,
+            "source={source:?} target={target:?}: the malformed record is left for a human"
+        );
+        assert_eq!(generation, 1);
+    }
 }
 
 #[tokio::test]
