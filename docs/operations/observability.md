@@ -176,6 +176,19 @@ A committed example for one create and one attach is in
 [`traces/README.md`](traces/README.md) for generation and the migration-trace
 status.
 
+Validate the committed trace evidence (JSON shape, RFC 3339 timestamps,
+bounded span names, `operation`/`provider_call` id correlation and absence of
+secrets) with:
+
+```text
+cargo test -p volvisor-api --test trace_evidence --locked
+python3 scripts/validate-traces.py docs/operations/traces/attach.jsonl
+```
+
+The integration test runs in the ordinary workspace suite. The script exits
+`0` for valid input, `1` for an invalid trace and `2` for a usage error, and
+accepts every committed `docs/operations/traces/*.jsonl` file.
+
 ## Example alert rules
 
 [`alerts/volvisor.rules.yml`](alerts/volvisor.rules.yml) contains example

@@ -34,6 +34,46 @@ Regenerating this file is an explicit evidence step: the generator test is
 `#[ignore]`d so the ordinary workspace run does not rewrite committed
 evidence.
 
+## Validating committed traces
+
+Two independent checks validate every committed `*.jsonl` file. They are
+required because a trace that is malformed, uncorrelated or leaks a credential
+is not evidence.
+
+The ordinary integration test runs in the normal workspace suite (it is not
+`#[ignore]`d):
+
+```text
+cargo test -p volvisor-api --test trace_evidence --locked
+```
+
+The operator/CI script performs the same structural, correlation and
+secret-field checks and can be run on one file or all of them:
+
+```text
+python3 scripts/validate-traces.py docs/operations/traces/attach.jsonl
+python3 scripts/validate-traces.py docs/operations/traces/*.jsonl
+```
+
+The script exits `0` for valid input, `1` for an invalid trace, and `2` for a
+usage error; `--help` documents `--require-operation-id`, which additionally
+requires a non-empty `operation_id` on every span. It uses only the Python 3
+standard library.
+
+Both checks require one JSON object per non-empty line, an RFC 3339
+`timestamp`, `level` and `fields.message`, and span names from the bounded set
+documented in [`../observability.md`](../observability.md). `operation` and
+`provider_call` spans must carry a non-empty `operation_id`, and a
+`provider_call` must include its enclosing `operation` in `spans` with the same
+id. For `attach.jsonl` the create and attach operation ids must both appear,
+and the audit events for `/v2/volumes` and
+`/v2/volumes/{volume_id}/attach` must carry those matching ids. No line may
+contain the `trace-admin-token` test value or a secret-like field such as
+`authorization`, `token`, `secret` or `password`.
+
+The test and script discover files by name. If a future `migration.jsonl` is
+committed it is validated automatically; neither check requires it to exist.
+
 ## Migration trace: NOT RUN
 
 `migration.jsonl` is **not committed** because this workspace has no real
@@ -64,4 +104,6 @@ RUST_LOG=info volvisord --config /etc/volvisor/volvisord.toml 2>&1 \
 ```
 
 Do not check a simulated trace in as a real one, and do not mark the issue's
-migration-trace box done until the output comes from that rig.
+migration-trace box done until the output comes from that rig. **No simulated
+or synthesized `migration.jsonl` is committed**, and the in-repo simulated
+migration test output is not evidence for this file.
