@@ -15,13 +15,14 @@
 //!
 //! Every physical write uses its own bounded temp name,
 //! `.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, where the
-//! hash is a stable FNV-1a 64-bit hash of the state path's identity
-//! bytes (raw `OsStr` bytes on unix, lossy UTF-8 elsewhere) and the
-//! sequence is a process-wide atomic counter. The name does not grow
-//! with the state file name, so a long state name cannot exceed
-//! `NAME_MAX`. Two writers — even in the same process — therefore never
-//! share, truncate or delete each other's temp file, and a failed save
-//! removes only the temp path it allocated for that attempt.
+//! hash is a stable FNV-1a 64-bit hash of the canonical state-path
+//! identity (the canonicalized parent plus the file name; raw `OsStr`
+//! bytes on unix, lossy UTF-8 elsewhere) and the sequence is a
+//! process-wide atomic counter. The name does not grow with the state
+//! file name, so a long state name cannot exceed `NAME_MAX`. Two
+//! writers — even in the same process — therefore never share, truncate
+//! or delete each other's temp file, and a failed save removes only the
+//! temp path it allocated for that attempt.
 //!
 //! A process that died mid-save leaves its temp file behind. The
 //! provider constructor sweeps them before it loads or writes state
@@ -29,11 +30,19 @@
 //! parent directory and only considers the exact legacy `<path>.tmp`
 //! name plus this state path's hashed namespace. It never removes a temp
 //! registered as in flight in this process; it removes a same-pid
-//! unregistered temp immediately (pid reuse) and a foreign-pid temp only
-//! after a one-hour grace; non-regular entries are skipped. The real
-//! guarantee is therefore: active temps are never removed, stale
-//! same-pid temps are removed, and a foreign process's recent temp is
-//! left alone.
+//! unregistered temp immediately (pid reuse), and removes a foreign-pid
+//! temp only after a one-hour grace. A regular legacy `<path>.tmp` has no
+//! pid component and is treated like a foreign writer: it is removed only
+//! when its mtime is older than that grace, because a fresh one may
+//! belong to an old binary during a rolling restart or to an operator's
+//! copy; non-regular entries are skipped. The real guarantee is therefore:
+//! active temps are never removed, stale same-pid temps are removed, and a
+//! foreign process's recent temp (or a fresh legacy temp) is left alone.
+//!
+//! The intermediate `f0e5237` temp shape `<path>.<pid>.<sequence>.tmp`
+//! was never released; the final sweep does not recognize it, so any such
+//! test or development leftovers need manual removal. Do not broaden the
+//! sweep to accept it.
 //!
 //! This sweep is not cross-process writer exclusion. Cross-process
 //! exclusion is the journal flock; two daemons must not alias one state
@@ -972,7 +981,7 @@ const TEMP_PREFIX: &str = ".volvisor-";
 /// Suffix shared by the bounded namespace and the legacy fixed name.
 const TEMP_SUFFIX: &str = ".tmp";
 
-/// Number of lowercase hex digits in the path-identity hash.
+/// Number of lowercase hex digits in the canonical path-identity hash.
 const TEMP_HASH_HEX_LEN: usize = 16;
 
 /// A foreign process's temp must be at least this old before the sweep
@@ -990,17 +999,21 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Hash of the state path's identity bytes: raw `OsStr` bytes on unix,
-/// lossy UTF-8 bytes elsewhere.
+/// Hash of the canonical state-path identity bytes: raw `OsStr` bytes on
+/// unix, lossy UTF-8 bytes elsewhere.
+///
+/// The identity is [`canonical_state_identity`] (the canonicalized parent
+/// plus the file name), so a restart that spells the same file through a
+/// symlink, `..` or `./` still recognizes its predecessor's temp files.
 #[cfg(unix)]
 fn state_hash(path: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt;
-    fnv1a64(path.as_os_str().as_bytes())
+    fnv1a64(canonical_state_identity(path).as_os_str().as_bytes())
 }
 
 #[cfg(not(unix))]
 fn state_hash(path: &Path) -> u64 {
-    fnv1a64(path.to_string_lossy().as_bytes())
+    fnv1a64(canonical_state_identity(path).to_string_lossy().as_bytes())
 }
 
 /// One parsed temp name in this implementation's bounded namespace.
@@ -1053,7 +1066,7 @@ fn parse_temp_name(name: &str) -> Option<TempName> {
 ///
 /// The bounded name is
 /// `.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, built
-/// from a stable hash of this state path's identity bytes plus the
+/// from a stable hash of this state path's canonical identity plus the
 /// process id and a process-wide atomic sequence. The name never grows
 /// with the state file name, so a long state name cannot exceed
 /// `NAME_MAX`, and no other writer can receive the same name.
@@ -1178,6 +1191,12 @@ pub(crate) fn stale_temp_paths(path: &Path) -> Vec<PathBuf> {
 
 /// Whether one candidate temp may be removed without touching a live
 /// writer.
+///
+/// A temp registered as in flight is never removed. A same-pid
+/// unregistered temp is pid reuse and is removed immediately. A
+/// foreign-pid temp and a regular legacy `<state>.tmp` (which has no pid
+/// component, so it is treated exactly like a foreign writer) are removed
+/// only after [`FOREIGN_TEMP_GRACE`]. A non-regular entry is skipped.
 fn temp_may_be_swept(candidate: &Path, current_pid: u64, now: SystemTime) -> bool {
     if temp_is_registered(candidate) {
         return false;
@@ -1191,8 +1210,7 @@ fn temp_may_be_swept(candidate: &Path, current_pid: u64, now: SystemTime) -> boo
         return false;
     }
     // `stale_temp_paths` already proved the name is ours. A `None`
-    // parse here is the legacy fixed name, which may be non-UTF-8; this
-    // build never writes it, so a regular file at it is stale.
+    // parse here is the legacy fixed name, which may be non-UTF-8.
     let parsed = candidate
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
@@ -1203,15 +1221,14 @@ fn temp_may_be_swept(candidate: &Path, current_pid: u64, now: SystemTime) -> boo
             // writing it, so it is pid reuse or a lost registration.
             true
         }
-        Some(_) => {
-            // A live writer in another process may have just created
-            // it. Only a file older than the grace is presumed stale.
-            metadata.modified().is_ok_and(|modified| {
-                now.duration_since(modified)
-                    .is_ok_and(|age| age > FOREIGN_TEMP_GRACE)
-            })
-        }
-        None => true,
+        // A foreign-pid temp or the legacy fixed name: a live writer in
+        // another process (or an older binary during a rolling restart /
+        // an operator's copy) may have just created it. Only a file
+        // older than the grace is presumed stale.
+        Some(_) | None => metadata.modified().is_ok_and(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age > FOREIGN_TEMP_GRACE)
+        }),
     }
 }
 
@@ -1225,9 +1242,11 @@ fn temp_may_be_swept(candidate: &Path, current_pid: u64, now: SystemTime) -> boo
 /// The provider constructor calls this before loading or writing state.
 /// Active temps registered by this process are never removed; a
 /// same-pid unregistered temp is removed regardless of age (pid reuse);
-/// a foreign-pid temp is removed only after [`FOREIGN_TEMP_GRACE`]; a
-/// non-regular entry is skipped. Cross-process exclusion is the journal
-/// flock, not this sweep: two daemons must not alias one state path.
+/// a foreign-pid temp and a regular legacy `<state>.tmp` (no pid
+/// component, treated like a foreign writer) are removed only after
+/// [`FOREIGN_TEMP_GRACE`]; a non-regular entry is skipped. Cross-process
+/// exclusion is the journal flock, not this sweep: two daemons must not
+/// alias one state path.
 pub(crate) fn sweep_stale_temps(path: &Path) -> usize {
     let current_pid = u64::from(std::process::id());
     let now = SystemTime::now();
@@ -1508,6 +1527,30 @@ mod tests {
     }
 
     #[test]
+    fn temp_hash_follows_the_canonical_parent_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let dot = dir.path().join(".").join("state.json");
+        let child = dir.path().join("child");
+        fs::create_dir(&child).expect("child directory");
+        let dotdot = child.join("..").join("state.json");
+
+        assert_eq!(state_hash(&path), state_hash(&dot));
+        assert_eq!(state_hash(&path), state_hash(&dotdot));
+        let temp = unique_sibling_tmp_path(&dotdot);
+        let parsed = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_temp_name)
+            .expect("generated temp is in the bounded namespace");
+        assert_eq!(
+            parsed.hash,
+            state_hash(&path),
+            "a differently spelled parent carries the same canonical hash"
+        );
+    }
+
+    #[test]
     fn temp_name_stays_bounded_for_a_long_state_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(format!("{}.json", "s".repeat(240)));
@@ -1530,6 +1573,20 @@ mod tests {
         ))
     }
 
+    fn age_file(path: &Path, age: Duration) {
+        use std::fs::FileTimes;
+
+        let modified = SystemTime::now()
+            .checked_sub(age)
+            .expect("test age fits the platform clock");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file to age")
+            .set_times(FileTimes::new().set_modified(modified))
+            .expect("age the file");
+    }
+
     #[test]
     fn startup_sweep_removes_only_this_state_paths_stale_temps() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1541,6 +1598,7 @@ mod tests {
         fs::write(&second, b"stale").expect("second stale temp");
         let legacy = dir.path().join("state.json.tmp");
         fs::write(&legacy, b"legacy stale").expect("legacy temp");
+        age_file(&legacy, FOREIGN_TEMP_GRACE + Duration::from_secs(1));
 
         // Files that are *not* provably this state's temp namespace.
         let foreign = dir.path().join("other.json.123.456.tmp");
@@ -1634,6 +1692,25 @@ mod tests {
     }
 
     #[test]
+    fn fresh_legacy_temp_survives_a_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&legacy, b"possibly an old binary or an operator copy")
+            .expect("fresh legacy temp");
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "a fresh legacy temp has no pid component and may belong to a live old binary"
+        );
+        assert!(
+            legacy.exists(),
+            "the fresh legacy temp must not be removed before the grace"
+        );
+    }
+
+    #[test]
     fn directory_shaped_legacy_temp_survives_a_sweep() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.json");
@@ -1666,6 +1743,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_owner_only_reports_a_missing_parent_without_creating_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_parent = dir.path().join("missing");
+        let path = missing_parent.join("state.tmp");
+
+        let error =
+            create_owner_only(&path).expect_err("a missing parent must fail the temp create");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing parent is a real pre-rename I/O failure: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "the failed create must not leave a temp file"
+        );
+        assert!(
+            !missing_parent.exists(),
+            "the failed create must not create the parent"
+        );
+    }
+
+    #[test]
+    fn create_owner_only_refuses_a_directory_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("directory-shaped.tmp");
+        fs::create_dir(&path).expect("directory target");
+
+        let error = create_owner_only(&path).expect_err("a directory target must fail the create");
+        #[cfg(unix)]
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::IsADirectory | std::io::ErrorKind::AlreadyExists
+            ),
+            "the Unix create error is EISDIR or EEXIST: {error}"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Other
+            ),
+            "the platform reports the directory target as an existing/permission error: {error}"
+        );
+        assert!(path.is_dir(), "the directory target must not be modified");
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_utf8_state_path_temp_is_swept() {
@@ -1681,6 +1809,7 @@ mod tests {
         legacy_name.push(".tmp");
         let legacy = dir.path().join(legacy_name);
         fs::write(&legacy, b"legacy").expect("non-UTF-8 legacy temp");
+        age_file(&legacy, FOREIGN_TEMP_GRACE + Duration::from_secs(1));
 
         let candidates = stale_temp_paths(&path);
         assert!(

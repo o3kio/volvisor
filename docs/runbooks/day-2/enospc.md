@@ -118,6 +118,13 @@ instead report `failed to fsync journal record` after the bytes were written;
 treat it as "the frame may already be durable on disk", not as "nothing
 happened".
 
+> **Temp-name update (since `a8c23d6`).** New writes use
+> `.volvisor-<16-hex>.<pid>.<seq>.tmp` in the state file's directory, so a
+> current failure reads `failed to write .../.volvisor-...tmp`. The legacy
+> `<state>.tmp` name can still appear during an upgrade (an older binary or a
+> leftover). Match both when grepping. The observed messages above are
+> historical drill output and are left unchanged.
+
 ## B. Journal filesystem ENOSPC
 
 1. Do not retry in a tight loop. Free space first.
@@ -204,7 +211,9 @@ lvs --noheadings -o lv_name,vg_name,lv_size
 ## C. Provider-state filesystem ENOSPC
 
 The save is atomic up to the rename: a failure before it preserves the old
-`lvm-state.json` and removes the `.tmp`. Since #70 a create has **two** save
+`lvm-state.json` and removes its own temp file (since `a8c23d6`, the bounded
+`.volvisor-*` name; the legacy `<state>.tmp` may still appear during an
+upgrade). Since #70 a create has **two** save
 boundaries — the durable create intent before `lvcreate`, then the volume
 record after it. After the #58 fix, an uncommitted final save is compensated
 with a checked `lvremove` and the in-memory entry is rolled back. Six
@@ -414,6 +423,11 @@ create 500, old state unchanged, in-memory GET 200, LV present, restart GET
 
 **Post-fix re-drill (normal uncommitted-save path), product `1863a7a` /
 harness `940722e`:**
+
+> The Part B messages quoted below name the historical fixed
+> `lvm-state.json.tmp`. Since `a8c23d6` a current build names the bounded
+> `.volvisor-<16-hex>.<pid>.<seq>.tmp` instead; the legacy name may still
+> appear during an upgrade. The drilled evidence is left unchanged.
 
 - Part A re-confirmed: journal 12060 bytes with 228 bytes of slack, SHA256
   `41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172`;

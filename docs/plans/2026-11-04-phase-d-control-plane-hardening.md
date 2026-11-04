@@ -158,23 +158,38 @@ options:
   across the wait; captures therefore never overlap. Each physical write
   uses a bounded, path-hashed temp name
   (`.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, so it
-  cannot exceed `NAME_MAX`) plus a startup sweep. The sweep never removes
-  a temp registered in flight by this process, removes same-pid leftovers
-  immediately, and removes a foreign-pid temp only after a one-hour
-  grace; cross-process exclusion remains the journal flock, so two
-  daemons must not alias a custom `lvm_state_path`. Publication moves
-  from `StateGuard` drop to a post-durability, sequence-tagged snapshot;
-  the failure-keep branches that rely on drop-publication are migrated
-  explicitly. Existing tests, crash seams and physical save counts must
-  pass unchanged. **No throughput claim from slice 1.**
+  cannot exceed `NAME_MAX`) plus a startup sweep. The hash is over the
+  canonical state-path identity (the canonicalized parent plus the file
+  name), the same identity the writer gate and in-flight registry use, so
+  a restart that spells the parent differently (symlink, `..`, `./`)
+  recognizes its predecessor's temps. The sweep never removes a temp
+  registered in flight by this process, removes same-pid leftovers
+  immediately, removes a foreign-pid temp only after a one-hour grace, and
+  treats a regular legacy `<state>.tmp` like a foreign writer (it has no
+  pid component, so it is removed only when its mtime is older than that
+  grace; a fresh one may belong to an old binary during a rolling restart
+  or to an operator's copy). Non-regular entries are skipped;
+  cross-process exclusion remains the journal flock, so two daemons must
+  not alias a custom `lvm_state_path`. Publication remains `StateGuard`
+  drop in slice 1, and the failure-keep branches that rely on it are
+  unchanged. The intermediate `f0e5237` temp shape
+  `<path>.<pid>.<sequence>.tmp` was never released, so the final sweep
+  does not recognize it and any test/development leftovers need manual
+  removal. All existing suites pass; two failure-injection rigs were
+  re-mechanized onto the injected `AfterTmpWrite` consult because unique
+  temp names removed the fixed `.tmp` path they used to block (see the
+  slice-1 acceptance note). Physical save counts are unchanged. **No
+  throughput claim from slice 1.**
 - **Slice 2 is the release-the-lock change.** Attach/detach/report capture
   `(sequence, encoded bytes, snapshot)` under the lock, release it, and
   wait. A leader writes the latest capture once and marks every covered
   sequence durable. The win is one file `sync_all` plus one directory
-  `sync_all` for N covered waiters.
-- **Publication is post-durability and monotonic.** The read view is
-  sequence-tagged; a lower sequence never replaces a higher one. A failed
-  uncovered sequence is never published.
+  `sync_all` for N covered waiters. Publication moves from `StateGuard`
+  drop to a post-durability, sequence-tagged snapshot; the failure-keep
+  branches that rely on drop-publication are migrated explicitly here.
+- **Publication is post-durability and monotonic (slice 2).** The read
+  view is sequence-tagged; a lower sequence never replaces a higher one. A
+  failed uncovered sequence is never published.
 - **Capture monotonicity.** In-memory state is never rolled back between
   captures, so every later capture is a superset of every earlier one.
 - **Waiter resolution is guaranteed.** No waiter parks without a
@@ -205,15 +220,22 @@ the attach fencing contract. None is a shortcut for this slice.
 **Acceptance for the eventual code slices (not this batch).**
 
 - Slice 1: all existing workspace, journal-fault, conformance and campaign
-  suites pass unchanged; a direct-save-vs-pending-capture interleaving is
-  impossible by construction; unique-temp cleanup is tested; the
-  post-durability publication window is tested; no save-count drift in
-  single-writer rigs.
+  suites pass; a direct-save-vs-pending-capture interleaving is impossible
+  by construction; unique-temp generation, the legacy and foreign-temp
+  grace (including a fresh legacy `<state>.tmp` surviving a sweep) and
+  cleanup are tested; the state layer proves a real pre-rename
+  `create_owner_only` I/O failure (a missing parent and a directory
+  target) and the forced `AfterTmpWrite` consult covers the provider
+  classification; no save-count drift in single-writer rigs. Accepted
+  residual: no provider-end-to-end rig now drives a genuine EACCES/ENOSPC
+  on temp creation; the state-layer test plus the forced `AfterTmpWrite`
+  rig cover the classification.
 - Slice 2: deterministic tests for covered-failure success only when the
   durable file proves it; no resurrection after an error (the journal's
   terminal-replay rule); leader-kill wake-all; quiesced align on an
-  uncovered failure; monotonic publication; both fsyncs counted; every
-  crash seam still fires.
+  uncovered failure; the post-durability publication window is tested;
+  monotonic publication; both fsyncs counted; every crash seam still
+  fires.
 - A new clean-tree benchmark at the implementation SHA is published with
   the same comparator; no throughput claim before that run.
 - #62 stays open until the code and the measurement both exist.
@@ -247,7 +269,8 @@ NOT MET with gates 3 and 4 partial.
 2. **D2 (read posture) — delivered.** Self-contained, tests and docs updated.
 3. **D5 (ledger) — delivered.**
 4. **D3 slice 1 (single-writer funnel) — next batch.** Semantic no-op; no
-   throughput claim; all existing suites and save counts unchanged.
+   throughput claim; all existing suites green and physical save counts
+   unchanged.
 5. **D3 slice 2 (release the lock) — after slice 1 is reviewed and green.**
    The only batch that may claim a throughput change, and only with the new
    clean-tree measurement.

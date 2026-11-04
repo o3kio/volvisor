@@ -53,8 +53,11 @@ Not covered:
 
 Every privileged mutation writes a **durable intent** and fsyncs it before the
 allocating or destructive step, then commits the resulting volume record in a
-second atomic save. A save is `write .tmp` → `fsync file` → `rename` →
-`fsync directory`; an error can therefore land on either side of the rename:
+second atomic save. A save is `write a sibling temp file` → `fsync file` →
+`rename` → `fsync directory`; an error can therefore land on either side of
+the rename. Since `a8c23d6` the temp is
+`.volvisor-<16-hex>.<pid>.<seq>.tmp` in the state file's directory; the legacy
+`<state>.tmp` may still appear during upgrades. The two sides are:
 
 - **pre-rename:** the old durable file is intact, and the world step may or may
   not have run;
@@ -122,8 +125,9 @@ Four cross-cutting rules:
 ## A. Detect
 
 A failed persist surfaces as an `INTERNAL` 500 whose detail names the state
-path/`.tmp` write, the failed rename/fsync, or an injected test fault. Look for
-the mutation's own wording:
+path/temp-file write (since `a8c23d6`, `failed to write .../.volvisor-*`; the
+legacy `<state>.tmp` may still appear during upgrades), the failed
+rename/fsync, or an injected test fault. Look for the mutation's own wording:
 
 - create intent: `the create intent ... could not be made durable`
 - create command outcome unknown (runner error): `the lvcreate outcome is unknown`

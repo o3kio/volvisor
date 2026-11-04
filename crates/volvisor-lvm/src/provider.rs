@@ -6118,4 +6118,83 @@ mod durable_writer_tests {
             "the canonical state-path identity must alias the same gate"
         );
     }
+
+    #[test]
+    fn a_dropped_writer_gate_is_not_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+
+        let first = DurableWriter::new(&state_path);
+        let old = Arc::downgrade(&first.gate);
+        let same = DurableWriter::new(&state_path);
+        assert!(
+            Arc::ptr_eq(&first.gate, &same.gate),
+            "two live writers on the same path share one gate"
+        );
+
+        drop(same);
+        drop(first);
+        assert!(
+            old.upgrade().is_none(),
+            "the registry must not keep a strong reference to a dropped writer's gate"
+        );
+
+        let fresh = DurableWriter::new(&state_path);
+        assert!(
+            old.upgrade().is_none(),
+            "a fresh writer after every strong reference dropped gets a new gate"
+        );
+        let mut state = LvmState::default();
+        fresh
+            .save(&mut state, &state_path, &StoreCrashHooks::new())
+            .expect("the fresh gate is unpoisoned and the save succeeds");
+        assert!(state_path.exists());
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // the test must panic while holding the gate to poison it
+    fn a_poisoned_gate_blocks_the_same_path_but_not_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let other_path = dir.path().join("other.json");
+
+        let first = DurableWriter::new(&state_path);
+        let gate = Arc::clone(&first.gate);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = gate
+                .lock()
+                .expect("the gate is unpoisoned before this panic");
+            panic!("poison the writer gate");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the helper thread panicked as intended");
+
+        let same = DurableWriter::new(&state_path);
+        assert!(
+            Arc::ptr_eq(&first.gate, &same.gate),
+            "the poisoned gate is still the shared gate for this path"
+        );
+        let mut state = LvmState::default();
+        let error = same
+            .save(&mut state, &state_path, &StoreCrashHooks::new())
+            .expect_err("a poisoned shared gate must fail the save");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error
+                .detail
+                .contains("LVM provider durable writer lock poisoned by a previous failure"),
+            "the typed INTERNAL error names the poisoned writer gate: {error}"
+        );
+
+        let different = DurableWriter::new(&other_path);
+        assert!(
+            !Arc::ptr_eq(&first.gate, &different.gate),
+            "a different path keeps an independent gate"
+        );
+        let mut other_state = LvmState::default();
+        different
+            .save(&mut other_state, &other_path, &StoreCrashHooks::new())
+            .expect("a different path's writer is unaffected by the poison");
+        assert!(other_path.exists());
+    }
 }

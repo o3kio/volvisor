@@ -653,14 +653,22 @@ async fn startup_sweeps_only_this_state_paths_stale_temps() {
             ))
     }
     fn state_path_hash(state_path: &std::path::Path) -> u64 {
+        // Mirrors `state::state_hash`: the hash is over the canonical
+        // state-path identity (canonicalized parent plus file name).
+        let identity = state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| state_path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| state_path.to_path_buf());
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            fnv1a64(state_path.as_os_str().as_bytes())
+            fnv1a64(identity.as_os_str().as_bytes())
         }
         #[cfg(not(unix))]
         {
-            fnv1a64(state_path.to_string_lossy().as_bytes())
+            fnv1a64(identity.to_string_lossy().as_bytes())
         }
     }
 
@@ -672,6 +680,17 @@ async fn startup_sweeps_only_this_state_paths_stale_temps() {
     legacy_name.push(".tmp");
     let legacy = std::path::PathBuf::from(legacy_name);
     fs::write(&legacy, b"legacy fixed temp").expect("write legacy temp");
+    // The legacy fixed name has no pid component, so the sweep treats it
+    // like a foreign writer and only removes it after the one-hour grace.
+    let old = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(2 * 60 * 60))
+        .expect("test age fits the platform clock");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&legacy)
+        .expect("open legacy temp")
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .expect("age the legacy temp");
 
     // Files that are not provably this state path's temp namespace.
     let foreign = parent.join("other-state.json.123.456.tmp");

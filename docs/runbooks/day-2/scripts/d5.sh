@@ -7,12 +7,15 @@
 # B: LVM provider state on a 256 KiB tmpfs with the journal on ordinary
 #    storage, so only the state save hits ENOSPC after lvcreate. Post-#58
 #    the failure is compensated: 500 INTERNAL carrying the original save
-#    error (state .tmp path and "No space left on device"), the old state
-#    file byte-identical, the just-created LV removed, the in-memory entry
-#    rolled back, and no .tmp residue. The same process reports the volume
-#    404; after a restart it is still 404, a replay of the same
-#    operation_id stays the recorded 500 (terminal failure), a fresh
-#    operation_id succeeds exactly once, and state/LVM agree throughout.
+#    error (the state temp path and "No space left on device"), the old
+#    state file byte-identical, the just-created LV removed, the in-memory
+#    entry rolled back, and no temp residue. Since a8c23d6 the temp name is
+#    `.volvisor-<16-hex>.<pid>.<seq>.tmp`; the legacy `<state>.tmp` names
+#    are kept only for historical drilled evidence and upgrades. The same
+#    process reports the volume 404; after a restart it is still 404, a
+#    replay of the same operation_id stays the recorded 500 (terminal
+#    failure), a fresh operation_id succeeds exactly once, and state/LVM
+#    agree throughout.
 # shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
@@ -336,7 +339,12 @@ FAIL_CODE="$(jq -r '.code' "$FAIL_RESP")"
 FAIL_MSG="$(jq -r '.message' "$FAIL_RESP")"
 assert_eq "$FAIL_CODE" "INTERNAL" "state save ENOSPC error code"
 assert_contains "$FAIL_MSG" "No space left on device" "state save ENOSPC message names the OS error"
-assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the exact state tmp path"
+if [[ "$FAIL_MSG" == *".volvisor-"* ]]; then
+  assert_contains "$FAIL_MSG" ".volvisor-" "state save ENOSPC message names the hashed state temp path"
+else
+  # Historical pre-a8c23d6 shape, kept so an old drill log can still be replayed.
+  assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the legacy state tmp path"
+fi
 assert_not_contains "$FAIL_MSG" "manual lvremove" "compensating lvremove succeeded (no manual remediation named)"
 assert_not_contains "$FAIL_MSG" "were kept" "failure is the uncommitted-save compensation, not the post-rename carve-out"
 
