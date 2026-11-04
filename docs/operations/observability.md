@@ -84,15 +84,22 @@ as a fabricated zero.
 | `journal_open` | gauge | — | `1` while the daemon holds the journal open, `0` if the journal mutex is unusable. |
 | `journal_records` | gauge | — | Valid journal records (replayed plus appended), sampled from the live `Journal`. |
 | `journal_log_bytes` | gauge | — | Size of the journal log file in bytes. Omitted if it cannot be stat'ed. |
+| `journal_compactions_total` | counter | — | Successful compactions since the daemon opened the journal. |
+| `journal_compaction_failures_total` | counter | — | Failed compaction attempts since open. A sustained increase means the log is not being bounded; alert on any increase and inspect the daemon log for the `journal compaction failed` warning (the detail is also available as `Journal::last_compaction_error`). A failure counted after the snapshot rename already succeeded means only the directory fsync is pending: the in-process log is bounded, the fsync is retried and cleared by the next append, and the counter still records that the rename's crash durability is not yet proven. |
+| `journal_retained_operations` | gauge | — | Terminal plus in-flight operations currently retained in the idempotency registry. |
+| `journal_tombstones` | gauge | — | Exact evicted-operation fingerprints currently in the tombstone ring. |
 | `reconcile_age_seconds` | gauge | `scope` | Seconds since the last completed reconcile pass, or since the `grow`/`move` task started if no pass has completed: `startup`, `grow`, or `move`. |
 | `witness_reachable` | gauge | — | `1`/`0` from the last witness transport probe. Absent without a configured probe target (and before the first probe). |
 
 `operations_total.outcome` is one of `success`, `failure`, `replayed`,
-`in_doubt`, `conflict`, `resolved`, `re_drive`. `resolved` is a terminal
-recovery outcome: a retry proved by inspection that the act had landed, so
-the operation returns the recorded result without a second provider call.
-`re_drive` is not terminal: a retry proved the act had **not** landed and is
-re-executing, so the same operation later records its `success`/`failure`.
+`in_doubt`, `conflict`, `resolved`, `re_drive`, `expired`. `resolved` is a
+terminal recovery outcome: a retry proved by inspection that the act had
+landed, so the operation returns the recorded result without a second
+provider call. `expired` is a terminal fail-closed refusal: the operation's
+journal entry was evicted by bounded retention, so it is never re-executed
+(`OPERATION_EXPIRED`, HTTP 410). `re_drive` is not terminal: a retry proved
+the act had **not** landed and is re-executing, so the same operation later
+records its `success`/`failure`.
 Operation kinds are the
 compile-time constants in `volvisor-api/src/ops.rs` (`create_volume`,
 `attach_volume`, `detach_volume`, `report_attachment_state`, `grow_volume`,

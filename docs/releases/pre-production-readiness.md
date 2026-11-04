@@ -76,15 +76,43 @@ pre-production, production-ready, or a release candidate.
 | #41 schema evolution | Landed | `712afb7` | — |
 | #40 transport/auth | Landed | `ad9efb0` | Same-host capture; cross-host validation open |
 | #42 provider consolidation | Landed | `db04182` | Parity suite uses simulated Ceph/DRBD worlds; no real clusters |
-| #45 admission control | Landed | `0c853f3` | No resumable operation handle/long-poll; one uniform read timeout, not per-route values; rate limiting is opt-in |
+| #45 admission control | Landed | `0c853f3` | No resumable operation handle/long-poll (synchronous journaled mutations); read timeout is a fallback with optional per-route overrides; rate limiting is opt-in |
 | #46 day-2 runbooks | Landed | `8de06c2`; [bundle](../evidence/day2/2026-11-03-devhost/REPORT.md) | 5 drilled, 2 partial, 1 not run; single host; bundle source `e551d26` predates #42/#45/#44. D5 filed #58, now fixed by #69 and re-drilled post-fix at harness `940722e` (both parts); the three non-injected branches are test-covered; #70 persist contracts are implemented and deterministically test-covered (not hardware-drilled), documented in `lvm-state-divergence.md` |
 | #44 observability | Landed | `5017ea0`; [docs](../operations/observability.md) | State-save duration and lease/epoch gauges deliberately omitted; real migration trace **not run** |
 | #43 benchmarks | Landed | `575acfc`; [bundle](../benchmarks/2026-11-03-devhost/REPORT.md) | Single host, loop-backed LVM, control plane only; 25.0 min soak, **not 24 h**; no real Ceph/DRBD/physical-disk LVM |
-| #49 harness flake | Partial | `5037db9` | LVM mid-move abort flake fixed; fuzz targets, interleaving tests and nightly flake rate remain open |
+| #49 harness flake | Partial | `5037db9`; #49 slice in this change | LVM mid-move abort flake fixed; four fuzz targets, a committed seed corpus with deterministic regression tests, journal pin/compaction and retained-listener interleaving regressions, and bounded nightly fuzz/flake workflows are delivered. The **14 consecutive clean nightly campaign runs and published flake rate are still not recorded** |
 
 The detailed workstream state is on
 [#36](https://github.com/o3kio/volvisor/issues/36). The measured benchmark
 source is `e3aa365`; it remains an ancestor of `main` for inspection.
+
+## Knowledge-concentration workstream (#50)
+
+This section records the documentation and ownership work for
+[#50](https://github.com/o3kio/volvisor/issues/50) as of **2026-11-04**. It
+changes no gate verdict and is **not** a release, restore or readiness
+sign-off.
+
+| #50 item | State | Evidence / limit |
+|---|---|---|
+| `ARCHITECTURE.md` | **Delivered** | [ARCHITECTURE.md](../../ARCHITECTURE.md): 13-crate map and dependency direction, Volume API v2 request flow, witness/peer/migration paths, invariants, crash/failure model, authoritative state locations and the AGENTS rule 12 non-production statement. Links to the v2 ADRs, SPEC-0002 and the v2 contracts. |
+| Ownership map / `CODEOWNERS` | **Structural coverage delivered; per-area assignment outstanding** | [`.github/CODEOWNERS`](../../.github/CODEOWNERS) has an explicit pattern for every one of the 13 workspace crates plus contracts, docs, CI, scripts, tests, packaging and examples. The current write-access collaborators are listed as provisional coverage owners. The repository still records no per-area primary/backup owner; `@o3kio` is an organization and cannot be a CODEOWNERS owner by itself. |
+| Contributor guide | **Delivered** | [CONTRIBUTING.md](../../CONTRIBUTING.md): build and CI gates, the real test tiers (workspace, conformance, LVM, Ceph, DRBD, campaign S/R/V), fake versus privileged suites, the four fuzz targets and their corpus regression, hardware prerequisites, review checklist, commit/PR expectations and the schema-change procedure linked to [schema-compatibility.md](../schema-compatibility.md). |
+| Bus-factor risks and mitigations | **Delivered** | [docs/bus-factor.md](../bus-factor.md): risk register, delivered structural mitigations, outstanding organizational actions and an explicit "what is not a mitigation" section. |
+| Two maintainers independently complete a release and a restore drill | **OUTSTANDING** | No two-person sign-off, names, dates or independent results are recorded. The existing [day-2 drills](../runbooks/day-2/README.md) are single-host and partly partial; D8 host loss is not run. This depends on #46 and #47 and is not satisfied by the existing bundle. |
+| No undocumented "ask person X" step in release or recovery | **NOT VERIFIED** | The commands and fail-closed rules are in-tree, but the release/restore paths still depend on a small set of people and have not had an independent operator review. Treat this acceptance criterion as open. |
+
+Related assurance gap, not a #50 checklist item: [#49](https://github.com/o3kio/volvisor/issues/49)
+requires **no open campaign flake for 14 consecutive nightly runs** and a
+published flake rate. The fuzz targets, committed corpus/regression tests and
+deterministic interleaving tests are delivered in this change, and bounded
+nightly fuzz/flake workflows collect samples, but the 14-night evidence and
+published flake rate **do not exist yet**. This report does not claim that
+flake evidence.
+
+**No gate verdict changes:** gates 1, 2 and 5 remain **NOT MET**, gates 3 and
+4 remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
+READY**.
 
 ## Evidence inventory
 
@@ -148,8 +176,9 @@ report mapping every gate to evidence. Current status:
 5. **#43 — credible backend numbers and 24 h soak.** Single-host loop-LVM
    only; no real Ceph/DRBD/physical-disk numbers and no 24 h run.
 6. **#49 / #62 / #63 / #64 — open assurance and growth findings; #58 fixed.**
-   Fuzzing and
-   interleaving tests are not implemented. The ENOSPC state-save leak is fixed
+   The #49 fuzz targets, corpus regression, deterministic interleaving tests
+   and nightly evidence collectors are delivered, but the **14-night
+   flake-rate criterion remains open**. The ENOSPC state-save leak is fixed
    by [PR #69](https://github.com/o3kio/volvisor/pull/69) (`#58`, merged at
    `1863a7a`), and the normal uncommitted-save path was re-drilled at harness
    `940722e`; the cleanup-failure, carve-out, clear-save and unreadable-reread

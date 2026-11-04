@@ -56,29 +56,40 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 
 ## Implementation (prototype)
 
-A Rust workspace implements the P0 control plane (stable IDs, device claiming,
-single-volume API/attachments, provider conformance — SPEC-0002 section 12)
-plus the native-local LVM slice, the external Ceph RBD adapter slice and the
-DRBD 9 nearline baseline slice:
+A Rust workspace implements the Volume API v2 control plane (stable IDs,
+journaled and idempotent mutations, admission/auth/audit, provider
+conformance) plus the native-local LVM, external Ceph RBD, DRBD 9 nearline,
+witness/fencing, and migration/handoff slices. The workspace has 13 members:
 
 ```text
-crates/volvisor-types      typed domain vocabulary (Volume API v2 mirror)
-crates/volvisor-journal    durable intent journal + idempotency registry
-crates/volvisor-provider   engine-neutral provider trait, command runner,
-                           fake provider + conformance kit
-crates/volvisor-lvm        native-local LVM provider (thick LV, P1 slice)
-crates/volvisor-ceph       ceph-rbd adapter for an existing external Ceph
-                           cluster (P2 slice, ADR-0005 Phase A)
-crates/volvisor-drbd       DRBD 9 nearline baseline: the local end of a
-                           single-primary replicated resource over an
-                           operator-designated VG (P3 slice, ADR-0007)
-crates/volvisor-api        HTTP/JSON Volume API v2 server
-crates/volvisord           daemon binary
+crates/volvisor-types          typed domain vocabulary (Volume API v2 mirror)
+crates/volvisor-journal        durable intent journal + idempotency registry
+crates/volvisor-provider       engine-neutral provider trait, command runner,
+                               fake provider + conformance kit
+crates/volvisor-lvm            native-local LVM provider
+crates/volvisor-ceph           ceph-rbd adapter for an existing external cluster
+crates/volvisor-drbd           DRBD 9 nearline: local end of a replicated resource
+crates/volvisor-drbd-testkit   test-only fake DRBD+LVM world
+crates/volvisor-witness        writer-authority (epoch/lease) service core
+crates/volvisor-campaign       test-only failure-campaign harness + summary binary
+crates/volvisor-handoff        migration state machine + durable migration records
+crates/volvisor-api            Volume API v2 router and journal-before-mutate pipeline
+crates/volvisor-tls            shared rustls server/client configuration
+crates/volvisord               composition root + volvisord/volvisor-witnessd binaries
 ```
 
-Build and test: `cargo build`, `cargo test --workspace`,
-`cargo clippy --all-targets` (CI denies warnings). Real-backend suites have
-one-command gates with typed, loud failures when their rig is missing:
+`volvisor-drbd-testkit` and `volvisor-campaign` are test-only; no production
+crate depends on them. The crate dependency direction, API request flow,
+witness/peer/migration paths, invariants, failure model and authoritative
+state locations are in [ARCHITECTURE.md](ARCHITECTURE.md). Build, test-tier,
+review and schema-change procedures are in [CONTRIBUTING.md](CONTRIBUTING.md);
+ownership and bus-factor risks are tracked in
+[docs/bus-factor.md](docs/bus-factor.md).
+
+Build and test: `cargo build --locked`, `cargo test --workspace --locked`,
+`cargo clippy --workspace --locked --all-targets -- -D warnings` (CI denies
+warnings). Real-backend suites have one-command gates with typed, loud
+failures when their rig is missing:
 
 ```sh
 sudo ./scripts/test-lvm.sh          # locally runnable (root + lvm2 + loop + tmpfs mount)

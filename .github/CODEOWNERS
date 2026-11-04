@@ -1,0 +1,71 @@
+# CODEOWNERS — structural review routing
+#
+# Coverage statement: every workspace crate and the docs, contracts, CI,
+# scripts, tests and packaging surfaces have an explicit owner pattern.
+#
+# This file provides *structural* coverage, not a per-area ownership
+# assignment. The repository has no recorded area owners yet. The handles
+# below are the current repository collaborators with write access; they are
+# listed so review routing is valid today. Replace them with named area
+# owners or teams as part of issue #50's follow-up.
+#
+# Note: `@o3kio` is the owning GitHub *organization*, not a user or team.
+# GitHub CODEOWNERS requires a user or team handle, so the organization
+# cannot be listed as a code owner by itself.
+#
+# Last matching pattern wins.
+
+# Default: anything not matched below.
+*                                   @senolcolak @zoorpha
+
+# Workspace crates (one explicit pattern per Cargo workspace member).
+/crates/volvisor-types/             @senolcolak @zoorpha
+/crates/volvisor-journal/           @senolcolak @zoorpha
+/crates/volvisor-provider/          @senolcolak @zoorpha
+/crates/volvisor-lvm/               @senolcolak @zoorpha
+/crates/volvisor-ceph/              @senolcolak @zoorpha
+/crates/volvisor-drbd/              @senolcolak @zoorpha
+/crates/volvisor-drbd-testkit/      @senolcolak @zoorpha
+/crates/volvisor-witness/           @senolcolak @zoorpha
+/crates/volvisor-campaign/          @senolcolak @zoorpha
+/crates/volvisor-handoff/           @senolcolak @zoorpha
+/crates/volvisor-api/               @senolcolak @zoorpha
+/crates/volvisor-tls/               @senolcolak @zoorpha
+/crates/volvisord/                  @senolcolak @zoorpha
+
+# Contracts and all documentation.
+/contracts/                         @senolcolak @zoorpha
+/docs/                              @senolcolak @zoorpha
+/docs/adr/                          @senolcolak @zoorpha
+/docs/specs/                        @senolcolak @zoorpha
+/docs/reviews/                      @senolcolak @zoorpha
+/docs/plans/                        @senolcolak @zoorpha
+
+# Operational, evidence and testing material.
+/docs/runbooks/                     @senolcolak @zoorpha
+/docs/evidence/                     @senolcolak @zoorpha
+/docs/testing/                      @senolcolak @zoorpha
+/docs/security/                     @senolcolak @zoorpha
+/docs/operations/                   @senolcolak @zoorpha
+/docs/benchmarks/                   @senolcolak @zoorpha
+/docs/releases/                     @senolcolak @zoorpha
+
+# CI, release, scripts and executable test assets.
+/.github/                           @senolcolak @zoorpha
+/scripts/                           @senolcolak @zoorpha
+/tests/                             @senolcolak @zoorpha
+/fuzz/                              @senolcolak @zoorpha
+/packaging/                         @senolcolak @zoorpha
+/examples/                          @senolcolak @zoorpha
+
+# Root-level policy, scope, architecture and contributor documents.
+/AGENTS.md                          @senolcolak @zoorpha
+/ARCHITECTURE.md                    @senolcolak @zoorpha
+/CONTRIBUTING.md                    @senolcolak @zoorpha
+/README.md                          @senolcolak @zoorpha
+/SUPPORT_MATRIX.md                  @senolcolak @zoorpha
+/release-scope.toml                 @senolcolak @zoorpha
+/Cargo.toml                         @senolcolak @zoorpha
+/Cargo.lock                         @senolcolak @zoorpha
+/deny.toml                          @senolcolak @zoorpha
+/rust-toolchain.toml                @senolcolak @zoorpha

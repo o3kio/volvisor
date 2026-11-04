@@ -48,24 +48,61 @@ claiming a capability the daemon does not have.
 
 ## Read-route timeout
 
-A **single** configurable value, `admission.read_timeout_secs` (default
-`30`), bounds every read-only provider call. There are no distinct per-route
-timeout values; the same wall-clock bound applies uniformly to each route
-listed below. On expiry the daemon answers:
+`admission.read_timeout_secs` (default `30`) is the **fallback** bound for
+every read-only provider call. The optional `[admission.route_timeouts]`
+table overrides it per route. Keys name the axum **matched path** (the route
+pattern, not the request URI); a read-only route without an override falls
+back to `read_timeout_secs`, so the default is unchanged.
+
+| Override key | Matched path | Route |
+|---|---|---|
+| `list_volumes_secs` | `/v2/volumes` | `GET /v2/volumes` |
+| `inspect_volume_secs` | `/v2/volumes/{volume_id}` | `GET /v2/volumes/{volume_id}` |
+| `capabilities_secs` | `/v2/capabilities` | `GET /v2/capabilities` |
+| `observe_migration_secs` | `/v2/migrations/{migration_id}` | `GET /v2/migrations/{migration_id}` |
+| `list_devices_secs` | `/v2/admin/devices` | `GET /v2/admin/devices` |
+| `device_ownership_secs` | `/v2/admin/devices/{device_id}/ownership` | `GET /v2/admin/devices/{device_id}/ownership` |
+| `check_mobility_secs` | `/v2/vms/{vm_id}/check-mobility` | `POST /v2/vms/{vm_id}/check-mobility` (read-only) |
+| `peer_health_secs` | `/v2/internal/peer/health` | `GET /v2/internal/peer/health` |
+| `verify_lineage_secs` | `/v2/internal/peer/verify-lineage` | `POST /v2/internal/peer/verify-lineage` (read-only) |
+
+Two of these routes are `POST` but **read-only**: `check-mobility` and
+`verify-lineage` never journal and are observations, so they are bounded
+like `GET`/`HEAD`. Journaled mutations are never bounded.
+
+Every key is optional; each value is whole seconds in `1..=3600`, the same
+range as `read_timeout_secs`. Unknown keys are refused at startup
+(`deny_unknown_fields`), and overlapping routes are not possible because the
+key space is the matched path exactly.
+
+```toml
+[admission]
+read_timeout_secs = 30
+
+[admission.route_timeouts]
+list_volumes_secs = 60          # large listings may legitimately be slow
+inspect_volume_secs = 10        # a single metadata read should be quick
+check_mobility_secs = 120       # provider-wide eligibility observation
+verify_lineage_secs = 120       # barrier-time DRBD lineage observation
+```
+
+On expiry the daemon answers `504 REQUEST_TIMEOUT`, naming the matched route
+and the **effective** limit (the override if one matched, otherwise the
+fallback):
 
 ```http
 HTTP/1.1 504 Gateway Timeout
 Content-Type: application/json
 
-{"code":"REQUEST_TIMEOUT","message":"read-only route ... exceeded its 30s timeout"}
+{"code":"REQUEST_TIMEOUT","message":"read-only route /v2/volumes exceeded its 60s timeout"}
 ```
 
-The bound applies to `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
-`GET /v2/capabilities`, `GET /v2/migrations/{migration_id}`,
-`GET /v2/admin/devices`, `GET /v2/admin/devices/{device_id}/ownership`,
-`POST /v2/vms/{vm_id}/check-mobility` and the read-only peer health route.
 `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` are local
-and unbounded. Mutations are never bounded by this value (see above).
+and unbounded. Mutations are never bounded by any entry, including when a
+mutating method shares a matched path with an overridden read route (for
+example `POST /v2/volumes` versus `GET /v2/volumes`): the selector first
+admits only `GET`/`HEAD` and the read-only `check-mobility` and
+`verify-lineage` routes, then looks up an override.
 
 `HEAD` requests are bounded exactly like `GET` (axum routes `HEAD` to the
 `GET` handler), so a hung provider cannot pin a `HEAD` request past the
@@ -109,8 +146,10 @@ bucket. **Bearer tokens are never used as keys and never logged.**
 
 A request rejected by authentication or authorization is charged to the
 `anonymous` bucket before its `401`/`403` is returned, so a credential
-brute-force flood is rate-limited rather than bypassing the limiter. When
-the anonymous bucket is exhausted the rejection becomes `429 RATE_LIMITED`.
+brute-force flood is rate-limited rather than bypassing the limiter — this
+includes denials on the otherwise admission-exempt probe and `/metrics`
+routes. When the anonymous bucket is exhausted the rejection becomes
+`429 RATE_LIMITED`.
 
 Enable it in the daemon config:
 
@@ -190,14 +229,20 @@ not reach the provider.
   legitimate **read**. It must not impose a timeout that silently abandons a
   journaled mutation that the daemon is still running.
 - The daemon does not implement slowloris defense at the application layer;
-  bound request headers/body timing at the listener or proxy as well.
+  bound request headers/body timing at the listener or proxy as well. This
+  matters most for authenticated mutating requests: a permit is acquired
+  before the body is read, and mutations are deliberately never
+  wall-clock-bounded, so `max_concurrent_requests` connections that dribble
+  a body can exhaust the cap and turn every other request (reads included)
+  into `503 OVERLOADED`. Size client/proxy body timeouts accordingly.
 
 ## Defaults at a glance
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `max_body_bytes` | `1048576` | Request body ceiling (sized and streamed). |
-| `admission.read_timeout_secs` | `30` | Single read-only timeout applied to every read route (`504 REQUEST_TIMEOUT`). |
+| `admission.read_timeout_secs` | `30` | Fallback read-only timeout; a matching `[admission.route_timeouts]` override wins (`504 REQUEST_TIMEOUT`). |
+| `admission.route_timeouts` | empty | Optional per-route overrides (matched-path keys, each `1..=3600` seconds); unset keys fall back. |
 | `admission.queue_timeout_secs` | `5` | Concurrency-permit wait (`503 OVERLOADED`). |
 | `admission.max_concurrent_requests` | `256` | Global in-flight cap (probes/metrics exempt). |
 | `admission.rate_limit_per_second` | `0` (disabled) | Per-principal refill rate; opt-in, `0` keeps legacy behavior. |

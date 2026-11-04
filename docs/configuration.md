@@ -68,6 +68,7 @@ typo'd key is a startup refusal, never a silently ignored setting.
 | `allow_insecure` | boolean | `false` | Explicit opt-in to plain HTTP on a non-loopback listener and to plain-HTTP witness/peer URLs. Emits a startup warning. Never a silent fallback. |
 | `max_body_bytes` | integer (bytes) | 1048576 (1 MiB) | Maximum accepted request body size, enforced for sized and streamed bodies. |
 | `admission` | table, below | defaults | HTTP admission control: read timeout, concurrency cap, opt-in per-principal rate limit and pagination maximum. |
+| `journal` | table, below | defaults | Bounded intent-journal retention and compaction. Defaults bound restart memory and log growth. |
 
 ### Admission control (`[admission]`)
 
@@ -78,12 +79,37 @@ timeout.
 
 | Field | Type | Default | Controls |
 |---|---|---|---|
-| `admission.read_timeout_secs` | integer (seconds) | `30` | Single bound applied to every read-only provider call; expiry is `504 REQUEST_TIMEOUT`. |
+| `admission.read_timeout_secs` | integer (seconds) | `30` | Fallback bound applied to every read-only provider call; a `[admission.route_timeouts]` override wins for its matched path. Expiry is `504 REQUEST_TIMEOUT`. |
 | `admission.queue_timeout_secs` | integer (seconds) | `5` | Maximum wait for a global concurrency permit; expiry is `503 OVERLOADED` with `Retry-After`. |
 | `admission.max_concurrent_requests` | integer | `256` | Global in-flight request cap. `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass it. |
 | `admission.rate_limit_per_second` | integer | `0` (disabled) | Per-principal token refill rate; opt-in, `0` preserves legacy behavior. |
 | `admission.rate_limit_burst` | integer | `0` (disabled) | Per-principal burst; ignored while the rate is `0`, must be at least one when the rate is non-zero. |
 | `admission.max_list_limit` | integer | `1000` | Maximum accepted `GET /v2/volumes?limit=` (1..=1000; never above the contract maximum). |
+
+Optional per-route read timeouts live in `[admission.route_timeouts]`. Each
+key is optional, is whole seconds in `1..=3600`, and names an axum matched
+path; an absent key falls back to `admission.read_timeout_secs`. Unknown
+keys are refused at startup. Mutations are never bounded by these entries.
+
+| Key | Matched path |
+|---|---|
+| `list_volumes_secs` | `GET /v2/volumes` |
+| `inspect_volume_secs` | `GET /v2/volumes/{volume_id}` |
+| `capabilities_secs` | `GET /v2/capabilities` |
+| `observe_migration_secs` | `GET /v2/migrations/{migration_id}` |
+| `list_devices_secs` | `GET /v2/admin/devices` |
+| `device_ownership_secs` | `GET /v2/admin/devices/{device_id}/ownership` |
+| `check_mobility_secs` | `POST /v2/vms/{vm_id}/check-mobility` (read-only) |
+| `verify_lineage_secs` | `POST /v2/internal/peer/verify-lineage` (read-only) |
+| `peer_health_secs` | `GET /v2/internal/peer/health` |
+
+```toml
+[admission.route_timeouts]
+list_volumes_secs = 60
+inspect_volume_secs = 10
+check_mobility_secs = 120
+verify_lineage_secs = 120
+```
 
 Per-principal rate limiting is **opt-in and disabled by default** (`0`/`0`)
 so unmodified deployments keep their existing client behavior. Enable it
@@ -100,6 +126,51 @@ limiting together: without scoped credentials every legacy caller shares the
 single `anonymous` bucket. The concurrency cap, read timeout and body limit
 remain on by default because they shed overload without changing the success
 path for well-behaved clients.
+
+### Journal retention and compaction (`[journal]`)
+
+The intent journal is fsynced per record and compacted during an ordinary
+append when a threshold is crossed. Compaction runs synchronously while the
+journal lock is held, after the triggering record is already durable;
+it atomically rewrites `journal.log` as one `snapshot` frame (tmp file,
+fsync, rename, directory fsync). A failed compaction never fails that append
+and is retried on the next one. Size the thresholds well above the steady
+operation rate so compaction stays rare and its pause stays bounded.
+
+| Field | Type | Default | Controls |
+|---|---|---|---|
+| `journal.max_retained_operations` | integer | `65536` | Target bound on terminal operations kept in memory and in the snapshot (1..=10000000). In-flight intents are always kept. Compaction may retain fewer when the encoded snapshot would exceed the one-frame limit. The terminal-count trigger fires at **twice** this value, so the in-memory registry may hold up to 2× the configured value between compactions; after the first compaction the trigger also waits for at least 64 new log records, so a tiny bound cannot rewrite the snapshot on every append. The growth floors are per daemon lifetime and reset on restart, so a restart may compact once against the configured thresholds even when the compacted snapshot is small. |
+| `journal.max_tombstones` | integer | `65536` | Upper bound on newest evicted-operation fingerprints kept by the tombstone ring (1..=10000000). A zero ring would silently re-execute retries, so zero is refused. The effective ring is capped by the one-frame limit. |
+| `journal.max_log_records` | integer | `500000` | Compact after this many valid records in the current log (2..=100000000). A successful compaction requires meaningful new growth (at least 64 records) before this trigger can fire again, so a tiny value cannot rewrite the snapshot on every append. |
+| `journal.max_log_bytes` | integer (bytes) | 67108864 (64 MiB) | Compact after the log reaches this size; `0` disables the byte trigger (the record-count and retention triggers still apply). After a successful compaction the trigger requires at least 1 MiB of new growth. |
+
+**One-frame limit.** A snapshot is written as a single journal frame, whose
+payload is capped at 8 MiB. If the configured retention would produce a
+larger snapshot, compaction first evicts the oldest unpinned terminal
+operations (recording their fingerprints as tombstones, so retries still
+fail closed) and then shortens the tombstone ring until the snapshot fits.
+The effective retention can therefore be below the configured upper bounds;
+this keeps compaction making progress instead of failing forever. If
+in-flight or pinned operations alone exceed one frame, compaction fails
+closed, `/metrics` shows `journal_compaction_failures_total` increasing, and
+the next append retries.
+
+```toml
+[journal]
+max_retained_operations = 65536
+max_tombstones = 65536
+max_log_records = 500000
+max_log_bytes = 67108864
+```
+
+A retry whose operation was evicted **within** the tombstone window answers
+`410 OPERATION_EXPIRED` (metric `operations_total{outcome="expired"}`)
+instead of re-executing a possibly-completed mutation. An operation evicted
+before the ring's window is indistinguishable from a new one, so keep
+`max_tombstones` above the longest client retry horizon. The witness registry
+folds the full record history and refuses a compacted journal; it must not
+share `journal_dir` with a control-plane journal. See
+[schema compatibility](schema-compatibility.md).
 
 ### TLS and transport fields
 
