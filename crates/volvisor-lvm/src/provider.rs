@@ -7145,7 +7145,14 @@ impl VolumeProvider for LvmProvider {
         &self,
         req: &CreateVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
-        self.create_volume_inner(req)
+        // The create body is synchronous end to end: `vgs`, `lvcreate` and
+        // the size-verifying `lvs` are blocking LVM CLI calls. Running them
+        // inline pins an async worker for their full duration, so at high
+        // in-flight enough concurrent creates can pin every worker and
+        // starve reads, attaches, reports and detaches. `block_in_place`
+        // hands this worker's core to the scheduler for the duration; see
+        // `grow_volume` for the handoff and fallback rationale.
+        run_blocking_body(|| self.create_volume_inner(req))
     }
 
     async fn inspect_volume(&self, id: &VolumeId) -> Result<InspectVolumeResponse, ApiError> {
@@ -7253,7 +7260,14 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
-        self.delete_volume_inner(volume_id, req)
+        // The delete body is synchronous end to end: the `lvs` check,
+        // `blkdiscard` and `lvremove` are blocking LVM CLI calls. Running
+        // them inline pins an async worker for their full duration, so at
+        // high in-flight enough concurrent deletes can pin every worker and
+        // starve reads, attaches, reports and detaches. `block_in_place`
+        // hands this worker's core to the scheduler for the duration; see
+        // `grow_volume` for the handoff and fallback rationale.
+        run_blocking_body(|| self.delete_volume_inner(volume_id, req))
     }
 }
 

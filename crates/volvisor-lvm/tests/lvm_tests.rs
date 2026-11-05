@@ -5252,6 +5252,19 @@ async fn delete_releases_the_state_lock_across_lvremove() {
         "{err}"
     );
 
+    // The shared drive map also refuses the cross-kind case: a create of
+    // the same id must not start while the delete body is parked.
+    let cross_create = fixture_create_request("delete-lock", GIB);
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, provider.create_volume(&cross_create))
+        .await
+        .expect("a create during a delete must not block on the state lock")
+        .expect_err("a create during a delete must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(
+        err.detail.contains("already has a delete in progress"),
+        "{err}"
+    );
+
     gate.release();
     delete
         .await
@@ -5321,6 +5334,7 @@ fn gated_create_provider(
 /// `lvcreate`/`lvs`, reserve the capacity it is about to spend, and refuse a
 /// concurrent structural mutation of the same volume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // one lock-release/reservation/drive narrative
 async fn create_releases_the_state_lock_across_lvcreate() {
     // One existing 1 GiB volume plus one more 1 GiB and 8 MiB slack: the
     // parked create fits, but without its reservation another 1 GiB
@@ -5409,6 +5423,22 @@ async fn create_releases_the_state_lock_across_lvcreate() {
         "{err}"
     );
 
+    // The shared drive map also refuses the cross-kind case: a delete of
+    // the same id must not start while the create body is parked.
+    let cross_delete = delete_request_with("create-lock-delete", 1, ErasurePolicy::Retain);
+    let err = tokio::time::timeout(
+        IN_FLIGHT_TIMEOUT,
+        provider.delete_volume(&request.volume_id, &cross_delete),
+    )
+    .await
+    .expect("a delete during a create must not block on the state lock")
+    .expect_err("a delete during a create must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(
+        err.detail.contains("already has a create in progress"),
+        "{err}"
+    );
+
     gate.release();
     let created = create
         .await
@@ -5421,6 +5451,16 @@ async fn create_releases_the_state_lock_across_lvcreate() {
     assert!(durable.volume(&request.volume_id).is_some());
     assert!(durable.create_intent(&request.volume_id).is_none());
     assert!(durable.volume(&other.volume_id).is_some());
+
+    // The in-flight reservation was released when the command returned:
+    // the pool has exactly 8 MiB left, so a 4 MiB create (4 MiB
+    // extent-rounded demand plus 4 MiB headroom) fits only if the parked
+    // create's 1 GiB promise is gone.
+    let small = provider
+        .create_volume(&fixture_create_request("create-small", 4 * MIB))
+        .await
+        .expect("the completed create's reservation must be released");
+    assert_eq!(small.provisioned_bytes, 4 * MIB);
 
     // The drive guard was released: an idempotent replay answers.
     let replay = provider
