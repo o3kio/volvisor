@@ -5264,3 +5264,168 @@ async fn delete_releases_the_state_lock_across_lvremove() {
     assert!(durable.delete_intent(&doomed.volume_id).is_none());
     assert!(durable.volume(&other.volume_id).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Phase E E2: create releases the provider state lock
+// ---------------------------------------------------------------------------
+
+/// A provider whose fake `lvcreate` parks on the returned gate until the
+/// test releases it, over a claimed pool with exactly `free_bytes` free.
+fn gated_create_provider(
+    free_bytes: u64,
+) -> (
+    Arc<LvmProvider>,
+    Arc<OneShotProgramGate>,
+    Arc<FakeRunner>,
+    std::path::PathBuf,
+) {
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = Arc::new(Mutex::new({
+        let mut world = common::FakeLvm::with_claimed_pool();
+        world
+            .vg_free
+            .insert(common::CLAIMED_VG.to_owned(), free_bytes);
+        world
+            .vg_size
+            .insert(common::CLAIMED_VG.to_owned(), free_bytes);
+        world
+    }));
+    let gate = Arc::new(OneShotProgramGate::default());
+    let runner = {
+        let world = Arc::clone(&world);
+        let gate = Arc::clone(&gate);
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            if program == "lvcreate" && gate.try_fire() {
+                gate.entered();
+                gate.wait_release();
+            }
+            let mut world = world.lock().ok()?;
+            common::script(&mut world, program, args)
+        }))
+    };
+    let provider = Arc::new(
+        LvmProvider::new(
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+            state_path.clone(),
+            common::leak_tempdir(),
+            common::VG_PREFIX.to_owned(),
+            common::AUTH_TOKEN.to_owned(),
+        )
+        .expect("provider construction"),
+    );
+    (provider, gate, runner, state_path)
+}
+
+/// Phase E E2 (#62): a create must release the provider state lock across
+/// `lvcreate`/`lvs`, reserve the capacity it is about to spend, and refuse a
+/// concurrent structural mutation of the same volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn create_releases_the_state_lock_across_lvcreate() {
+    // One existing 1 GiB volume plus one more 1 GiB and 8 MiB slack: the
+    // parked create fits, but without its reservation another 1 GiB
+    // allocation would still fit in the free space `vgs` reports while the
+    // command is parked.
+    let free = 2 * GIB + 8 * MIB;
+    let (provider, gate, _runner, state_path) = gated_create_provider(free);
+    let _release = OneShotGateRelease(Arc::clone(&gate));
+
+    let other = provider
+        .create_volume(&fixture_create_request("create-other", GIB))
+        .await
+        .expect("create other volume");
+
+    gate.arm();
+    let request = fixture_create_request("create-lock", GIB);
+    let create = {
+        let provider = Arc::clone(&provider);
+        let request = request.clone();
+        tokio::spawn(async move { provider.create_volume(&request).await })
+    };
+    wait_for_gate_entered(&gate).await;
+
+    // A different volume's attach must not queue behind the create's
+    // `lvcreate`/`lvs`: the state lock is released for the command body.
+    let attach_other = {
+        let provider = Arc::clone(&provider);
+        let volume_id = other.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .attach_volume(
+                    &volume_id,
+                    &fixture_attach_request("create-other", "create-other-att", 1),
+                )
+                .await
+        })
+    };
+    let attached = tokio::time::timeout(IN_FLIGHT_TIMEOUT, attach_other)
+        .await
+        .expect("another volume's attach must not wait behind lvcreate")
+        .expect("attach task join")
+        .expect("attach other volume");
+    assert_eq!(attached.volume_generation, 2);
+
+    // The parked create's reservation is visible to grow admission: `vgs`
+    // still reports the pre-`lvcreate` free space, so without the
+    // reservation this 1 GiB grow would fit.
+    let grow_other = {
+        let provider = Arc::clone(&provider);
+        let volume_id = other.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .grow_volume(
+                    &volume_id,
+                    &fixture_grow_request("create-other", 2 * GIB, 2),
+                )
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, grow_other)
+        .await
+        .expect("grow admission must not block behind lvcreate")
+        .expect("grow task join")
+        .expect_err("the parked create's reservation must be honored by grow admission");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity);
+    assert!(
+        err.detail.contains("reserved for in-flight allocations"),
+        "{err}"
+    );
+
+    // A second structural mutation of the same volume is refused by the
+    // create drive guard, not queued and not run concurrently.
+    let same_id = {
+        let provider = Arc::clone(&provider);
+        let request = request.clone();
+        tokio::spawn(async move { provider.create_volume(&request).await })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, same_id)
+        .await
+        .expect("a same-id create must not block on the state lock")
+        .expect("same-id task join")
+        .expect_err("a concurrent create of the same volume must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(
+        err.detail.contains("already has a create in progress"),
+        "{err}"
+    );
+
+    gate.release();
+    let created = create
+        .await
+        .expect("create task join")
+        .expect("create completes after the gate releases");
+    assert_eq!(created.generation, 1);
+
+    // The final save committed the volume and dropped the intent.
+    let durable = LvmState::load(&state_path).expect("durable state after create");
+    assert!(durable.volume(&request.volume_id).is_some());
+    assert!(durable.create_intent(&request.volume_id).is_none());
+    assert!(durable.volume(&other.volume_id).is_some());
+
+    // The drive guard was released: an idempotent replay answers.
+    let replay = provider
+        .create_volume(&request)
+        .await
+        .expect("idempotent replay after the create completes");
+    assert_eq!(replay.volume_id, request.volume_id);
+}

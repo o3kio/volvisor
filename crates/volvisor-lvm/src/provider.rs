@@ -460,21 +460,21 @@ pub struct LvmProvider {
     /// and non-blocking: the second grow is refused, never queued on a
     /// runtime worker.
     grow_drives: Mutex<BTreeSet<VolumeId>>,
-    /// Volume ids with a live delete drive. A delete releases the provider
-    /// state lock across the destructive command body, so this in-memory set
-    /// refuses a second concurrent delete of the same volume instead of
-    /// letting both run `blkdiscard`/`lvremove`. It is fail-closed and
-    /// non-blocking: the duplicate is refused, never queued. The durable
-    /// delete intent (not this set) survives a restart.
-    delete_drives: Mutex<BTreeSet<VolumeId>>,
-    /// Bytes promised to in-flight grow allocations, keyed by volume
-    /// group. The state lock no longer serializes the long `lvextend`,
-    /// so capacity admission subtracts these reservations to stay
-    /// honest: a create (or another grow) that takes the state lock
-    /// while a resize runs must not spend the same free space twice.
-    /// The entry is removed when the command returns, after which `vgs`
-    /// reports the real free space. Leaf lock: never held while taking
-    /// the provider state lock.
+    /// Volume ids with a live create or delete drive. Both paths release the
+    /// provider state lock across external LVM commands, so this map refuses
+    /// a concurrent structural mutation of the same volume instead of
+    /// letting two bodies race (or spend the same capacity). It is
+    /// fail-closed and non-blocking: the duplicate is refused, never queued.
+    /// The durable intent (not this map) survives a restart.
+    volume_drives: Mutex<BTreeMap<VolumeId, StructuralDriveKind>>,
+    /// Bytes promised to in-flight grow and create allocations, keyed by
+    /// volume group. The state lock no longer serializes the long
+    /// `lvextend`/`lvcreate`, so capacity admission subtracts these
+    /// reservations to stay honest: a create (or another grow) that takes
+    /// the state lock while an allocation runs must not spend the same free
+    /// space twice. The entry is removed when the command returns, after
+    /// which `vgs` reports the real free space. Leaf lock: never held while
+    /// taking the provider state lock.
     capacity_reservations: Mutex<BTreeMap<String, u64>>,
     /// Counts completed allocations (create `lvcreate`, grow `lvextend`)
     /// that may have reduced free space.
@@ -1392,27 +1392,65 @@ impl Drop for GrowDriveGuard<'_> {
     }
 }
 
-/// RAII marker for one live delete drive.
+/// Which structural drive currently holds a volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuralDriveKind {
+    Create,
+    Delete,
+}
+
+impl StructuralDriveKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// RAII marker for one live create or delete drive.
 ///
-/// The drive releases the provider state lock across `blkdiscard`/`lvremove`,
-/// so this marker prevents a second delete of the same volume from running
-/// the destructive body concurrently against the same durable intent.
+/// Both paths release the provider state lock across external LVM commands,
+/// so this marker prevents a concurrent structural mutation of the same
+/// volume from racing the durable intent or spending the same capacity.
 /// Removal on drop (including unwinding) is what makes the exclusion
 /// recoverable; the durable intent is the cross-restart fence.
-struct DeleteDriveGuard<'a> {
+struct StructuralDriveGuard<'a> {
     provider: &'a LvmProvider,
     volume_id: VolumeId,
 }
 
-impl Drop for DeleteDriveGuard<'_> {
+impl Drop for StructuralDriveGuard<'_> {
     fn drop(&mut self) {
         let mut drives = self
             .provider
-            .delete_drives
+            .volume_drives
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         drives.remove(&self.volume_id);
     }
+}
+
+/// A pool choice and the `vgs` sample it was admitted against.
+struct PickedPool {
+    vg_name: String,
+    /// Free bytes the sample reported, before subtracting in-flight
+    /// capacity reservations.
+    sampled_free: u64,
+    /// Extent-rounded bytes this allocation needs.
+    demand: u64,
+}
+
+/// The outcome of running `lvcreate` without the provider state lock.
+enum CreateCommandOutcome {
+    /// The LV exists at or above the requested size; commit it.
+    Created { effective: u64 },
+    /// The command runner returned no exit status: the outcome is unknown.
+    Unknown(ApiError),
+    /// `lvcreate` reported a non-zero exit: a failed start to classify.
+    StartFailed(ApiError),
+    /// `lvcreate` succeeded but LVM's own report disagrees with the request.
+    VerifyFailed(ApiError),
 }
 
 /// One in-flight allocation reservation in a volume group.
@@ -1550,7 +1588,7 @@ impl LvmProvider {
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
-            delete_drives: Mutex::new(BTreeSet::new()),
+            volume_drives: Mutex::new(BTreeMap::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state),
@@ -2254,29 +2292,36 @@ impl LvmProvider {
         })
     }
 
-    /// Enter one live delete drive for `volume_id`, refusing a second one.
+    /// Enter one live create or delete drive for `volume_id`, refusing a
+    /// concurrent structural mutation of the same volume.
     ///
-    /// The delete releases the provider state lock across the destructive
-    /// command body. A second concurrent delete of the same volume must not
-    /// run that body against the same durable intent, so it is refused
-    /// typed rather than queued. The guard is removed on drop, and the
-    /// durable intent remains the crash-recovery fence.
-    fn begin_delete_drive(&self, volume_id: &VolumeId) -> Result<DeleteDriveGuard<'_>, ApiError> {
+    /// Both paths release the provider state lock across external LVM
+    /// commands. A second create/delete must not run that body against the
+    /// same volume, so it is refused typed rather than queued. The guard is
+    /// removed on drop, and the durable intent remains the crash-recovery
+    /// fence.
+    fn begin_structural_drive(
+        &self,
+        volume_id: &VolumeId,
+        kind: StructuralDriveKind,
+    ) -> Result<StructuralDriveGuard<'_>, ApiError> {
         let mut drives = self
-            .delete_drives
+            .volume_drives
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !drives.insert(volume_id.clone()) {
+        if let Some(existing) = drives.get(volume_id) {
+            let existing = existing.as_str();
             return Err(ApiError::new(
                 ApiErrorCode::InvalidState,
                 format!(
-                    "volume {volume_id} already has a delete in progress; retry after it \
+                    "volume {volume_id} already has a {existing} in progress; retry after it \
                      completes or resolves"
                 ),
             ));
         }
+        drives.insert(volume_id.clone(), kind);
         drop(drives);
-        Ok(DeleteDriveGuard {
+        Ok(StructuralDriveGuard {
             provider: self,
             volume_id: volume_id.clone(),
         })
@@ -2294,14 +2339,14 @@ impl LvmProvider {
     }
 
     /// Record that an allocation completed and may have reduced free
-    /// space. A create calls this under the state lock, after `lvcreate`;
-    /// a grow calls it immediately after `lvextend` returns, before it
-    /// releases its reservation.
+    /// space. A create and a grow both call this under the state lock when
+    /// the command returns, before releasing their reservation.
     fn note_capacity_change(&self) {
         self.capacity_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Bytes currently promised to in-flight grow allocations in `vg_name`.
+    /// Bytes currently promised to in-flight structural allocations in
+    /// `vg_name`.
     fn reserved_capacity(&self, vg_name: &str) -> u64 {
         self.capacity_reservations
             .lock()
@@ -2315,15 +2360,16 @@ impl LvmProvider {
     /// space, given a `vgs` sample.
     ///
     /// The check and the insertion happen under the reservation leaf lock,
-    /// so concurrent grows cannot both spend the same sampled free bytes
-    /// (grow-grow admission is serialized by no lock except this leaf; the
-    /// state lock is not held across the sample).
+    /// so concurrent allocations cannot both spend the same sampled free
+    /// bytes (grow admission samples without the state lock, so grow-grow
+    /// and grow-create exclusion rests on this leaf during the sample
+    /// window).
     /// Returns the bytes already reserved for the VG on refusal so the
     /// typed refusal can report the honest accounting.
     ///
-    /// Called under the provider state lock. Any create that takes the
-    /// state lock while the resize runs subtracts this reservation, so the
-    /// freed-lock window cannot spend the same extents twice.
+    /// Called under the provider state lock. Both create and grow subtract
+    /// these reservations while the other command runs, so the freed-lock
+    /// window cannot spend the same extents twice.
     fn try_reserve_capacity(
         &self,
         vg_name: &str,
@@ -2571,7 +2617,7 @@ impl LvmProvider {
     /// Pick the first claimed native-pool volume group with enough free
     /// space for the **extent-rounded** demand (headroom included);
     /// `NO_SAFE_CAPACITY` when none qualifies.
-    fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<String, ApiError> {
+    fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<PickedPool, ApiError> {
         let capacity_map = self.vg_capacity_map()?;
         for entry in state.devices().values() {
             if entry.role != volvisor_types::DeviceRole::NativePool {
@@ -2579,13 +2625,17 @@ impl LvmProvider {
             }
             if let Some(capacity) = capacity_map.get(&entry.vg_name) {
                 let demand = extent_rounded(size_bytes, capacity.extent_bytes);
-                // A grow that released the state lock for `lvextend`
+                // A grow (or another create) that released the state lock
                 // promised these bytes to itself; do not spend them again.
                 let free = capacity
                     .free_bytes
                     .saturating_sub(self.reserved_capacity(&entry.vg_name));
                 if demand.saturating_add(VG_HEADROOM_BYTES) <= free {
-                    return Ok(entry.vg_name.clone());
+                    return Ok(PickedPool {
+                        vg_name: entry.vg_name.clone(),
+                        sampled_free: capacity.free_bytes,
+                        demand,
+                    });
                 }
             }
         }
@@ -2978,31 +3028,49 @@ impl LvmProvider {
 
     /// Resume a matching pending create intent.
     ///
-    /// Returns `Some(response)` when the intent-owned LV was verified
-    /// and adopted (or `Err` when that adoption could not be made
-    /// durable). Returns `None` when there is no matching intent or
-    /// the intent's LV is verifiably absent (the intent is cleared in
-    /// memory so a fresh create can proceed). A different payload or
-    /// requested size is a typed idempotency conflict; a present LV
-    /// smaller than the request is never adopted.
+    /// The caller observed `intent` under the provider state lock and then
+    /// dropped the guard: the size check is an `lvs` command and must not
+    /// run under the state lock. Returns `Some(response)` when the
+    /// intent-owned LV was verified and adopted (or `Err` when that
+    /// adoption could not be made durable). Returns `None` when the intent's
+    /// LV is verifiably absent (the intent is cleared in memory so a fresh
+    /// create can proceed). A different payload or requested size is a typed
+    /// idempotency conflict; a present LV smaller than the request is never
+    /// adopted, and a state view that no longer holds the same intent fails
+    /// closed.
     fn resume_create_intent(
         &self,
-        state: &mut LvmState,
         req: &CreateVolumeRequest,
         payload: &str,
+        intent: &CreateIntent,
     ) -> Result<Option<InspectVolumeResponse>, ApiError> {
-        let Some(intent) = state.create_intent(&req.volume_id).cloned() else {
-            return Ok(None);
-        };
         if intent.creation_payload != payload || intent.requested_size_bytes != req.size_bytes {
             return Err(ApiError::idempotency_conflict(&req.volume_id));
         }
-        match self.lv_size(&intent.vg_name, &intent.lv_name)? {
+        // Observe the intent-owned LV without the provider state lock.
+        let observed = self.lv_size(&intent.vg_name, &intent.lv_name)?;
+        let mut state = self.lock_state_stable()?;
+        // The create/delete drive guard excludes another structural mutation
+        // of this volume while the observation ran, so the intent must still
+        // be the one this call observed. Refuse to adopt under a different
+        // authorization (an aligned/reloaded state view is the only way this
+        // can move).
+        if state.create_intent(&req.volume_id) != Some(intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable create intent for volume {} changed while its LV was being \
+                     verified; refusing to adopt a volume under a mismatched intent",
+                    req.volume_id
+                ),
+            ));
+        }
+        match observed {
             Some(observed) if observed >= intent.requested_size_bytes => {
-                let stored = Self::stored_volume_from_create_intent(&intent, observed);
+                let stored = Self::stored_volume_from_create_intent(intent, observed);
                 state.remove_create_intent(&req.volume_id);
                 state.insert_volume(req.volume_id.clone(), stored.clone());
-                if let Err(save_error) = self.persist(state) {
+                if let Err(save_error) = self.persist(&mut state) {
                     // The adoption's save failed. If its rename landed
                     // (the post-rename carve-out), the durable record
                     // already holds the volume: keep the in-memory
@@ -3050,75 +3118,25 @@ impl LvmProvider {
             }
             None => {
                 // The prior attempt never created the LV: clear the
-                // stale intent in memory and create fresh.
+                // stale intent in memory and let the caller create fresh.
                 state.remove_create_intent(&req.volume_id);
                 Ok(None)
             }
         }
     }
 
-    /// Persist the create intent and run the allocating command.
+    /// Run `lvcreate` and verify the observed geometry without the provider
+    /// state lock.
     ///
-    /// Durable-first: the intent is saved before `lvcreate`, so a kill-9
-    /// after the CLI created the LV leaves an intent startup recovery
-    /// can verify and adopt. A failed intent save creates no LV; a
-    /// failed start or size verification leaves/clears the intent
-    /// exactly as the create contract documents. Returns the chosen
-    /// VG/LV names, the block size and the verified effective size.
-    fn create_lv_with_intent(
+    /// The caller writes the durable create intent before this call; it is
+    /// the recovery anchor for the gap. The caller releases the create's
+    /// capacity reservation as soon as this returns.
+    fn run_create_lv(
         &self,
-        state: &mut LvmState,
         req: &CreateVolumeRequest,
-        payload: &str,
-    ) -> Result<(String, String, u32, u64), ApiError> {
-        let vg_name = self.pick_pool_vg(state, req.size_bytes)?;
-        let lv_name = lv_name_for(&req.volume_id);
-        let block_size = req.logical_block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
-        let intent = CreateIntent {
-            vg_name: vg_name.clone(),
-            lv_name: lv_name.clone(),
-            requested_size_bytes: req.size_bytes,
-            project_id: req.project_id.clone(),
-            block_size,
-            creation_payload: payload.to_owned(),
-        };
-        state.insert_create_intent(req.volume_id.clone(), intent.clone());
-        if let Err(save_error) = self.persist(state) {
-            state.remove_create_intent(&req.volume_id);
-            // Classify the failed save in three ways: the rename may
-            // have landed (the post-rename carve-out), it may provably
-            // not have landed, or the re-read may itself fail. Never
-            // report a clean "not saved" (or drop the possibly-durable
-            // intent from memory) when the durable file could not be
-            // read. No LV was created on any path; startup observes no
-            // intent-owned LV and drops the intent.
-            let note = match LvmState::load(&self.state_path) {
-                Ok(durable) if durable.create_intent(&req.volume_id).is_some() => format!(
-                    "the durable state did record the create intent for volume {}, but no LV \
-                     was created; startup recovery observes no intent-owned LV and drops it",
-                    req.volume_id
-                ),
-                Ok(_) => format!(
-                    "the create intent for volume {} could not be made durable, so no LV was \
-                     created",
-                    req.volume_id
-                ),
-                Err(load_error) => {
-                    state.insert_create_intent(req.volume_id.clone(), intent);
-                    format!(
-                        "the create intent for volume {} could not be verified after the \
-                         failed save ({load_error}); treat it as possibly durable — no LV was \
-                         created, and startup recovery observes no intent-owned LV and drops it",
-                        req.volume_id
-                    )
-                }
-            };
-            return Err(ApiError::new(
-                save_error.code,
-                format!("{}; {note}", save_error.detail),
-            ));
-        }
-
+        intent: &CreateIntent,
+    ) -> CreateCommandOutcome {
+        let (vg_name, lv_name) = (intent.vg_name.as_str(), intent.lv_name.as_str());
         let output = match self.runner.run(
             "lvcreate",
             &[
@@ -3126,8 +3144,8 @@ impl LvmProvider {
                 "-L",
                 &format!("{}B", req.size_bytes),
                 "-n",
-                &lv_name,
-                &vg_name,
+                lv_name,
+                vg_name,
             ],
         ) {
             Ok(output) => output,
@@ -3138,15 +3156,7 @@ impl LvmProvider {
                 // reached LVM. Keep the durable intent — never clear it
                 // on an unknown outcome — and let startup recovery
                 // classify the observed LV.
-                //
-                // The command may also have allocated space before the
-                // runner lost the outcome. Bump the allocation epoch so a
-                // grow that sampled capacity before this attempt cannot
-                // reserve against a stale free-space figure. This is
-                // conservative: an attempt that never reached LVM costs
-                // one extra capacity sample, never a wrong admission.
-                self.note_capacity_change();
-                return Err(ApiError::new(
+                return CreateCommandOutcome::Unknown(ApiError::new(
                     error.code,
                     format!(
                         "{}; the lvcreate outcome is unknown (the command runner returned an \
@@ -3160,133 +3170,122 @@ impl LvmProvider {
             }
         };
         if !output.success {
-            let error = self.clear_create_intent_after_failed_start(
-                state,
-                &req.volume_id,
-                command_failed("lvcreate", &output),
-            );
-            // A non-zero exit is a known failure on the normal path, but
-            // LVM can report failure after changing metadata, and the
-            // clear path does not prove the LV absent. Bump the epoch so
-            // a grow that sampled before this attempt re-samples rather
-            // than reserving against the pre-attempt figure.
-            self.note_capacity_change();
-            return Err(error);
+            return CreateCommandOutcome::StartFailed(command_failed("lvcreate", &output));
         }
         // Verify against LVM's own report: a successful exit status is
         // not evidence of the requested geometry. Thick LVM rounds the
         // size up to whole physical extents, so anything at or above
         // the request is a success — the effective size is what gets
         // persisted and reported.
-        match self.verify_created_size(&vg_name, &lv_name, req.size_bytes) {
-            Ok(effective) => Ok((vg_name, lv_name, block_size, effective)),
-            Err(error) => {
-                // The durable intent stays: startup recovery adopts the
-                // LV only if it is present and at least the requested
-                // size, so a partially-created LV cannot leak unowned.
-                // `lvcreate` exited successfully, so space may already be
-                // allocated even though the size check failed: bump the
-                // epoch before returning.
+        match self.verify_created_size(vg_name, lv_name, req.size_bytes) {
+            Ok(effective) => CreateCommandOutcome::Created { effective },
+            Err(error) => CreateCommandOutcome::VerifyFailed(ApiError::new(
+                error.code,
+                format!(
+                    "{}; the durable create intent remains, and startup recovery will \
+                     adopt the LV only if it is present and at least the requested size, \
+                     drop the intent if the LV is absent, and refuse startup if the LV \
+                     is present but smaller",
+                    error.detail
+                ),
+            )),
+        }
+    }
+
+    /// Publish a completed create allocation and release its capacity
+    /// reservation.
+    ///
+    /// `vgs` now reports the real free space, so the in-flight promise can
+    /// be released on every outcome. The allocation epoch is bumped *before*
+    /// the reservation is dropped (the same ordering as grow): a grow that
+    /// sampled before this allocation must either see the bump and re-sample,
+    /// or have observed this reservation in its accounting. Dropping first
+    /// would let a stale sample reserve the freed bytes twice. The state lock
+    /// is taken only for the atomic bump and the leaf-lock removal, never
+    /// across an LVM command.
+    fn publish_created_allocation(&self, reservation: CapacityReservation<'_>) {
+        match self.lock_state_stable() {
+            Ok(_state) => {
                 self.note_capacity_change();
-                Err(ApiError::new(
-                    error.code,
-                    format!(
-                        "{}; the durable create intent remains, and startup recovery will \
-                         adopt the LV only if it is present and at least the requested size, \
-                         drop the intent if the LV is absent, and refuse startup if the LV \
-                         is present but smaller",
-                        error.detail
-                    ),
-                ))
+                drop(reservation);
+            }
+            Err(error) => {
+                // `lock_state_stable` fails only on a poisoned state mutex
+                // or an unreadable alignment load. The allocation has
+                // already happened and `vgs` reports its real free space,
+                // so the epoch must still be bumped and the reservation
+                // released. Log it rather than swallowing the error,
+                // because the invariant "publish under the state lock" did
+                // not hold.
+                tracing::warn!(
+                    error = %error,
+                    "create publish could not take the provider state lock; capacity epoch \
+                     bumped and reservation released without the state guard"
+                );
+                self.note_capacity_change();
+                drop(reservation);
             }
         }
     }
 
-    /// Create with a durable-first create intent.
+    /// Clear a create intent after a known-failed start, reacquiring the
+    /// provider state lock only for the state change and its durable save.
+    fn clear_create_intent_drive(&self, volume_id: &VolumeId, error: ApiError) -> ApiError {
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            Err(lock_error) => {
+                let code = error.code;
+                return ApiError::new(
+                    code,
+                    format!(
+                        "{}; the create intent could not be cleared because the provider state \
+                         could not be re-read ({lock_error}); the durable intent remains, and \
+                         startup recovery will adopt the LV only if it is present and at least \
+                         the requested size, drop the intent if the LV is absent, and refuse \
+                         startup if the LV is present but smaller",
+                        error.detail
+                    ),
+                );
+            }
+        };
+        self.clear_create_intent_after_failed_start(&mut state, volume_id, error)
+    }
+
+    /// Commit a verified create under a fresh provider state lock.
     ///
-    /// The intent is persisted before `lvcreate`; a retry with a
-    /// matching intent adopts an intent-owned LV only when it is
-    /// present and at least the requested size, and clears the intent
-    /// when the LV is verifiably absent. A failed start clears the
-    /// intent (leaving it durable if that clear fails, for startup
-    /// recovery). A failed size verification leaves the durable intent
-    /// so recovery never adopts a wrong geometry. The final save
-    /// commits the volume record and drops the intent together; a
-    /// failed final save runs [`Self::compensate_unpersisted_create`],
-    /// whose carve-out keeps the volume when the durable record already
-    /// landed.
-    fn create_volume_inner(
+    /// The command ran without the lock. Reacquire and revalidate that the
+    /// durable intent is still the one this create was authorized under, then
+    /// insert the record, drop the intent and save once. A failed final save
+    /// runs the existing compensation (whose `lvremove` is an accepted E3
+    /// residual: it still runs in this reacquired critical section).
+    fn commit_created_volume(
         &self,
         req: &CreateVolumeRequest,
+        intent: &CreateIntent,
+        effective: u64,
     ) -> Result<InspectVolumeResponse, ApiError> {
-        req.validate()?;
-        if !self.supported_classes().contains(&req.volume_class) {
-            return Err(unsupported(format!(
-                "volume class {:?} is not served by provider {PROVIDER_NAME}",
-                req.volume_class
-            )));
-        }
-        check_policies(req)?;
-
-        let payload = canonical_create_payload(req)?;
         let mut state = self.lock_state_stable()?;
-        // A durable pending delete owns this volume id: even an
-        // idempotent create replay must not report a doomed volume as
-        // live. Retry the delete or restart to complete it; a create
-        // of a different volume id is unaffected.
-        self.ensure_no_pending_delete(&state, &req.volume_id)?;
-        // Idempotent replay: same volume_id + same payload returns the
-        // current state; a different payload is a typed conflict. The
-        // comparison uses the *requested* size (stored in
-        // `requested_size_bytes` and embedded in the canonical payload),
-        // never the extent-rounded effective size.
-        if let Some(existing) = state.volume(&req.volume_id) {
-            if existing.entry.creation_payload == payload
-                && existing.entry.requested_size_bytes == req.size_bytes
-            {
-                return Ok(inspect_response(&req.volume_id, existing));
-            }
-            return Err(ApiError::idempotency_conflict(&req.volume_id));
+        if state.create_intent(&req.volume_id) != Some(intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable create intent for volume {} changed while lvcreate ran; \
+                     refusing to commit a volume under a mismatched intent",
+                    req.volume_id
+                ),
+            ));
         }
-
-        // A durable create intent means an earlier attempt reached (or
-        // may have reached) `lvcreate` without committing the volume
-        // record. This call is the retry: a different payload/requested
-        // size is a typed idempotency conflict; a matching intent either
-        // adopts the verified LV or, when the LV is verifiably absent,
-        // clears the intent and proceeds with a fresh create.
-        //
-        // Any retry that finds an intent must treat the allocation epoch
-        // as changed, because the earlier attempt may already have spent
-        // space: adoption returns early below, and a refusal would
-        // otherwise leave a grow's pre-attempt sample valid. Bumping on
-        // the absent-LV path too is conservative (one extra sample).
-        if state.create_intent(&req.volume_id).is_some() {
-            self.note_capacity_change();
-        }
-        if let Some(response) = self.resume_create_intent(&mut state, req, &payload)? {
-            return Ok(response);
-        }
-
-        let (vg_name, lv_name, block_size, effective) =
-            self.create_lv_with_intent(&mut state, req, &payload)?;
-        // `lvcreate` may have changed free space (a verified adoption of a
-        // prior attempt's LV does not, but the bump is conservative). Bump
-        // under the state lock so a grow sampling concurrently either sees
-        // the bump or the reservation accounting covers the window.
-        self.note_capacity_change();
-
         let stored = StoredVolume {
             entry: VolumeEntry {
-                vg_name: vg_name.clone(),
-                lv_name: lv_name.clone(),
+                vg_name: intent.vg_name.clone(),
+                lv_name: intent.lv_name.clone(),
                 size_bytes: effective,
                 requested_size_bytes: req.size_bytes,
                 generation: 1,
                 data_epoch: 0,
                 project_id: req.project_id.clone(),
-                block_size,
-                creation_payload: payload,
+                block_size: intent.block_size,
+                creation_payload: intent.creation_payload.clone(),
             },
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
@@ -3305,13 +3304,229 @@ impl LvmProvider {
             return Err(self.compensate_unpersisted_create(
                 &mut state,
                 &req.volume_id,
-                &vg_name,
-                &lv_name,
+                &intent.vg_name,
+                &intent.lv_name,
                 create_intent,
                 &save_error,
             ));
         }
         Ok(inspect_response(&req.volume_id, &stored))
+    }
+
+    /// Create with a durable-first create intent.
+    ///
+    /// The intent is persisted before `lvcreate`; a retry with a
+    /// matching intent adopts an intent-owned LV only when it is
+    /// present and at least the requested size, and clears the intent
+    /// when the LV is verifiably absent. A failed start clears the
+    /// intent (leaving it durable if that clear fails, for startup
+    /// recovery). A failed size verification leaves the durable intent
+    /// so recovery never adopts a wrong geometry.
+    ///
+    /// Phase E E2 (#62): once the intent is durable, the provider state lock
+    /// is released for `lvcreate` and its size-verifying `lvs`. The final
+    /// commit reacquires it, and a failed final save runs
+    /// [`Self::compensate_unpersisted_create`], whose carve-out keeps the
+    /// volume when the durable record already landed.
+    fn create_volume_inner(
+        &self,
+        req: &CreateVolumeRequest,
+    ) -> Result<InspectVolumeResponse, ApiError> {
+        req.validate()?;
+        if !self.supported_classes().contains(&req.volume_class) {
+            return Err(unsupported(format!(
+                "volume class {:?} is not served by provider {PROVIDER_NAME}",
+                req.volume_class
+            )));
+        }
+        check_policies(req)?;
+
+        let payload = canonical_create_payload(req)?;
+        // One live structural drive per volume. Create and delete both
+        // release the state lock across external LVM commands, so a
+        // concurrent structural mutation of the same volume is refused
+        // rather than racing the durable intent or spending the same
+        // capacity.
+        let _drive = self.begin_structural_drive(&req.volume_id, StructuralDriveKind::Create)?;
+
+        // Admission and allocation are deliberately separate critical
+        // sections. Admission decides (replay, adopt, or a fresh durable
+        // intent) under the state lock; the allocation and its verification
+        // run without it. A durable intent found at admission needs an `lvs`
+        // look before it can be adopted or cleared, so that look is outside
+        // the lock too.
+        let mut resumed: Option<CreateIntent> = None;
+        let (intent, reservation) = loop {
+            let mut state = self.lock_state_stable()?;
+            // A durable pending delete owns this volume id: even an
+            // idempotent create replay must not report a doomed volume as
+            // live. Retry the delete or restart to complete it; a create
+            // of a different volume id is unaffected.
+            self.ensure_no_pending_delete(&state, &req.volume_id)?;
+            // Idempotent replay: same volume_id + same payload returns the
+            // current state; a different payload is a typed conflict. The
+            // comparison uses the *requested* size (stored in
+            // `requested_size_bytes` and embedded in the canonical payload),
+            // never the extent-rounded effective size.
+            if let Some(existing) = state.volume(&req.volume_id) {
+                if existing.entry.creation_payload == payload
+                    && existing.entry.requested_size_bytes == req.size_bytes
+                {
+                    return Ok(inspect_response(&req.volume_id, existing));
+                }
+                return Err(ApiError::idempotency_conflict(&req.volume_id));
+            }
+
+            // A durable create intent means an earlier attempt reached (or
+            // may have reached) `lvcreate` without committing the volume
+            // record. This call is the retry: a different payload/requested
+            // size is a typed idempotency conflict; a matching intent either
+            // adopts the verified LV or, when the LV is verifiably absent,
+            // clears the intent and proceeds with a fresh create.
+            //
+            // Any retry that finds an intent must treat the allocation epoch
+            // as changed, because the earlier attempt may already have spent
+            // space: adoption returns early below, and a refusal would
+            // otherwise leave a grow's pre-attempt sample valid. Bumping on
+            // the absent-LV path too is conservative (one extra sample).
+            if let Some(pending) = state.create_intent(&req.volume_id).cloned() {
+                if resumed.as_ref() == Some(&pending) {
+                    // This call already verified this intent's LV absent; a
+                    // state-alignment reload restored the durable copy. Clear
+                    // it in memory and continue with the fresh allocation.
+                    state.remove_create_intent(&req.volume_id);
+                } else if resumed.is_some() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "the durable create intent for volume {} changed while its LV was \
+                             being verified; refusing to allocate under a different intent",
+                            req.volume_id
+                        ),
+                    ));
+                } else {
+                    self.note_capacity_change();
+                    resumed = Some(pending.clone());
+                    drop(state);
+                    match self.resume_create_intent(req, &payload, &pending)? {
+                        Some(response) => return Ok(response),
+                        // The prior attempt never created the LV; its intent
+                        // is cleared in memory. Re-enter admission to create
+                        // fresh.
+                        None => continue,
+                    }
+                }
+            }
+
+            break self.prepare_create_intent(&mut state, req, &payload)?;
+        };
+
+        // The intent is durable; the state lock is now released. `lvcreate`
+        // and the size-verifying `lvs` are the long-running steps of a
+        // create; holding the single provider mutex across them queued every
+        // other volume's mutation behind one allocation.
+        let outcome = self.run_create_lv(req, &intent);
+        // The command returned: `vgs` now reports the real free space, so
+        // the in-flight promise can be released on every outcome.
+        self.publish_created_allocation(reservation);
+        match outcome {
+            CreateCommandOutcome::Created { effective } => {
+                // The final commit is a fresh critical section: other
+                // volumes may have saved state while the command ran.
+                self.commit_created_volume(req, &intent, effective)
+            }
+            CreateCommandOutcome::Unknown(error) => {
+                // Keep the durable intent for recovery; it stays in the
+                // in-memory state, so structural mutations remain fenced.
+                Err(error)
+            }
+            CreateCommandOutcome::StartFailed(error) => {
+                Err(self.clear_create_intent_drive(&req.volume_id, error))
+            }
+            CreateCommandOutcome::VerifyFailed(error) => {
+                // The durable intent stays: recovery adopts only a correct
+                // geometry, and a partially-created LV cannot leak unowned.
+                Err(error)
+            }
+        }
+    }
+
+    /// Sample the pool, promise the extents, and persist a fresh create
+    /// intent under the provider state lock.
+    ///
+    /// The reservation covers the released-lock window up to the `lvcreate`
+    /// answer, so a concurrent grow (or create) cannot spend the same sampled
+    /// free bytes. The intent save is durable-first: no LV exists until it
+    /// succeeds. A failed save returns with the reservation dropped (no LV
+    /// was created).
+    fn prepare_create_intent<'a>(
+        &'a self,
+        state: &mut LvmState,
+        req: &CreateVolumeRequest,
+        payload: &str,
+    ) -> Result<(CreateIntent, CapacityReservation<'a>), ApiError> {
+        let picked = self.pick_pool_vg(state, req.size_bytes)?;
+        let reservation =
+            match self.try_reserve_capacity(&picked.vg_name, picked.sampled_free, picked.demand) {
+                Ok(reservation) => reservation,
+                Err((free, already)) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::NoSafeCapacity,
+                        format!(
+                            "no safe capacity: pool {} has {free} bytes free after {already} \
+                             bytes already promised to in-flight allocations, and this create \
+                             needs {} bytes (extent-rounded) plus headroom",
+                            picked.vg_name, picked.demand
+                        ),
+                    ));
+                }
+            };
+        let intent = CreateIntent {
+            vg_name: picked.vg_name.clone(),
+            lv_name: lv_name_for(&req.volume_id),
+            requested_size_bytes: req.size_bytes,
+            project_id: req.project_id.clone(),
+            block_size: req.logical_block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
+            creation_payload: payload.to_owned(),
+        };
+        state.insert_create_intent(req.volume_id.clone(), intent.clone());
+        if let Err(save_error) = self.persist(state) {
+            state.remove_create_intent(&req.volume_id);
+            // Classify the failed save in three ways: the rename may have
+            // landed (the post-rename carve-out), it may provably not have
+            // landed, or the re-read may itself fail. Never report a clean
+            // "not saved" (or drop the possibly-durable intent from memory)
+            // when the durable file could not be read. No LV was created on
+            // any path; startup observes no intent-owned LV and drops the
+            // intent.
+            let note = match LvmState::load(&self.state_path) {
+                Ok(durable) if durable.create_intent(&req.volume_id).is_some() => format!(
+                    "the durable state did record the create intent for volume {}, but no LV \
+                     was created; startup recovery observes no intent-owned LV and drops it",
+                    req.volume_id
+                ),
+                Ok(_) => format!(
+                    "the create intent for volume {} could not be made durable, so no LV was \
+                     created",
+                    req.volume_id
+                ),
+                Err(load_error) => {
+                    state.insert_create_intent(req.volume_id.clone(), intent.clone());
+                    format!(
+                        "the create intent for volume {} could not be verified after the \
+                         failed save ({load_error}); treat it as possibly durable — no LV was \
+                         created, and startup recovery observes no intent-owned LV and drops \
+                         it",
+                        req.volume_id
+                    )
+                }
+            };
+            return Err(ApiError::new(
+                save_error.code,
+                format!("{}; {note}", save_error.detail),
+            ));
+        }
+        Ok((intent, reservation))
     }
 
     async fn attach_volume_inner(
@@ -4557,11 +4772,11 @@ impl LvmProvider {
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
-        // One live delete drive per volume. The destructive body runs
-        // without the provider state lock, so a second delete of the same
-        // volume must be refused instead of racing `blkdiscard`/`lvremove`
-        // against the same durable intent.
-        let _drive = self.begin_delete_drive(volume_id)?;
+        // One live structural drive per volume. The destructive body runs
+        // without the provider state lock, so a second delete or create of
+        // the same volume must be refused instead of racing
+        // `blkdiscard`/`lvremove` against the same durable intent.
+        let _drive = self.begin_structural_drive(volume_id, StructuralDriveKind::Delete)?;
         let mut state = self.lock_state_stable()?;
         let (mut stored_before, pending_intent) =
             Self::validate_delete_request(&state, volume_id, req)?;
@@ -7545,7 +7760,7 @@ mod read_snapshot_tests {
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
-            delete_drives: Mutex::new(BTreeSet::new()),
+            volume_drives: Mutex::new(BTreeMap::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state.clone()),
@@ -8735,7 +8950,7 @@ mod admission_retry_tests {
                 move_timing: MoveTiming::default(),
                 move_observe_failures: Mutex::new(BTreeMap::new()),
                 grow_drives: Mutex::new(BTreeSet::new()),
-                delete_drives: Mutex::new(BTreeSet::new()),
+                volume_drives: Mutex::new(BTreeMap::new()),
                 capacity_reservations: Mutex::new(BTreeMap::new()),
                 capacity_epoch: AtomicU64::new(0),
                 state: Mutex::new(state.clone()),

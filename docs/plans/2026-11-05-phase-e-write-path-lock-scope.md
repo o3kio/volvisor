@@ -121,6 +121,11 @@ size-verifying `lvs` and the final save.
 - `pick_pool_vg`'s `vgs` sample stays inside the admission critical section
   in E2. Moving the sample outside (the grow epoch protocol) is an E3
   residual, not a claim of this slice.
+- Accepted residuals: the failed-final-save compensation
+  (`compensate_unpersisted_create`) still runs its checked `lvremove` in the
+  reacquired critical section; moving that `lvremove` out is an E3 residual.
+  A create whose pool shrank between its own sample and its reservation
+  fails closed with `NO_SAFE_CAPACITY` instead of overcommitting.
 
 **Acceptance.**
 
