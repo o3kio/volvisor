@@ -1,6 +1,6 @@
 # NON-EVIDENCE DIAGNOSTIC — c128 run-to-run variance
 
-**This directory is not measured evidence.** It is a four-run, sweep-only
+**This directory is not measured evidence.** It is a four-run `--skip-soak`
 diagnostic executed *after* the measured run, solely to test whether the
 measured c128 throughput drop (`610.988 → 462.899` ops/s) can be attributed
 to the measured change. It was not used to select, replace or support any
@@ -10,8 +10,8 @@ evidence is the bundle root's `json/`, `csv/`, `summary/`, `records/`,
 
 ## Design
 
-Two binaries alternated, sweep-only (`--skip-soak`, same 30 s 1/8/32/128
-tiers):
+Two binaries alternated with `--skip-soak` (no soak; the micro run, the same
+30 s 1/8/32/128 tiers, the probes and the pre-soak restart still ran):
 
 - **A** = `7204a53` — byte-identical to the measured binary,
   SHA256 `db09dff8090eae07a8ea26c70bb3bfcf8200969b82b49d165f72a801eb6a8717`.
@@ -41,11 +41,13 @@ regardless; they are non-evidence.
 | B2 | 2c5b065 | 427.457 | 141.587 | 24.676 | no |
 
 The c128 tier swings by about 45% between adjacent runs (A1 626.011 →
-B1 432.752), and the arms overlap: B1 (432.752) and A2 (439.497) differ by
-1.6%, while B2 is 427.457. A1 is a high-state outlier; the later runs are
-all in a low state, with attach p50 ≈ 25 ms versus A1's 10.9 ms. The
-measured run (462.899) and its earlier same-SHA sweep-only repeat (519.539,
-not part of this directory) fall inside the observed range.
+B1 432.752), and the arms are within 1.6% at their closest (B1 432.752 vs
+A2 439.497) but cannot be separated at n=2; B2 is 427.457 and A1 is a
+high-state outlier. The later runs are all in a low state, with attach p50 ≈
+25 ms versus A1's 10.9 ms. The measured run (462.899) and its earlier
+same-SHA `--skip-soak` repeat (519.539, published as non-evidence under
+[../same-sha-repeat/](../same-sha-repeat/README.md)) fall inside the observed
+range.
 
 The diagnostic therefore shows that the c128 tier is dominated by
 time-varying host state in this lab, not by the binary: the measured c128

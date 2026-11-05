@@ -43,20 +43,25 @@ evidence at that SHA. It does not demonstrate the handoff's liveness
 benefit, because the timed sweep and soak contain no concurrent
 create/delete.
 
-- **Micro create/delete are flat.** create p50 **194.991 → 195.561 ms
-  (+0.29%)**, p95 **215.837 → 215.488 (−0.16%)**; delete p50
-  **154.492 → 154.685 (+0.12%)**, p95 **174.464 → 174.961 (+0.28%)**. At
-  concurrency 1 the handoff adds no measurable per-op overhead in this
-  sample.
+- **Micro create is flat; delete is not stable across samples.** create p50
+  **194.991 → 195.561 ms (+0.29%)**, p95 **215.837 → 215.488 ms (−0.16%)**;
+  delete p50 **154.492 → 154.685 (+0.12%)**, p95
+  **174.464 → 174.961 (+0.28%)** in the published sample. A same-SHA
+  `--skip-soak` repeat (explicitly non-evidence) measured create
+  +0.70%/+0.02% (flat) but delete **+6.34%/+5.90%**, so delete overhead is
+  unresolved and no per-op overhead claim is made. See
+  [diagnostics/same-sha-repeat/README.md](diagnostics/same-sha-repeat/README.md).
 - **The mixed sweep is mixed, and c128 fell sharply in this sample.** c1
   **1,822.948 → 1,837.885 (+0.82%)**, c8 **3,756.659 → 3,824.485
   (+1.81%)**, c32 **2,476.245 → 2,436.350 (−1.61%)**, c128
   **610.988 → 462.899 (−24.24%)**. The timed sweep has no create/delete and
   the binary differs only in the two create/delete wrappers, so the c128
   drop is **not attributed to this slice**. A non-evidence alternating
-  diagnostic found c128 varying from **427.5 to 626.0 ops/s** across runs
-  of both binaries, with adjacent different-arm runs within 1.6%; the tier
-  is variance-dominated on this host. See
+  diagnostic found c128 from **427.5 to 626.0 ops/s across the four runs of
+  both arms** (A 439.5–626.0, B 427.5–432.8); the closest adjacent
+  different-arm pair differed by 1.6%, but the other adjacent pairs differed
+  by 2.7% and 31%, and one same-arm pair by 42%. The tier is
+  variance-dominated on this host. See
   [diagnostics/c128-variance/README.md](diagnostics/c128-variance/README.md).
   No gain and no zero-regression claim is made.
 - **The c128 write p95 is not like-for-like.** Aggregate write p95
@@ -66,7 +71,7 @@ create/delete.
   **10,390.696 → 9,719.410 ms** and **22,079.170 → 18,123.642 ms**. The
   aggregate rise is a composition/quantile effect.
 - **The shortened soak rose 7.32%:** **6,626,734 → 7,112,020 ops** and
-  **4,417.815 → 4,741.344 ops/s**. It recorded 72 network errors
+  **4,417.815 → 4,741.343 ops/s**. It recorded 72 network errors
   (70 `ConnectionRefusedError`, 2 `RemoteDisconnected`) at the planned
   restart, no provider or HTTP errors. The soak contains no create/delete;
   the difference is not attributed to this slice.
@@ -97,8 +102,10 @@ These are findings, not fixes, and they are not production claims:
   evidence.
 - **The c128 grow queue/tail is unresolved** and LVM-per-VG-bound; this run
   did not improve it.
-- **No same-SHA repeat was used** to select, replace or support the measured
-  sample. The only repeat is the explicitly non-evidence diagnostic above.
+- **A same-SHA repeat exists and is non-evidence.** It is disclosed under
+  `diagnostics/same-sha-repeat/`, was not used to select, replace or support
+  the measured sample, and is cited only to show run-to-run variance and the
+  delete micro result.
 - **The 25-minute soak is not the 24-hour soak.** The 24 h soak is **NOT
   RUN**.
 
@@ -109,7 +116,7 @@ throughput was **1,837.885 ops/s at 1 in-flight**, **3,824.485 at 8**,
 **2,436.350 at 32**, and **462.899 at 128** (completion-inclusive; the
 first-30 s sample at c128 completed 625.8 ops/s). Overall p95 latency was
 **1.449 → 7.372 → 46.539 → 144.116 ms**. The 25-minute soak sustained
-**4,741.344 ops/s**. The c128 number is a single-sample measurement of a
+**4,741.343 ops/s**. The c128 number is a single-sample measurement of a
 variance-dominated tier and is not a property of the change.
 
 ## Verify

@@ -206,13 +206,15 @@ in the 8 MiB left only if the departed create's 1 GiB promise is gone); both
 new assertions were shown to fail under targeted negative controls. The
 measurement at `7204a53` is
 [2026-11-05-devhost-phase-e-worker-handoff](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md):
-micro create/delete p50/p95 flat (+0.29%/−0.16% create, +0.12%/+0.28%
-delete), c1/c8 +0.82%/+1.81%, c32 −1.61%, c128 −24.24%. The timed sweep and
-soak contain no create/delete and the binary differs from `2c5b065` only in
-the two wrappers, so the c128 drop is **not attributed** to this slice; a
-non-evidence alternating A/B found c128 varying 427.5–626.0 ops/s in both
-arms, so the tier is variance-dominated on this host. No throughput gain and
-no zero-regression claim is made.
+create p50/p95 flat in both same-SHA samples; delete +0.12%/+0.28% in the
+measured sample but +6.34%/+5.90% in an explicitly non-evidence same-SHA
+repeat, so delete overhead is unresolved; c1/c8 +0.82%/+1.81%, c32 −1.61%,
+c128 −24.24%. The timed sweep and soak contain no create/delete and the
+binary differs from `2c5b065` only in the two wrappers, so the c128 drop is
+**not attributed** to this slice; a non-evidence alternating A/B measured
+c128 427.5–626.0 ops/s across the four runs of both arms (A 439.5–626.0, B
+427.5–432.8), so the tier is variance-dominated on this host. No throughput
+gain and no zero-regression claim is made.
 
 `#62` stays open; no gate verdict changes.
 

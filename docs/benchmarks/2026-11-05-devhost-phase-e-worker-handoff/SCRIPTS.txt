@@ -59,22 +59,30 @@ No earlier run is used as evidence for this tree. The comparator is the
 published 2c5b065 E1/E2 bundle. No number from a different SHA is presented
 as this tree's measurement.
 
-Repetition and the non-evidence diagnostic
-------------------------------------------
-No same-SHA repeat was used to select, replace or support the measured
-sample. After the measured run, a four-run sweep-only diagnostic alternated
-the 7204a53 binary with a rebuild at 2c5b065 to test whether the measured
-c128 drop is attributable to the change. It is explicitly **non-evidence**,
-was not used to select or replace the measured record, supports no claim,
-and lives only under `diagnostics/c128-variance/` with its own label. The
-A runs in that diagnostic record `worktree_dirty: yes` because the untracked
-published bundle existed at that time; the executed binary hash is identical
-to the clean measured run. See that directory's README before reading it.
+Repetition and the non-evidence diagnostics
+-------------------------------------------
+After the measured run, a same-SHA `--skip-soak` repeat ran at 21:21:42Z
+(micro, 1/8/32/128 sweep, both probes and the pre-soak restart; no soak).
+It is explicitly **non-evidence**, was not used to select, replace or support
+the measured sample, and lives under `diagnostics/same-sha-repeat/` with its
+own label. It is cited only to disclose run-to-run variance and to qualify
+the micro delete result: create is flat in both samples, while delete is
++0.12%/+0.28% in the published sample and +6.34%/+5.90% in the repeat.
+
+A second diagnostic then alternated the 7204a53 binary with a rebuild at
+2c5b065 over four `--skip-soak` runs to test whether the measured c128 drop is
+attributable to the change. It is also **non-evidence**, was not used to
+select or replace the measured record, supports no performance claim, and
+lives under `diagnostics/c128-variance/` with its own label. The A runs in
+that diagnostic record `worktree_dirty: yes` because the untracked published
+bundle existed at that time; the executed binary hash is identical to the
+clean measured run. See each directory's README before reading it.
 
 Post-run tools
 --------------
-scripts/bench/publish.sh copied the run directory into this bundle, redacted
-the run token in configs/, and gzip-compressed the oversized daemon log
+scripts/bench/publish.sh copied the run's measured records (raw/csv/json/
+summary and the named records files) into this bundle, redacted the run token
+in configs/, and gzip-compressed the oversized daemon log
 (2,393,781,369 bytes = 2.39 GB / 2.23 GiB raw) with `gzip -9 -n` to
 62,953,722 bytes = 62.95 MB / 60.04 MiB. It does not alter any measured JSON
 or CSV.
@@ -87,7 +95,7 @@ change the measurement.
 
 The authored README.md, REPORT.md and this file were written after the run
 from the run's raw records; they add no measured values. The final
-MANIFEST.sha256 covers the authored files and the non-evidence diagnostic.
+MANIFEST.sha256 covers the authored files and both non-evidence diagnostics.
 
 Measurement caveat
 ------------------

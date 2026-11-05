@@ -154,23 +154,26 @@ cannot be presented as a property of the handoff. However, the mixed
 scenario does call create during untimed setup, so a runtime-level side
 effect of the handoff cannot be excluded from a single sample.
 
-To test that, a **non-evidence** diagnostic ran four sweep-only runs
+To test that, a **non-evidence** diagnostic ran four `--skip-soak` runs
+(no soak; micro, sweep, probes and pre-soak restart still ran)
 alternating the two binaries: A = `7204a53` (same binary), B = `2c5b065`
 (rebuilt at that source). The c128 results were A 626.011 and 439.497, B
-432.752 and 427.457. Adjacent runs of different arms were within 1.6%
-(B1 432.752 vs A2 439.497), while one run of the same arm was 45% higher
-(A1 626.011 vs A2 439.497); the attach p50 moved with the state (10.9 ms in
-A1, about 25 ms in the three later runs in both arms). The measured run's
-462.899 and an earlier same-SHA sweep-only repeat of 519.539 both fall
-inside that range. The tier is dominated by time-varying host state in this
-lab on this day. See
+432.752 and 427.457. The closest adjacent different-arm pair (B1 432.752 vs
+A2 439.497) differed by 1.6%, but the other adjacent different-arm pairs
+differed by 2.7% (A2→B2) and 31% (A1→B1), and consecutive runs of the same
+arm (A1 626.011 vs A2 439.497) differed by 42%; the attach p50 moved with the
+state (10.9 ms in A1, about 25 ms in the three later runs in both arms). The
+measured run's 462.899 and an earlier same-SHA `--skip-soak` repeat of
+519.539 both fall inside that range; see
+[diagnostics/same-sha-repeat/README.md](diagnostics/same-sha-repeat/README.md).
+The tier is dominated by time-varying host state in this lab on this day. See
 [diagnostics/c128-variance/README.md](diagnostics/c128-variance/README.md).
 
 That diagnostic is **not measured evidence**, was not used to select or
-replace the measured sample, and supports no claim. It does not prove the
-absence of a small effect; it shows that one c128 sample cannot establish
-one. **No throughput gain and no zero-regression claim is made for this
-slice.**
+replace the measured sample, and supports no performance claim; it is used
+only to characterize run-to-run variance. It does not prove the absence of a
+small effect; it shows that one c128 sample cannot establish one. **No
+throughput gain and no zero-regression claim is made for this slice.**
 
 ### 4.1 The c128 write p95 is not like-for-like
 
@@ -221,11 +224,17 @@ non-grow: c8 10.660 → 10.401 ms (−2.43%), c32 81.996 → 82.691 ms (+0.85%).
 | list | 0.111 ms | 0.118 ms | −5.93% | 0.146 ms | 0.133 ms | +9.77% |
 | capabilities | 0.099 ms | 0.109 ms | −9.17% | 0.128 ms | 0.125 ms | +2.40% |
 
-Create and delete are flat within this single sample: p50 +0.29%/+0.12%,
-p95 −0.16%/+0.28%. The handoff adds no measurable per-op overhead in this
-sample. A concurrency-1 create/delete cannot show the worker-pinning benefit
-it targets, and there is no same-SHA repeat, so the change is reported as
-**neutral/unattributed**, neither a gain nor a proven regression.
+Within the published sample, create and delete p50/p95 are +0.29%/+0.12%
+and −0.16%/+0.28% versus the comparator. A same-SHA `--skip-soak` repeat
+(explicitly non-evidence; see
+[diagnostics/same-sha-repeat/README.md](diagnostics/same-sha-repeat/README.md))
+measured create p50/p95 +0.70%/+0.02% versus the comparator (flat), but
+delete p50/p95 **+6.34%/+5.90%**. Create is therefore flat in both samples;
+**delete is not flat across samples**, and with two samples and no A/B micro
+control its overhead is unresolved. The handoff's concurrency-1 cost is
+**neutral/unattributed** for create and **unresolved** for delete, neither a
+proven gain nor a proven regression. A concurrency-1 create/delete cannot
+show the worker-pinning benefit it targets.
 
 ## 6. Diagnostic probes
 
@@ -246,7 +255,7 @@ cap, not default-cap errors. Neither probe is attributed to this slice.
 |---|---|---|---|
 | duration | 1,500.001 s | 1,500.002 s | ≈0 |
 | ops | 7,112,020 | 6,626,734 | +7.32% |
-| throughput | 4,741.344 ops/s | 4,417.815 ops/s | +7.32% |
+| throughput | 4,741.343 ops/s | 4,417.815 ops/s | +7.32% |
 | errors | 72, all `NETWORK_ERROR` (70 `ConnectionRefusedError`, 2 `RemoteDisconnected`) | 48 of the same class | — |
 | overall p50 / p95 / p99 | 0.298 / 2.866 / 3.613 ms | 0.301 / 2.929 / 3.890 ms | p95 −2.15% |
 | grow | 512; p50 458.283 / p95 690.054 ms | 512; p50 438.034 / p95 691.290 ms | p50 +4.62%, p95 −0.18% |
@@ -301,8 +310,10 @@ It supports, for the clean tree at `7204a53`:
   workspace test suite pass;
 - the deterministic create/delete gate tests, including the new cross-kind
   and reservation-release coverage, pass with their negative controls;
-- the micro create/delete p50 and p95 are flat in this single sample, so the
-  handoff shows no measurable per-op overhead here;
+- the micro create p50/p95 are flat in the published sample and in the
+  same-SHA repeat, while delete is flat only in the published sample and
+  +6.34%/+5.90% in the repeat, so create shows no measurable per-op overhead
+  and delete overhead is unresolved;
 - every aggregate record is `OK`, the daemon logged zero `ERROR` records,
   teardown removed only its own lab VG, and the restart replay recovered
   all expected volumes;
@@ -317,18 +328,18 @@ It does **not** support:
   that drop is not attributed to this slice but is also not explained away;
 - any production, SLA, zero-RPO, hardware, multi-host or data-path claim;
 - the 24-hour soak (NOT RUN) or any crash-consistency claim from load;
-- a claim that concurrent create/delete no longer pins workers, other than
-  the deterministic gate tests: this run has no concurrent create/delete
-  load.
+- a claim that concurrent create/delete no longer pins workers: this run has
+  no concurrent create/delete load, and the gate tests cover refusal,
+  fencing and reservation release, not worker pinning.
 
 ## 10. Caveats and NOT RUN
 
 - Single host, loop-backed LVM, control-plane HTTP only. Not production
   capacity, durability or data-path evidence.
 - The c128 tier is variance-dominated on this host on this day; see the
-  non-evidence [diagnostic](diagnostics/c128-variance/README.md). No
-  same-SHA repeat was used to select, replace or support the measured
-  sample.
+  non-evidence [A/B diagnostic](diagnostics/c128-variance/README.md) and the
+  non-evidence [same-SHA repeat](diagnostics/same-sha-repeat/README.md). The
+  repeat was not used to select, replace or support the measured sample.
 - The 24-hour soak is **NOT RUN**.
 - No hardware fencing, host loss, second physical host, real Ceph/DRBD,
   physical-disk LVM, witness or `fio` evidence. `#37`/`#38`/`#39`, D3
@@ -359,5 +370,8 @@ It does **not** support:
 - `configs/` — sanitized daemon configurations (token replaced with
   `<redacted>`).
 - `comparison/` — generated comparison against the `2c5b065` bundle.
-- `diagnostics/c128-variance/` — **non-evidence** diagnostic, explicitly
-  labeled; not part of the measured evidence.
+- `diagnostics/c128-variance/` — **non-evidence** A/B diagnostic,
+  explicitly labeled; not part of the measured evidence.
+- `diagnostics/same-sha-repeat/` — **non-evidence** same-SHA `--skip-soak`
+  repeat, explicitly labeled; cited only to disclose run-to-run variance and
+  the delete micro result, never to select or support the measured sample.
