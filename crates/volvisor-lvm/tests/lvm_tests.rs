@@ -982,8 +982,8 @@ fn gated_capacity_provider_inner(
 
 /// A gate for `lvextend` that counts how many calls are inside at once.
 ///
-/// Used to prove the grow bulkhead: beyond the drive bound, further grows
-/// must wait for a slot rather than entering the LVM CLI.
+/// Used to hold a grow inside its resize while a concurrent create samples
+/// capacity and publishes its admission.
 #[derive(Default)]
 struct LvextendGate {
     state: Mutex<LvextendGateState>,
@@ -993,7 +993,6 @@ struct LvextendGate {
 #[derive(Default)]
 struct LvextendGateState {
     inside: usize,
-    max_inside: usize,
     released: bool,
 }
 
@@ -1001,7 +1000,6 @@ impl LvextendGate {
     fn enter_and_wait(&self) {
         let mut state = self.state.lock().expect("lvextend gate lock");
         state.inside += 1;
-        state.max_inside = state.max_inside.max(state.inside);
         self.wake.notify_all();
         while !state.released {
             state = self.wake.wait(state).expect("lvextend gate wait");
@@ -1011,10 +1009,6 @@ impl LvextendGate {
 
     fn inside(&self) -> usize {
         self.state.lock().expect("lvextend gate lock").inside
-    }
-
-    fn max_inside(&self) -> usize {
-        self.state.lock().expect("lvextend gate lock").max_inside
     }
 
     fn release(&self) {
@@ -1032,36 +1026,6 @@ impl Drop for LvextendGateRelease {
     fn drop(&mut self) {
         self.0.release();
     }
-}
-
-/// A provider whose fake `lvextend` parks at a multi-entrant gate.
-fn grow_limit_provider() -> (Arc<LvmProvider>, Arc<LvextendGate>, Arc<FakeRunner>) {
-    let state_path = common::leak_tempdir().join("state.json");
-    common::seed_claimed_state(&state_path);
-    let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
-    let gate = Arc::new(LvextendGate::default());
-    let runner = {
-        let world = Arc::clone(&world);
-        let gate = Arc::clone(&gate);
-        Arc::new(FakeRunner::with_closure(move |program, args| {
-            if program == "lvextend" {
-                gate.enter_and_wait();
-            }
-            let mut world = world.lock().ok()?;
-            common::script(&mut world, program, args)
-        }))
-    };
-    let provider = Arc::new(
-        LvmProvider::new(
-            Arc::clone(&runner) as Arc<dyn CommandRunner>,
-            state_path,
-            common::leak_tempdir(),
-            common::VG_PREFIX.to_owned(),
-            common::AUTH_TOKEN.to_owned(),
-        )
-        .expect("provider construction"),
-    );
-    (provider, gate, runner)
 }
 
 /// A provider whose `vgs` can be held on its first armed call (with the
@@ -1574,78 +1538,6 @@ async fn concurrent_grows_sample_capacity_in_parallel() {
     assert!(
         count_program(&runner, "vgs") >= vgs_before + 3,
         "the first grow must re-sample after the second grow's allocation"
-    );
-}
-
-/// Regression for the grow bulkhead: at most `GROW_CONCURRENCY_LIMIT`
-/// grow drives may run LVM commands at once, and further grows wait for a
-/// slot. The bound and queueing are what this test asserts; the claim
-/// that waiting on a Tokio semaphore does not pin a worker is a property
-/// of the semaphore, not something this test measures.
-///
-/// This test hard-codes nine grows against the provider limit of eight.
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-async fn grow_drives_beyond_the_limit_wait_for_a_slot() {
-    const LIMIT: usize = 8;
-    let (provider, gate, runner) = grow_limit_provider();
-    let _release = LvextendGateRelease(Arc::clone(&gate));
-
-    let mut created = Vec::new();
-    for index in 0..=LIMIT {
-        let name = format!("grow-limit-{index}");
-        created.push(
-            provider
-                .create_volume(&fixture_create_request(&name, GIB))
-                .await
-                .expect("create grow-limit volume"),
-        );
-    }
-
-    let mut drives = Vec::new();
-    for (index, volume) in created.iter().enumerate() {
-        let provider = Arc::clone(&provider);
-        let volume_id = volume.volume_id.clone();
-        let name = format!("grow-limit-{index}");
-        let request = fixture_grow_request(&name, 2 * GIB, volume.generation);
-        drives.push(tokio::spawn(async move {
-            provider.grow_volume(&volume_id, &request).await
-        }));
-    }
-
-    // The bound is reached and the extra grow stays out of `lvextend`.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while gate.inside() < LIMIT {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the grow drive bound must be reached"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        gate.inside(),
-        LIMIT,
-        "a grow beyond the drive bound must wait for a slot, not enter lvextend"
-    );
-
-    gate.release();
-    for drive in drives {
-        let result = tokio::time::timeout(IN_FLIGHT_TIMEOUT, drive)
-            .await
-            .expect("a queued grow must not hang")
-            .expect("grow task join")
-            .expect("grow succeeds");
-        assert_eq!(result.effective_size_bytes, 2 * GIB);
-    }
-    assert_eq!(
-        count_program(&runner, "lvextend"),
-        LIMIT + 1,
-        "every queued grow must eventually run"
-    );
-    assert!(
-        gate.max_inside() <= LIMIT,
-        "the drive bound must cap concurrent lvextend calls: {}",
-        gate.max_inside()
     );
 }
 

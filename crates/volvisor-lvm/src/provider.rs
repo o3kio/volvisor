@@ -175,23 +175,11 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// always be written (`NO_SAFE_CAPACITY` is reported before the VG fills).
 pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 
-/// Maximum number of grow drives running their LVM commands at once.
-///
-/// Design rationale, not a measured result: LVM commands are understood to
-/// serialize on the host's LVM lock, so letting every in-flight grow run
-/// at once may only convert that lock into an async-worker queue, with one
-/// parked worker per drive. Bounding the drives is intended to keep the
-/// worker pool available for reads, attaches, reports and detaches while
-/// the LVM lock stays busy. Further grow requests wait on a Tokio
-/// semaphore, which does not occupy a worker. The value 8 is a conservative
-/// default chosen without a bounded-vs-unbounded measurement.
-pub(crate) const GROW_CONCURRENCY_LIMIT: usize = 8;
-
 /// Maximum optimistic capacity-sample rounds for one grow admission.
 ///
-/// Each stale round costs another `vgs` call. The cap keeps a grow (and
-/// its bulkhead permit) from looping forever under sustained allocation
-/// churn; exhaustion returns a retryable `OVERLOADED` refusal.
+/// Each stale round costs another `vgs` call. The cap keeps a grow from
+/// looping forever under sustained allocation churn; exhaustion returns a
+/// retryable `OVERLOADED` refusal.
 const GROW_ADMISSION_ATTEMPTS: usize = 32;
 
 /// Physical extent size assumed when `vgs` does not report one (LVM's
@@ -489,8 +477,6 @@ pub struct LvmProvider {
     /// (under the state lock for a create) and forces a re-sample. Moves
     /// allocate outside this protocol (pre-existing residual).
     capacity_epoch: AtomicU64,
-    /// Bounds concurrent grow drives. See [`GROW_CONCURRENCY_LIMIT`].
-    grow_limiter: tokio::sync::Semaphore,
     /// The writer view: every mutation is admitted under this mutex.
     /// Attach/detach/report capture and reserve under it, then release it
     /// before waiting for durability; the synchronous multi-save paths
@@ -1534,7 +1520,6 @@ impl LvmProvider {
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
-            grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
             state: Mutex::new(state),
             read_snapshot,
         };
@@ -4020,9 +4005,9 @@ impl LvmProvider {
         req: &GrowVolumeRequest,
     ) -> Result<GrowAdmissionOutcome<'_>, ApiError> {
         // A stale sample costs another `vgs` call. Bound the optimistic
-        // rounds so a sustained allocation churn cannot keep one grow (and
-        // one bulkhead permit) looping forever; the caller can retry the
-        // request. This is a liveness guard, not a capacity answer.
+        // rounds so a sustained allocation churn cannot keep one grow
+        // looping forever; the caller can retry the request. This is a
+        // liveness guard, not a capacity answer.
         let mut attempts = 0usize;
         // The pending-intent check observes the LV with `lvs` and may
         // finalize a rolled-forward grow. It runs once per drive: while
@@ -6847,26 +6832,17 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
     ) -> Result<GrowVolumeResponse, ApiError> {
-        // One live grow drive per volume. The drive guard is taken
-        // before the bulkhead so a duplicate request is refused
-        // immediately instead of queueing for a slot behind unrelated
-        // volumes. It also releases the drive if the request is cancelled
-        // while waiting for a slot.
+        // One live grow drive per volume. A duplicate request is refused
+        // immediately, even before it can observe the durable intent.
+        // Total in-flight grow bodies are bounded by the daemon's request
+        // admission cap; the provider adds no second, lower bound. A
+        // grow-specific bulkhead below that cap was tested in a
+        // non-evidence A/B diagnostic of the parent commit (limit 8 versus
+        // effectively unbounded): the bounded arm added a provider-side
+        // queue without raising the LVM-bound grow completion rate, and
+        // had lower c128 throughput and longer grow latency. The mechanism
+        // beyond that added queue is not attributed.
         let _drive = self.begin_grow_drive(volume_id)?;
-        // Bound how many grow bodies run at once. The rationale is that
-        // LVM commands serialize on the host's LVM lock, so an unbounded
-        // grow wave may only queue inside the CLI with one async worker
-        // parked per request. At most [`GROW_CONCURRENCY_LIMIT`] drives
-        // run; the rest wait here without occupying a worker. This is a
-        // design choice, not a measured attribution of the c128 tail.
-        let Ok(_drive_slot) = self.grow_limiter.acquire().await else {
-            // The semaphore is never closed by this provider; failing
-            // closed is still the only honest answer if it ever is.
-            return Err(ApiError::new(
-                ApiErrorCode::Internal,
-                "grow admission is closed; refusing the drive",
-            ));
-        };
         // The grow body is synchronous end to end: `vgs`, `lvextend` and
         // the size-verifying `lvs` are blocking LVM CLI calls. Running
         // them inline pins an async worker for their full duration, so at
@@ -7409,7 +7385,6 @@ mod read_snapshot_tests {
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
-            grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
             state: Mutex::new(state.clone()),
             read_snapshot,
         };
@@ -8534,8 +8509,7 @@ mod admission_retry_tests {
 
     /// A `vgs` that completes an allocation on every call makes every
     /// sample stale. The admission must stop after the cap with a typed
-    /// retryable refusal instead of looping forever while holding a
-    /// bulkhead permit.
+    /// retryable refusal instead of looping forever.
     #[test]
     fn sustained_epoch_churn_refuses_after_the_attempt_cap() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8598,7 +8572,6 @@ mod admission_retry_tests {
                 grow_drives: Mutex::new(BTreeSet::new()),
                 capacity_reservations: Mutex::new(BTreeMap::new()),
                 capacity_epoch: AtomicU64::new(0),
-                grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
                 state: Mutex::new(state.clone()),
                 read_snapshot,
             }
