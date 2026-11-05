@@ -766,14 +766,21 @@ The earlier `6519068` measurement is superseded and is not evidence for
 New residuals and corrections from this work (LOW/NIT unless noted; none is
 a production claim):
 
-- **c128 grow queue/tail (open; envelope accepted).** Grow completions are
-  per-VG-bound; 128 simultaneous resizes queue for seconds. The aggregate
-  c128 write p95 is composition- and run-sensitive. A read-only
-  [decision memo](../reviews/2026-11-05-grow-tail-decision.md) accepted the
-  measured per-VG envelope (~11–12 grows/s; admission ~2 ms median, body
-  9.1–9.8 s at c128) and added no new bound. The exact serialized component
-  is unattributed; a phase-timing diagnostic is required before any body
-  optimization. **#62 remains open.**
+- **c128 grow queue/tail (open; envelope accepted; attribution corrected).**
+  Grow completions are per-VG-bound; 128 simultaneous resizes queue for
+  seconds. The aggregate c128 write p95 is composition- and run-sensitive. A
+  read-only [decision memo](../reviews/2026-11-05-grow-tail-decision.md)
+  accepted the measured per-VG envelope (~11–12 grows/s) and added no new
+  bound. The subsequent
+  [non-evidence phase diagnostic](../reviews/2026-11-05-grow-tail-phase-diagnostic.md)
+  corrected the attribution: the ~2 ms anchor is the `ops::execute` journal
+  intent, not provider admission. At c128 the provider capacity-admission
+  loop is 5.0–6.3 s mean, dominated by `vgs` samples invalidated by the
+  global capacity epoch and retried (783–1,082 stale attempts across
+  409–411 grows); `lvextend`/`lvs` are ~1.8–2.4 s each; the provider intent
+  save is ~1.7–1.9 ms. The body-optimization question is reopened: a
+  coalesced per-VG `vgs` sample is the preferred candidate, subject to tests,
+  adversarial review and a fresh clean benchmark. **#62 remains open.**
 - **Shared-cap grow starvation posture (open).** A grow flood can occupy
   the shared admission cap and shed reads/attaches; rate limiting is
   disabled by default, and the cap has no LVM cross-check. Documented, not

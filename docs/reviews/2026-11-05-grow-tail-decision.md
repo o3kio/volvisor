@@ -28,26 +28,38 @@ a new benchmark, change production code, or change issue state.
 
 ## Answer in one paragraph
 
-The queue is **after** admission, not in it. In the same-SHA repeat journals,
-the durable grow intent is written a median of **2 ms** after the client
-starts the request (mean 25 ms), while the remaining body — `lvextend`, size
-verification, commit, notification, response — takes a median of **9.1–9.8 s**
-at c128. Grow completions are flat at **~11–12 per second** at c8, c32 and
-c128 even as in-flight grows rise from ~7 to ~104, and grow latency scales
-linearly with in-flight grows at **~83–93 ms per in-flight grow**. That is the
-signature of a serialized post-admission bottleneck, not an admission convoy
-and not a client artifact. The exact serialized component (LVM CLI, state
-save, journal fsync, or notification save) is **not attributable from the
-existing records**: the primary run's journal was compacted (frame 1 is a
-retention snapshot of 14,774 recent soak-era operations; the c128 grow
-intents/outcomes are absent), and the repeat journals retain intent/outcome
-records but no phase timestamps.
+The journal anchor is fast, but the queue is **inside** the provider capacity
+admission that runs after it. `ops::execute` writes the operation's journal
+intent a median of **2 ms** after the client starts (mean 25 ms). The
+provider then runs `prepare_grow_admission`, which samples the VG with
+`vgs`, reserves capacity, and retries whenever the global capacity epoch
+has moved. In the non-evidence instrumented runs, at c128 that loop takes
+**5.0–6.3 s mean**, dominated by `vgs` samples that are invalidated and
+retried: 409–411 grows needed 1,201–1,620 attempts, 783–1,082 of them
+stale, with a tail to 20 attempts.
+The provider's own durable grow intent save is **~1.7–1.9 ms**;
+`lvextend` and the verifying `lvs` are **~1.8–2.4 s each**; the state
+commit is ~65–72 ms; notification and journal outcome are **~2 ms or
+less**. Grow completions remain flat at **~11–12 per second** at c8, c32
+and c128 even as in-flight grows rise from ~7 to ~104, and latency scales
+at **~83–93 ms per in-flight grow**. The measured envelope stands; the
+attribution does not: the tail is a provider capacity-sampling convoy, not
+a fixed LVM-body ceiling.
 
-**Recommendation: accept and document the measured per-VG envelope for this
-slice; do not add a per-VG grow bound now.** Before any future optimization,
-run a short non-evidence phase-timing diagnostic to attribute the ~83–93 ms
-body. If that diagnostic shows provider bookkeeping dominates, revisit with a
-focused fix; if LVM dominates, this accept decision is final for the slice.
+**Decision: accept and document the measured per-VG envelope for this
+slice.** The post-acceptance diagnostic reopens the body-optimization
+question: the largest removable cost is the `vgs` retry convoy, so a
+focused fix is now justified. Do **not** add a blind bound; design a
+coalesced per-VG capacity sample (preferred) or a measured per-VG bound,
+then run tests, adversarial review and a fresh clean benchmark. See
+[the phase diagnostic](2026-11-05-grow-tail-phase-diagnostic.md).
+
+> **Correction (2026-11-05, post-acceptance).** As accepted, this memo
+> described the 2 ms journal-intent split as "admission" and treated the
+> rest as an LVM body. That was wrong about the provider: the provider's
+> capacity-admission loop is the largest phase. The measured envelope and
+> the accepted no-blind-bound position stand; the body attribution and the
+> "no optimization now" conclusion are superseded by the diagnostic.
 
 ## 1. What is measured
 
@@ -81,11 +93,17 @@ The rate is flat across concurrency:
 | comparator c128 | 255 | 30.226 s | 8.44/s | 0.357 s | 3.01 | 118 ms |
 
 Adding in-flight grows raises latency almost exactly in proportion and does
-not raise completion rate. The candidate raised the serialized-body ceiling
-from about **8.4/s (118 ms)** to about **11–12/s (83–93 ms)**, which is a real
-improvement, but it is still a ceiling.
+not raise completion rate. The candidate raised the serialized
+provider-path ceiling from about **8.4/s (118 ms)** to about **11–12/s
+(83–93 ms)**, which is a real improvement, but it is still a ceiling.
 
-## 2. Phase attribution: admission is not the tail
+## 2. Phase attribution: the journal intent is not the provider admission cost
+
+> The split below is at the `ops::execute` journal intent. It is not the
+> provider's capacity-admission cost; see the correction above and the
+> [phase diagnostic](2026-11-05-grow-tail-phase-diagnostic.md). The
+> "post-intent" column includes the provider capacity loop, `lvextend`,
+> `lvs`, state commit and notification.
 
 The published run's journal was compacted; its c128 grow segment is not
 retained. The two repeat runs at the same SHA and binary retain it
@@ -98,29 +116,37 @@ retained. The two repeat runs at the same SHA and binary retain it
 3. Interpolate the intent frame's wall time; the interpolation reproduces
    each outcome's client completion time to within **4 ms** (repeat A) and
    **1 ms** (repeat B).
-4. Split each grow's client latency at the interpolated durable-intent time:
-   **admission** (request start → durable intent) and **body** (intent →
-   response).
+4. Split each grow's client latency at the interpolated journal-intent time:
+   **journal intent** (request start → `ops::execute` intent) and
+   **post-intent work** (intent → response).
 
-| c128 run | admission mean / p50 / p95 | body mean / p50 / p95 | total mean |
+| c128 run | journal-intent mean / p50 / p95 | post-intent work mean / p50 / p95 | total mean |
 |---|---|---|---|
 | repeat A | 25 ms / 2 ms / 279 ms | 9.422 s / 9.070 s / 16.862 s | 9.447 s |
 | repeat B | 25 ms / 2 ms / 74 ms | 9.700 s / 9.772 s / 16.164 s | 9.726 s |
 
-Admission exceeds half of the total latency for **0.9 %** (repeat A) and
-**0.7 %** (repeat B) of grows. The admission p99 is long for a few requests
-(6.95 s and 4.16 s), which is consistent with a small number of grows caught
-behind a sampled-state revalidation or a create; it is not the population
-tail. The body carries essentially all of the c128 latency.
+The journal-intent phase exceeds half of the total latency for **0.9 %**
+(repeat A) and **0.7 %** (repeat B) of grows. Its p99 is long for a few
+requests (6.95 s and 4.16 s), consistent with a small number of grows
+caught behind a sampled-state revalidation or a create; it is not the
+population tail. The post-intent work carries essentially all of the c128
+latency.
 
-This is a non-evidence diagnostic, not a published measurement. It is used
-here only to reject the "admission is the tail" hypothesis, which it does
-decisively: the median admission cost is 2 ms against a 9 s body.
+This is a non-evidence diagnostic, not a published measurement. It rejects
+the "journal intent is the tail" hypothesis: the median journal-intent cost
+is 2 ms against ~9 s of post-intent work. It does **not** show that the
+queue is outside admission: the post-intent work begins with the provider
+capacity-admission loop, which the phase diagnostic measures at
+**5.0–6.3 s mean**.
 
-## 3. What the body contains, and what is not attributed
+## 3. What the post-intent work contains
 
-After the durable intent, one grow runs:
+After the journal intent, one grow runs:
 
+- `prepare_grow_admission`: up to 32 capacity-sample rounds, each running
+  `vgs`, reserving capacity and checking the global capacity epoch; at
+  c128 this is the largest phase (**5.0–6.3 s mean**), with 783–1,082
+  stale-sample attempts across 409–411 grows and a tail to 20 attempts;
 - `lvextend` on the LV (LVM metadata, per-VG serialization);
 - a size-verifying `lvs`;
 - `commit_grown_size`: the provider state lock plus a durable state save;
@@ -129,17 +155,16 @@ After the durable intent, one grow runs:
   notification);
 - the journal outcome append and the HTTP response.
 
-Each of these is serialized by a different lock (LVM, provider state,
-notification store, journal). The measured body is consistent with the sum
-of those serialized steps, but the existing records do not time them
-separately: successful LVM calls are not logged with `elapsed_ms`, the
-journal has no timestamps, and the state and notification saves are not
-traced. **No cause is assigned to the ~83–93 ms body beyond "a serialized
-post-admission resource".**
+The phase diagnostic attributes the largest share to **`vgs` capacity
+sampling and its stale-epoch retries**. `lvextend` and `lvs` are also
+contended (**~1.8–2.4 s each**), but smaller. The provider's own durable
+grow-intent save is **~1.7–1.9 ms**, the state commit ~65–72 ms, and the
+journal outcome append **< 1 ms**; those are not the c128 bottleneck.
 
-The observed completion waves (multi-second clusters) are recorded but not
-attributed. They are consistent with a shared serialized resource in the
-body; they do not change the flat-throughput result.
+The exact split inside a single `vgs` call — LVM global-lock wait versus
+process execution — is still not separated. The observed completion waves
+are consistent with the sample-retry convoy; they do not change the
+flat-throughput result.
 
 ## 4. Contract constraints
 
@@ -162,41 +187,38 @@ not dropped after the intent. Any bound must preserve that rule.
 
 ## 5. Options
 
-### A. Accept and document the envelope (accepted)
+### A. Accept and document the envelope (accepted for the envelope)
 
 Record that, on one loop-backed VG, grow completions are ~11–12/s, grow
-latency is approximately `in-flight × 83–93 ms`, and the serialized resource
-is post-admission. Operators with grow-heavy clients should spread volumes
-across independently lockable VGs and enable per-principal rate limiting.
-Add no new admission bound.
+latency is approximately `in-flight × 83–93 ms`, and the measured envelope
+is an operating point, not a validated ceiling. Operators with grow-heavy
+clients should spread volumes across independently lockable VGs and enable
+per-principal rate limiting. Do not add a blind admission bound.
 
 Why: the protocol change already delivered its measurable gain (ceiling
 ~8.4/s → ~11–12/s; c128 grow completions 255 → 438), the default-cap sweep
-recorded **zero 503s** and non-grow p95 ~200 ms, and a bound cannot raise a
-serialized-body ceiling. The previous provider-level bulkhead A/B already
-showed that a concurrency bound added queue delay without raising the
-LVM-bound completion rate.
+recorded **zero 503s** and non-grow p95 ~200 ms. This option settles the
+envelope, not the body: the diagnostic attributes the largest removable
+cost to the `vgs` sample-retry convoy, so option C is reopened. The earlier
+provider-level bulkhead A/B does not settle a per-VG sample coalescer.
 
-### B. Bound per-VG grow admission now
+### B. Bound per-VG grow admission
 
-Cap queue depth or wait time and return a typed refusal. This protects the
-shared admission permits and makes latency predictable, but it does not raise
-the ~11–12/s ceiling; it converts queue into refusal. At the measured default
-cap, no read/attach starvation was observed, so the protection is a posture,
-not a measured defect. It also needs the pre-journal vs post-intent decision
-in §4.
+Cap concurrent grow bodies or capacity samples per VG and return a typed
+refusal (or queue) for excess. This now directly targets the convoy and is
+a measured candidate, not a rejected posture. It changes client-visible
+behavior and needs the pre-journal vs post-intent decision in §4; it is not
+selected without measurement.
 
-Not recommended now. Revisit only if a sustained grow flood produces
-default-cap 503s, material non-grow p95 degradation, or an explicit latency
-SLO.
+### C. Coalesce the capacity sample (recommended next)
 
-### C. Optimize the serialized body
-
-If a phase-timing diagnostic shows provider bookkeeping (state save, journal
-append, notification store) dominates the ~83–93 ms, reduce or coalesce that
-work without weakening durable-first intent, fail-closed recovery or
-idempotency. If LVM dominates, option A stands. This is a future,
-measurement-first path; it is not authorized by this memo.
+Use one in-flight `vgs` sample per VG and capacity epoch, shared by
+concurrent grows and still validated against the epoch. Retries share the
+next sample instead of each issuing its own `vgs`. This removes redundant
+samples without weakening durable-first intent, fail-closed recovery or
+idempotency. The diagnostic attributes the largest removable cost here.
+It requires code, tests, adversarial review and a **fresh clean benchmark**;
+it is not implemented by this memo.
 
 ### D. Asynchronous grow handle
 
@@ -205,30 +227,33 @@ of scope for this slice.
 
 ## 6. Decision and conditions
 
-1. **Option A is accepted** for the measured slice (2026-11-05, repository
-   owner). Do not add a grow bound now.
+1. The measured per-VG envelope is accepted (2026-11-05, repository owner).
+   No blind grow bound is added.
 2. The envelope is documented in
    [admission-control.md](../admission-control.md), the
    [Phase D D3 addendum](../plans/2026-11-04-phase-d-control-plane-hardening.md)
-   and the [readiness ledger](../releases/pre-production-readiness.md): the
-   ~11–12/s per-VG completion rate, the `in-flight × 83–93 ms` scaling, and
-   the fact that admission is ~2 ms median while the body is ~9 s at c128.
-3. Before any body optimization, run a **short non-evidence phase-timing
-   diagnostic** at c128 (instrumented or sampled: `lvextend`, `lvs`, state
-   intent/commit save, journal append, notification save). Do not change
-   production code on an unattributed cause.
+   and the [readiness ledger](../releases/pre-production-readiness.md):
+   the ~11–12/s per-VG completion rate, the `in-flight × 83–93 ms` scaling,
+   the journal intent at ~2 ms median, the provider capacity admission at
+   5.0–6.3 s mean, and `lvextend`/`lvs` at ~1.8–2.4 s each at c128.
+3. The phase-timing diagnostic has now been run
+   ([non-evidence note](2026-11-05-grow-tail-phase-diagnostic.md)). It
+   attributes the largest share to the `vgs` sample-retry convoy. No
+   production code has been changed. The next step is option C (coalesced
+   sample) or a measured option B, with tests, adversarial review and a
+   fresh clean benchmark.
 4. Keep **#62 open**. Create and delete still hold the provider state lock
    across their CLI work; the grow body is not fully independent of provider
    bookkeeping. No gate verdict changes.
-5. Keep the published bundle as the primary evidence. The repeats and this
-   memo are non-evidence diagnostics.
+5. Keep the published bundle as the primary evidence. The repeats, the
+   diagnostic and this memo are non-evidence.
 
 ## 7. What would change this decision
 
-- A phase diagnostic attributes a majority of the ~83–93 ms body to
-  removable provider bookkeeping **and** a test shows the durability
-  invariants still hold: then implement option C and re-measure with a fresh
-  clean bundle.
+- The phase diagnostic has met the first trigger: it attributes the largest
+  share to removable provider bookkeeping. Implement option C (or measure
+  option B) only after tests show the durability invariants still hold, and
+  re-measure with a fresh clean bundle.
 - A sustained grow-heavy run at the default cap produces 503s or material
   non-grow tail degradation: then revisit option B with a pre-journal refusal
   and a contract note.
@@ -237,11 +262,14 @@ of scope for this slice.
 
 ## 8. What this memo does not claim
 
-- It is **not** a new benchmark and introduces no new measured run. The
-  phase split is derived from same-SHA repeat journals and is explicitly
-  non-evidence.
-- It does **not** claim LVM is the sole cause of the body. The exact
-  serialized component is unattributed.
+- It is **not** a new benchmark. The phase split is derived from same-SHA
+  repeat journals; the post-acceptance diagnostic is a separate
+  non-evidence instrumented run.
+- It does **not** claim LVM is the sole cause. The diagnostic attributes the
+  largest share to `vgs` sampling and stale-epoch retries; the split inside
+  a single `vgs` call is not separated.
+- It does **not** claim the 2 ms journal-intent split is the provider
+  admission cost; the diagnostic corrects that.
 - It does **not** claim a bound would improve throughput, or that the c128
   aggregate write p95 improved. The aggregate p95 remains a grow-value
   quantile and is not like-for-like with `8029df8`.

@@ -288,9 +288,14 @@ is a production-support, SLA, capacity, durability or hardware claim.
   are per-VG-bound (255 → 438 grows, 8.43 → 11.12/s) and the queue
   deepened (p50 338 → 8,339 ms, p95 499 → 19,633 ms). A read-only
   [decision memo](../reviews/2026-11-05-grow-tail-decision.md) accepted this
-  as the measured per-VG envelope (admission ~2 ms median, body 9.1–9.8 s at
-  c128; the exact serialized component is unattributed) and added no new
-  bound; the envelope is not a validated ceiling or an SLO. Two clean same-SHA
+  as the measured per-VG envelope and added no new bound; the envelope is not
+  a validated ceiling or an SLO. A subsequent
+  [non-evidence phase diagnostic](../reviews/2026-11-05-grow-tail-phase-diagnostic.md)
+  corrected the attribution: the ~2 ms anchor is the `ops::execute` journal
+  intent, while the provider capacity-admission loop is 5.0–6.3 s mean,
+  dominated by `vgs` samples invalidated by the global capacity epoch and
+  retried (783–1,082 stale attempts across 409–411 grows); `lvextend`/`lvs`
+  are ~1.8–2.4 s each and the provider intent save is ~1.7–1.9 ms. Two clean same-SHA
   repeats (non-evidence) measured c128 599.405 and 614.158 ops/s and
   aggregate write p95 7,478.820 and 7,586.304 ms, so the published sample is
   at the high end of the observed range.

@@ -134,20 +134,27 @@ The cap counts **requests**, not LVM capacity or fairness. A grow holds its
 permit for the whole synchronous body: up to 32 capacity-sample rounds, the
 `lvextend`, and the size-verifying `lvs`, with each LVM command bounded by
 the 60-second provider watchdog. Grow completions are bounded by a per-VG
-serialized post-admission body, not by the daemon: the published dev-lab
+serialized provider path, not by the daemon: the published dev-lab
 measurement at the capacity-domain fix completed 438 grows in 39.4 s with
 128 in flight (about 11.1 grows/s) while also serving reads and non-grow
 writes.
 
 The measured single-VG envelope is **~11–12 grow completions/s** at c8, c32
 and c128, with grow latency approximated by `in-flight × 83–93 ms`. At c128
-the durable grow intent lands a median of **2 ms** after the request starts,
-while the post-intent body (`lvextend`, verification, state save,
-notification save, journal outcome) takes a median of **9.1–9.8 s**. The
-exact serialized component is not attributed from the existing records. A
+the **operation journal intent** in `ops::execute` lands a median of **2 ms**
+after the request starts, but that is not the provider's capacity-admission
+cost. The provider's `prepare_grow_admission` loop takes **5.0–6.3 s mean**,
+dominated by `vgs` capacity samples that are invalidated by the global
+capacity epoch and retried (783–1,082 stale attempts across 409–411 grows,
+tail to 20 attempts). `lvextend` and the verifying `lvs` are **~1.8–2.4 s
+each**; the provider's own durable grow-intent save is **~1.7–1.9 ms**, the
+state commit ~65–72 ms, and the journal outcome append **< 1 ms**. A
 read-only [decision memo](reviews/2026-11-05-grow-tail-decision.md) accepted
-this as the measured envelope and added no per-VG bound; treat it as an
-observed operating point, not a validated ceiling or an SLO.
+the measured envelope and added no per-VG bound; a subsequent
+[non-evidence phase diagnostic](reviews/2026-11-05-grow-tail-phase-diagnostic.md)
+attributed the largest removable share to the `vgs` sample-retry convoy.
+Treat the envelope as an observed operating point, not a validated ceiling
+or an SLO.
 
 Consequences an operator must plan for:
 
