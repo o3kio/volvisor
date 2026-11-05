@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; write-tail fix measured at `8029df8`)
+### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; capacity-domain grow admission measured at `4290b84`; c128 grow tail open)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -651,6 +651,153 @@ the attach fencing contract. None is a shortcut for this slice.
   is unchanged and the high-in-flight write tail is worse, so no
   throughput-gain is claimed. Delivered.
 - #62 stays open until explicitly instructed.
+
+#### Capacity-domain grow admission, adversarial review, and re-measurement (2026-11-05): recorded at `4290b84`
+
+The `8029df8` re-measurement left the c128 write p95 at 3,413.886 ms and did
+not attribute the remainder. The grows-disabled diagnostic had already
+isolated the tail to grow work. The remaining artificial serialization was
+the capacity sample: `vgs` ran behind a capacity-domain mutex, so concurrent
+grows convoyed, and a create could spend capacity between a grow's sample
+and its reservation.
+
+`a3ea5abf` samples capacity outside the provider state lock; an allocation
+epoch invalidates a sample that raced with any allocation; the per-VG
+reservation and durable grow intent publish under the state lock; a capped
+optimistic-retry budget turns sustained churn into a typed refusal instead
+of a loop; a per-volume drive guard refuses a duplicate grow; and
+`run_blocking_body` hands the worker's core off for the synchronous LVM
+body. `6519068` removed the provider-level grow semaphore after a
+same-commit A/B diagnostic measured the bounded arm at lower c128
+throughput and longer grow latency while the LVM-bound completion rate
+stayed roughly constant.
+
+**Adversarial review (2026-11-05).** Two independent read-only reviews read
+the delta `8029df8..6519068` and the system design. Neither found a Critical
+or High runtime-correctness defect on the success path. They did find two
+Medium defects, both fixed at `4290b8425baf35f73f5df80b76fc9a3a75f39583`
+before any measurement of the final tree:
+
+- **Create-attempt epoch window (Medium).** A create whose `lvcreate`
+  outcome was unknown, exited non-zero, failed size verification, or was
+  adopted on retry could spend capacity without bumping the allocation
+  epoch. A grow that sampled before the attempt could reserve against the
+  pre-attempt figure. The fix bumps the epoch on every post-`lvcreate` exit
+  path and whenever a durable create intent is found on retry; it is
+  conservative on an attempt that never reached LVM (one extra sample).
+  Three integration tests cover the unknown outcome, the known failed
+  start, and adoption; all three fail on the unfixed parent as negative
+  controls.
+- **Publish error path (Medium).** The grow publish discarded
+  `lock_state_stable()`'s `Result`, so on a poisoned state mutex or an
+  unreadable alignment load it bumped the epoch and released the
+  reservation without the state guard and with no observable error. The
+  fix matches the result, keeps the bump and drop on both paths, and emits
+  a structured warning when the lock cannot be held. The unlocked drop is
+  safe today because a create holds the state mutex across its sample and
+  reservation read, and a poisoned mutex also refuses new creates; the
+  warning keeps the degraded path visible.
+
+The reviews also corrected the record rather than the code:
+
+- The `a3ea5abf` commit message said its regression tests covered "the
+  retry cap" with negative controls. The cap **is** exercised by a unit
+  test (`sustained_epoch_churn_refuses_after_the_attempt_cap`), but it was
+  not part of the negative-control set; the message overstates that. The
+  provider-level `OVERLOADED` is raised after the journal intent and is
+  therefore the **terminal** outcome for that `operation_id`; a retry needs
+  a new id. The constant, test and error detail now say so.
+- The plan-of-record and readiness ledger ended at `8029df8` while the tree
+  carried later production changes; this addendum and the readiness
+  addendum close that gap.
+- The bulkhead removal's "bounded by the admission cap" is a **count**
+  bound only. The cap is shared with reads and attaches, mutations have no
+  execution timeout, and rate limiting is off by default. A sustained grow
+  flood can shed reads/attaches with `503` after the queue timeout, and
+  `max_concurrent_requests` can be raised to 65536 without an LVM
+  cross-check. This is documented in
+  [admission-control.md](../admission-control.md); the
+  semaphore is not re-added, because the A/B showed it did not raise the
+  LVM-bound completion rate.
+- The c128 aggregate write p95 is a quantile of a bimodal mixture sitting
+  near the 5 % grow-share boundary. It flips between the non-grow and grow
+  populations and must not be compared head-to-head across SHAs. The
+  report publishes the per-operation split, realized grow share, grow
+  completion rate, and two same-SHA repeat sweeps.
+
+Static checks at `4290b84`: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, full
+`cargo test --workspace --locked`, and
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` pass.
+The three new create/epoch negative controls fail at the unfixed parent.
+
+**Clean-tree re-measurement (2026-11-05, `4290b84`).** The run used the
+published harness unchanged (identical hashes at `8029df8`), source clean,
+binary `80ecd137…`, window 12:18:30–12:49:23Z. Against `8029df8`, throughput
+rose 1,729.154 → 1,825.419 ops/s at c1 (+5.6 %), 3,118.787 → 3,846.899 at
+c8 (+23.4 %), 1,830.005 → 2,609.257 at c32 (+42.6 %), 440.376 → 655.326 at
+c128 (+48.8 %, completion-inclusive; the first 30 s window completed 851.3
+vs 439.3 ops/s), and the 25-minute soak 4,425.586 → 4,756.348 (+7.5 %). The
+non-grow tail collapsed: c32 write p95 206.203 → 82.927 ms (−59.8 %), c128
+attach/report/detach p95 3,200–3,642 → 194–211 ms, c128 read p95 87.276 →
+6.584 ms (−92.5 %), c128 overall p95 1,836.718 → 117.870 ms (−93.6 %). All
+274,352 default-cap sweep requests returned 2xx; the soak ran 7,134,530 ops
+at 4,756.348 ops/s with 0 HTTP/provider errors, 0 conflicts and 81 client
+reconnects at the planned restart. The c128 **aggregate write p95** rose
+3,413.886 → 5,078.906 ms (+48.8 %) but is **not like-for-like**: the
+candidate's 5,078.906 ms is a grow value (slowest non-grow 819.067 ms), the
+comparator's 3,413.886 ms is a non-grow value (slowest grow 600.611 ms).
+Grow completions rose 255 → 438 and the LVM-bound completion rate 8.43 →
+11.12/s, while the grow queue deepened (p50 338 → 8,339 ms, p95 499 →
+19,633 ms). **The c128 grow tail is not fixed**; it is bound by the host's
+LVM-per-VG serialization.
+Two clean same-SHA repeats (`--skip-soak`, non-evidence) measured c128
+599.405 and 614.158 ops/s with aggregate write p95 7,478.820 and
+7,586.304 ms (both grow values; non-grow p95 179–228 ms), versus the
+published 655.326 ops/s and 5,078.906 ms. They agree on the non-grow path
+and the seconds-long grow queue, and differ in both completion-inclusive
+throughput and the aggregate p95 because the realized grow share sits near
+the 5 % boundary. The published sample was not selected from them. The
+bundle is published at
+[2026-11-05-devhost-capacity-domain-fix](../benchmarks/2026-11-05-devhost-capacity-domain-fix/REPORT.md).
+The earlier `6519068` measurement is superseded and is not evidence for
+`4290b84`.
+
+New residuals and corrections from this work (LOW/NIT unless noted; none is
+a production claim):
+
+- **c128 grow queue/tail (open).** Grow completions are LVM-per-VG-bound;
+  128 simultaneous resizes queue for seconds. The aggregate c128 write p95
+  is composition- and run-sensitive.
+- **Shared-cap grow starvation posture (open).** A grow flood can occupy
+  the shared admission cap and shed reads/attaches; rate limiting is
+  disabled by default, and the cap has no LVM cross-check. Documented, not
+  solved.
+- **Create still holds the state lock across its `vgs` sample and
+  `lvcreate`/`lvs` (pre-existing, understated before).** This is the same
+  defect class the epoch protocol removed for grow; the mixed sweep has no
+  create/delete, so it is not measured here.
+- **In-doubt journal intents accumulate across restarts (pre-existing).**
+  A client disconnect or crash after the intent and before the outcome
+  leaves `OPERATION_IN_DOUBT` permanently; recovery reconciles provider
+  state, not journal intents. The runbook requires a new operation id.
+- **Retry `resume_pending_grow` and `settle_failed_lvextend` run `lvs`
+  under the state lock; `intent_is_durable` re-reads the durable file under
+  the lock (pre-existing).** Admitted, not measured.
+- **`block_in_place` worker-set cost is unmeasured; the LocalSet fallback
+  pins the caller's thread and prints the runtime panic hook's refusal
+  message.** Correctness fallback for embedders; `volvisord` uses the
+  multi-thread runtime.
+- **Duplicate-grow refusals are journaled terminal failures**, so
+  same-volume spam is a journal write-amplification vector (bounded by
+  compaction).
+- **Cumulative-run RSS/journal effects are not attributed.** The c128
+  segment starts with much higher RSS/journal than a fresh-daemon
+  diagnostic; the cause is not claimed.
+- **The default INFO daemon log is unbounded** (2.24 GiB raw here).
+- **24-hour soak (NOT RUN).** The run is 25 minutes with one restart.
+
+#62 stays open until explicitly instructed. All gate verdicts are unchanged.
 
 ### D4 — ADR-0012 acceptance
 

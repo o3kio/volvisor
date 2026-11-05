@@ -128,6 +128,43 @@ of permits; it cannot create unbounded tasks or connections. `/healthz`,
 `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass the cap so
 liveness, readiness and monitoring stay available during overload.
 
+## Grow-heavy workloads and the shared cap
+
+The cap counts **requests**, not LVM capacity or fairness. A grow holds its
+permit for the whole synchronous body: up to 32 capacity-sample rounds, the
+`lvextend`, and the size-verifying `lvs`, with each LVM command bounded by
+the 60-second provider watchdog. Grow completions are bounded by the host's
+per-VG LVM serialization, not by the daemon: the published dev-lab
+measurement at the capacity-domain fix completed 438 grows in 39.4 s with
+128 in flight (about 11.1 grows/s) while also serving reads and non-grow
+writes.
+
+Consequences an operator must plan for:
+
+- A sustained grow flood can fill the cap with journaled mutations. Reads
+  and attaches then wait `queue_timeout_secs` (default 5) and are shed with
+  `503 OVERLOADED`; probes and `/metrics` remain available. The cap reserves
+  nothing for reads or for non-grow mutations.
+- `max_concurrent_requests` accepts up to 65536 and is not cross-checked
+  against LVM, process or thread capacity. Raising it raises the number of
+  concurrent grow bodies, child processes and converted runtime workers.
+  The measured envelope is 128 in-flight and 256 admitted; that is an
+  observed operating point, not a validated ceiling.
+- Per-principal rate limiting is the intended control for a shared or
+  untrusted network. It is disabled by default; enable it before exposing a
+  grow-heavy workload to clients that can burst.
+- The provider-level grow retry cap returns `OVERLOADED` after 32 stale
+  capacity samples. It is raised after the journal intent, so the refusal is
+  the **terminal** outcome for that request's `operation_id`; a retry must
+  carry a new id.
+- The removed provider-level grow semaphore was an internal bulkhead, not a
+  fairness mechanism: a same-commit A/B diagnostic (non-evidence) showed it
+  added queue delay without raising the LVM-bound completion rate. The
+  admission cap is the remaining count bound, with the limits above.
+- Grow throughput scales with the number of independently lockable VGs, not
+  with in-flight requests. Adding daemon concurrency beyond the measured
+  envelope does not raise LVM's per-VG completion rate.
+
 ## Per-principal rate limits (opt-in)
 
 Per-principal rate limiting is **disabled by default**: both
