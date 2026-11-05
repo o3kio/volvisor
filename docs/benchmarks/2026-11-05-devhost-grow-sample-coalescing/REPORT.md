@@ -8,6 +8,11 @@ disposable loop-backed LVM volume group, control-plane HTTP only. It is
 **not** production evidence, **not** a data-path benchmark, **not** an SLA,
 and **not** the issue's 24-hour soak (a shortened 25-minute soak ran).
 
+**Post-measurement disposition:** option C was reverted locally at
+`59f64cceaa9483760500ed3b68ca7da89ece8ee3` (a code-only revert of
+`a07203e`), restoring the `4290b84` behavior. This report remains the
+measurement of `75beea3`; it is not evidence for the reverted tree.
+
 - **Exact source:** `75beea399e593c561104d4d0bb473c88d4d8b93e`
   (`volvisord 75beea3`).
 - **Production-code commit:** `a07203e4965aef9e5776d96d496a09b3304437a1`

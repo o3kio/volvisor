@@ -16,6 +16,12 @@ rose (**8,338.505 → 11,335.103 ms**), aggregate write p95 rose
 (**5,078.906 → 10,772.171 ms**), and the 25-minute soak fell
 **4,756.348 → 4,543.361 ops/s (−4.48%)**. See [REPORT.md](REPORT.md) §6–§9.
 
+**Post-measurement disposition:** option C was reverted locally at
+`59f64cceaa9483760500ed3b68ca7da89ece8ee3` (a code-only revert of
+`a07203e`); the current tree matches `4290b84` for `crates/volvisor-lvm`.
+This bundle remains the measured evidence for why, and every value in it
+still describes `75beea3`, not the reverted tree.
+
 - **Exact source:** `75beea399e593c561104d4d0bb473c88d4d8b93e`
   (`volvisord 75beea3`). The production-code commit is
   `a07203e4965aef9e5776d96d496a09b3304437a1`; `75beea3` is the subsequent

@@ -240,9 +240,9 @@ of scope for this slice.
    ([non-evidence note](2026-11-05-grow-tail-phase-diagnostic.md)). It
    attributes the largest share to the `vgs` sample-retry convoy. Option C
    was subsequently implemented and measured as recorded in §9. The fresh
-   clean benchmark is a c128 regression; it does not support the change on
-   throughput or envelope grounds, and the keep/rework/revert decision is
-   open.
+   clean benchmark is a c128 regression; it did not support the change on
+   throughput or envelope grounds, and it was reverted locally at `59f64cc`
+   (code-only revert of `a07203e`), restoring the `4290b84` behavior.
 4. Keep **#62 open**. Create and delete still hold the provider state lock
    across their CLI work; the grow body is not fully independent of provider
    bookkeeping. No gate verdict changes.
@@ -252,10 +252,10 @@ of scope for this slice.
 ## 7. What would change this decision
 
 - The phase-diagnostic trigger was met, and option C was implemented and
-  re-measured. The fresh bundle shows a c128 throughput regression (grow
-  median up, upper tail down), so the next step is a keep/rework/revert
-  decision, not another unmeasured implementation. A rework should be
-  justified by a mechanism this bundle can measure.
+  re-measured. The fresh bundle showed a c128 throughput regression (grow
+  median up, upper tail down), so the change was reverted at `59f64cc`.
+  Reopening it requires a mechanism this bundle can measure; another
+  unmeasured implementation is not justified.
 - A sustained grow-heavy run at the default cap produces 503s or material
   non-grow tail degradation: then revisit option B with a pre-journal refusal
   and a contract note.
@@ -311,8 +311,9 @@ grow completion rate fell **11.118 → 10.615/s** and the aggregate write p95
 rose because the grow distribution flattened at a higher median, not because
 the tail worsened (the bundle explains why that p95 is not like-for-like).
 
-This measurement does **not** support keeping the change on throughput or
-envelope grounds. Whether to revert or rework it is an open decision; until
-that decision, `4290b84` remains the prior measured envelope. The bundle has
-no per-grow `vgs` attempt counter, so the mechanism is not attributed.
-`#62` stays open and no gate verdict changes.
+This measurement did **not** support keeping the change on throughput or
+envelope grounds, and option C was reverted locally at `59f64cc` (a
+code-only revert of `a07203e`); the current tree matches `4290b84` for
+`crates/volvisor-lvm`, so `4290b84` is again the current measured envelope.
+The bundle has no per-grow `vgs` attempt counter, so the mechanism is not
+attributed. `#62` stays open and no gate verdict changes.

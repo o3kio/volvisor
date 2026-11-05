@@ -160,5 +160,8 @@ It was then measured in a fresh clean bundle at
 upper tail narrowed (p95 **19,633.371 → 12,396.977 ms**). This diagnostic's
 `4290b84` attempt and admission timings remain non-evidence for the new SHA,
 and the new bundle has no attempt counter, so the convoy mechanism is still
-not directly observed after the change. `#62` remains open and no gate
-verdict changes.
+not directly observed after the change. Option C was reverted locally at
+`59f64cceaa9483760500ed3b68ca7da89ece8ee3`; the current tree therefore has
+the `4290b84` grow behavior, and this diagnostic's `4290b84` timings again
+describe the current code (they remain non-evidence for the reverted-SHA
+bundle). `#62` remains open and no gate verdict changes.

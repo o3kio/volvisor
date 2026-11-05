@@ -163,9 +163,10 @@ and the 25-minute soak **4,756.348 → 4,543.361 ops/s (−4.48%)**. The grow
 upper tail narrowed (p95 **19,633.371 → 12,396.977 ms**; max **34,044.828 →
 15,251.096 ms**), but the grow completion rate fell **11.118 → 10.615/s**,
 at or below the accepted **~11–12/s** band. `4290b84` therefore remains the
-prior measured envelope: the change is not adopted on throughput or envelope
-grounds, and the keep/rework/revert decision is open. The numbers above
-describe `4290b84` only.
+prior measured envelope: the change was not adopted on throughput or envelope
+grounds and was reverted locally at
+`59f64cceaa9483760500ed3b68ca7da89ece8ee3`, so the current code has the
+`4290b84` grow behavior. The numbers above describe `4290b84` only.
 Treat the envelope as an observed operating point, not a validated ceiling
 or an SLO.
 

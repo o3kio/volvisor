@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; capacity-domain grow admission measured at `4290b84`; per-VG sample coalescing measured at `75beea3` and not adopted on throughput/envelope grounds; c128 grow tail open)
+### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; capacity-domain grow admission measured at `4290b84`; per-VG sample coalescing measured at `75beea3` and reverted at `59f64cc`; c128 grow tail open)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -783,9 +783,10 @@ a production claim):
   [grow-sample-coalescing bundle](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
   **The measurement is a c128 regression**: 655.326 → 508.225 ops/s
   (−22.45%), grow p50 8,338.505 → 11,335.103 ms, soak 4,756.348 → 4,543.361
-  ops/s (−4.48%), while the grow p95/max narrowed. The change is not adopted
-  on throughput or envelope grounds and the keep/rework/revert decision is
-  open; `4290b84` remains the prior measured envelope. **#62 remains open.**
+  ops/s (−4.48%), while the grow p95/max narrowed. The change was not adopted
+  on throughput or envelope grounds and was reverted locally at `59f64cc`
+  (code-only revert of `a07203e`), restoring the `4290b84` behavior;
+  `4290b84` is again the current measured envelope. **#62 remains open.**
 - **Shared-cap grow starvation posture (open).** A grow flood can occupy
   the shared admission cap and shed reads/attaches; rate limiting is
   disabled by default, and the cap has no LVM cross-check. Documented, not
