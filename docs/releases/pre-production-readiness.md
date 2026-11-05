@@ -285,8 +285,12 @@ is a production-support, SLA, capacity, durability or hardware claim.
   5,078.906 ms but is not like-for-like: it is a quantile of a bimodal
   mixture and flips between the non-grow and grow populations near the 5 %
   grow-share boundary. **The c128 grow tail is not fixed**; grow completions
-  are LVM-per-VG-bound (255 → 438 grows, 8.43 → 11.12/s) and the queue
-  deepened (p50 338 → 8,339 ms, p95 499 → 19,633 ms). Two clean same-SHA
+  are per-VG-bound (255 → 438 grows, 8.43 → 11.12/s) and the queue
+  deepened (p50 338 → 8,339 ms, p95 499 → 19,633 ms). A read-only
+  [decision memo](../reviews/2026-11-05-grow-tail-decision.md) accepted this
+  as the measured per-VG envelope (admission ~2 ms median, body 9.1–9.8 s at
+  c128; the exact serialized component is unattributed) and added no new
+  bound; the envelope is not a validated ceiling or an SLO. Two clean same-SHA
   repeats (non-evidence) measured c128 599.405 and 614.158 ops/s and
   aggregate write p95 7,478.820 and 7,586.304 ms, so the published sample is
   at the high end of the observed range.

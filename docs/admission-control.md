@@ -133,11 +133,21 @@ liveness, readiness and monitoring stay available during overload.
 The cap counts **requests**, not LVM capacity or fairness. A grow holds its
 permit for the whole synchronous body: up to 32 capacity-sample rounds, the
 `lvextend`, and the size-verifying `lvs`, with each LVM command bounded by
-the 60-second provider watchdog. Grow completions are bounded by the host's
-per-VG LVM serialization, not by the daemon: the published dev-lab
+the 60-second provider watchdog. Grow completions are bounded by a per-VG
+serialized post-admission body, not by the daemon: the published dev-lab
 measurement at the capacity-domain fix completed 438 grows in 39.4 s with
 128 in flight (about 11.1 grows/s) while also serving reads and non-grow
 writes.
+
+The measured single-VG envelope is **~11–12 grow completions/s** at c8, c32
+and c128, with grow latency approximated by `in-flight × 83–93 ms`. At c128
+the durable grow intent lands a median of **2 ms** after the request starts,
+while the post-intent body (`lvextend`, verification, state save,
+notification save, journal outcome) takes a median of **9.1–9.8 s**. The
+exact serialized component is not attributed from the existing records. A
+read-only [decision memo](reviews/2026-11-05-grow-tail-decision.md) accepted
+this as the measured envelope and added no per-VG bound; treat it as an
+observed operating point, not a validated ceiling or an SLO.
 
 Consequences an operator must plan for:
 
@@ -159,11 +169,11 @@ Consequences an operator must plan for:
   carry a new id.
 - The removed provider-level grow semaphore was an internal bulkhead, not a
   fairness mechanism: a same-commit A/B diagnostic (non-evidence) showed it
-  added queue delay without raising the LVM-bound completion rate. The
+  added queue delay without raising the per-VG completion rate. The
   admission cap is the remaining count bound, with the limits above.
 - Grow throughput scales with the number of independently lockable VGs, not
   with in-flight requests. Adding daemon concurrency beyond the measured
-  envelope does not raise LVM's per-VG completion rate.
+  envelope does not raise the per-VG completion rate.
 
 ## Per-principal rate limits (opt-in)
 

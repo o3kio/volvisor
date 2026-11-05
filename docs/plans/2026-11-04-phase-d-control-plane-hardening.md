@@ -766,9 +766,14 @@ The earlier `6519068` measurement is superseded and is not evidence for
 New residuals and corrections from this work (LOW/NIT unless noted; none is
 a production claim):
 
-- **c128 grow queue/tail (open).** Grow completions are LVM-per-VG-bound;
-  128 simultaneous resizes queue for seconds. The aggregate c128 write p95
-  is composition- and run-sensitive.
+- **c128 grow queue/tail (open; envelope accepted).** Grow completions are
+  per-VG-bound; 128 simultaneous resizes queue for seconds. The aggregate
+  c128 write p95 is composition- and run-sensitive. A read-only
+  [decision memo](../reviews/2026-11-05-grow-tail-decision.md) accepted the
+  measured per-VG envelope (~11–12 grows/s; admission ~2 ms median, body
+  9.1–9.8 s at c128) and added no new bound. The exact serialized component
+  is unattributed; a phase-timing diagnostic is required before any body
+  optimization. **#62 remains open.**
 - **Shared-cap grow starvation posture (open).** A grow flood can occupy
   the shared admission cap and shed reads/attaches; rate limiting is
   disabled by default, and the cap has no LVM cross-check. Documented, not

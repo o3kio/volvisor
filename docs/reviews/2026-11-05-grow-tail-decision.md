@@ -1,7 +1,8 @@
 # Grow-tail decision memo — 2026-11-05
 
-Status: **Proposed** (decision acceptance pending; this is not an ADR, not a
-code change, and not a new measurement)
+Status: **Accepted** (2026-11-05; accepting authority: repository owner).
+This is a decision memo, not an ADR, not a code change, and not a new
+measurement.
 Scope: Phase D D3 slice 2, issue #62, measured tree
 `4290b8425baf35f73f5df80b76fc9a3a75f39583`
 Related evidence:
@@ -161,7 +162,7 @@ not dropped after the intent. Any bound must preserve that rule.
 
 ## 5. Options
 
-### A. Accept and document the envelope (recommended)
+### A. Accept and document the envelope (accepted)
 
 Record that, on one loop-backed VG, grow completions are ~11–12/s, grow
 latency is approximately `in-flight × 83–93 ms`, and the serialized resource
@@ -202,12 +203,14 @@ measurement-first path; it is not authorized by this memo.
 A contract change (operation handle, polling, retention, idempotency) and out
 of scope for this slice.
 
-## 6. Recommendation and conditions
+## 6. Decision and conditions
 
-1. **Accept option A for the measured slice.** Do not add a grow bound now.
-2. If accepted, document the envelope in
-   [admission-control.md](../admission-control.md) (the grow-heavy section
-   already records 438 grows in 39.4 s) and in the Phase D D3 addendum: the
+1. **Option A is accepted** for the measured slice (2026-11-05, repository
+   owner). Do not add a grow bound now.
+2. The envelope is documented in
+   [admission-control.md](../admission-control.md), the
+   [Phase D D3 addendum](../plans/2026-11-04-phase-d-control-plane-hardening.md)
+   and the [readiness ledger](../releases/pre-production-readiness.md): the
    ~11–12/s per-VG completion rate, the `in-flight × 83–93 ms` scaling, and
    the fact that admission is ~2 ms median while the body is ~9 s at c128.
 3. Before any body optimization, run a **short non-evidence phase-timing
@@ -234,8 +237,9 @@ of scope for this slice.
 
 ## 8. What this memo does not claim
 
-- It is **not** a new benchmark and adds no measured values. The phase split
-  uses same-SHA repeat journals and is explicitly non-evidence.
+- It is **not** a new benchmark and introduces no new measured run. The
+  phase split is derived from same-SHA repeat journals and is explicitly
+  non-evidence.
 - It does **not** claim LVM is the sole cause of the body. The exact
   serialized component is unattributed.
 - It does **not** claim a bound would improve throughput, or that the c128
