@@ -122,8 +122,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -173,6 +175,25 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// always be written (`NO_SAFE_CAPACITY` is reported before the VG fills).
 pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 
+/// Maximum number of grow drives running their LVM commands at once.
+///
+/// Design rationale, not a measured result: LVM commands are understood to
+/// serialize on the host's LVM lock, so letting every in-flight grow run
+/// at once may only convert that lock into an async-worker queue, with one
+/// parked worker per drive. Bounding the drives is intended to keep the
+/// worker pool available for reads, attaches, reports and detaches while
+/// the LVM lock stays busy. Further grow requests wait on a Tokio
+/// semaphore, which does not occupy a worker. The value 8 is a conservative
+/// default chosen without a bounded-vs-unbounded measurement.
+pub(crate) const GROW_CONCURRENCY_LIMIT: usize = 8;
+
+/// Maximum optimistic capacity-sample rounds for one grow admission.
+///
+/// Each stale round costs another `vgs` call. The cap keeps a grow (and
+/// its bulkhead permit) from looping forever under sustained allocation
+/// churn; exhaustion returns a retryable `OVERLOADED` refusal.
+const GROW_ADMISSION_ATTEMPTS: usize = 32;
+
 /// Physical extent size assumed when `vgs` does not report one (LVM's
 /// own default; bigger arrays legitimately use bigger extents).
 const DEFAULT_EXTENT_BYTES: u64 = 4 << 20;
@@ -188,6 +209,55 @@ struct VgCapacity {
     free_bytes: u64,
     /// Physical extent bytes reported by `vgs` (4 MiB when absent).
     extent_bytes: u64,
+}
+
+/// The outcome of one grow-preparation attempt under the state lock.
+///
+/// `SampleStale` means an allocation completed after the `vgs` sample was
+/// taken; the reservation has been released and the caller must re-sample.
+enum GrowPrepare<'a> {
+    Prepared {
+        grow_intent: GrowIntent,
+        reservation: CapacityReservation<'a>,
+    },
+    SampleStale,
+}
+
+/// The volume fields one grow admission derives under the state lock and
+/// re-validates after the capacity sample releases and reacquires it.
+struct GrowAdmission {
+    vg_name: String,
+    lv_name: String,
+    current_size: u64,
+    current_generation: u64,
+    has_attachment: bool,
+}
+
+/// A grow admission that has sampled capacity, reserved it, and made its
+/// recovery intent durable.
+///
+/// The [`CapacityReservation`] must stay alive until the `lvextend` answer
+/// arrives; the capacity admission domain itself is released when
+/// [`LvmProvider::prepare_grow_admission`] returns.
+struct PreparedGrow<'a> {
+    grow_intent: GrowIntent,
+    reservation: CapacityReservation<'a>,
+    vg_name: String,
+    lv_name: String,
+    current_size: u64,
+    current_generation: u64,
+    has_attachment: bool,
+}
+
+/// The outcome of grow admission: either a pending grow that the world
+/// already proves landed (answer without another `lvextend`), or a drive
+/// ready to extend.
+enum GrowAdmissionOutcome<'a> {
+    Finalized {
+        has_attachment: bool,
+        effective_size_bytes: u64,
+    },
+    Prepared(PreparedGrow<'a>),
 }
 
 /// The space `size` bytes effectively occupy on a VG with `extent`-byte
@@ -409,6 +479,18 @@ pub struct LvmProvider {
     /// reports the real free space. Leaf lock: never held while taking
     /// the provider state lock.
     capacity_reservations: Mutex<BTreeMap<String, u64>>,
+    /// Counts completed allocations (create `lvcreate`, grow `lvextend`)
+    /// that may have reduced free space.
+    ///
+    /// Grow admission samples `vgs` without any admission lock so
+    /// concurrent grows do not serialize on the LVM CLI. A sample is used
+    /// only if this counter is unchanged across the whole sample and the
+    /// reservation insertion; a create or a completed `lvextend` bumps it
+    /// (under the state lock for a create) and forces a re-sample. Moves
+    /// allocate outside this protocol (pre-existing residual).
+    capacity_epoch: AtomicU64,
+    /// Bounds concurrent grow drives. See [`GROW_CONCURRENCY_LIMIT`].
+    grow_limiter: tokio::sync::Semaphore,
     /// The writer view: every mutation is admitted under this mutex.
     /// Attach/detach/report capture and reserve under it, then release it
     /// before waiting for durability; the synchronous multi-save paths
@@ -1451,6 +1533,8 @@ impl LvmProvider {
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
+            capacity_epoch: AtomicU64::new(0),
+            grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
             state: Mutex::new(state),
             read_snapshot,
         };
@@ -2152,6 +2236,25 @@ impl LvmProvider {
         })
     }
 
+    /// Read the allocation epoch.
+    ///
+    /// This is a protocol counter, not a lock: readers compare it before
+    /// and after a `vgs` sample and again after inserting their
+    /// reservation. Bumps are release-ordered with the allocation they
+    /// record; a grow needs the sample and the reservation insertion to
+    /// observe the same epoch.
+    fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that an allocation completed and may have reduced free
+    /// space. A create calls this under the state lock, after `lvcreate`;
+    /// a grow calls it immediately after `lvextend` returns, before it
+    /// releases its reservation.
+    fn note_capacity_change(&self) {
+        self.capacity_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Bytes currently promised to in-flight grow allocations in `vg_name`.
     fn reserved_capacity(&self, vg_name: &str) -> u64 {
         self.capacity_reservations
@@ -2162,26 +2265,42 @@ impl LvmProvider {
             .unwrap_or_default()
     }
 
-    /// Promise `bytes` of `vg_name`'s free space to this grow until the
-    /// returned guard drops.
+    /// Atomically check and promise `demand` bytes of `vg_name`'s free
+    /// space, given a `vgs` sample.
     ///
-    /// Called under the provider state lock, immediately after the
-    /// capacity admission. Any create that takes the state lock while the
-    /// resize runs subtracts this reservation, so the freed-lock window
-    /// cannot spend the same extents twice.
-    fn reserve_capacity(&self, vg_name: &str, bytes: u64) -> CapacityReservation<'_> {
+    /// The check and the insertion happen under the reservation leaf lock,
+    /// so concurrent grows cannot both spend the same sampled free bytes
+    /// (grow-grow admission is serialized by no lock except this leaf; the
+    /// state lock is not held across the sample).
+    /// Returns the bytes already reserved for the VG on refusal so the
+    /// typed refusal can report the honest accounting.
+    ///
+    /// Called under the provider state lock. Any create that takes the
+    /// state lock while the resize runs subtracts this reservation, so the
+    /// freed-lock window cannot spend the same extents twice.
+    fn try_reserve_capacity(
+        &self,
+        vg_name: &str,
+        sampled_free: u64,
+        demand: u64,
+    ) -> Result<CapacityReservation<'_>, (u64, u64)> {
         let mut reserved = self
             .capacity_reservations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let already = reserved.get(vg_name).copied().unwrap_or_default();
+        let free = sampled_free.saturating_sub(already);
+        if demand.saturating_add(VG_HEADROOM_BYTES) > free {
+            return Err((free, already));
+        }
         let total = reserved.entry(vg_name.to_owned()).or_insert(0);
-        *total = total.saturating_add(bytes);
+        *total = total.saturating_add(demand);
         drop(reserved);
-        CapacityReservation {
+        Ok(CapacityReservation {
             provider: self,
             vg_name: vg_name.to_owned(),
-            bytes,
-        }
+            bytes: demand,
+        })
     }
 
     /// `ZeroDiscard` `blkdiscard` first (never followed by `lvremove`
@@ -3077,6 +3196,11 @@ impl LvmProvider {
 
         let (vg_name, lv_name, block_size, effective) =
             self.create_lv_with_intent(&mut state, req, &payload)?;
+        // `lvcreate` may have changed free space (a verified adoption of a
+        // prior attempt's LV does not, but the bump is conservative). Bump
+        // under the state lock so a grow sampling concurrently either sees
+        // the bump or the reservation accounting covers the window.
+        self.note_capacity_change();
 
         let stored = StoredVolume {
             entry: VolumeEntry {
@@ -3488,27 +3612,79 @@ impl LvmProvider {
         ApiError::new(save_error.code, format!("{}; {note}", save_error.detail))
     }
 
-    /// Validate capacity, reserve it, and make the grow intent durable.
+    /// Validate one grow admission against the current state and derive
+    /// the volume fields the drive needs.
     ///
-    /// Runs under the provider state lock: the capacity check, the
-    /// in-flight reservation, the intent insertion and its save are
-    /// atomic with respect to every other admission. The returned intent
-    /// is the exact anchor this drive later re-validates before
-    /// committing the observed size; the returned reservation covers the
-    /// released-lock window up to the `lvextend` answer.
+    /// Runs under the provider state lock. A durable pending delete owns
+    /// the volume's fate (growing would race the delete authorization); a
+    /// move completion bumps the generation and a grow must not straddle
+    /// it (the durable intent would look stale to recovery). Grow-only
+    /// plus alignment is enforced fail-closed (Volume API v2 §4A). The
+    /// caller re-runs this after reacquiring admission around the
+    /// capacity sample, so a record that moved in that window is refused
+    /// or re-derived rather than used stale.
+    fn grow_admission(
+        &self,
+        state: &LvmState,
+        volume_id: &VolumeId,
+        req: &GrowVolumeRequest,
+    ) -> Result<GrowAdmission, ApiError> {
+        self.ensure_no_pending_delete(state, volume_id)?;
+        Self::ensure_no_unsettled_move(state, volume_id)?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        if req.expected_generation != stored.entry.generation {
+            return Err(ApiError::stale_generation(
+                req.expected_generation,
+                stored.entry.generation,
+            ));
+        }
+        match stored.runtime.state {
+            VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded => {}
+            other => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!("grow requires Ready/Attached/Degraded, volume is {other:?}"),
+                ));
+            }
+        }
+        req.validate(stored.entry.size_bytes)?;
+        Ok(GrowAdmission {
+            vg_name: stored.entry.vg_name.clone(),
+            lv_name: stored.entry.lv_name.clone(),
+            current_size: stored.entry.size_bytes,
+            current_generation: stored.entry.generation,
+            has_attachment: stored.runtime.attachment.is_some(),
+        })
+    }
+
+    /// Validate the sampled capacity, reserve it, and make the grow intent
+    /// durable.
+    ///
+    /// Runs under the provider state lock: the in-flight reservation, the
+    /// intent insertion and its save are atomic with respect to every
+    /// other admission. `capacity` was sampled *without* that lock (and
+    /// without a capacity mutex), which is what keeps the `vgs` CLI off
+    /// both locks; `expected_epoch` is the allocation epoch the sample
+    /// observed. If a create or another grow completed an allocation in
+    /// the meantime, this returns [`GrowPrepare::SampleStale`] and the
+    /// caller re-samples. The returned intent is the exact anchor this
+    /// drive later re-validates before committing the observed size; the
+    /// returned reservation covers the released-lock window up to the
+    /// `lvextend` answer.
     fn prepare_grow(
         &self,
         state: &mut LvmState,
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
         vg_name: &str,
+        capacity: VgCapacity,
         current_size: u64,
         current_generation: u64,
         intent_is_durable: bool,
-    ) -> Result<(GrowIntent, CapacityReservation<'_>), ApiError> {
-        let capacity = self.vg_capacity(vg_name)?;
-        let reserved = self.reserved_capacity(vg_name);
-        let free = capacity.free_bytes.saturating_sub(reserved);
+        expected_epoch: u64,
+    ) -> Result<GrowPrepare<'_>, ApiError> {
         let delta = req.new_size_bytes - current_size;
         // Thick LVM rounds the grown LV up to whole physical extents,
         // so the space the grow actually consumes is the
@@ -3517,23 +3693,49 @@ impl LvmProvider {
         // the rounding and surface the over-allocation later as a raw
         // INTERNAL instead of the typed NO_SAFE_CAPACITY.
         let demand = extent_rounded(delta, capacity.extent_bytes);
-        if demand.saturating_add(VG_HEADROOM_BYTES) > free {
-            return Err(ApiError::new(
-                ApiErrorCode::NoSafeCapacity,
-                format!(
-                    "grow needs {demand} more bytes (extent-rounded from {delta}), {free} free \
-                     in {vg_name} ({reserved} reserved for in-flight allocations)"
-                ),
-            ));
+        let reservation = match self.try_reserve_capacity(vg_name, capacity.free_bytes, demand) {
+            Ok(reservation) => reservation,
+            Err((free, reserved)) => {
+                return Err(ApiError::new(
+                    ApiErrorCode::NoSafeCapacity,
+                    format!(
+                        "grow needs {demand} more bytes (extent-rounded from {delta}), {free} free \
+                         in {vg_name} ({reserved} reserved for in-flight allocations)"
+                    ),
+                ));
+            }
+        };
+        // Reserve first, then check: a reservation inserted before an
+        // allocation completes still covers it, so a bump observed here
+        // means the sample may be stale in the optimistic direction and
+        // the caller must re-read `vgs` before promising anything else.
+        if self.capacity_epoch() != expected_epoch {
+            drop(reservation);
+            return Ok(GrowPrepare::SampleStale);
         }
-        // Promise the bytes before releasing the lock for `lvextend`.
-        let reservation = self.reserve_capacity(vg_name, demand);
-        let grow_intent = state.grow_intent(volume_id).cloned().unwrap_or(GrowIntent {
-            operation_id: req.operation_id.clone(),
-            from_size_bytes: current_size,
-            requested_size_bytes: req.new_size_bytes,
-            expected_generation: current_generation,
-        });
+        let grow_intent = match state.grow_intent(volume_id).cloned() {
+            Some(intent) => intent,
+            // A caller that verified the durable file holds this intent
+            // must find it in memory too. Fabricating one and skipping
+            // the save would run `lvextend` without a durable anchor,
+            // reopening the crash window the durable-first rule closes.
+            None if intent_is_durable => {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} was admitted as resuming a durable grow intent, \
+                         but the in-memory state no longer holds it; refusing to extend \
+                         without a durable anchor"
+                    ),
+                ));
+            }
+            None => GrowIntent {
+                operation_id: req.operation_id.clone(),
+                from_size_bytes: current_size,
+                requested_size_bytes: req.new_size_bytes,
+                expected_generation: current_generation,
+            },
+        };
         if !intent_is_durable {
             // Durable-first: persist the intent before `lvextend`, so a
             // crash between the CLI's success and the volume-record
@@ -3550,7 +3752,10 @@ impl LvmProvider {
                 ));
             }
         }
-        Ok((grow_intent, reservation))
+        Ok(GrowPrepare::Prepared {
+            grow_intent,
+            reservation,
+        })
     }
 
     /// Run `lvextend` without the provider state lock.
@@ -3788,6 +3993,153 @@ impl LvmProvider {
         Ok(())
     }
 
+    /// Admit one grow drive: sample capacity, reserve it, and make the
+    /// recovery intent durable, with the `vgs` sample outside the provider
+    /// state lock.
+    ///
+    /// The sample is also outside any capacity mutex: concurrent grows
+    /// must not queue behind each other's `vgs` CLI call. A diagnostic
+    /// build with a capacity mutex (non-evidence, dirty tree) still
+    /// measured the c128 collapse (about 395 ops/s grows-on versus about
+    /// 2,460 grows-off on that build); the convoy is the suspected
+    /// mechanism, and the published residual tail remains unattributed.
+    /// Safety comes from the allocation epoch instead — a sample is used
+    /// only if no create or completed `lvextend` changed free space during
+    /// it, and the reservation is inserted before the epoch is re-read so
+    /// an allocation completing in the window is still accounted for.
+    /// A record that moved between the two admissions is re-derived (or
+    /// refused typed), never used stale. A concurrent attach or detach
+    /// that lands in the sample window therefore wins: the grow is
+    /// refused with `STALE_GENERATION` (its CAS token no longer matches)
+    /// instead of making the attach wait behind the grow's CLI. That is
+    /// contract-correct but a client-visible inversion from the
+    /// parent shape, which held the state lock across admission.
+    fn prepare_grow_admission(
+        &self,
+        volume_id: &VolumeId,
+        req: &GrowVolumeRequest,
+    ) -> Result<GrowAdmissionOutcome<'_>, ApiError> {
+        // A stale sample costs another `vgs` call. Bound the optimistic
+        // rounds so a sustained allocation churn cannot keep one grow (and
+        // one bulkhead permit) looping forever; the caller can retry the
+        // request. This is a liveness guard, not a capacity answer.
+        let mut attempts = 0usize;
+        // The pending-intent check observes the LV with `lvs` and may
+        // finalize a rolled-forward grow. It runs once per drive: while
+        // this drive holds `grow_drives`, no other actor can insert or
+        // remove this volume's grow intent, so re-entering admission for
+        // the capacity revalidation does not need to repeat the world
+        // observation. This check (and the failed-`lvextend` settlement)
+        // still runs its `lvs` under the state lock — a recorded residual,
+        // not a property this change fixes.
+        let mut resume_checked = false;
+        let mut intent_is_durable = false;
+        loop {
+            attempts += 1;
+            if attempts > GROW_ADMISSION_ATTEMPTS {
+                return Err(ApiError::new(
+                    ApiErrorCode::Overloaded,
+                    format!(
+                        "capacity admission for volume {volume_id} could not obtain a stable \
+                         free-space sample after {GROW_ADMISSION_ATTEMPTS} attempts; retry the \
+                         grow"
+                    ),
+                ));
+            }
+            // Read the admission record under the state lock, then release
+            // it for the capacity sample.
+            let first = {
+                let state = self.lock_state_stable()?;
+                self.grow_admission(&state, volume_id, req)?
+            };
+            let epoch = self.capacity_epoch();
+            let capacity = self.vg_capacity(&first.vg_name)?;
+            if self.capacity_epoch() != epoch {
+                // A create or a completed grow allocated during the
+                // sample; the free figure may already be stale.
+                continue;
+            }
+
+            // Re-enter admission and re-validate against whatever happened
+            // while the state lock was released for the CLI.
+            let mut state = self.lock_state_stable()?;
+            let current = self.grow_admission(&state, volume_id, req)?;
+            if current.vg_name != first.vg_name {
+                // The record moved to another pool; the sample describes
+                // the wrong VG.
+                drop(state);
+                continue;
+            }
+            if !resume_checked {
+                resume_checked = true;
+                match self.resume_pending_grow(
+                    &mut state,
+                    volume_id,
+                    req,
+                    &current.vg_name,
+                    &current.lv_name,
+                    current.current_size,
+                    current.current_generation,
+                )? {
+                    GrowResume::NoIntent => {}
+                    GrowResume::Continue => {
+                        // The in-memory intent may be *possibly* durable: a
+                        // failed intent save whose re-read was unreadable
+                        // reinserted it. Never promote that to an anchor by
+                        // inference — running `lvextend` without a confirmed
+                        // durable intent reopens the crash window the
+                        // durable-first save exists to close. Re-save unless
+                        // the durable file verifiably holds this exact intent;
+                        // an unreadable re-read also takes the safe re-save
+                        // path (and fails closed if that save fails).
+                        intent_is_durable = state.grow_intent(volume_id).is_some_and(|memory| {
+                            LvmState::load(&self.state_path)
+                                .is_ok_and(|durable| durable.grow_intent(volume_id) == Some(memory))
+                        });
+                    }
+                    GrowResume::Finalized(observed) => {
+                        return Ok(GrowAdmissionOutcome::Finalized {
+                            has_attachment: current.has_attachment,
+                            effective_size_bytes: observed,
+                        });
+                    }
+                }
+            }
+            match self.prepare_grow(
+                &mut state,
+                volume_id,
+                req,
+                &current.vg_name,
+                capacity,
+                current.current_size,
+                current.current_generation,
+                intent_is_durable,
+                epoch,
+            )? {
+                GrowPrepare::SampleStale => {
+                    // The reservation was released by `prepare_grow`; a
+                    // create or completed grow got between the sample and
+                    // the reservation. Re-sample.
+                    drop(state);
+                }
+                GrowPrepare::Prepared {
+                    grow_intent,
+                    reservation,
+                } => {
+                    return Ok(GrowAdmissionOutcome::Prepared(PreparedGrow {
+                        grow_intent,
+                        reservation,
+                        vg_name: current.vg_name,
+                        lv_name: current.lv_name,
+                        current_size: current.current_size,
+                        current_generation: current.current_generation,
+                        has_attachment: current.has_attachment,
+                    }));
+                }
+            }
+        }
+    }
+
     /// Grow with a durable-first grow intent.
     ///
     /// Rejected while a delete is pending. A matching pending intent is
@@ -3808,102 +4160,53 @@ impl LvmProvider {
         if !self.capabilities().contains(Capability::Resize) {
             return Err(unsupported("the resize capability is not advertised"));
         }
-        // One live grow drive per volume. The drive releases the provider
-        // state lock across the long LVM commands; structural mutations
-        // are refused by the durable intent, and a second grow is refused
-        // here even before it can observe that intent.
-        let _drive = self.begin_grow_drive(volume_id)?;
-        let mut state = self.lock_state_stable()?;
-        // A durable pending delete owns this volume's fate: growing it
-        // would race a delete authorization (and possibly resurrect a
-        // half-discarded LV).
-        self.ensure_no_pending_delete(&state, volume_id)?;
-        // A move completion bumps the generation; a grow must not straddle
-        // that change or its durable intent would look stale to recovery.
-        Self::ensure_no_unsettled_move(&state, volume_id)?;
-        let (vg_name, lv_name, current_size, current_generation, has_attachment) = {
-            let stored = state
-                .volume(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            if req.expected_generation != stored.entry.generation {
-                return Err(ApiError::stale_generation(
-                    req.expected_generation,
-                    stored.entry.generation,
-                ));
-            }
-            match stored.runtime.state {
-                VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded => {}
-                other => {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidState,
-                        format!("grow requires Ready/Attached/Degraded, volume is {other:?}"),
-                    ));
-                }
-            }
-            // Grow-only plus alignment, fail-closed (Volume API v2 4A).
-            req.validate(stored.entry.size_bytes)?;
-            (
-                stored.entry.vg_name.clone(),
-                stored.entry.lv_name.clone(),
-                stored.entry.size_bytes,
-                stored.entry.generation,
-                stored.runtime.attachment.is_some(),
-            )
+        // The drive guard (one live grow per volume) is held by the async
+        // wrapper; structural mutations are refused by the durable intent.
+        let prepared = match self.prepare_grow_admission(volume_id, req)? {
+            GrowAdmissionOutcome::Finalized {
+                has_attachment,
+                effective_size_bytes,
+            } => return Ok(grow_response(has_attachment, effective_size_bytes)),
+            GrowAdmissionOutcome::Prepared(prepared) => prepared,
         };
+        let PreparedGrow {
+            grow_intent,
+            reservation,
+            vg_name,
+            lv_name,
+            current_size,
+            current_generation,
+            has_attachment,
+        } = prepared;
+        // The resize and its verification are the only long-running steps.
+        // The provider state guard was scoped to the revalidation loop and
+        // is already released, so other volumes' writes are not queued
+        // behind this volume's LVM CLI call. The durable intent (written
+        // above) is the recovery anchor for the gap, and the capacity
+        // reservation keeps concurrent admissions honest.
         let respond =
             |effective_size_bytes: u64| grow_response(has_attachment, effective_size_bytes);
-
-        // A durable grow intent means an earlier attempt may already
-        // have extended the LV. Roll it forward against the observed
-        // world; never extend again when the request differs.
-        let mut intent_is_durable = false;
-        match self.resume_pending_grow(
-            &mut state,
-            volume_id,
-            req,
-            &vg_name,
-            &lv_name,
-            current_size,
-            current_generation,
-        )? {
-            GrowResume::NoIntent => {}
-            GrowResume::Continue => {
-                // The in-memory intent may be *possibly* durable: a
-                // failed intent save whose re-read was unreadable
-                // reinserted it. Never promote that to an anchor by
-                // inference — running `lvextend` without a confirmed
-                // durable intent reopens the crash window the
-                // durable-first save exists to close. Re-save unless
-                // the durable file verifiably holds this exact intent;
-                // an unreadable re-read also takes the safe re-save
-                // path (and fails closed if that save fails).
-                intent_is_durable = state.grow_intent(volume_id).is_some_and(|memory| {
-                    LvmState::load(&self.state_path)
-                        .is_ok_and(|durable| durable.grow_intent(volume_id) == Some(memory))
-                });
-            }
-            GrowResume::Finalized(observed) => return Ok(respond(observed)),
-        }
-
-        let (grow_intent, reservation) = self.prepare_grow(
-            &mut state,
-            volume_id,
-            req,
-            &vg_name,
-            current_size,
-            current_generation,
-            intent_is_durable,
-        )?;
-        // The resize and its verification are the only long-running steps.
-        // Release the provider state lock so other volumes' writes are not
-        // queued behind this volume's LVM CLI call. The durable intent
-        // (written above) is the recovery anchor for the gap, and the
-        // capacity reservation keeps concurrent admissions honest.
-        drop(state);
         let lvextend = self.run_lvextend(&vg_name, &lv_name, req.new_size_bytes);
         // The command returned: `vgs` now reports the real free space, so
-        // the in-flight promise can be released on every outcome.
+        // the in-flight promise can be released on every outcome. Bump the
+        // allocation epoch *before* dropping the reservation: a grow that
+        // sampled before this allocation must either see the bump and
+        // re-sample, or have observed this reservation in its accounting.
+        // Dropping first would let a stale sample reserve the freed bytes
+        // twice.
+        // Publish the completed allocation under the state lock. A create
+        // takes that lock for its `vgs` sample and its `reserved_capacity`
+        // read; a grow's completion otherwise needs no lock. Without this
+        // ordering, a create could sample free space before this
+        // allocation, then read the reservations after they were dropped,
+        // and admit against space that no longer exists. Holding the lock
+        // makes the sample and the reservation accounting atomic with
+        // respect to completed allocations. It is held for an atomic bump
+        // and a leaf-lock removal only, never across an LVM command.
+        let publish = self.lock_state_stable();
+        self.note_capacity_change();
         drop(reservation);
+        drop(publish);
         match lvextend {
             LvextendOutcome::Extended => {}
             LvextendOutcome::Unknown(error) => {
@@ -6544,7 +6847,48 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
     ) -> Result<GrowVolumeResponse, ApiError> {
-        self.grow_volume_inner(volume_id, req)
+        // One live grow drive per volume. The drive guard is taken
+        // before the bulkhead so a duplicate request is refused
+        // immediately instead of queueing for a slot behind unrelated
+        // volumes. It also releases the drive if the request is cancelled
+        // while waiting for a slot.
+        let _drive = self.begin_grow_drive(volume_id)?;
+        // Bound how many grow bodies run at once. The rationale is that
+        // LVM commands serialize on the host's LVM lock, so an unbounded
+        // grow wave may only queue inside the CLI with one async worker
+        // parked per request. At most [`GROW_CONCURRENCY_LIMIT`] drives
+        // run; the rest wait here without occupying a worker. This is a
+        // design choice, not a measured attribution of the c128 tail.
+        let Ok(_drive_slot) = self.grow_limiter.acquire().await else {
+            // The semaphore is never closed by this provider; failing
+            // closed is still the only honest answer if it ever is.
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "grow admission is closed; refusing the drive",
+            ));
+        };
+        // The grow body is synchronous end to end: `vgs`, `lvextend` and
+        // the size-verifying `lvs` are blocking LVM CLI calls. Running
+        // them inline pins an async worker for their full duration, so at
+        // high in-flight enough concurrent grows can pin every worker and
+        // starve reads, attaches, reports and detaches behind them. The
+        // grows-on/off diagnostic (non-evidence) implicated the grow path
+        // in the residual c128 tail but did not attribute the mechanism;
+        // worker pinning is a hypothesis, not a measured cause.
+        // `block_in_place` hands this worker's core to the scheduler for
+        // the duration, so admission keeps running.
+        //
+        // This is a worker handoff, not a move to the blocking pool: the
+        // calling thread still runs the blocking body (blocking mode) and
+        // the runtime may transiently grow its worker set to cover the
+        // handed-off core. That cost is not measured here.
+        //
+        // `block_in_place` panics on a current-thread runtime (test
+        // runtimes, embedded callers) or inside a `LocalSet`, where there
+        // is no other worker to hand off to; `run_blocking_body` falls
+        // back to the inline call there. The daemon uses the multi-thread
+        // runtime, which is the case this protects.
+        run_blocking_body(|| self.grow_volume_inner(volume_id, req))
     }
 
     async fn move_volume_backing(
@@ -6572,6 +6916,65 @@ impl VolumeProvider for LvmProvider {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether the current Tokio runtime reports the multi-thread flavor.
+///
+/// This is only a fast-path predicate. It is **not sufficient** to prove
+/// [`tokio::task::block_in_place`] is legal: a `LocalSet` on a
+/// multi-thread runtime disallows blocking in place even though the
+/// flavor says `MultiThread`, and `block_in_place` then panics. The
+/// actual handoff goes through [`run_blocking_body`], which falls back to
+/// the inline call if the handoff is refused.
+fn on_multi_thread_runtime() -> bool {
+    matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
+/// Run a synchronous blocking body with the current async worker's core
+/// handed off to the scheduler, when the runtime permits it.
+///
+/// `block_in_place` panics (before running the closure) on a
+/// current-thread runtime and inside a `LocalSet`, where there is no
+/// legal handoff. The panic is caught here and the body runs inline
+/// instead. The `ran` flag distinguishes a refused handoff (body never
+/// started, safe to run it now) from a panic *inside* the body (re-raised
+/// unchanged, never run twice).
+fn run_blocking_body<F, R>(body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if !on_multi_thread_runtime() {
+        return body();
+    }
+    let mut body = Some(body);
+    let mut ran = false;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| {
+            let Some(body) = body.take() else {
+                unreachable!("the blocking body runs exactly once");
+            };
+            ran = true;
+            body()
+        })
+    }));
+    match result {
+        Ok(value) => value,
+        Err(payload) => {
+            if ran {
+                // The body itself panicked; preserve the original panic.
+                resume_unwind(payload);
+            }
+            // `block_in_place` refused to hand off (LocalSet or another
+            // disallowed context): the caller's body never ran.
+            let Some(body) = body.take() else {
+                unreachable!("a refused handoff leaves the body unexecuted");
+            };
+            body()
+        }
+    }
+}
 
 /// The shared `--reportformat json --units b --nosuffix` LVM arguments.
 fn lvm_json_args() -> &'static [&'static str] {
@@ -6955,7 +7358,7 @@ mod read_snapshot_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    fn seeded_provider(dir: &tempfile::TempDir) -> (Arc<LvmProvider>, VolumeId) {
+    pub(super) fn seeded_provider(dir: &tempfile::TempDir) -> (Arc<LvmProvider>, VolumeId) {
         seeded_provider_with_state_path(dir, dir.path().join("state.json"))
     }
 
@@ -7005,6 +7408,8 @@ mod read_snapshot_tests {
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
+            capacity_epoch: AtomicU64::new(0),
+            grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
             state: Mutex::new(state.clone()),
             read_snapshot,
         };
@@ -8014,6 +8419,247 @@ mod read_snapshot_tests {
             writes,
             "a no-op report must not perform a physical save"
         );
+    }
+}
+
+#[cfg(test)]
+mod capacity_epoch_tests {
+    use super::*;
+
+    fn grow_request(new_size_bytes: u64) -> GrowVolumeRequest {
+        GrowVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-epoch-grow").expect("valid id"),
+            new_size_bytes,
+            expected_generation: 1,
+        }
+    }
+
+    fn capacity() -> VgCapacity {
+        VgCapacity {
+            free_bytes: 1 << 30,
+            extent_bytes: 4096,
+        }
+    }
+
+    /// The reservation is recorded before the epoch is re-read, so an
+    /// allocation that completed after the `vgs` sample is still caught.
+    ///
+    /// This isolates the post-reservation check: the sample and the
+    /// reservation insertion happen at the same epoch value, and only the
+    /// counter bump (a completed `lvcreate`/`lvextend`) separates them. If
+    /// the check were removed, this attempt would reserve and persist a
+    /// grow intent against free space that no longer exists.
+    #[tokio::test]
+    async fn a_completed_allocation_invalidates_a_sampled_reservation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = super::read_snapshot_tests::seeded_provider(&dir);
+        let mut state = provider.lock_state().expect("writer guard");
+        let request = grow_request(2048);
+        let sampled_epoch = provider.capacity_epoch();
+
+        // A concurrent `lvcreate` or `lvextend` completed between the
+        // sample and this admission.
+        provider.note_capacity_change();
+
+        let outcome = provider
+            .prepare_grow(
+                &mut state,
+                &volume_id,
+                &request,
+                "vg-1",
+                capacity(),
+                1024,
+                1,
+                false,
+                sampled_epoch,
+            )
+            .expect("prepare the stale grow");
+        assert!(
+            matches!(outcome, GrowPrepare::SampleStale),
+            "a reservation derived from a stale sample must be released"
+        );
+        assert_eq!(
+            provider.reserved_capacity("vg-1"),
+            0,
+            "the stale reservation must not leak"
+        );
+        assert!(
+            state.grow_intent(&volume_id).is_none(),
+            "no durable intent may be written from a stale sample"
+        );
+
+        // The same admission at the current epoch reserves exactly the
+        // extent-rounded demand and becomes durable.
+        let current_epoch = provider.capacity_epoch();
+        let fresh = provider
+            .prepare_grow(
+                &mut state,
+                &volume_id,
+                &request,
+                "vg-1",
+                capacity(),
+                1024,
+                1,
+                false,
+                current_epoch,
+            )
+            .expect("prepare the fresh grow");
+        assert!(
+            matches!(fresh, GrowPrepare::Prepared { .. }),
+            "the current epoch must be accepted"
+        );
+        let GrowPrepare::Prepared {
+            grow_intent: intent,
+            reservation,
+        } = fresh
+        else {
+            return;
+        };
+        assert_eq!(intent.requested_size_bytes, 2048);
+        assert!(state.grow_intent(&volume_id).is_some());
+        assert_eq!(provider.reserved_capacity("vg-1"), 4096);
+        drop(reservation);
+        assert_eq!(
+            provider.reserved_capacity("vg-1"),
+            0,
+            "dropping the reservation returns the promise"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+
+    /// A `vgs` that completes an allocation on every call makes every
+    /// sample stale. The admission must stop after the cap with a typed
+    /// retryable refusal instead of looping forever while holding a
+    /// bulkhead permit.
+    #[test]
+    fn sustained_epoch_churn_refuses_after_the_attempt_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let volume_id = VolumeId::new("vol-retry").expect("valid id");
+        let mut state = LvmState::default();
+        state.insert_volume(
+            volume_id.clone(),
+            StoredVolume {
+                entry: VolumeEntry {
+                    vg_name: "vg-1".to_owned(),
+                    lv_name: "vol-vol-retry-abcd1234".to_owned(),
+                    size_bytes: 1024,
+                    requested_size_bytes: 1024,
+                    generation: 1,
+                    data_epoch: 0,
+                    project_id: ProjectId::new("tenant-a").expect("valid id"),
+                    block_size: 4096,
+                    creation_payload: "{}".to_owned(),
+                },
+                runtime: VolumeRuntime {
+                    state: VolumeLifecycle::Ready,
+                    attachment: None,
+                    retired_attachments: RetiredAttachmentFilter::default(),
+                },
+            },
+        );
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
+        let provider: Arc<LvmProvider> = Arc::new_cyclic(|weak: &Weak<LvmProvider>| {
+            let weak = weak.clone();
+            let runner = Arc::new(volvisor_provider::FakeRunner::with_closure(
+                move |program, _args| {
+                    if program == "vgs" {
+                        if let Some(provider) = weak.upgrade() {
+                            provider.note_capacity_change();
+                        }
+                        return Some(CommandOutput::success(
+                            r#"{"report":[{"vg":[{"vg_name":"vg-1","vg_free":"1099511627776","vg_size":"1099511627776","vg_extent_size":"4194304"}]}]}"#,
+                        ));
+                    }
+                    None
+                },
+            ));
+            LvmProvider {
+                runner,
+                writer,
+                state_path: state_path.clone(),
+                sysfs_root: dir.path().to_path_buf(),
+                vg_prefix: "vg-volvisor".to_owned(),
+                expected_auth_token: "test-token".to_owned(),
+                store_crash,
+                move_timing: MoveTiming::default(),
+                move_observe_failures: Mutex::new(BTreeMap::new()),
+                grow_drives: Mutex::new(BTreeSet::new()),
+                capacity_reservations: Mutex::new(BTreeMap::new()),
+                capacity_epoch: AtomicU64::new(0),
+                grow_limiter: tokio::sync::Semaphore::new(GROW_CONCURRENCY_LIMIT),
+                state: Mutex::new(state.clone()),
+                read_snapshot,
+            }
+        });
+
+        let request = GrowVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-retry").expect("valid id"),
+            new_size_bytes: 2048,
+            expected_generation: 1,
+        };
+        let outcome = provider.prepare_grow_admission(&volume_id, &request);
+        assert!(
+            outcome.is_err(),
+            "continuous churn must exhaust the attempt cap"
+        );
+        let Err(err) = outcome else {
+            return;
+        };
+        assert_eq!(err.code, ApiErrorCode::Overloaded, "{err}");
+        assert!(err.detail.contains("attempts"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod blocking_body_tests {
+    use super::*;
+
+    /// A `LocalSet` on a multi-thread runtime refuses `block_in_place`
+    /// even though the runtime flavor is multi-thread. The fallback must
+    /// run the body inline exactly once, not panic and not run it twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_set_refuses_the_handoff_and_runs_the_body_once() {
+        let local = tokio::task::LocalSet::new();
+        let runs = AtomicUsize::new(0);
+        let value = local
+            .run_until(async {
+                run_blocking_body(|| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    42
+                })
+            })
+            .await;
+        assert_eq!(value, 42);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A panic inside the blocking body is the body's own; it must be
+    /// re-raised unchanged and must not cause a second execution.
+    #[allow(clippy::panic)] // the body's panic is the property under test
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_panic_is_propagated_and_runs_once() {
+        let runs = AtomicUsize::new(0);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_blocking_body(|| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any("blocking body panic");
+            })
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }
 
