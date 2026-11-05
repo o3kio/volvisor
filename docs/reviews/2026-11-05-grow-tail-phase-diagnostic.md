@@ -149,6 +149,16 @@ Option C was implemented locally at
 per-epoch cache): concurrent grows share one in-flight `vgs` round, each
 sample or wait consumes one admission attempt, a failed round is shared, and
 an unwind publishes a typed failure. It passed tests, lint and adversarial
-review. **It has not been benchmarked**, so this diagnostic's `4290b84`
-timings remain non-evidence for the new SHA; a fresh clean bundle is
-required before any claim about the convoy or the c128 tail after the fix.
+review.
+
+It was then measured in a fresh clean bundle at
+`75beea399e593c561104d4d0bb473c88d4d8b93e` (code-identical to `a07203e`):
+[2026-11-05-devhost-grow-sample-coalescing](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+**The measured effect is a c128 regression**: aggregate throughput
+**655.326 → 508.225 ops/s (−22.45%)**, grow median **8,338.505 →
+11,335.103 ms**, soak **4,756.348 → 4,543.361 ops/s (−4.48%)**; the grow
+upper tail narrowed (p95 **19,633.371 → 12,396.977 ms**). This diagnostic's
+`4290b84` attempt and admission timings remain non-evidence for the new SHA,
+and the new bundle has no attempt counter, so the convoy mechanism is still
+not directly observed after the change. `#62` remains open and no gate
+verdict changes.

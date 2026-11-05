@@ -1,0 +1,90 @@
+{
+  "argv": [
+    "/root/git/volvisor-phase-a/scripts/bench/bench.py",
+    "restart",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "56955",
+    "--token-file",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/configs/token",
+    "--out-dir",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105",
+    "--journal",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/lab/journal/journal.log",
+    "--state",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/lab/lvm-state.json",
+    "--repo",
+    "/root/git/volvisor-phase-a",
+    "--binary",
+    "/root/git/volvisor-phase-a/target/release/volvisord",
+    "--config",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/configs/volvisord.toml",
+    "--daemon-log",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/raw/daemon.daemon.log",
+    "--pidfile",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/records/daemon.pid",
+    "--daemon-pid",
+    "1634039",
+    "--restart-iterations",
+    "2",
+    "--label",
+    "post-soak"
+  ],
+  "generated_utc": "2026-11-05T14:58:51Z",
+  "healthy_seconds": {
+    "count": 2,
+    "max_ms": 627.0,
+    "mean_ms": 618.0,
+    "min_ms": 609.0,
+    "p50_ms": 609.0,
+    "p95_ms": 627.0,
+    "p99_ms": 627.0
+  },
+  "host": "dev",
+  "iterations": 2,
+  "kernel": "6.8.0-142-generic",
+  "python": "3.12.3",
+  "records": [
+    {
+      "after": {
+        "journal_bytes": 54296692,
+        "list_status": 200,
+        "listed_volumes": 0,
+        "state_bytes": 198
+      },
+      "before": {
+        "journal_bytes": 54296692,
+        "pid": 1634039,
+        "state_bytes": 198
+      },
+      "healthy_seconds": 0.609,
+      "iteration": 1,
+      "new_pid": 1642625,
+      "started_utc": "2026-11-05T14:58:50Z",
+      "stop_seconds": 0.342
+    },
+    {
+      "after": {
+        "journal_bytes": 54296692,
+        "list_status": 200,
+        "listed_volumes": 0,
+        "state_bytes": 198
+      },
+      "before": {
+        "journal_bytes": 54296692,
+        "pid": 1642625,
+        "state_bytes": 198
+      },
+      "healthy_seconds": 0.627,
+      "iteration": 2,
+      "new_pid": 1642656,
+      "started_utc": "2026-11-05T14:58:51Z",
+      "stop_seconds": 0.164
+    }
+  ],
+  "scenario": "restart-post-soak",
+  "source_sha": "75beea399e593c561104d4d0bb473c88d4d8b93e",
+  "status": "OK",
+  "worktree_dirty": false
+}

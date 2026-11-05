@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; capacity-domain grow admission measured at `4290b84`; per-VG sample coalescing implemented at `a07203e` but unmeasured; c128 grow tail open)
+### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; capacity-domain grow admission measured at `4290b84`; per-VG sample coalescing measured at `75beea3` and not adopted on throughput/envelope grounds; c128 grow tail open)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -778,12 +778,14 @@ a production claim):
   loop is 5.0–6.3 s mean, dominated by `vgs` samples invalidated by the
   global capacity epoch and retried (783–1,082 stale attempts across
   409–411 grows); `lvextend`/`lvs` are ~1.8–2.4 s each; the provider intent
-  save is ~1.7–1.9 ms. Option C was subsequently implemented at
-  `a07203e` (per-round single-flight `vgs`; no per-epoch cache). It passed
-  tests, lint and adversarial review but has **not been benchmarked**; the
-  `4290b84` numbers describe that commit only and are not evidence for the
-  new SHA. A fresh clean bundle is required before any envelope or
-  throughput claim. **#62 remains open.**
+  save is ~1.7–1.9 ms. Option C was implemented at `a07203e` (per-round
+  single-flight `vgs`; no per-epoch cache) and measured at `75beea3` in the
+  [grow-sample-coalescing bundle](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+  **The measurement is a c128 regression**: 655.326 → 508.225 ops/s
+  (−22.45%), grow p50 8,338.505 → 11,335.103 ms, soak 4,756.348 → 4,543.361
+  ops/s (−4.48%), while the grow p95/max narrowed. The change is not adopted
+  on throughput or envelope grounds and the keep/rework/revert decision is
+  open; `4290b84` remains the prior measured envelope. **#62 remains open.**
 - **Shared-cap grow starvation posture (open).** A grow flood can occupy
   the shared admission cap and shed reads/attaches; rate limiting is
   disabled by default, and the cap has no LVM cross-check. Documented, not

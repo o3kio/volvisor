@@ -154,11 +154,18 @@ read-only [decision memo](reviews/2026-11-05-grow-tail-decision.md) accepted
 the measured envelope and added no per-VG bound; a subsequent
 [non-evidence phase diagnostic](reviews/2026-11-05-grow-tail-phase-diagnostic.md)
 attributed the largest removable share to the `vgs` sample-retry convoy.
-Option C — per-round single-flight `vgs`, with concurrent grows sharing one
-in-flight sample — is implemented locally at
-`a07203e4965aef9e5776d96d496a09b3304437a1` but is **not yet measured**.
-The numbers above describe `4290b84` only; they are not an envelope for the
-new SHA and must not be reused as evidence for it.
+Option C — per-round single-flight `vgs` — was implemented at `a07203e` and
+measured at `75beea3` in the
+[grow-sample-coalescing bundle](benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+**That measurement is a c128 regression**: aggregate throughput
+**655.326 → 508.225 ops/s (−22.45%)**, grow p50 **8,338.505 → 11,335.103 ms**,
+and the 25-minute soak **4,756.348 → 4,543.361 ops/s (−4.48%)**. The grow
+upper tail narrowed (p95 **19,633.371 → 12,396.977 ms**; max **34,044.828 →
+15,251.096 ms**), but the grow completion rate fell **11.118 → 10.615/s**,
+at or below the accepted **~11–12/s** band. `4290b84` therefore remains the
+prior measured envelope: the change is not adopted on throughput or envelope
+grounds, and the keep/rework/revert decision is open. The numbers above
+describe `4290b84` only.
 Treat the envelope as an observed operating point, not a validated ceiling
 or an SLO.
 

@@ -238,10 +238,11 @@ of scope for this slice.
    5.0–6.3 s mean, and `lvextend`/`lvs` at ~1.8–2.4 s each at c128.
 3. The phase-timing diagnostic has now been run
    ([non-evidence note](2026-11-05-grow-tail-phase-diagnostic.md)). It
-   attributes the largest share to the `vgs` sample-retry convoy. At the
-   time of this memo no production code had changed; option C was
-   subsequently implemented as recorded in §9. Tests, adversarial review
-   and a fresh clean benchmark remain conditions on any evidence claim.
+   attributes the largest share to the `vgs` sample-retry convoy. Option C
+   was subsequently implemented and measured as recorded in §9. The fresh
+   clean benchmark is a c128 regression; it does not support the change on
+   throughput or envelope grounds, and the keep/rework/revert decision is
+   open.
 4. Keep **#62 open**. Create and delete still hold the provider state lock
    across their CLI work; the grow body is not fully independent of provider
    bookkeeping. No gate verdict changes.
@@ -250,10 +251,11 @@ of scope for this slice.
 
 ## 7. What would change this decision
 
-- The phase diagnostic has met the first trigger: it attributes the largest
-  share to removable provider bookkeeping. Implement option C (or measure
-  option B) only after tests show the durability invariants still hold, and
-  re-measure with a fresh clean bundle.
+- The phase-diagnostic trigger was met, and option C was implemented and
+  re-measured. The fresh bundle shows a c128 throughput regression (grow
+  median up, upper tail down), so the next step is a keep/rework/revert
+  decision, not another unmeasured implementation. A rework should be
+  justified by a mechanism this bundle can measure.
 - A sustained grow-heavy run at the default cap produces 503s or material
   non-grow tail degradation: then revisit option B with a pre-journal refusal
   and a contract note.
@@ -295,9 +297,22 @@ failure and clears the slot.
 
 The change passed the workspace tests, `cargo fmt` and workspace clippy, and
 two independent adversarial reviews (one final delta review); no Critical or
-High findings remained. **No benchmark of this SHA has been run.** The
-`4290b84` numbers in this memo describe that measured commit only and must
-not be reused as evidence for `a07203e`. A fresh clean bundle is required
-before any throughput, latency, envelope or production-support claim; until
-then this implementation is unmeasured and #62 stays open with no gate
-verdict change.
+High findings remained.
+
+It was then measured in a fresh clean single-host dev-lab run at `75beea3`
+(code-identical to `a07203e`) against `4290b84`; the bundle is
+[2026-11-05-devhost-grow-sample-coalescing](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+**The measured result is a c128 regression, not an improvement.** Aggregate
+c128 throughput fell **655.326 → 508.225 ops/s (−22.45%)**; the grow median
+rose **8,338.505 → 11,335.103 ms**; the 25-minute soak fell **4,756.348 →
+4,543.361 ops/s (−4.48%)**. The per-grow upper tail narrowed (p95
+**19,633.371 → 12,396.977 ms**; max **34,044.828 → 15,251.096 ms**), but the
+grow completion rate fell **11.118 → 10.615/s** and the aggregate write p95
+rose because the grow distribution flattened at a higher median, not because
+the tail worsened (the bundle explains why that p95 is not like-for-like).
+
+This measurement does **not** support keeping the change on throughput or
+envelope grounds. Whether to revert or rework it is an open decision; until
+that decision, `4290b84` remains the prior measured envelope. The bundle has
+no per-grow `vgs` attempt counter, so the mechanism is not attributed.
+`#62` stays open and no gate verdict changes.

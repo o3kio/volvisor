@@ -208,8 +208,9 @@ is a production-support, SLA, capacity, durability or hardware claim.
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
 - **D3 — #62 write path (slice 1 and slice 2 delivered; capacity-domain grow
-  admission measured at `4290b84`; per-VG sample coalescing implemented at
-  `a07203e` but unmeasured; c128 grow tail open).** Slice 1 code is
+  admission measured at `4290b84`; per-VG sample coalescing measured at
+  `75beea3` and not adopted on throughput/envelope grounds; c128 grow tail
+  open).** Slice 1 code is
   in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
   hardened sweep and per-state-path in-process writer gate (`a8c23d6`);
@@ -297,9 +298,14 @@ is a production-support, SLA, capacity, durability or hardware claim.
   dominated by `vgs` samples invalidated by the global capacity epoch and
   retried (783–1,082 stale attempts across 409–411 grows); `lvextend`/`lvs`
   are ~1.8–2.4 s each and the provider intent save is ~1.7–1.9 ms. Option C
-  (per-round single-flight `vgs`) is implemented locally at `a07203e` but
-  is **not yet measured**; the numbers above describe `4290b84` only and are
-  not evidence for the new SHA. Two clean same-SHA
+  (per-round single-flight `vgs`) was implemented at `a07203e` and measured
+  at `75beea3` in the
+  [grow-sample-coalescing bundle](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+  **The measurement is a c128 regression**: 655.326 → 508.225 ops/s
+  (−22.45%), grow p50 8,338.505 → 11,335.103 ms, soak −4.48%, while grow
+  p95/max narrowed. It is not adopted on throughput or envelope grounds;
+  `4290b84` remains the prior measured envelope and the keep/rework/revert
+  decision is open. Two clean same-SHA
   repeats (non-evidence) measured c128 599.405 and 614.158 ops/s and
   aggregate write p95 7,478.820 and 7,586.304 ms, so the published sample is
   at the high end of the observed range.
@@ -390,6 +396,7 @@ READY**.
 | [Control-plane benchmark, D3 slice 2, 2026-11-04](../benchmarks/2026-11-04-devhost-slice2/REPORT.md) | `c4b0b13`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the provider state lock; read/write latency split recorded; no throughput-gain claim | Data path, real backends, 24 h soak, production capacity/SLA, throughput improvement |
 | [Control-plane benchmark, D3 slice-2 grow-lock fix, 2026-11-05](../benchmarks/2026-11-05-devhost-slice2-fix/REPORT.md) | `8029df8`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak at the grow-lock fix; c32 write p95 590.847 → 206.203 ms and c128 6330.548 → 3413.886 ms; c32/c128 throughput +113.2 / +85.7 % versus the regression run | Data path, real backends, 24 h soak, production capacity/SLA, a completed c128 write-tail fix, a blanket throughput gain |
 | [Capacity-domain grow admission, 2026-11-05](../benchmarks/2026-11-05-devhost-capacity-domain-fix/REPORT.md) | `4290b84`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak; throughput +5.6 / +23.4 / +42.6 / +48.8 % (c128 completion-inclusive and at the high end of a same-SHA repeat range); c32 write p95 206.203 → 82.927 ms; c128 read p95 87.276 → 6.584 ms; c128 aggregate write p95 is a grow value and is not comparable head-to-head | Data path, real backends, 24 h soak, production capacity/SLA, a fixed c128 grow tail, a blanket throughput gain |
+| [Per-VG grow capacity-sample coalescing, 2026-11-05](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md) | `75beea3` (code-identical to `a07203e`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after per-VG single-flight `vgs`; c128 throughput 655.326 → 508.225 ops/s (−22.45 %), grow p50 8,338.505 → 11,335.103 ms while p95 19,633.371 → 12,396.977 ms, soak −4.48 %; measured regression | Data path, real backends, 24 h soak, production capacity/SLA, a throughput or envelope improvement, an adopted change |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of
