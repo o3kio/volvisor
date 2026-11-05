@@ -188,13 +188,32 @@ deltas is attributed to E1/E2**. E3 therefore does not support a Phase E
 throughput or latency gain. The recorded residuals remain: delete's `lvs`
 check and create's `pick_pool_vg` `vgs` sample stay inside their admission
 critical sections, and the failed-create compensation's `lvremove` stays in
-the reacquired critical section. Create and delete also still run their
-synchronous LVM bodies inline on async workers (only grow uses the blocking
-handoff; move's request path runs its CLI calls inline), so sustained
-structural concurrency at or above the worker count can pin the runtime —
-pre-existing, not introduced by E1/E2. The gate tests exercise same-kind
-duplicate refusal; the cross-kind create-vs-delete refusal is implemented by
-the shared map but not directly gate-tested.
+the reacquired critical section. At E3 (`2c5b065`) create and delete also
+still ran their synchronous LVM bodies inline on async workers (only grow
+used the blocking handoff; move's request path runs its CLI calls inline).
+That statement is correct for the E3 measured SHA.
+
+**E4 — create/delete worker handoff (2026-11-05).** At
+`7204a53198457bf69aa9797db67708a696270142` the create/delete inline-body
+residual was closed: both wrappers now run through the existing
+`run_blocking_body` handoff, keeping the inline fallback for current-thread
+runtimes and `LocalSet` contexts. Move's request-path CLI calls remain
+inline, and the short in-lock steps and compensation `lvremove` above remain.
+The gate tests were extended to exercise the shared drive map's cross-kind
+refusal (create during delete and delete during create) and to prove the
+create capacity reservation is released on completion (a 4 MiB create fits
+in the 8 MiB left only if the departed create's 1 GiB promise is gone); both
+new assertions were shown to fail under targeted negative controls. The
+measurement at `7204a53` is
+[2026-11-05-devhost-phase-e-worker-handoff](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md):
+micro create/delete p50/p95 flat (+0.29%/−0.16% create, +0.12%/+0.28%
+delete), c1/c8 +0.82%/+1.81%, c32 −1.61%, c128 −24.24%. The timed sweep and
+soak contain no create/delete and the binary differs from `2c5b065` only in
+the two wrappers, so the c128 drop is **not attributed** to this slice; a
+non-evidence alternating A/B found c128 varying 427.5–626.0 ops/s in both
+arms, so the tier is variance-dominated on this host. No throughput gain and
+no zero-regression claim is made.
+
 `#62` stays open; no gate verdict changes.
 
 ## Out of scope
@@ -214,6 +233,8 @@ the shared map but not directly gate-tested.
 2. **E2 (create)** — needs the create capacity reservation and the
    create/delete drive guard.
 3. **E3 (measurement)** — only after E1 and E2 pass tests, lint and review.
+4. **E4 (worker handoff)** — after E3, close the create/delete inline-body
+   residual and re-measure at the exact new SHA.
 
 `#62` stays open until explicitly instructed. All gate verdicts are
 unchanged: gates 1, 2 and 5 **NOT MET**; gates 3 and 4 **PARTIAL**; overall

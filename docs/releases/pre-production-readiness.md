@@ -210,7 +210,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
 - **D3 — #62 write path (slice 1 and slice 2 delivered; capacity-domain grow
   admission measured at `4290b84`; per-VG sample coalescing measured at
   `75beea3` and reverted at `59f64cc`; Phase E create/delete lock scope
-  delivered and measured at `2c5b065`; c128 grow tail
+  delivered and measured at `2c5b065`; create/delete worker handoff measured
+  at `7204a53`; c128 grow tail
   open).** Slice 1 code is
   in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
@@ -337,12 +338,25 @@ is a production-support, SLA, capacity, durability or hardware claim.
   does not support a Phase E throughput or latency gain. Residuals: delete's
   `lvs` check and create's `pick_pool_vg` `vgs` sample remain in their
   admission critical sections, and the failed-create compensation's
-  `lvremove` remains in the reacquired critical section. Create and delete
-  also still run their synchronous LVM bodies inline on async workers
-  (only grow uses the blocking handoff; move's request path runs its CLI
-  calls inline), so sustained concurrency at or above the worker count can
-  pin the runtime — pre-existing, not introduced by E1/E2. The gate tests exercise same-kind duplicate refusal; the cross-kind
-  create-vs-delete refusal is implemented but not directly gate-tested.
+  `lvremove` remains in the reacquired critical section. At `2c5b065` create
+  and delete also still ran their synchronous LVM bodies inline on async
+  workers (only grow used the blocking handoff; move's request path runs its
+  CLI calls inline); that statement is correct for the E3 measured SHA.
+  **Phase E create/delete worker handoff (2026-11-05, `7204a53`).** Both
+  wrappers now use the existing `run_blocking_body` `block_in_place` handoff,
+  keeping the inline fallback for current-thread runtimes and `LocalSet`;
+  move's request-path CLI calls remain inline. Gate tests now exercise both
+  same-kind and cross-kind refusal and prove the create capacity reservation
+  is released on completion (a 4 MiB create in the 8 MiB remaining), each
+  with a targeted negative control. The clean-tree re-measurement is in the
+  [worker-handoff bundle](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md)
+  (comparator `2c5b065`): micro create/delete p50/p95 flat (+0.29%/−0.16%
+  create, +0.12%/+0.28% delete), c1/c8 +0.82%/+1.81%, c32 −1.61%, c128
+  −24.24%. The timed sweep and soak contain no create/delete and the binary
+  differs only in the two wrappers, so the c128 drop is **not attributed**
+  to this slice; a non-evidence alternating A/B measured c128 427.5–626.0
+  ops/s in both arms, so the tier is variance-dominated on this host. No
+  throughput gain and no zero-regression claim is made.
   **#62 remains open** until explicitly instructed, and no gate
   verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
   not re-drilled at this SHA here, so its `.volvisor-` message assertion is
@@ -431,6 +445,8 @@ READY**.
 | [Control-plane benchmark, D3 slice-2 grow-lock fix, 2026-11-05](../benchmarks/2026-11-05-devhost-slice2-fix/REPORT.md) | `8029df8`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak at the grow-lock fix; c32 write p95 590.847 → 206.203 ms and c128 6330.548 → 3413.886 ms; c32/c128 throughput +113.2 / +85.7 % versus the regression run | Data path, real backends, 24 h soak, production capacity/SLA, a completed c128 write-tail fix, a blanket throughput gain |
 | [Capacity-domain grow admission, 2026-11-05](../benchmarks/2026-11-05-devhost-capacity-domain-fix/REPORT.md) | `4290b84`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak; throughput +5.6 / +23.4 / +42.6 / +48.8 % (c128 completion-inclusive and at the high end of a same-SHA repeat range); c32 write p95 206.203 → 82.927 ms; c128 read p95 87.276 → 6.584 ms; c128 aggregate write p95 is a grow value and is not comparable head-to-head | Data path, real backends, 24 h soak, production capacity/SLA, a fixed c128 grow tail, a blanket throughput gain |
 | [Per-VG grow capacity-sample coalescing, 2026-11-05](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md) | `75beea3` (code-identical to `a07203e`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after per-VG single-flight `vgs`; c128 throughput 655.326 → 508.225 ops/s (−22.45 %), grow p50 8,338.505 → 11,335.103 ms while p95 19,633.371 → 12,396.977 ms, soak −4.48 %; measured regression, reverted locally at `59f64cc` | Data path, real backends, 24 h soak, production capacity/SLA, a throughput or envelope improvement, an adopted change |
+| [Phase E create/delete lock scope, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-write-lock-scope/REPORT.md) | `2c5b065` (E1 `8cfa4c2`, E2 `2c5b065`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the state lock across `lvcreate`/`lvremove`; deterministic create/delete gate tests; c8/c32/c128 −2.35/−5.10/−6.77 %, soak −7.12 %; sweep and soak contain no create/delete, so no delta is attributed to E1/E2 | Data path, real backends, 24 h soak, production capacity/SLA, a Phase E gain, a zero-regression result, concurrent create/delete load |
+| [Phase E create/delete worker handoff, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md) | `7204a53`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after routing create/delete bodies through `run_blocking_body`; micro create/delete p50/p95 flat; gate tests for cross-kind refusal and reservation release with negative controls; c128 −24.24 % measured but not attributed (timed load has no create/delete; non-evidence A/B spans 427.5–626.0 ops/s in both arms) | Data path, real backends, 24 h soak, production capacity/SLA, a handoff gain, a zero-regression result, concurrent create/delete load |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of
