@@ -1120,20 +1120,6 @@ fn count_program(runner: &Arc<FakeRunner>, program: &str) -> usize {
         .count()
 }
 
-/// Wait until the runner has recorded at least `expected` invocations of
-/// one LVM program. Used to prove a concurrent call *started* while
-/// another is parked (the invocation is recorded before the gate blocks).
-async fn wait_for_program_count(runner: &Arc<FakeRunner>, program: &str, expected: usize) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while count_program(runner, program) < expected {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a concurrent {program} invocation must start while the first is parked"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 /// Wait until the fake `lvextend` has started (and therefore the grow has
 /// released the provider state lock, when the fix is present).
 async fn wait_for_lvextend(gate: &Arc<GrowGate>) {
@@ -1494,76 +1480,6 @@ async fn grow_samples_capacity_without_holding_the_state_lock() {
     assert_eq!(grown.effective_size_bytes, 2 * GIB);
 }
 
-/// Regression for grow-grow admission concurrency: two grows must be
-/// able to sample `vgs` at the same time. A diagnostic build with a
-/// global capacity mutex (non-evidence, dirty tree) measured the c128
-/// collapse with grows on (about 395 ops/s versus about 2,460 grows-off
-/// on that build); that convoy is the suspected mechanism, not an
-/// attributed cause of the published residual tail.
-///
-/// The first grow's `vgs` is a snapshot taken before it parks. A second
-/// volume's grow must reach its own `vgs` while the first is still
-/// parked (two recorded samples), finish, and bump the epoch; the first
-/// then re-samples (three samples). A state-locked sample cannot start
-/// the second `vgs`, and an admitted stale sample never re-samples, so
-/// both the wait and the final count fail without the respective
-/// property.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_grows_sample_capacity_in_parallel() {
-    let (provider, gate, runner) = gated_capacity_provider_snapshot();
-    let _release = OneShotGateRelease(Arc::clone(&gate));
-
-    let first = provider
-        .create_volume(&fixture_create_request("cap-par-grow-a", GIB))
-        .await
-        .expect("create first grow volume");
-    let second = provider
-        .create_volume(&fixture_create_request("cap-par-grow-b", GIB))
-        .await
-        .expect("create second grow volume");
-    let vgs_before = count_program(&runner, "vgs");
-
-    gate.arm();
-    let first_grow = {
-        let provider = Arc::clone(&provider);
-        let volume_id = first.volume_id.clone();
-        let request = fixture_grow_request("cap-par-grow-a", 2 * GIB, first.generation);
-        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
-    };
-    wait_for_vgs(&gate).await;
-
-    let second_grow = {
-        let provider = Arc::clone(&provider);
-        let volume_id = second.volume_id.clone();
-        let request = fixture_grow_request("cap-par-grow-b", 2 * GIB, second.generation);
-        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
-    };
-    // The evidence: B's own `vgs` starts while A's first `vgs` is held.
-    // A's invocation was already recorded before it parked, so two
-    // recorded samples means B reached the fake CLI too.
-    wait_for_program_count(&runner, "vgs", vgs_before + 2).await;
-
-    let second_result = tokio::time::timeout(IN_FLIGHT_TIMEOUT, second_grow)
-        .await
-        .expect("the second grow must not wait for the first grow's sample")
-        .expect("second grow task join")
-        .expect("second grow succeeds while the first samples capacity");
-    assert_eq!(second_result.effective_size_bytes, 2 * GIB);
-
-    gate.release();
-    let first_result = first_grow
-        .await
-        .expect("first grow task join")
-        .expect("first grow succeeds after re-sampling");
-    assert_eq!(first_result.effective_size_bytes, 2 * GIB);
-    // A's first sample was a pre-B snapshot, so A must re-sample rather
-    // than reserving against stale free space: A, B, and A's re-sample.
-    assert!(
-        count_program(&runner, "vgs") >= vgs_before + 3,
-        "the first grow must re-sample after the second grow's allocation"
-    );
-}
-
 /// Regression for the allocation epoch: a create that completes between a
 /// grow's `vgs` sample and its reservation must force the grow to
 /// re-sample. Without the epoch check the grow would reserve (and extend)
@@ -1617,6 +1533,73 @@ async fn a_create_during_a_grow_sample_forces_a_resample() {
     assert!(
         count_program(&runner, "vgs") >= vgs_before + 2,
         "the grow must re-sample capacity after the create"
+    );
+}
+
+/// End-to-end concurrent grows on one VG: both must reach the resize and
+/// complete. The `lvextend` gate holds both resizes, so neither can bump the
+/// allocation epoch before the other has reserved. Sampling is bounded by at
+/// most one `vgs` per grow (a shared round uses one); this is a success and
+/// no-deadlock regression, while `capacity_coalescing_tests` proves the
+/// single-flight state machine deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_grows_on_one_vg_both_complete() {
+    let (provider, vgs_gate, extend_gate, runner) = gated_capacity_and_extend_provider();
+    let _vgs_release = OneShotGateRelease(Arc::clone(&vgs_gate));
+    let _extend_release = LvextendGateRelease(Arc::clone(&extend_gate));
+
+    let first = provider
+        .create_volume(&fixture_create_request("cap-cohort-grow-a", GIB))
+        .await
+        .expect("create first cohort volume");
+    let second = provider
+        .create_volume(&fixture_create_request("cap-cohort-grow-b", GIB))
+        .await
+        .expect("create second cohort volume");
+    let vgs_before = count_program(&runner, "vgs");
+
+    vgs_gate.arm();
+    let first_grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = first.volume_id.clone();
+        let request = fixture_grow_request("cap-cohort-grow-a", 2 * GIB, first.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_vgs(&vgs_gate).await;
+
+    let second_grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = second.volume_id.clone();
+        let request = fixture_grow_request("cap-cohort-grow-b", 2 * GIB, second.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    vgs_gate.release();
+
+    // Both grows must pass admission and park in `lvextend`; the epoch
+    // cannot move while the gate holds the resizes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while extend_gate.inside() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both cohort grows must reach lvextend"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    extend_gate.release();
+
+    let first_result = first_grow
+        .await
+        .expect("first grow task join")
+        .expect("first grow succeeds");
+    let second_result = second_grow
+        .await
+        .expect("second grow task join")
+        .expect("second grow succeeds");
+    assert_eq!(first_result.effective_size_bytes, 2 * GIB);
+    assert_eq!(second_result.effective_size_bytes, 2 * GIB);
+    assert!(
+        count_program(&runner, "vgs") <= vgs_before + 2,
+        "two grows may take at most one sample each; a shared round takes one"
     );
 }
 
