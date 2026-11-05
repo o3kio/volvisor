@@ -177,13 +177,11 @@ pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 
 /// Maximum optimistic capacity-sample rounds for one grow admission.
 ///
-/// Each attempt that arrives at a sampling round either runs `vgs` or waits
-/// for an already-in-flight one, so a waiter consumes an attempt without
-/// issuing a CLI call of its own. The cap keeps a grow from looping forever
-/// under sustained allocation churn; exhaustion returns an `OVERLOADED`
-/// refusal. The refusal is raised inside the journaled run closure, so it is
-/// the terminal outcome for that `operation_id`: a client retry must use a
-/// new operation id.
+/// Each stale round costs another `vgs` call. The cap keeps a grow from
+/// looping forever under sustained allocation churn; exhaustion returns an
+/// `OVERLOADED` refusal. The refusal is raised inside the journaled run
+/// closure, so it is the terminal outcome for that `operation_id`: a client
+/// retry must use a new operation id.
 const GROW_ADMISSION_ATTEMPTS: usize = 32;
 
 /// Physical extent size assumed when `vgs` does not report one (LVM's
@@ -201,88 +199,6 @@ struct VgCapacity {
     free_bytes: u64,
     /// Physical extent bytes reported by `vgs` (4 MiB when absent).
     extent_bytes: u64,
-}
-
-/// The outcome of one single-flight `vgs` round.
-#[derive(Clone)]
-struct CapacityRoundOutcome {
-    /// Allocation epoch read immediately before the CLI call. Meaningless
-    /// when `capacity` is `Err`; the caller discards it on the error path.
-    epoch: u64,
-    /// The sample, or the typed failure the leader received.
-    capacity: Result<VgCapacity, ApiError>,
-}
-
-/// One in-flight `vgs` round. Waiters hold an `Arc` to it, so a later
-/// caller starting a new round cannot erase the answer this waiter is
-/// waiting for.
-struct CapacityRound {
-    outcome: Mutex<Option<CapacityRoundOutcome>>,
-    completed: Condvar,
-}
-
-#[derive(Default)]
-struct CapacitySampleState {
-    /// The round currently sampling, if any.
-    in_flight: Option<Arc<CapacityRound>>,
-    /// Callers currently parked on an in-flight round.
-    #[cfg(test)]
-    waiters: usize,
-}
-
-struct CapacitySampleSlot {
-    state: Mutex<CapacitySampleState>,
-}
-
-/// Releases an in-flight round even if the sampling caller unwinds, so a
-/// panic in `vgs` cannot leave every later grow waiting forever.
-struct CapacitySampleFlight<'a> {
-    slot: &'a CapacitySampleSlot,
-    round: &'a Arc<CapacityRound>,
-    armed: bool,
-}
-
-impl Drop for CapacitySampleFlight<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Publish a typed failure first so waiters are never left without
-        // an outcome, then release the slot. The two locks are taken
-        // separately and never nested.
-        {
-            let mut outcome = self
-                .round
-                .outcome
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if outcome.is_none() {
-                *outcome = Some(CapacityRoundOutcome {
-                    epoch: 0,
-                    capacity: Err(ApiError::new(
-                        ApiErrorCode::Internal,
-                        "capacity sampling caller panicked; retry the grow with a new \
-                         operation_id",
-                    )),
-                });
-            }
-        }
-        {
-            let mut state = self
-                .slot
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let ours = state
-                .in_flight
-                .as_ref()
-                .is_some_and(|round| Arc::ptr_eq(round, self.round));
-            if ours {
-                state.in_flight = None;
-            }
-        }
-        self.round.completed.notify_all();
-    }
 }
 
 /// The outcome of one grow-preparation attempt under the state lock.
@@ -553,26 +469,15 @@ pub struct LvmProvider {
     /// reports the real free space. Leaf lock: never held while taking
     /// the provider state lock.
     capacity_reservations: Mutex<BTreeMap<String, u64>>,
-    /// Per-VG single-flight capacity samples (issue #62 grow-tail).
-    /// Concurrent grows for the same VG share one in-flight `vgs` call
-    /// instead of convoying on the CLI. Leaf lock: never held while `vgs`
-    /// runs or while the provider state lock is taken.
-    ///
-    /// Keyed by VG name, which is derived from the claimed device id, so the
-    /// key set is bounded by the devices this daemon has ever claimed and is
-    /// not attacker-controlled. Entries are small and intentionally kept for
-    /// the provider's lifetime; a released VG's slot is inert.
-    capacity_samples: Mutex<BTreeMap<String, Arc<CapacitySampleSlot>>>,
     /// Counts completed allocations (create `lvcreate`, grow `lvextend`)
     /// that may have reduced free space.
     ///
-    /// Grow admission samples `vgs` without any admission lock and
-    /// single-flights concurrent callers to at most one in-flight `vgs` per
-    /// VG. A sample is used only if this counter is unchanged across the
-    /// whole sample and the reservation insertion; a create or a completed
-    /// `lvextend` bumps it (under the state lock for a create) and forces a
-    /// re-sample. Moves allocate outside this protocol (pre-existing
-    /// residual).
+    /// Grow admission samples `vgs` without any admission lock so
+    /// concurrent grows do not serialize on the LVM CLI. A sample is used
+    /// only if this counter is unchanged across the whole sample and the
+    /// reservation insertion; a create or a completed `lvextend` bumps it
+    /// (under the state lock for a create) and forces a re-sample. Moves
+    /// allocate outside this protocol (pre-existing residual).
     capacity_epoch: AtomicU64,
     /// The writer view: every mutation is admitted under this mutex.
     /// Attach/detach/report capture and reserve under it, then release it
@@ -1616,7 +1521,6 @@ impl LvmProvider {
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
-            capacity_samples: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state),
             read_snapshot,
@@ -1919,132 +1823,6 @@ impl LvmProvider {
                     format!("volume group {vg_name:?} is not reported by vgs"),
                 )
             })
-    }
-
-    /// Sample one VG's free space with per-VG single-flight.
-    ///
-    /// The first caller for a VG runs `vgs`; concurrent grow admissions for
-    /// the same VG wait for that one call and share its answer (success or
-    /// failure) instead of each spawning the CLI. A caller that arrives
-    /// after `in_flight` is cleared starts a fresh sample rather than
-    /// reusing a prior round, so a delete or move that changed free space is
-    /// observed by the next round instead of being hidden behind a
-    /// long-lived cache. A caller that overlaps the tail of a completed
-    /// round shares that round's already-published outcome; its epoch check
-    /// still validates it, exactly as it does for a wait.
-    ///
-    /// Each call consumes one admission attempt in the caller's loop,
-    /// whether it samples or waits for exactly one round. The waiter
-    /// returns the round's outcome even when the sampled epoch has already
-    /// moved; it does not re-sample internally, so
-    /// `GROW_ADMISSION_ATTEMPTS` still bounds total wait and work. A
-    /// waiter's sample can predate its own arrival by up to one round, so a
-    /// churn burst can retire that attempt without it having observed the
-    /// newest allocation; that is an availability cost, not a safety one.
-    /// Callers re-check the epoch after sampling, and `prepare_grow` checks
-    /// it again after inserting the reservation.
-    ///
-    /// Failure is shared deliberately: every waiter on a round receives the
-    /// leader's typed error rather than retrying the CLI serially, and every
-    /// waiter is parked for at most the leader's command watchdog (60 s for
-    /// the daemon's `RealRunner`). The slot lock is a leaf: it is never held
-    /// across `vgs` or while the provider state lock is taken.
-    fn coalesced_vg_capacity(&self, vg_name: &str) -> Result<(u64, VgCapacity), ApiError> {
-        let slot = {
-            // The map lock is held across the lookup and the first insert,
-            // so concurrent first-touch callers share one slot and only one
-            // can become that slot's round leader.
-            let mut slots = self
-                .capacity_samples
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(slot) = slots.get(vg_name) {
-                Arc::clone(slot)
-            } else {
-                let slot = Arc::new(CapacitySampleSlot {
-                    state: Mutex::new(CapacitySampleState::default()),
-                });
-                slots.insert(vg_name.to_owned(), Arc::clone(&slot));
-                slot
-            }
-        };
-
-        let (round, is_leader) = {
-            let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let in_flight = state.in_flight.as_ref().map(Arc::clone);
-            if let Some(round) = in_flight {
-                #[cfg(test)]
-                {
-                    state.waiters += 1;
-                }
-                (round, false)
-            } else {
-                let round = Arc::new(CapacityRound {
-                    outcome: Mutex::new(None),
-                    completed: Condvar::new(),
-                });
-                state.in_flight = Some(Arc::clone(&round));
-                (round, true)
-            }
-        };
-
-        if !is_leader {
-            // Wait for exactly this round and return what it published.
-            // This is one attempt; it never starts another sample itself.
-            let outcome = {
-                let mut outcome = round.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-                loop {
-                    if let Some(published) = outcome.as_ref() {
-                        break published.clone();
-                    }
-                    outcome = round
-                        .completed
-                        .wait(outcome)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-            };
-            #[cfg(test)]
-            {
-                let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.waiters = state.waiters.saturating_sub(1);
-            }
-            return outcome.capacity.map(|capacity| (outcome.epoch, capacity));
-        }
-
-        // Leader: sample outside the slot lock, then publish the outcome
-        // to every waiter. The epoch is read immediately before the CLI
-        // call; callers still re-check it after this returns. The unwind
-        // guard is armed before anything else can fail, so a panic anywhere
-        // from here on publishes a failure instead of stranding the round.
-        let mut flight = CapacitySampleFlight {
-            slot: &slot,
-            round: &round,
-            armed: true,
-        };
-        let epoch = self.capacity_epoch();
-        let result = self.vg_capacity(vg_name);
-
-        {
-            let mut outcome = round.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-            *outcome = Some(CapacityRoundOutcome {
-                epoch,
-                capacity: result.clone(),
-            });
-        }
-        {
-            let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let ours = state
-                .in_flight
-                .as_ref()
-                .is_some_and(|in_flight| Arc::ptr_eq(in_flight, &round));
-            if ours {
-                state.in_flight = None;
-            }
-        }
-        flight.armed = false;
-        round.completed.notify_all();
-        drop(flight);
-        result.map(|capacity| (epoch, capacity))
     }
 
     /// Actual size of one LV as reported by `lvs`, when it exists.
@@ -2479,8 +2257,7 @@ impl LvmProvider {
     ///
     /// The check and the insertion happen under the reservation leaf lock,
     /// so concurrent grows cannot both spend the same sampled free bytes
-    /// (grow-grow admission reserves under no broader lock; the per-VG
-    /// sample slot serializes only the `vgs` call, never this check, and the
+    /// (grow-grow admission is serialized by no lock except this leaf; the
     /// state lock is not held across the sample).
     /// Returns the bytes already reserved for the VG on refusal so the
     /// typed refusal can report the honest accounting.
@@ -4235,20 +4012,14 @@ impl LvmProvider {
     /// recovery intent durable, with the `vgs` sample outside the provider
     /// state lock.
     ///
-    /// The sample is also outside any admission mutex: concurrent grows for
-    /// the same VG share one in-flight `vgs` call through
-    /// [`coalesced_vg_capacity`](Self::coalesced_vg_capacity) instead of
-    /// queueing behind each other's CLI. A caller that arrives after the
-    /// round clears starts a fresh sample; only a caller that overlaps the
-    /// round's tail shares its already-published figure, and the epoch
-    /// check below still validates it. A failed round is shared too, so one
-    /// failed `vgs` fails every grow parked on it rather than retrying the
-    /// CLI once per waiter. A non-evidence diagnostic build with a capacity
-    /// *mutex* (dirty tree, not a published bundle) showed the c128 collapse
-    /// return when grows were enabled; the convoy is the suspected
-    /// mechanism. Safety still comes from the allocation epoch — a sample is
-    /// used only if no create attempt or completed `lvextend` changed free
-    /// space across the sample and the reservation, and the reservation is
+    /// The sample is also outside any capacity mutex: concurrent grows
+    /// must not queue behind each other's `vgs` CLI call. A non-evidence
+    /// diagnostic build with a capacity mutex (dirty tree, not a published
+    /// bundle) showed the c128 collapse return when grows were enabled;
+    /// the convoy is the suspected mechanism, and the published residual
+    /// tail remains unattributed. Safety comes from the allocation epoch
+    /// instead — a sample is used only if no create attempt or completed
+    /// `lvextend` changed free space during it, and the reservation is
     /// inserted before the epoch is re-read so an allocation completing in
     /// the window is still accounted for.
     /// A record that moved between the two admissions is re-derived (or
@@ -4296,7 +4067,8 @@ impl LvmProvider {
                 let state = self.lock_state_stable()?;
                 self.grow_admission(&state, volume_id, req)?
             };
-            let (epoch, capacity) = self.coalesced_vg_capacity(&first.vg_name)?;
+            let epoch = self.capacity_epoch();
+            let capacity = self.vg_capacity(&first.vg_name)?;
             if self.capacity_epoch() != epoch {
                 // A create or a completed grow allocated during the
                 // sample; the free figure may already be stale.
@@ -7673,7 +7445,6 @@ mod read_snapshot_tests {
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
-            capacity_samples: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state.clone()),
             read_snapshot,
@@ -8794,612 +8565,6 @@ mod capacity_epoch_tests {
 }
 
 #[cfg(test)]
-mod capacity_coalescing_tests {
-    use super::*;
-
-    const VGS_JSON: &str = r#"{"report":[{"vg":[{"vg_name":"vg-1","vg_free":"1099511627776","vg_size":"1099511627776","vg_extent_size":"4194304"},{"vg_name":"vg-2","vg_free":"1099511627776","vg_size":"1099511627776","vg_extent_size":"4194304"}]}]}"#;
-
-    fn test_provider(dir: &tempfile::TempDir, runner: Arc<dyn CommandRunner>) -> Arc<LvmProvider> {
-        test_provider_with_state(dir, runner, LvmState::default())
-    }
-
-    fn test_provider_with_state(
-        dir: &tempfile::TempDir,
-        runner: Arc<dyn CommandRunner>,
-        state: LvmState,
-    ) -> Arc<LvmProvider> {
-        let state_path = dir.path().join("state.json");
-        let store_crash = Arc::new(StoreCrashHooks::new());
-        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
-        let writer = Arc::new(WriterCore::new(
-            &state_path,
-            Arc::clone(&store_crash),
-            Arc::clone(&read_snapshot),
-        ));
-        Arc::new(LvmProvider {
-            runner,
-            writer,
-            state_path,
-            sysfs_root: dir.path().to_path_buf(),
-            vg_prefix: "vg-volvisor".to_owned(),
-            expected_auth_token: "test-token".to_owned(),
-            store_crash,
-            move_timing: MoveTiming::default(),
-            move_observe_failures: Mutex::new(BTreeMap::new()),
-            grow_drives: Mutex::new(BTreeSet::new()),
-            capacity_reservations: Mutex::new(BTreeMap::new()),
-            capacity_samples: Mutex::new(BTreeMap::new()),
-            capacity_epoch: AtomicU64::new(0),
-            state: Mutex::new(state),
-            read_snapshot,
-        })
-    }
-
-    /// Insert one Ready 1 KiB volume into `vg-1` and return its id.
-    fn insert_growable(state: &mut LvmState, volume_id: &str, lv_name: &str) -> VolumeId {
-        let volume_id = VolumeId::new(volume_id).expect("valid id");
-        state.insert_volume(
-            volume_id.clone(),
-            StoredVolume {
-                entry: VolumeEntry {
-                    vg_name: "vg-1".to_owned(),
-                    lv_name: lv_name.to_owned(),
-                    size_bytes: 1024,
-                    requested_size_bytes: 1024,
-                    generation: 1,
-                    data_epoch: 0,
-                    project_id: ProjectId::new("tenant-a").expect("valid id"),
-                    block_size: 4096,
-                    creation_payload: "{}".to_owned(),
-                },
-                runtime: VolumeRuntime {
-                    state: VolumeLifecycle::Ready,
-                    attachment: None,
-                    retired_attachments: RetiredAttachmentFilter::default(),
-                },
-            },
-        );
-        volume_id
-    }
-
-    fn grow_request(operation_id: &str) -> GrowVolumeRequest {
-        GrowVolumeRequest {
-            api_version: volvisor_types::API_VERSION.to_owned(),
-            operation_id: volvisor_types::OperationId::new(operation_id).expect("valid id"),
-            new_size_bytes: 2048,
-            expected_generation: 1,
-        }
-    }
-
-    fn counting_runner(calls: Arc<AtomicUsize>) -> Arc<dyn CommandRunner> {
-        Arc::new(volvisor_provider::FakeRunner::with_closure(
-            move |program, _args| {
-                if program != "vgs" {
-                    return None;
-                }
-                calls.fetch_add(1, Ordering::SeqCst);
-                Some(CommandOutput::success(VGS_JSON))
-            },
-        ))
-    }
-
-    /// A runner that parks its first `vgs` call until the test releases it.
-    /// Returns the started signal (sent once the first call is parked) and
-    /// the release sender. Later calls return normally; `success` selects
-    /// whether the parked call (and later calls) succeed or fail.
-    fn gated_runner(
-        calls: Arc<AtomicUsize>,
-        success: bool,
-    ) -> (
-        Arc<dyn CommandRunner>,
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let started = Mutex::new(Some(started_tx));
-        let release = Mutex::new(Some(release_rx));
-        let runner = Arc::new(volvisor_provider::FakeRunner::with_closure(
-            move |program, _args| {
-                if program != "vgs" {
-                    return None;
-                }
-                calls.fetch_add(1, Ordering::SeqCst);
-                let notify = started
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                if let Some(notify) = notify {
-                    notify.send(()).expect("test observes the sample");
-                    let wait = release
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
-                    if let Some(wait) = wait {
-                        wait.recv().expect("test releases the sample");
-                    }
-                }
-                if success {
-                    Some(CommandOutput::success(VGS_JSON))
-                } else {
-                    None
-                }
-            },
-        ));
-        (runner, started_rx, release_tx)
-    }
-
-    /// Wait until `expected` callers have joined the in-flight `vg-1` round.
-    ///
-    /// The counter is incremented under the slot lock just before a caller
-    /// parks. A counted caller that is not yet on the condvar still cannot
-    /// miss the outcome: publish happens before the round is cleared, and
-    /// the caller checks the outcome under the same mutex before waiting.
-    fn wait_until_coalescer_waiters(provider: &Arc<LvmProvider>, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let parked = {
-                let slots = provider
-                    .capacity_samples
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let slot = slots.get("vg-1").expect("sample slot");
-                let state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.waiters
-            };
-            if parked == expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "expected {expected} callers on the round, saw {parked}"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// Concurrent grows for one VG share a single in-flight `vgs`; a caller
-    /// that arrives after the round does not reuse the completed sample.
-    #[test]
-    fn concurrent_callers_share_one_in_flight_sample() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (runner, started_rx, release_tx) = gated_runner(Arc::clone(&calls), true);
-        let provider = test_provider(&dir, runner);
-
-        let sampler = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the first sample starts");
-
-        let mut waiters = Vec::new();
-        for _ in 0..7 {
-            let provider = Arc::clone(&provider);
-            waiters.push(std::thread::spawn(move || {
-                provider.coalesced_vg_capacity("vg-1")
-            }));
-        }
-        wait_until_coalescer_waiters(&provider, 7);
-        release_tx.send(()).expect("release the sample");
-
-        let first = sampler.join().expect("sampler thread").expect("sample");
-        assert_eq!(first.0, 0);
-        assert_eq!(first.1.free_bytes, 1 << 40);
-        for waiter in waiters {
-            let (epoch, capacity) = waiter.join().expect("waiter thread").expect("sample");
-            assert_eq!(epoch, 0);
-            assert_eq!(capacity.free_bytes, 1 << 40);
-            assert_eq!(capacity.extent_bytes, 4 << 20);
-        }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the whole cohort must share one vgs call"
-        );
-
-        let (epoch, _) = provider
-            .coalesced_vg_capacity("vg-1")
-            .expect("fresh sample");
-        assert_eq!(epoch, 0);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a later caller must sample fresh, not reuse an older answer"
-        );
-    }
-
-    /// Per-VG keying: a parked round for one VG must not block sampling for
-    /// a different VG. A regression to a global sample gate would make the
-    /// second call wait for the first.
-    #[test]
-    fn different_vgs_sample_independently() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (runner, started_rx, release_tx) = gated_runner(Arc::clone(&calls), true);
-        let provider = test_provider(&dir, runner);
-
-        let parked = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the vg-1 sample starts");
-
-        let (epoch, capacity) = {
-            let provider = Arc::clone(&provider);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let _ = tx.send(provider.coalesced_vg_capacity("vg-2"));
-            });
-            let result = rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("vg-2 must not wait for vg-1's in-flight round")
-                .expect("vg-2 samples without waiting for vg-1");
-            handle.join().expect("vg-2 thread");
-            result
-        };
-        assert_eq!(epoch, 0);
-        assert_eq!(capacity.free_bytes, 1 << 40);
-        assert!(
-            !parked.is_finished(),
-            "the vg-1 sample is still parked, so vg-2 ran independently"
-        );
-
-        release_tx.send(()).expect("release the vg-1 sample");
-        parked
-            .join()
-            .expect("vg-1 thread")
-            .expect("vg-1 sample succeeds");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "each VG runs its own sample"
-        );
-    }
-
-    /// A panic inside the real sampling path must publish a typed failure
-    /// and wake a parked waiter. This exercises the composition: the guard
-    /// is armed by `coalesced_vg_capacity`, a second caller is parked on the
-    /// round, the leader unwinds, and the waiter receives the failure. A
-    /// later caller must then be able to start a fresh round.
-    #[test]
-    #[allow(clippy::panic)] // the injected panic is the failure under test
-    fn a_panicking_sample_wakes_a_parked_waiter() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let started = Mutex::new(Some(started_tx));
-        let release = Mutex::new(Some(release_rx));
-        let counted = Arc::clone(&calls);
-        let runner: Arc<dyn CommandRunner> = Arc::new(volvisor_provider::FakeRunner::with_closure(
-            move |program, _args| {
-                if program != "vgs" {
-                    return None;
-                }
-                counted.fetch_add(1, Ordering::SeqCst);
-                let notify = started
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                if let Some(notify) = notify {
-                    notify.send(()).expect("test observes the sample");
-                    let wait = release
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
-                    if let Some(wait) = wait {
-                        wait.recv().expect("test releases the sample");
-                    }
-                    panic!("injected vgs panic");
-                }
-                Some(CommandOutput::success(VGS_JSON))
-            },
-        ));
-        let provider = test_provider(&dir, runner);
-
-        let sampler = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the sampling call starts");
-
-        let waiter = {
-            let provider = Arc::clone(&provider);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let _ = tx.send(provider.coalesced_vg_capacity("vg-1"));
-            });
-            (handle, rx)
-        };
-        wait_until_coalescer_waiters(&provider, 1);
-        release_tx.send(()).expect("let the sample panic");
-        assert!(
-            sampler.join().is_err(),
-            "the sampling thread unwinds on the injected panic"
-        );
-        let (waiter, waiter_rx) = waiter;
-        assert!(
-            waiter_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the waiter must wake after the sampling caller panics")
-                .is_err(),
-            "the waiter must receive the published failure, not a sample"
-        );
-        waiter.join().expect("waiter thread");
-
-        let (epoch, capacity) = provider
-            .coalesced_vg_capacity("vg-1")
-            .expect("a later caller starts a fresh round");
-        assert_eq!(epoch, 0);
-        assert_eq!(capacity.free_bytes, 1 << 40);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "the failed round is not reused by the later caller"
-        );
-    }
-
-    /// Admission-level coalescing: two concurrent `prepare_grow_admission`
-    /// calls for different volumes on one VG share a single `vgs`, and both
-    /// reach a prepared intent. The test parks the second admission inside
-    /// the coalescer (observed through the test-only waiter count) before
-    /// releasing the sample, so it is deterministic rather than a timing
-    /// race.
-    #[test]
-    fn concurrent_admissions_share_one_capacity_sample() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (runner, started_rx, release_tx) = gated_runner(Arc::clone(&calls), true);
-        let mut state = LvmState::default();
-        let first_id = insert_growable(&mut state, "vol-admit-first", "vol-vol-admit-first-abcd");
-        let second_id =
-            insert_growable(&mut state, "vol-admit-second", "vol-vol-admit-second-abcd");
-        let provider = test_provider_with_state(&dir, runner, state);
-
-        let first_admission = {
-            let provider = Arc::clone(&provider);
-            let volume_id = first_id.clone();
-            let request = grow_request("op-admit-first");
-            std::thread::spawn(move || {
-                provider
-                    .prepare_grow_admission(&volume_id, &request)
-                    .map(|_| ())
-            })
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the first admission's sample starts");
-
-        let second_admission = {
-            let provider = Arc::clone(&provider);
-            let volume_id = second_id.clone();
-            let request = grow_request("op-admit-second");
-            std::thread::spawn(move || {
-                provider
-                    .prepare_grow_admission(&volume_id, &request)
-                    .map(|_| ())
-            })
-        };
-        // The second admission is now parked on the in-flight round; let it
-        // proceed only after that is observed.
-        wait_until_coalescer_waiters(&provider, 1);
-        release_tx.send(()).expect("release the sample");
-
-        first_admission
-            .join()
-            .expect("first admission thread")
-            .expect("the first admission prepares");
-        second_admission
-            .join()
-            .expect("second admission thread")
-            .expect("the second admission prepares from the shared sample");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the two admissions must share one vgs call"
-        );
-    }
-
-    /// A waiter consumes exactly the round it parked on, even when the
-    /// allocation epoch moved while the CLI ran. It returns that round's
-    /// (now stale) epoch and does not start an internal re-sample: the
-    /// outer admission loop decides, so one wait costs one attempt and the
-    /// 32-attempt cap still bounds the grow.
-    #[test]
-    fn a_waiter_shares_a_stale_round_without_resampling() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (runner, started_rx, release_tx) = gated_runner(Arc::clone(&calls), true);
-        let provider = test_provider(&dir, runner);
-
-        let sampler = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the first sample starts");
-
-        let waiter = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        wait_until_coalescer_waiters(&provider, 1);
-
-        // A create or completed grow allocates while the sample is parked.
-        provider.note_capacity_change();
-        release_tx.send(()).expect("release the sample");
-
-        let (sampled_epoch, _) = sampler.join().expect("sampler thread").expect("sample");
-        assert_eq!(sampled_epoch, 0);
-        let (shared_epoch, _) = waiter.join().expect("waiter thread").expect("sample");
-        assert_eq!(
-            shared_epoch, 0,
-            "the waiter returns the sampled epoch, not a fresh one"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the waiter must not start an internal re-sample"
-        );
-    }
-
-    /// A failed round is shared with every waiter: they receive the leader's
-    /// typed failure instead of each retrying the CLI serially. The next
-    /// caller to arrive after the round starts a new attempt.
-    #[test]
-    fn a_failed_round_is_shared_with_waiters() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (runner, started_rx, release_tx) = gated_runner(Arc::clone(&calls), false);
-        let provider = test_provider(&dir, runner);
-
-        let sampler = {
-            let provider = Arc::clone(&provider);
-            std::thread::spawn(move || provider.coalesced_vg_capacity("vg-1"))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the first sample starts");
-
-        let mut waiters = Vec::new();
-        for _ in 0..3 {
-            let provider = Arc::clone(&provider);
-            waiters.push(std::thread::spawn(move || {
-                provider.coalesced_vg_capacity("vg-1")
-            }));
-        }
-        wait_until_coalescer_waiters(&provider, 3);
-        release_tx.send(()).expect("release the failing sample");
-
-        assert!(
-            sampler.join().expect("sampler thread").is_err(),
-            "the leader sees the failure"
-        );
-        for waiter in waiters {
-            assert!(
-                waiter.join().expect("waiter thread").is_err(),
-                "every waiter shares the failure"
-            );
-        }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the cohort must not retry the CLI once per waiter"
-        );
-    }
-
-    /// Every admission attempt sees the current epoch; completion rounds are
-    /// not cached across attempts, so a later grow takes a fresh sample.
-    #[test]
-    fn each_attempt_samples_fresh_at_the_current_epoch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = test_provider(&dir, counting_runner(Arc::clone(&calls)));
-
-        let (first_epoch, _) = provider.coalesced_vg_capacity("vg-1").expect("first");
-        assert_eq!(first_epoch, 0);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let (same_epoch, _) = provider.coalesced_vg_capacity("vg-1").expect("second");
-        assert_eq!(same_epoch, 0);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a later attempt must not reuse the prior completion"
-        );
-
-        provider.note_capacity_change();
-        let (next_epoch, _) = provider.coalesced_vg_capacity("vg-1").expect("third");
-        assert_eq!(next_epoch, 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-    }
-
-    /// A failed `vgs` is not a capacity answer; the next caller retries the
-    /// command.
-    #[test]
-    fn a_failed_sample_is_retried_by_the_next_caller() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let runner: Arc<dyn CommandRunner> = Arc::new(volvisor_provider::FakeRunner::with_closure(
-            move |program, _args| {
-                if program != "vgs" {
-                    return None;
-                }
-                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return None;
-                }
-                Some(CommandOutput::success(VGS_JSON))
-            },
-        ));
-        let provider = test_provider(&dir, runner);
-
-        assert!(
-            provider.coalesced_vg_capacity("vg-1").is_err(),
-            "the first sample fails"
-        );
-        let (epoch, _) = provider
-            .coalesced_vg_capacity("vg-1")
-            .expect("retry succeeds");
-        assert_eq!(epoch, 0);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a failed sample must be retried"
-        );
-    }
-
-    /// A panic in the sampling caller must release the in-flight round and
-    /// publish a typed failure, so waiting callers never block forever and
-    /// a later caller is not locked out.
-    #[test]
-    #[allow(clippy::panic)] // the body's panic is the property under test
-    fn an_unwinding_sampler_releases_the_in_flight_round() {
-        let round = Arc::new(CapacityRound {
-            outcome: Mutex::new(None),
-            completed: Condvar::new(),
-        });
-        let slot = CapacitySampleSlot {
-            state: Mutex::new(CapacitySampleState {
-                in_flight: Some(Arc::clone(&round)),
-                #[cfg(test)]
-                waiters: 0,
-            }),
-        };
-        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _flight = CapacitySampleFlight {
-                slot: &slot,
-                round: &round,
-                armed: true,
-            };
-            panic!("sample caller unwinds");
-        }));
-        assert!(caught.is_err(), "the panic is re-raised");
-        {
-            let state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
-            assert!(
-                state.in_flight.is_none(),
-                "the in-flight round must be cleared on unwind"
-            );
-        }
-        let outcome = round.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        let published = outcome.as_ref().expect("the panic publishes an outcome");
-        assert!(
-            published.capacity.is_err(),
-            "waiters must receive a typed failure, not a sample"
-        );
-    }
-}
-
-#[cfg(test)]
 mod admission_retry_tests {
     use super::*;
 
@@ -9469,7 +8634,6 @@ mod admission_retry_tests {
                 move_observe_failures: Mutex::new(BTreeMap::new()),
                 grow_drives: Mutex::new(BTreeSet::new()),
                 capacity_reservations: Mutex::new(BTreeMap::new()),
-                capacity_samples: Mutex::new(BTreeMap::new()),
                 capacity_epoch: AtomicU64::new(0),
                 state: Mutex::new(state.clone()),
                 read_snapshot,
