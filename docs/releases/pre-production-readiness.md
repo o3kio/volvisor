@@ -207,8 +207,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
   security posture change in an unreleased prototype; read clients using
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
-- **D3 — #62 write path (slice 1 and slice 2 delivered; measured at
-  `c4b0b13`).** Slice 1 code is in the tree: the single durable-writer funnel
+- **D3 — #62 write path (slice 1 and slice 2 delivered; write-tail fix measured
+  at `8029df8`).** Slice 1 code is in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
   hardened sweep and per-state-path in-process writer gate (`a8c23d6`);
   canonical-path keying of the temp-name hash (`a068947`); and test/doc-only
@@ -242,7 +242,25 @@ is a production-support, SLA, capacity, durability or hardware claim.
   that is a single non-fixed-dataset observation, not a capacity claim. No
   throughput-gain claim is made for either slice. The earlier post-fix c32
   −4.1 % / c128 −2.6 % measurement predates slice 1 and is not evidence for
-  either slice. **#62 remains open** until explicitly instructed, and no gate
+  either slice.
+  **Grow-lock fix (2026-11-05, `8029df8`).** A grows-disabled diagnostic
+  attributed the slice-2 write tail to `grow_volume` holding the provider
+  state lock across `lvextend`. The fix releases the lock across the resize
+  and size verification, keeps the durable grow intent as the recovery
+  anchor (structural mutations refused typed while live, reports admitted),
+  preserves capacity atomicity with an in-memory per-VG reservation, refuses
+  a second concurrent grow of one volume, and makes the move reconcile pass
+  defer only the growing record. The clean-tree re-measurement is published
+  in the
+  [slice-2 fix bundle](../benchmarks/2026-11-05-devhost-slice2-fix/REPORT.md)
+  (comparator `c4b0b13`). c32 write p95 fell 590.847 → 206.203 ms (−65.1 %)
+  and c128 6330.548 → 3413.886 ms (−46.1 %); throughput rose
+  858.371 → 1830.005 ops/s at c32 (+113.2 %) and 237.088 → 440.376 at c128
+  (+85.7 %). c1/c8 throughput fell 6.3 / 8.6 % and is not attributed. The
+  c128 write tail remains about 2.2× the older `aab773b` baseline, so the
+  write-tail work is **not** claimed complete; the 25-minute soak recorded
+  6,640,950 ops at 4425.586 ops/s with 0 HTTP errors and 0 conflicts.
+  **#62 remains open** until explicitly instructed, and no gate
   verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
   not re-drilled at this SHA here, so its `.volvisor-` message assertion is
   code-derived until the next drill, and the symlink test panics rather than
@@ -327,6 +345,7 @@ READY**.
 | [D5 post-fix re-drill](../evidence/day2/2026-11-03-d5-redrill/REPORT.md) | `1863a7a` product / `940722e` harness, clean worktree | One host; loop LVM; 256 KiB tmpfs ENOSPC | The normal uncommitted state-save path fails closed and converges: 500 with ENOSPC and the state `.tmp` path, byte-identical old state, LV compensated, 404 in the same process and after restart, terminal same-`operation_id` replay, new-`operation_id` 200/`Ready`, one LV for the new volume and two durable records total, no residue; journal path re-confirmed | The three non-injected tails (cleanup failure, post-rename carve-out, unreadable durable re-read), real disk/inode/thin-pool failure, multi-host, production readiness |
 | [Control-plane benchmarks](../benchmarks/2026-11-03-devhost/REPORT.md) | `e3aa365`, clean worktree | One host, loop-backed LVM, loopback HTTP | 1/8/32/128 sweep, 25-min soak, restart replay, 46-entry manifest verifies | Data path, real backends, 24 h soak, production capacity or SLA |
 | [Control-plane benchmark, D3 slice 2, 2026-11-04](../benchmarks/2026-11-04-devhost-slice2/REPORT.md) | `c4b0b13`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the provider state lock; read/write latency split recorded; no throughput-gain claim | Data path, real backends, 24 h soak, production capacity/SLA, throughput improvement |
+| [Control-plane benchmark, D3 slice-2 grow-lock fix, 2026-11-05](../benchmarks/2026-11-05-devhost-slice2-fix/REPORT.md) | `8029df8`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak at the grow-lock fix; c32 write p95 590.847 → 206.203 ms and c128 6330.548 → 3413.886 ms; c32/c128 throughput +113.2 / +85.7 % versus the regression run | Data path, real backends, 24 h soak, production capacity/SLA, a completed c128 write-tail fix, a blanket throughput gain |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of

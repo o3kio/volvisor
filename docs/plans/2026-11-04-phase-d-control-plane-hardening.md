@@ -97,7 +97,7 @@ exists to protect mutations; the same credential can protect reads.
 - The existing scoped-role matrix and the tokenless tests still pass.
 - No token ever appears in a log or an error body.
 
-### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; measured at `c4b0b13`)
+### D3 — #62 write-path hardening (slice 1 and slice 2 delivered; write-tail fix measured at `8029df8`)
 
 **Gap.** Attach, detach, report, create, grow, delete and move all take
 `LvmProvider::state` and hold it across `LvmState::save_with_hooks`
@@ -492,6 +492,108 @@ New residuals from this measurement:
   left unchanged here so the measured code SHA stays frozen. No correctness
   impact is claimed.
 - **24-hour soak (NOT RUN).** The run is 25 minutes with one restart.
+
+#### Grow-lock fix and re-measurement (2026-11-05): recorded at `8029df8`
+
+The slice-2 measurement left the write-tail cause unattributed. A
+grows-disabled diagnostic then isolated it: with grow work removed from the
+mixed workers, c128 write p95 fell **6.33 s → 0.57 s** and throughput
+**237 → 2,522 ops/s**; c32 write p95 fell **590 → 85 ms**. The serializer was
+`grow_volume_inner` holding the provider state mutex across the long
+`lvextend` command (≈200 ms median): every other volume's admission queued
+behind one resize. The diagnostic is not published bundle evidence.
+
+The fix is committed locally at `8029df8e8f6e1856499927df6f434422894005ad`:
+
+- Grow is split into **prepare** (capacity check, in-memory per-VG
+  reservation, durable grow intent) under the state lock, **`run_lvextend`**
+  and size verification with the lock released, and **commit** (reacquire
+  the lock, re-validate the exact intent and volume generation, persist the
+  observed size).
+- The durable grow intent remains the crash-recovery anchor. Fresh attach,
+  detach, delete, move start and move completion are refused typed while it
+  is live; **reports stay admitted** (they never move the generation or
+  size). A second concurrent grow of one volume is refused by a non-blocking
+  drive set.
+- The in-memory per-VG reservation preserves the capacity-check-plus-
+  allocation atomicity the coarse lock used to provide for creates and
+  other grows.
+- A non-zero `lvextend` exit clears the intent only when `lvs` proves the LV
+  is still at its from-size.
+- The move reconcile pass defers a verified completion for the one growing
+  volume (`deferred_while_growing`) and continues classifying the rest,
+  instead of aborting the pass.
+
+Static checks at the fix SHA: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, full
+`cargo test --workspace --locked` and
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked` all
+pass. Three adversarial review rounds plus two final re-reviews returned GO
+with no BLOCKER/HIGH/MEDIUM findings; only the LOW/NIT residuals recorded
+below remain.
+
+The re-measurement is published as
+[2026-11-05-devhost-slice2-fix](../benchmarks/2026-11-05-devhost-slice2-fix/REPORT.md).
+Source `8029df8e8f6e1856499927df6f434422894005ad`, worktree clean
+(`worktree_dirty: no`), binary `volvisord 8029df8` SHA256
+`18f260c2ef878985f23fdcc15a659d36db87ff7209477756e98638ff0e28b941`, run
+window 2026-11-05T09:29:39Z–10:00:20Z, same harness shape (`--skip-build
+--sweep-seconds 30 --soak-minutes 25`). The primary comparator is the
+clean-tree regression run `c4b0b13`
+([slice-2 bundle](../benchmarks/2026-11-04-devhost-slice2/REPORT.md)); both
+manifests verified. **No code or harness change was made after the measured
+SHA**; the documentation change recording this run is a follow-up commit.
+
+Measured results:
+
+- **Mixed sweep:** 1729.154 / 3118.787 / 1830.005 / 440.376 ops/s at
+  1/8/32/128 in-flight. Against `c4b0b13` that is −6.3 / −8.6 / **+113.2 /
+  +85.7 %**. The c1/c8 drop is recorded and not attributed.
+- **Write tail:** c32 write p95 **590.847 → 206.203 ms** (−65.1 %, now below
+  the `aab773b` baseline of 388.84 ms); c128 write p95
+  **6330.548 → 3413.886 ms** (−46.1 %, still about 2.2× the `aab773b`
+  baseline of 1552.261 ms). The harness does not attribute the residual
+  c128 tail, so no claim is made that it is fully eliminated.
+- **Reads:** read p95 1.481 ms at c32 and 87.276 ms at c128, versus
+  179.332 / 1288.505 ms at `aab773b`.
+- **Soak:** 6,640,950 ops at 4425.586 ops/s, with 0 HTTP errors and 0
+  attachment conflicts; the 46 network errors are client reconnects at the
+  planned restart. RSS delta was +2,126,132 KiB (peak 2,538,456 KiB) versus
+  +2,943,816 KiB (peak 3,236,184 KiB) at `c4b0b13`. State ended at 3,147 B
+  (max 3,950 B); journal ended at 75,496,834 B (max 75,497,693 B, consistent
+  with the documented compaction hysteresis). The mid-soak restart listed
+  4/4 volumes in 0.264 s.
+- **Diagnostic probes:** cap-32/128-in-flight shed 16 × `503`; the 50 req/s
+  probe returned 960 × `429`. Diagnostic shapes, not capacity results.
+
+**What this measurement supports.** The grow-lock serialization is gone:
+c32/c128 throughput recovers sharply and the c32 write tail is below the
+pre-regression baseline. **What it does not support:** a blanket
+throughput-gain claim (c1/c8 fell; the c128 write tail remains above the old
+baseline), a capacity/SLA claim, or a claim that the write-tail work is
+finished.
+
+New residuals from the fix (LOW/NIT unless noted; none is a production
+claim):
+
+- **Residual c128 write tail (open).** Write p95 is still 3413.886 ms.
+  Candidate contributors (the grow intent's prepare/commit fsyncs, the
+  synchronous writer funnel, the harness mix) are not attributed by the
+  harness.
+- **Create/delete still hold the state lock across `lvcreate`/`lvremove`
+  (pre-existing, out of this change).** The mixed harness does not create or
+  delete inside the sweep, so this run does not measure them.
+- **Move admission capacity still ignores grow reservations (pre-existing,
+  M2).** Not fixed here.
+- **A live grow intent with an absent or mid-size LV needs a same-request
+  retry, a restart, or an operator.** A non-zero/unknown `lvextend` outcome
+  keeps the intent; the reconcile pass defers a settled move for that volume
+  but does not starve other records.
+- **Post-poison alignment reload and the unbounded INFO log remain**
+  (pre-existing; see the slice-2 residuals and the benchmark report).
+- **24-hour soak (NOT RUN).** The run is 25 minutes with one restart.
+
+#62 stays open until explicitly instructed. All gate verdicts are unchanged.
 
 **Rejected alternatives.** Per-volume files need a multi-file commit for
 delete/move/create intent atomicity; an append-only WAL would rewrite every
