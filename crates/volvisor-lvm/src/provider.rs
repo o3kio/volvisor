@@ -116,7 +116,7 @@
 //! health are `Unknown` until proven; `evidence_status` is
 //! `PrototypeOnly`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
@@ -346,6 +346,16 @@ pub struct MoveReconcileReport {
     /// Records skipped: the world could not be observed this pass
     /// (retried on the next tick; never resolved destructively).
     pub unobservable: Vec<VolumeId>,
+    /// Records whose verified completion this pass deferred because the
+    /// volume has a live grow. A completion bumps the volume generation
+    /// without touching the grow's durable intent, so recording it while
+    /// the resize is in flight would make the intent look stale to
+    /// recovery; the pass must skip this record and keep classifying the
+    /// rest, not abort. Retried on the next tick (the grow normally
+    /// resolves well inside one tick; a durable intent with no live drive
+    /// — an unknown `lvextend` outcome — can defer until a same-request
+    /// retry or a restart classifies it, without starving other records).
+    pub deferred_while_growing: Vec<VolumeId>,
 }
 
 /// The native-local LVM provider.
@@ -383,6 +393,22 @@ pub struct LvmProvider {
     /// bound). In-memory and per-incarnation: it never persists, and
     /// a successful observation clears it.
     move_observe_failures: Mutex<BTreeMap<VolumeId, u32>>,
+    /// Volume ids with a live grow drive. A grow releases the provider
+    /// state lock across the long `lvextend`/`lvs` commands, so this
+    /// in-memory set prevents a second grow of the same volume from
+    /// resuming the same durable intent concurrently. It is fail-closed
+    /// and non-blocking: the second grow is refused, never queued on a
+    /// runtime worker.
+    grow_drives: Mutex<BTreeSet<VolumeId>>,
+    /// Bytes promised to in-flight grow allocations, keyed by volume
+    /// group. The state lock no longer serializes the long `lvextend`,
+    /// so capacity admission subtracts these reservations to stay
+    /// honest: a create (or another grow) that takes the state lock
+    /// while a resize runs must not spend the same free space twice.
+    /// The entry is removed when the command returns, after which `vgs`
+    /// reports the real free space. Leaf lock: never held while taking
+    /// the provider state lock.
+    capacity_reservations: Mutex<BTreeMap<String, u64>>,
     /// The writer view: every mutation is admitted under this mutex.
     /// Attach/detach/report capture and reserve under it, then release it
     /// before waiting for durability; the synchronous multi-save paths
@@ -1267,6 +1293,60 @@ impl Drop for StateGuard<'_> {
     }
 }
 
+/// RAII marker for one live grow drive.
+///
+/// The drive releases the provider state lock across `lvextend`, so this
+/// marker is what prevents a second grow of the same volume from
+/// concurrently resuming that volume's durable intent. Removal on drop
+/// (including unwinding) is what makes the exclusion recoverable.
+struct GrowDriveGuard<'a> {
+    provider: &'a LvmProvider,
+    volume_id: VolumeId,
+}
+
+impl Drop for GrowDriveGuard<'_> {
+    fn drop(&mut self) {
+        let mut drives = self
+            .provider
+            .grow_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drives.remove(&self.volume_id);
+    }
+}
+
+/// One in-flight allocation reservation in a volume group.
+///
+/// Taken under the provider state lock immediately after the capacity
+/// admission that promised the bytes, and released when the allocation
+/// command returns (after which `vgs` reports the truth). Removal on drop
+/// covers every error and unwinding path.
+struct CapacityReservation<'a> {
+    provider: &'a LvmProvider,
+    vg_name: String,
+    bytes: u64,
+}
+
+impl Drop for CapacityReservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .provider
+            .capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let remove = match reserved.get_mut(&self.vg_name) {
+            Some(total) => {
+                *total = total.saturating_sub(self.bytes);
+                *total == 0
+            }
+            None => false,
+        };
+        if remove {
+            reserved.remove(&self.vg_name);
+        }
+    }
+}
+
 /// The phase-1 admission outcome for a move request.
 enum MoveAdmission {
     /// Answer now: the idempotent re-observation of a completed
@@ -1285,6 +1365,18 @@ enum MoveAdmission {
     },
 }
 
+/// The result of a verified move completion attempt.
+enum MoveCompletion {
+    /// The completion was recorded (or already was): the response to
+    /// answer.
+    Completed(MoveVolumeBackingResponse),
+    /// A live grow holds the volume's durable recovery anchor, so
+    /// recording the completion now would void it. The error detail
+    /// names the in-flight grow; the reconcile pass records the
+    /// deferral and classifies the remaining records.
+    Deferred(ApiError),
+}
+
 /// What a pending grow intent says about this grow request.
 enum GrowResume {
     /// No pending intent: a fresh grow must persist one.
@@ -1295,6 +1387,23 @@ enum GrowResume {
     /// The grow already landed: the record was finalized from the
     /// observed effective size and the response reports it.
     Finalized(u64),
+}
+
+/// The result of one `lvextend` invocation, kept distinct so the caller
+/// can classify a known start failure (clear the intent) from an unknown
+/// outcome (keep it for recovery) after the provider state lock has been
+/// released for the command.
+enum LvextendOutcome {
+    /// The command reported success; the size is verified separately.
+    Extended,
+    /// A non-zero exit status from `lvextend`. Whether the command
+    /// resized the LV is **not** assumed here: `settle_failed_lvextend`
+    /// re-verifies the observed size before clearing the intent, so an
+    /// exit status alone never proves the LV did not move.
+    StartFailed(ApiError),
+    /// The command runner returned an error with no exit status: the
+    /// command may have reached LVM, so the outcome is unknown.
+    Unknown(ApiError),
 }
 
 impl LvmProvider {
@@ -1340,6 +1449,8 @@ impl LvmProvider {
             writer,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
+            grow_drives: Mutex::new(BTreeSet::new()),
+            capacity_reservations: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state),
             read_snapshot,
         };
@@ -1957,7 +2068,122 @@ impl LvmProvider {
         Ok(())
     }
 
-    /// Run the destructive delete steps for one LV: the
+    /// Refuse a structural mutation of a volume whose durable grow intent
+    /// is still in flight.
+    ///
+    /// A grow releases the provider state lock across `lvextend` (so the
+    /// long LVM resize no longer stalls every other volume). The durable
+    /// intent is the anchor that startup recovery uses to roll the grow
+    /// forward, and it records the generation the grow was authorized
+    /// against. Allowing an attach, detach, move start or delete to change
+    /// that generation (or remove the LV) while the resize is in flight
+    /// would make a crash between `lvextend` and the final commit look
+    /// like a stale authorization, so those mutations are refused until
+    /// the grow resolves. A report is *not* refused: it only advances the
+    /// attachment record and never moves the volume generation.
+    fn ensure_no_pending_grow(state: &LvmState, volume_id: &VolumeId) -> Result<(), ApiError> {
+        Self::pending_grow_error(state, volume_id).map_or(Ok(()), Err)
+    }
+
+    /// The typed refusal for a live simultaneous grow, if one exists.
+    ///
+    /// Split from [`Self::ensure_no_pending_grow`] so the move
+    /// completion can *defer* to a grow (recording the refusal in the
+    /// reconcile report) instead of aborting the whole pass.
+    fn pending_grow_error(state: &LvmState, volume_id: &VolumeId) -> Option<ApiError> {
+        state.grow_intent(volume_id).map(|intent| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} has a durable grow in progress (operation {}, \
+                     generation {}); retry after that grow completes or resolves",
+                    intent.operation_id, intent.expected_generation
+                ),
+            )
+        })
+    }
+
+    /// Refuse a grow while an online move leaves the volume's placement
+    /// unsettled.
+    ///
+    /// A completed move bumps the volume generation. A grow that ran
+    /// across that completion would hold a durable intent whose recorded
+    /// generation no longer matches a crash-time recovery read, so the
+    /// two structural operations are mutually excluded.
+    fn ensure_no_unsettled_move(state: &LvmState, volume_id: &VolumeId) -> Result<(), ApiError> {
+        if let Some(record) = state.move_record(volume_id) {
+            if Self::move_blocks_delete(record) {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "volume {volume_id} has an unsettled online move in state {:?}; \
+                         resolve the move before growing the volume",
+                        record.state
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enter one live grow drive for `volume_id`, refusing a second one.
+    ///
+    /// The guard is removed on drop, so a completed, failed or unwound
+    /// drive never leaves the volume permanently un-growable. The durable
+    /// intent (not this set) is what survives a process restart.
+    fn begin_grow_drive(&self, volume_id: &VolumeId) -> Result<GrowDriveGuard<'_>, ApiError> {
+        let mut drives = self
+            .grow_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !drives.insert(volume_id.clone()) {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} already has a grow in progress; retry after it \
+                     completes or resolves"
+                ),
+            ));
+        }
+        drop(drives);
+        Ok(GrowDriveGuard {
+            provider: self,
+            volume_id: volume_id.clone(),
+        })
+    }
+
+    /// Bytes currently promised to in-flight grow allocations in `vg_name`.
+    fn reserved_capacity(&self, vg_name: &str) -> u64 {
+        self.capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(vg_name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Promise `bytes` of `vg_name`'s free space to this grow until the
+    /// returned guard drops.
+    ///
+    /// Called under the provider state lock, immediately after the
+    /// capacity admission. Any create that takes the state lock while the
+    /// resize runs subtracts this reservation, so the freed-lock window
+    /// cannot spend the same extents twice.
+    fn reserve_capacity(&self, vg_name: &str, bytes: u64) -> CapacityReservation<'_> {
+        let mut reserved = self
+            .capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let total = reserved.entry(vg_name.to_owned()).or_insert(0);
+        *total = total.saturating_add(bytes);
+        drop(reserved);
+        CapacityReservation {
+            provider: self,
+            vg_name: vg_name.to_owned(),
+            bytes,
+        }
+    }
+
     /// `ZeroDiscard` `blkdiscard` first (never followed by `lvremove`
     /// when it fails — the caller asked for erased data and must learn
     /// the truth), then the checked `lvremove`. Shared by the live
@@ -2188,7 +2414,12 @@ impl LvmProvider {
             }
             if let Some(capacity) = capacity_map.get(&entry.vg_name) {
                 let demand = extent_rounded(size_bytes, capacity.extent_bytes);
-                if demand.saturating_add(VG_HEADROOM_BYTES) <= capacity.free_bytes {
+                // A grow that released the state lock for `lvextend`
+                // promised these bytes to itself; do not spend them again.
+                let free = capacity
+                    .free_bytes
+                    .saturating_sub(self.reserved_capacity(&entry.vg_name));
+                if demand.saturating_add(VG_HEADROOM_BYTES) <= free {
                     return Ok(entry.vg_name.clone());
                 }
             }
@@ -2928,6 +3159,9 @@ impl LvmProvider {
             // recorded replays the recorded response (even if the volume
             // generation has since moved) and never fabricates a second
             // attachment; the same id with a different payload conflicts.
+            // A replay is read-only, so it is answered even while a grow
+            // is in flight (the grow leaves the volume generation
+            // unchanged until it commits).
             let identity = AttachmentIdentity::from_request(volume_id, req, mode);
             for (recorded_volume, stored) in state.volumes() {
                 if let Some(record) = stored.runtime.attachment.as_ref() {
@@ -2937,6 +3171,10 @@ impl LvmProvider {
                     }
                 }
             }
+
+            // A fresh attach bumps the volume generation, which would void
+            // the in-flight grow's recovery anchor: refuse it typed.
+            Self::ensure_no_pending_grow(&state, volume_id)?;
 
             let response = {
                 let stored = state
@@ -3015,6 +3253,7 @@ impl LvmProvider {
                 }
                 AdmissionGate::Align => continue,
             }
+            Self::ensure_no_pending_grow(&state, volume_id)?;
             let response = {
                 let stored = state
                     .volume_mut(volume_id)
@@ -3089,6 +3328,10 @@ impl LvmProvider {
                 }
                 AdmissionGate::Align => continue,
             }
+            // A report only advances the attachment record's state; it
+            // never moves the volume generation or size, so it cannot
+            // invalidate an in-flight grow's recovery anchor. It stays
+            // admitted (idempotent no-op reports included).
             let response = {
                 let stored = state
                     .volume_mut(volume_id)
@@ -3245,28 +3488,27 @@ impl LvmProvider {
         ApiError::new(save_error.code, format!("{}; {note}", save_error.detail))
     }
 
-    /// Execute a grow that already passed the request/intent checks.
+    /// Validate capacity, reserve it, and make the grow intent durable.
     ///
-    /// Validates capacity (extent-rounded demand plus headroom), then
-    /// persists the grow intent when the resume path did not already
-    /// have one, runs `lvextend`, verifies the effective size from
-    /// `lvs`, and commits the new size/generation with the intent
-    /// removal. Start failures clear the intent (or leave it durable
-    /// when the clear fails); verification/final-save failures leave
-    /// the durable intent for roll-forward. Returns the observed
-    /// effective size.
-    fn execute_grow(
+    /// Runs under the provider state lock: the capacity check, the
+    /// in-flight reservation, the intent insertion and its save are
+    /// atomic with respect to every other admission. The returned intent
+    /// is the exact anchor this drive later re-validates before
+    /// committing the observed size; the returned reservation covers the
+    /// released-lock window up to the `lvextend` answer.
+    fn prepare_grow(
         &self,
         state: &mut LvmState,
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
         vg_name: &str,
-        lv_name: &str,
         current_size: u64,
         current_generation: u64,
         intent_is_durable: bool,
-    ) -> Result<u64, ApiError> {
+    ) -> Result<(GrowIntent, CapacityReservation<'_>), ApiError> {
         let capacity = self.vg_capacity(vg_name)?;
+        let reserved = self.reserved_capacity(vg_name);
+        let free = capacity.free_bytes.saturating_sub(reserved);
         let delta = req.new_size_bytes - current_size;
         // Thick LVM rounds the grown LV up to whole physical extents,
         // so the space the grow actually consumes is the
@@ -3275,26 +3517,29 @@ impl LvmProvider {
         // the rounding and surface the over-allocation later as a raw
         // INTERNAL instead of the typed NO_SAFE_CAPACITY.
         let demand = extent_rounded(delta, capacity.extent_bytes);
-        if demand.saturating_add(VG_HEADROOM_BYTES) > capacity.free_bytes {
+        if demand.saturating_add(VG_HEADROOM_BYTES) > free {
             return Err(ApiError::new(
                 ApiErrorCode::NoSafeCapacity,
                 format!(
-                    "grow needs {demand} more bytes (extent-rounded from {delta}), {} free \
-                     in {vg_name}",
-                    capacity.free_bytes
+                    "grow needs {demand} more bytes (extent-rounded from {delta}), {free} free \
+                     in {vg_name} ({reserved} reserved for in-flight allocations)"
                 ),
             ));
         }
+        // Promise the bytes before releasing the lock for `lvextend`.
+        let reservation = self.reserve_capacity(vg_name, demand);
+        let grow_intent = state.grow_intent(volume_id).cloned().unwrap_or(GrowIntent {
+            operation_id: req.operation_id.clone(),
+            from_size_bytes: current_size,
+            requested_size_bytes: req.new_size_bytes,
+            expected_generation: current_generation,
+        });
         if !intent_is_durable {
             // Durable-first: persist the intent before `lvextend`, so a
             // crash between the CLI's success and the volume-record
-            // commit rolls the grow forward on restart.
-            let grow_intent = GrowIntent {
-                operation_id: req.operation_id.clone(),
-                from_size_bytes: current_size,
-                requested_size_bytes: req.new_size_bytes,
-                expected_generation: current_generation,
-            };
+            // commit rolls the grow forward on restart. The already
+            // recorded intent keeps its original authorizing operation
+            // when this call is the payload-identical resume.
             state.insert_grow_intent(volume_id.clone(), grow_intent.clone());
             if let Err(save_error) = self.persist(state) {
                 return Err(self.grow_intent_save_failure(
@@ -3305,70 +3550,128 @@ impl LvmProvider {
                 ));
             }
         }
-        let output = match self.runner.run(
+        Ok((grow_intent, reservation))
+    }
+
+    /// Run `lvextend` without the provider state lock.
+    ///
+    /// This is the only long-running step of a grow (~200 ms of LVM CLI
+    /// on the measured host). Holding the state lock across it made every
+    /// other volume's admission queue behind one resize; the caller
+    /// therefore drops the guard before this call and reacquires it only
+    /// after the size has been verified.
+    fn run_lvextend(&self, vg_name: &str, lv_name: &str, new_size_bytes: u64) -> LvextendOutcome {
+        match self.runner.run(
             "lvextend",
             &[
                 "--yes",
                 "-L",
-                &format!("{}B", req.new_size_bytes),
+                &format!("{new_size_bytes}B"),
                 &format!("{vg_name}/{lv_name}"),
             ],
         ) {
-            Ok(output) => output,
-            Err(error) => {
-                // The runner returned an error without an exit status,
-                // so the outcome is unknown: the command may have
-                // reached LVM. Keep the durable grow intent — never
-                // clear it on an unknown outcome — and let startup
-                // recovery classify the observed size.
-                return Err(ApiError::new(
-                    error.code,
+            Ok(output) if output.success => LvextendOutcome::Extended,
+            Ok(output) => LvextendOutcome::StartFailed(command_failed("lvextend", &output)),
+            Err(error) => LvextendOutcome::Unknown(ApiError::new(
+                error.code,
+                format!(
+                    "{}; the lvextend outcome is unknown (the command runner returned an \
+                     error rather than an exit status); the durable grow intent remains, \
+                     and startup recovery will roll the grow forward only if the LV is at \
+                     least the requested size, drop the intent if the LV is still at the \
+                     from-size, and refuse startup on an ambiguous size",
+                    error.detail
+                ),
+            )),
+        }
+    }
+
+    /// Classify a non-zero `lvextend` exit after the state lock was released.
+    ///
+    /// Re-reads the state under a fresh admission and classifies the LV's
+    /// observed size. A lock failure keeps the original command error
+    /// visible and leaves the durable intent for recovery.
+    fn settle_failed_lvextend_drive(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        from_size_bytes: u64,
+        error: ApiError,
+    ) -> ApiError {
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            Err(lock_error) => {
+                let code = lock_error.code;
+                return ApiError::new(
+                    code,
                     format!(
-                        "{}; the lvextend outcome is unknown (the command runner returned an \
-                         error rather than an exit status); the durable grow intent remains, \
-                         and startup recovery will roll the grow forward only if the LV is at \
-                         least the requested size, drop the intent if the LV is still at the \
-                         from-size, and refuse startup on an ambiguous size",
+                        "{}; the grow intent could not be cleared because the provider \
+                         state could not be re-read ({lock_error}); the durable intent \
+                         remains, and a retry or startup will classify the observed size",
                         error.detail
                     ),
-                ));
+                );
             }
         };
-        if !output.success {
-            return Err(self.clear_grow_intent_after_failed_start(
-                state,
-                volume_id,
-                command_failed("lvextend", &output),
-            ));
-        }
-        // Verify the effective size from LVM's own report. Like create,
-        // grow rounds up to whole extents: anything at or above the
-        // requested size is a success, and the effective size is what
-        // gets persisted and reported. A verification failure leaves
-        // the durable grow intent for recovery (never a silent
-        // success).
-        let actual = self.verify_grown_size(vg_name, lv_name, req.new_size_bytes)?;
+        self.settle_failed_lvextend(
+            &mut state,
+            volume_id,
+            vg_name,
+            lv_name,
+            from_size_bytes,
+            error,
+        )
+    }
 
-        let new_generation = {
-            let stored = state
-                .volume_mut(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            stored.entry.size_bytes = actual;
-            stored.entry.generation += 1;
-            stored.entry.generation
-        };
-        state.remove_grow_intent(volume_id);
-        if let Err(save_error) = self.persist(state) {
-            return Err(self.persist_completed_grow(
-                save_error,
-                volume_id,
-                vg_name,
-                lv_name,
-                actual,
-                new_generation,
-            ));
+    /// Classify a non-zero `lvextend` exit against the observed world.
+    ///
+    /// The intent is cleared only when `lvs` proves the LV is still at its
+    /// from-size. A non-zero exit that nevertheless left the LV grown (or
+    /// whose size cannot be re-verified) keeps the durable intent: clearing
+    /// it there would silently drop the recovery anchor and leave the
+    /// recorded size below the real LV.
+    fn settle_failed_lvextend(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        from_size_bytes: u64,
+        error: ApiError,
+    ) -> ApiError {
+        match self.lv_size(vg_name, lv_name) {
+            Ok(Some(observed)) if observed == from_size_bytes => {
+                self.clear_grow_intent_after_failed_start(state, volume_id, error)
+            }
+            Ok(Some(observed)) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; the lvextend exit status was non-zero but LVM reports {observed} bytes \
+                     for {vg_name}/{lv_name} (from {from_size_bytes}); the durable grow intent \
+                     remains, and a retry or startup classifies the observed size rather than \
+                     assuming the command did nothing",
+                    error.detail
+                ),
+            ),
+            Ok(None) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; lvs no longer reports {vg_name}/{lv_name} after the non-zero lvextend \
+                     exit; the durable grow intent remains for recovery (it never recreates or \
+                     shrinks the LV)",
+                    error.detail
+                ),
+            ),
+            Err(observe_error) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; the LV size could not be re-verified after the non-zero lvextend exit \
+                     ({observe_error}); the durable grow intent remains for recovery",
+                    error.detail
+                ),
+            ),
         }
-        Ok(actual)
     }
 
     /// Verify the post-`lvextend` size from LVM's own report.
@@ -3414,16 +3717,88 @@ impl LvmProvider {
         }
     }
 
+    /// Commit the observed post-`lvextend` size under a fresh admission.
+    ///
+    /// The drive guard and the durable intent excluded every structural
+    /// mutation of this volume while the state lock was released, so the
+    /// anchor and generation must still be exactly what the drive
+    /// recorded; refuse to commit against a changed anchor rather than
+    /// fabricate a record the recovery path cannot explain.
+    fn commit_grown_size(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        grow_intent: &GrowIntent,
+        current_generation: u64,
+        actual: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = self.lock_state_stable()?;
+        if state.grow_intent(volume_id) != Some(grow_intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable grow intent for volume {volume_id} changed while lvextend was \
+                     in flight; refusing to commit a size against an unverified anchor. The LV \
+                     has already been extended to {actual} bytes; the durable intent is left in \
+                     place, but recovery refuses to apply it against a changed anchor, so the \
+                     recorded provisioned size may under-report until an operator reconciles it"
+                ),
+            ));
+        }
+        // Check against the immutable view first so a refusal does not
+        // mark the state guard dirty.
+        let observed_generation = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?
+            .entry
+            .generation;
+        if observed_generation != current_generation {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "volume {volume_id} generation moved from {current_generation} to \
+                     {observed_generation} while lvextend was in flight; refusing to commit the \
+                     observed size {actual} against a stale grow anchor. The LV has already been \
+                     extended; the durable intent is left in place, but startup recovery drops an \
+                     intent whose recorded generation moved, so the recorded provisioned size may \
+                     under-report until an operator reconciles it"
+                ),
+            ));
+        }
+        let new_generation = {
+            let stored = state
+                .volume_mut(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            stored.entry.size_bytes = actual;
+            stored.entry.generation += 1;
+            stored.entry.generation
+        };
+        state.remove_grow_intent(volume_id);
+        if let Err(save_error) = self.persist(&mut state) {
+            return Err(self.persist_completed_grow(
+                save_error,
+                volume_id,
+                vg_name,
+                lv_name,
+                actual,
+                new_generation,
+            ));
+        }
+        Ok(())
+    }
+
     /// Grow with a durable-first grow intent.
     ///
     /// Rejected while a delete is pending. A matching pending intent is
     /// a resume: at/above the request finalizes from the observed size,
     /// exactly at the from-size continues to `lvextend`, and anything
     /// else is ambiguous and refused. A fresh grow persists the intent
-    /// before `lvextend`; start/command failures clear it (or leave it
-    /// durable when the clear fails). A failed size verification or a
-    /// failed final save leaves the durable intent to roll the grow
-    /// forward on restart, and the LV is never shrunk as compensation.
+    /// before `lvextend`; a known failed start (proven by `lvs` to have
+    /// left the LV at its from-size) clears it, while an unknown outcome
+    /// leaves it durable. A failed size verification or a failed final
+    /// save leaves the durable intent to roll the grow forward on
+    /// restart, and the LV is never shrunk as compensation.
     fn grow_volume_inner(
         &self,
         volume_id: &VolumeId,
@@ -3433,11 +3808,19 @@ impl LvmProvider {
         if !self.capabilities().contains(Capability::Resize) {
             return Err(unsupported("the resize capability is not advertised"));
         }
+        // One live grow drive per volume. The drive releases the provider
+        // state lock across the long LVM commands; structural mutations
+        // are refused by the durable intent, and a second grow is refused
+        // here even before it can observe that intent.
+        let _drive = self.begin_grow_drive(volume_id)?;
         let mut state = self.lock_state_stable()?;
         // A durable pending delete owns this volume's fate: growing it
         // would race a delete authorization (and possibly resurrect a
         // half-discarded LV).
         self.ensure_no_pending_delete(&state, volume_id)?;
+        // A move completion bumps the generation; a grow must not straddle
+        // that change or its durable intent would look stale to recovery.
+        Self::ensure_no_unsettled_move(&state, volume_id)?;
         let (vg_name, lv_name, current_size, current_generation, has_attachment) = {
             let stored = state
                 .volume(volume_id)
@@ -3467,27 +3850,8 @@ impl LvmProvider {
                 stored.runtime.attachment.is_some(),
             )
         };
-        let respond = |effective_size_bytes: u64| GrowVolumeResponse {
-            backing_resized: true,
-            // The provider-layer placeholder, honestly labeled: this
-            // layer has no VMM to notify. When the daemon wires the
-            // P6-B grow-notification engine (volvisor-provider's
-            // `grow` module — the LVM daemon path always does), the
-            // API layer composes the real status over this response,
-            // inside the journal's execute closure, so the recorded
-            // outcome carries it and replays byte-compatibly. This
-            // placeholder remains the honest standalone answer (the
-            // conformance kit, provider-direct callers): an attached
-            // frontend still needs a (retried) notification; a
-            // detached volume has nobody to notify. Never `Notified`
-            // from here.
-            guest_notification_status: if has_attachment {
-                GrowGuestNotification::RetryRequired
-            } else {
-                GrowGuestNotification::NotApplicable
-            },
-            effective_size_bytes,
-        };
+        let respond =
+            |effective_size_bytes: u64| grow_response(has_attachment, effective_size_bytes);
 
         // A durable grow intent means an earlier attempt may already
         // have extended the LV. Roll it forward against the observed
@@ -3521,15 +3885,62 @@ impl LvmProvider {
             GrowResume::Finalized(observed) => return Ok(respond(observed)),
         }
 
-        let actual = self.execute_grow(
+        let (grow_intent, reservation) = self.prepare_grow(
             &mut state,
             volume_id,
             req,
             &vg_name,
-            &lv_name,
             current_size,
             current_generation,
             intent_is_durable,
+        )?;
+        // The resize and its verification are the only long-running steps.
+        // Release the provider state lock so other volumes' writes are not
+        // queued behind this volume's LVM CLI call. The durable intent
+        // (written above) is the recovery anchor for the gap, and the
+        // capacity reservation keeps concurrent admissions honest.
+        drop(state);
+        let lvextend = self.run_lvextend(&vg_name, &lv_name, req.new_size_bytes);
+        // The command returned: `vgs` now reports the real free space, so
+        // the in-flight promise can be released on every outcome.
+        drop(reservation);
+        match lvextend {
+            LvextendOutcome::Extended => {}
+            LvextendOutcome::Unknown(error) => {
+                // The command may have reached LVM: keep the durable
+                // intent for recovery. It stays in the in-memory state
+                // (the dropped guard published it), so structural
+                // mutations remain refused until a retry or restart
+                // classifies the observed size.
+                return Err(error);
+            }
+            LvextendOutcome::StartFailed(error) => {
+                // A non-zero exit is a failed start only when LVM proves
+                // the LV did not move; otherwise the durable intent must
+                // survive so recovery classifies the observed size.
+                return Err(self.settle_failed_lvextend_drive(
+                    volume_id,
+                    &vg_name,
+                    &lv_name,
+                    current_size,
+                    error,
+                ));
+            }
+        }
+        // Verify the effective size from LVM's own report. Like create,
+        // grow rounds up to whole extents: anything at or above the
+        // requested size is a success, and the effective size is what
+        // gets persisted and reported. A verification failure leaves
+        // the durable grow intent for recovery (never a silent success).
+        let actual = self.verify_grown_size(&vg_name, &lv_name, req.new_size_bytes)?;
+        // Reacquire the state lock only to commit the observed size.
+        self.commit_grown_size(
+            volume_id,
+            &vg_name,
+            &lv_name,
+            &grow_intent,
+            current_generation,
+            actual,
         )?;
         Ok(respond(actual))
     }
@@ -3583,6 +3994,10 @@ impl LvmProvider {
                 format!("volume {volume_id} must be fully detached before delete"),
             ));
         }
+        // A live grow releases the state lock across `lvextend`; deleting
+        // under it would destroy the LV the resize is operating on and
+        // leave a durable intent that can no longer be classified.
+        Self::ensure_no_pending_grow(state, volume_id)?;
         if let Some(record) = state.move_record(volume_id) {
             if Self::move_blocks_delete(record) {
                 return Err(ApiError::new(
@@ -4101,7 +4516,6 @@ impl LvmProvider {
     /// re-read itself fails, the verified completion is kept as
     /// possibly durable (never rolled back, so a later save cannot
     /// regress the generation or erase the anchor).
-    #[allow(clippy::too_many_lines)] // one verified-completion/persist-classification narrative
     fn finish_complete(
         &self,
         volume_id: &VolumeId,
@@ -4109,31 +4523,60 @@ impl LvmProvider {
         lv_name: &str,
         record: &crate::state::MoveRecord,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        match self.complete_move_unless_growing(volume_id, vg_name, lv_name, record)? {
+            MoveCompletion::Completed(response) => Ok(response),
+            MoveCompletion::Deferred(error) => Err(error),
+        }
+    }
+
+    /// The verified-completion body, answering `Deferred` (instead of an
+    /// error) when a live grow owns the volume's generation anchor.
+    ///
+    /// Consumer-driven callers ([`Self::finish_complete`]) turn a
+    /// deferral into the typed refusal; the background reconcile pass
+    /// records it and keeps classifying the remaining records instead
+    /// of starving them behind one volume's grow.
+    #[allow(clippy::too_many_lines)] // one verified-completion/persist-classification narrative
+    fn complete_move_unless_growing(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        record: &crate::state::MoveRecord,
+    ) -> Result<MoveCompletion, ApiError> {
         let verification = match self.observe_lv(vg_name, lv_name) {
             Ok(Some(verification)) => verification,
             // The LV is verifiably absent (a successful `lvs` with no
             // row): not an unobservable world. The move can never
             // complete and no pvmove can be active, so resolve the
             // record terminally instead of parking it forever.
-            Ok(None) => return self.resolve_absent_move(volume_id, vg_name, lv_name, record),
+            Ok(None) => {
+                return self
+                    .resolve_absent_move(volume_id, vg_name, lv_name, record)
+                    .map(MoveCompletion::Completed);
+            }
             // The completion was observed but cannot be verified:
             // unknown, never a silent success.
             Err(e) => {
-                return self.park_in_doubt(
-                    volume_id,
-                    format!("verification could not observe the LV after the move ended: {e}"),
-                );
+                return self
+                    .park_in_doubt(
+                        volume_id,
+                        format!("verification could not observe the LV after the move ended: {e}"),
+                    )
+                    .map(MoveCompletion::Completed);
             }
         };
         if !verification.relocated_to(&record.source_pv, &record.target_pv) {
-            return self.park_in_doubt(
-                volume_id,
-                format!(
-                    "verification refused: the LV's devices do not verify the relocation \
-                     to {} (observed {:?}); the source PV {} must no longer back the LV",
-                    record.target_pv, verification.devices, record.source_pv
-                ),
-            );
+            return self
+                .park_in_doubt(
+                    volume_id,
+                    format!(
+                        "verification refused: the LV's devices do not verify the relocation \
+                         to {} (observed {:?}); the source PV {} must no longer back the LV",
+                        record.target_pv, verification.devices, record.source_pv
+                    ),
+                )
+                .map(MoveCompletion::Completed);
         }
         let mut state = self.lock_state_stable()?;
         // The completion snapshot may be stale: this caller verified the
@@ -4171,7 +4614,23 @@ impl LvmProvider {
         // is the durable truth, answered as-is — never clobbered,
         // never re-bumped.
         if stored_record.state == MoveVolumeBackingState::Complete {
-            return Ok(Self::move_response(&state, volume_id, &stored_record));
+            return Ok(MoveCompletion::Completed(Self::move_response(
+                &state,
+                volume_id,
+                &stored_record,
+            )));
+        }
+        // A live grow holds the volume's durable recovery anchor at the
+        // current generation. A completion bumps that generation without
+        // touching the intent, so a crash before the grow commits would
+        // make the anchor look stale and recovery would drop it while the
+        // LV is already extended. Defer the completion: the next reconcile
+        // tick re-observes the world after the grow commits or clears its
+        // intent. (Unsettled records cannot coexist with a live grow —
+        // grow admission refuses them — so this can only defer a settled,
+        // e.g. previously FAILED, record whose world moved again.)
+        if let Some(error) = Self::pending_grow_error(&state, volume_id) {
+            return Ok(MoveCompletion::Deferred(error));
         }
         // A stored `FAILED` is deliberately **not** a barrier on this
         // path: unlike `park_in_doubt`, this caller holds a fresh world
@@ -4305,7 +4764,9 @@ impl LvmProvider {
                 }
             }
         }
-        response.ok_or_else(|| not_found(volume_id))
+        response
+            .map(MoveCompletion::Completed)
+            .ok_or_else(|| not_found(volume_id))
     }
 
     /// The MoveVolumeBackingOnline drive (contract section 4A,
@@ -4334,6 +4795,11 @@ impl LvmProvider {
     ) -> Result<MoveAdmission, ApiError> {
         let state = self.state_snapshot();
         self.ensure_no_pending_delete(&state, volume_id)?;
+        // Snapshot fence only: the authoritative re-check runs under the
+        // writer lock in `journal_move_intent` before the record is
+        // inserted, so this early answer cannot race a grow that persists
+        // its intent in the insert→publish gap.
+        Self::ensure_no_pending_grow(&state, volume_id)?;
         let stored = state
             .volume(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
@@ -4692,6 +5158,7 @@ impl LvmProvider {
                 ),
             ));
         }
+        Self::ensure_no_pending_grow(&state, volume_id)?;
         let mut inserted = false;
         let (source, record) = match state.move_record(volume_id) {
             Some(record)
@@ -5554,8 +6021,15 @@ impl LvmProvider {
                 // for an IN_DOUBT record ("rolls forward under
                 // reconciled authority") — and verified against the
                 // record's own target, never a foreign relocation.
-                self.finish_complete(&volume_id, &vg_name, &lv_name, &record)?;
-                report.completed.push(volume_id);
+                // A live grow defers this one record (its completion
+                // would void the grow's generation anchor); the pass
+                // records the deferral and keeps classifying the rest.
+                match self.complete_move_unless_growing(&volume_id, &vg_name, &lv_name, &record)? {
+                    MoveCompletion::Completed(_) => report.completed.push(volume_id),
+                    MoveCompletion::Deferred(_) => {
+                        report.deferred_while_growing.push(volume_id);
+                    }
+                }
                 continue;
             }
             match record.state {
@@ -6389,6 +6863,30 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
     }
 }
 
+/// Build the standalone grow answer.
+///
+/// The provider-layer status is a placeholder, honestly labeled: this
+/// layer has no VMM to notify. When the daemon wires the P6-B
+/// grow-notification engine (volvisor-provider's `grow` module — the LVM
+/// daemon path always does), the API layer composes the real status over
+/// this response, inside the journal's execute closure, so the recorded
+/// outcome carries it and replays byte-compatibly. This placeholder
+/// remains the honest standalone answer (the conformance kit,
+/// provider-direct callers): an attached frontend still needs a
+/// (retried) notification; a detached volume has nobody to notify.
+/// Never `Notified` from here.
+fn grow_response(has_attachment: bool, effective_size_bytes: u64) -> GrowVolumeResponse {
+    GrowVolumeResponse {
+        backing_resized: true,
+        guest_notification_status: if has_attachment {
+            GrowGuestNotification::RetryRequired
+        } else {
+            GrowGuestNotification::NotApplicable
+        },
+        effective_size_bytes,
+    }
+}
+
 impl AttachmentRecordView for AttachmentRecord {
     fn attachment_id(&self) -> &AttachmentId {
         &self.id
@@ -6505,6 +7003,8 @@ mod read_snapshot_tests {
             store_crash,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
+            grow_drives: Mutex::new(BTreeSet::new()),
+            capacity_reservations: Mutex::new(BTreeMap::new()),
             state: Mutex::new(state.clone()),
             read_snapshot,
         };

@@ -12,11 +12,13 @@
 mod common;
 
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use common::{fixture, unclaimed_fixture};
-use volvisor_lvm::provider::lv_name_for;
+use volvisor_lvm::provider::{LvmProvider, lv_name_for};
 use volvisor_lvm::state::LvmState;
+use volvisor_lvm::{CommandRunner, FakeRunner};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_delete_request, fixture_detach_request,
@@ -25,8 +27,8 @@ use volvisor_provider::conformance::{
 use volvisor_types::crash::{STORE_LVM_STATE, StoreSavePoint};
 use volvisor_types::request::{DeleteVolumeRequest, ErasurePolicy, MoveVolumeBackingRequest};
 use volvisor_types::{
-    ApiErrorCode, AttachmentEvidence, AttachmentState, DeviceId, OperationId, VolumeId,
-    VolumeLifecycle,
+    ApiErrorCode, AttachmentEvidence, AttachmentState, DeviceId, MoveVolumeBackingState,
+    OperationId, VolumeId, VolumeLifecycle,
 };
 
 const GIB: u64 = 1 << 30;
@@ -786,6 +788,517 @@ async fn grow_reports_retry_required_while_attached() {
         grown.guest_notification_status,
         volvisor_types::request::GrowGuestNotification::RetryRequired
     );
+}
+
+/// A one-shot gate that holds `lvextend` inside the fake runner, so a
+/// test can observe what other admissions do while a grow is in flight.
+#[derive(Default)]
+struct GrowGate {
+    state: Mutex<(bool, bool)>,
+    wake: Condvar,
+}
+
+impl GrowGate {
+    fn entered(&self) {
+        let mut state = self.state.lock().expect("gate lock");
+        state.0 = true;
+        self.wake.notify_all();
+    }
+
+    fn has_entered(&self) -> bool {
+        self.state.lock().expect("gate lock").0
+    }
+
+    fn wait_release(&self) {
+        let mut state = self.state.lock().expect("gate lock");
+        while !state.1 {
+            state = self.wake.wait(state).expect("gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("gate lock");
+        state.1 = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Release the fake `lvextend` even when an assertion panics, so a failed
+/// test cannot leave the grow task blocked at runtime shutdown.
+struct GateRelease(Arc<GrowGate>);
+
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A provider whose fake `lvextend` blocks on the returned gate until the
+/// test releases it.
+fn gated_provider() -> (Arc<LvmProvider>, Arc<GrowGate>) {
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
+    let gate = Arc::new(GrowGate::default());
+    let runner = {
+        let world = Arc::clone(&world);
+        let gate = Arc::clone(&gate);
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            if program == "lvextend" {
+                gate.entered();
+                gate.wait_release();
+            }
+            let mut world = world.lock().ok()?;
+            common::script(&mut world, program, args)
+        }))
+    };
+    let provider = Arc::new(
+        LvmProvider::new(
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+            state_path,
+            common::leak_tempdir(),
+            common::VG_PREFIX.to_owned(),
+            common::AUTH_TOKEN.to_owned(),
+        )
+        .expect("provider construction"),
+    );
+    (provider, gate)
+}
+
+/// Wait until the fake `lvextend` has started (and therefore the grow has
+/// released the provider state lock, when the fix is present).
+async fn wait_for_lvextend(gate: &Arc<GrowGate>) {
+    // Poll from an async task, never from a blocking task: if the grow
+    // fails before `lvextend` the polling loop simply times out instead
+    // of leaving a `spawn_blocking` thread parked on the condvar forever
+    // (which would hang the test binary at runtime shutdown).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !gate.has_entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lvextend must start"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The timeout used for calls that must answer while a grow is in flight.
+/// Pre-fix they block on the provider state lock; the calls run in their
+/// own tasks so the timeout is driven by another runtime worker.
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A fake world with the move's two PVs, both contributing free space to
+/// the claimed VG (the shape `move_fixture` builds).
+fn gated_move_world() -> Arc<Mutex<common::FakeLvm>> {
+    let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
+    {
+        let mut world = world.lock().expect("world");
+        world.add_pv_to_vg(
+            common::MOVE_SOURCE_PV,
+            common::CLAIMED_VG,
+            common::POOL_BYTES,
+        );
+        world.add_pv_to_vg(
+            common::MOVE_TARGET_PV,
+            common::CLAIMED_VG,
+            common::POOL_BYTES,
+        );
+        world
+            .vg_free
+            .insert(common::CLAIMED_VG.to_owned(), 2 * common::POOL_BYTES);
+        world
+            .vg_size
+            .insert(common::CLAIMED_VG.to_owned(), 2 * common::POOL_BYTES);
+    }
+    world
+}
+
+/// Regression for the measured c32/c128 write-tail: a grow must release
+/// the provider state lock across `lvextend`.
+///
+/// The fake `lvextend` blocks until this test releases it. While it is
+/// blocked, an attach on a *different* volume must complete (the state
+/// lock is not held) and structural mutations of the *growing* volume
+/// must be refused typed (the durable intent is the recovery anchor and
+/// its generation must not move under the resize).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn grow_releases_the_state_lock_across_lvextend() {
+    let (provider, gate) = gated_provider();
+    let _release = GateRelease(Arc::clone(&gate));
+
+    let growing = provider
+        .create_volume(&fixture_create_request("grow-lock", GIB))
+        .await
+        .expect("create growing volume");
+    let other = provider
+        .create_volume(&fixture_create_request("grow-other", GIB))
+        .await
+        .expect("create other volume");
+
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        let request = fixture_grow_request("grow-lock", 2 * GIB, growing.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_lvextend(&gate).await;
+
+    // The growing volume's structural mutations are refused while the
+    // intent is in flight, so the recovery anchor's generation cannot
+    // move under `lvextend`.
+    let refusal = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .attach_volume(
+                    &volume_id,
+                    &fixture_attach_request("grow-lock", "grow-lock-att", 1),
+                )
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, refusal)
+        .await
+        .expect("attach during a grow must not block on the state lock")
+        .expect("attach task join")
+        .expect_err("attach during a grow must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(err.detail.contains("grow in progress"), "{err}");
+
+    let second_grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .grow_volume(
+                    &volume_id,
+                    &fixture_grow_request("grow-lock-second", 3 * GIB, 1),
+                )
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, second_grow)
+        .await
+        .expect("a second grow must not block on the state lock")
+        .expect("grow task join")
+        .expect_err("a second grow of the same volume must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(
+        err.detail.contains("already has a grow in progress"),
+        "{err}"
+    );
+
+    // A different volume's write must not queue behind this volume's
+    // ~200 ms LVM CLI call: the state lock is released for the command.
+    let attach_other = {
+        let provider = Arc::clone(&provider);
+        let volume_id = other.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .attach_volume(
+                    &volume_id,
+                    &fixture_attach_request("grow-other", "grow-other-att", 1),
+                )
+                .await
+        })
+    };
+    let attached = tokio::time::timeout(IN_FLIGHT_TIMEOUT, attach_other)
+        .await
+        .expect("another volume's attach must not wait behind lvextend")
+        .expect("attach task join")
+        .expect("attach other volume");
+    assert_eq!(attached.volume_generation, 2);
+
+    gate.release();
+    let grown = grow.await.expect("grow task").expect("grow succeeds");
+    assert!(grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    let inspected = provider
+        .inspect_volume(&growing.volume_id)
+        .await
+        .expect("inspect grown volume");
+    assert_eq!(inspected.provisioned_bytes, 2 * GIB);
+    assert_eq!(inspected.generation, 2);
+}
+
+/// A report only advances the attachment record's own state; it does not
+/// move the volume generation, so it must stay admitted while a grow of the
+/// same volume is in flight (an idempotent report retry must not be turned
+/// into a typed failure by the grow's recovery reservation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn report_stays_admitted_during_a_grow() {
+    let (provider, gate) = gated_provider();
+    let _release = GateRelease(Arc::clone(&gate));
+
+    let volume = provider
+        .create_volume(&fixture_create_request("grow-report", GIB))
+        .await
+        .expect("create volume");
+    let attached = provider
+        .attach_volume(
+            &volume.volume_id,
+            &fixture_attach_request("grow-report", "grow-report-att", volume.generation),
+        )
+        .await
+        .expect("attach");
+
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = volume.volume_id.clone();
+        let request = fixture_grow_request("grow-report", 2 * GIB, attached.volume_generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_lvextend(&gate).await;
+
+    // Detach bumps the volume generation and is refused.
+    let detach = {
+        let provider = Arc::clone(&provider);
+        let volume_id = volume.volume_id.clone();
+        let attachment_id = attached.attachment_id.clone();
+        let request = fixture_detach_request("grow-report-att", attached.attachment_generation);
+        tokio::spawn(async move {
+            provider
+                .detach_volume(&volume_id, &attachment_id, &request)
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, detach)
+        .await
+        .expect("detach during a grow must not block on the state lock")
+        .expect("detach task join")
+        .expect_err("detach during a grow must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(err.detail.contains("grow in progress"), "{err}");
+
+    // The report is admitted and advances the attachment record.
+    let report = {
+        let provider = Arc::clone(&provider);
+        let volume_id = volume.volume_id.clone();
+        let request = fixture_report_request(
+            "grow-report-att",
+            attached.attachment_generation,
+            AttachmentState::Active,
+            AttachmentEvidence::GuestConfirmed,
+        );
+        tokio::spawn(async move { provider.report_attachment_state(&volume_id, &request).await })
+    };
+    let reported = tokio::time::timeout(IN_FLIGHT_TIMEOUT, report)
+        .await
+        .expect("a report must not wait behind lvextend")
+        .expect("report task join")
+        .expect("report during a grow");
+    assert!(reported.applied);
+    assert_eq!(reported.state, AttachmentState::Active);
+
+    gate.release();
+    let grown = grow.await.expect("grow task").expect("grow succeeds");
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    let inspected = provider
+        .inspect_volume(&volume.volume_id)
+        .await
+        .expect("inspect grown volume");
+    assert_eq!(inspected.generation, attached.volume_generation + 1);
+}
+
+/// The released-lock grow must still reserve its extents: a concurrent
+/// create, or another volume's grow, that takes the state lock while
+/// `lvextend` runs must not spend the same free space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grow_reserves_capacity_against_concurrent_admissions() {
+    let (provider, gate) = gated_provider();
+    let _release = GateRelease(Arc::clone(&gate));
+
+    let first = provider
+        .create_volume(&fixture_create_request("cap-first", GIB))
+        .await
+        .expect("create first volume");
+    let second = provider
+        .create_volume(&fixture_create_request("cap-second", GIB))
+        .await
+        .expect("create second volume");
+
+    // 599 GiB demand against a 1 TiB pool: admissible alone, but not
+    // twice. The grow is held inside `lvextend`, so its bytes are only
+    // promised (not yet consumed).
+    let grown_size = 600 * GIB;
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = first.volume_id.clone();
+        let request = fixture_grow_request("cap-first", grown_size, first.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_lvextend(&gate).await;
+
+    let other_grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = second.volume_id.clone();
+        let request = fixture_grow_request("cap-second", grown_size, second.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, other_grow)
+        .await
+        .expect("a second volume's grow must not block on the state lock")
+        .expect("grow task join")
+        .expect_err("the reserved bytes must not be promised twice");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity);
+    assert!(
+        err.detail.contains("reserved for in-flight allocations"),
+        "{err}"
+    );
+
+    let create = {
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            provider
+                .create_volume(&fixture_create_request("cap-create", grown_size))
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, create)
+        .await
+        .expect("a create must not block on the state lock")
+        .expect("create task join")
+        .expect_err("a create must not spend the reserved bytes");
+    assert_eq!(err.code, ApiErrorCode::NoSafeCapacity);
+
+    gate.release();
+    let grown = grow.await.expect("grow task").expect("grow succeeds");
+    assert_eq!(grown.effective_size_bytes, grown_size);
+}
+
+/// A move completion bumps the volume generation without touching the
+/// grow intent, so it must defer to a live grow; otherwise a crash would
+/// make the durable intent look stale to recovery and it would be dropped
+/// while the LV is already extended. The deferral must skip only that
+/// record: the rest of the pass still classifies other volumes.
+#[allow(clippy::too_many_lines)] // one grow/deferral/two-volume-pass narrative
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn move_completion_defers_while_a_grow_is_in_flight() {
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = gated_move_world();
+    let gate = Arc::new(GrowGate::default());
+    let runner = {
+        let world = Arc::clone(&world);
+        let gate = Arc::clone(&gate);
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            if program == "lvextend" {
+                gate.entered();
+                gate.wait_release();
+            }
+            let mut world = world.lock().ok()?;
+            common::script(&mut world, program, args)
+        }))
+    };
+    let build = |runner: Arc<FakeRunner>| {
+        Arc::new(
+            LvmProvider::new(
+                runner as Arc<dyn CommandRunner>,
+                state_path.clone(),
+                common::leak_tempdir(),
+                common::VG_PREFIX.to_owned(),
+                common::AUTH_TOKEN.to_owned(),
+            )
+            .expect("provider construction"),
+        )
+    };
+    let _release = GateRelease(Arc::clone(&gate));
+
+    let (growing, other) = {
+        let provider = build(Arc::clone(&runner));
+        let growing = provider
+            .create_volume(&fixture_create_request("move-grow", GIB))
+            .await
+            .expect("create growing volume");
+        let other = provider
+            .create_volume(&fixture_create_request("move-later", GIB))
+            .await
+            .expect("create later volume");
+        (growing, other)
+    };
+    // Seed a settled FAILED record for both volumes and restart so they
+    // are part of the provider's in-memory state. The placements are
+    // still on the source PV here, so the constructor's reconcile pass
+    // cannot complete either record and bump a generation behind this
+    // test's back.
+    for volume_id in ["move-grow", "move-later"] {
+        common::seed_move(
+            &state_path,
+            volume_id,
+            common::MOVE_SOURCE_PV,
+            common::MOVE_TARGET_PV,
+            MoveVolumeBackingState::Failed,
+        );
+    }
+    let provider = build(runner);
+    for volume in [&growing, &other] {
+        let inspected = provider
+            .inspect_volume(&volume.volume_id)
+            .await
+            .expect("inspect restarted");
+        assert_eq!(inspected.generation, volume.generation);
+    }
+    // Now move both LVs' placements to the records' target so the world
+    // proves the relocations the next reconcile pass will try to record.
+    {
+        let mut world = world.lock().expect("world");
+        for volume in [&growing, &other] {
+            world.lv_devices.insert(
+                format!("{}/{}", common::CLAIMED_VG, lv_name_for(&volume.volume_id)),
+                vec![common::MOVE_TARGET_PV.to_owned()],
+            );
+        }
+    }
+
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        let request = fixture_grow_request("move-grow", 2 * GIB, growing.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_lvextend(&gate).await;
+
+    // The growing volume's completion is deferred; the later volume's
+    // completion still lands in the same pass (no pass-wide abort).
+    let report = tokio::time::timeout(
+        IN_FLIGHT_TIMEOUT,
+        tokio::task::spawn_blocking({
+            let provider = Arc::clone(&provider);
+            move || provider.move_reconcile_pass()
+        }),
+    )
+    .await
+    .expect("the move pass must not block on the state lock")
+    .expect("move pass join")
+    .expect("a deferral must not abort the pass");
+    assert_eq!(
+        report.deferred_while_growing,
+        vec![growing.volume_id.clone()]
+    );
+    assert_eq!(report.completed, vec![other.volume_id.clone()]);
+    let inspected = provider
+        .inspect_volume(&other.volume_id)
+        .await
+        .expect("inspect later volume");
+    assert_eq!(inspected.generation, other.generation + 1);
+
+    gate.release();
+    let grown = grow.await.expect("grow task").expect("grow succeeds");
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+
+    // With the grow committed, the next pass completes the deferred move
+    // and bumps that volume's generation exactly once.
+    let report = provider
+        .move_reconcile_pass()
+        .expect("the retry pass completes the deferred move");
+    assert_eq!(report.completed, vec![growing.volume_id.clone()]);
+    assert_eq!(report.deferred_while_growing, Vec::<VolumeId>::new());
+    let inspected = provider
+        .inspect_volume(&growing.volume_id)
+        .await
+        .expect("inspect volume");
+    assert_eq!(inspected.generation, growing.generation + 2);
 }
 
 #[tokio::test]

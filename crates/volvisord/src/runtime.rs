@@ -480,6 +480,14 @@ fn log_move_pass(
                     "move record unobservable this pass; retried next tick"
                 );
             }
+            for volume_id in &report.deferred_while_growing {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "verified move completion deferred while the volume has a grow in \
+                     flight; retried next pass"
+                );
+            }
         }
         Ok(Err(error)) => tracing::error!(
             kind = "move_reconcile",
