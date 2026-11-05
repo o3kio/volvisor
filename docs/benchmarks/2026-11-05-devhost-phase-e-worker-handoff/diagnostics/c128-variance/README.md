@@ -40,10 +40,10 @@ regardless; they are non-evidence.
 | A2 | 7204a53 | 439.497 | 135.620 | 25.275 | yes (untracked docs only) |
 | B2 | 2c5b065 | 427.457 | 141.587 | 24.676 | no |
 
-The c128 tier swings by about 45% between adjacent runs (A1 626.011 →
-B1 432.752), and the arms are within 1.6% at their closest (B1 432.752 vs
-A2 439.497) but cannot be separated at n=2; B2 is 427.457 and A1 is a
-high-state outlier. The later runs are all in a low state, with attach p50 ≈
+The c128 tier swings by about 31% between adjacent runs (A1 626.011 →
+B1 432.752; equivalently B1 is about 45% below A1), and the arms are within
+1.6% at their closest (B1 432.752 vs A2 439.497) but cannot be separated at
+n=2; B2 is 427.457 and A1 is a high-state outlier. The later runs are all in a low state, with attach p50 ≈
 25 ms versus A1's 10.9 ms. The measured run (462.899) and its earlier
 same-SHA `--skip-soak` repeat (519.539, published as non-evidence under
 [../same-sha-repeat/](../same-sha-repeat/README.md)) fall inside the observed
@@ -61,5 +61,6 @@ c128 sample cannot establish one in either direction.
 - `<run>/ENVIRONMENT.txt` and `<run>/json/mixed-c{1,8,32,128}.json` — the
   exact records used.
 
-Daemon logs and full run trees are not included. The diagnostic contains no
-micro, soak, probe or restart record.
+Daemon logs and full run trees are not included. This directory contains no
+micro, soak, probe or restart record; only the mixed-c aggregates were
+copied from the four `--skip-soak` runs.

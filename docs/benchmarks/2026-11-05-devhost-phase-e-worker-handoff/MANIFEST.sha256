@@ -1,6 +1,6 @@
 f6f083331d3d6e27e67c5c9c845205e849c2262b69d2efae784423a6bf5093c4  ./ENVIRONMENT.txt
 6ad6f17d526c6b5217d8ba823d73907049ce145800619fa8f50da808a575c5ce  ./README.md
-3d4538592497f514de6cfc7c4e86ebe87ba458ad9e1c502c21e88ff0703dd426  ./REPORT.md
+a358b7f99e9215eac3ae328843f23c0a6acf36065e6487702701a1ec2e256e8d  ./REPORT.md
 1a5b5c33f27aecac8c23d93cecc239de960379e5025474ed6a30f08e523dedc6  ./SCRIPTS.txt
 f61c74d013138e3aa262c290572df03c06ff6cfddb5a53924fec44b3755ab25e  ./comparison/comparison.csv
 9b20076b773e35896336381fe3b4cbfc5224b4252abbd092ec29782d5ed05b45  ./comparison/comparison.md
@@ -22,7 +22,7 @@ dbce90906ae0a1a441224a815081ccb2162459cb92dd62cf7646a02b5c0639fa  ./csv/mixed-ra
 4728adfa229e9d4235aad65b238c598e093f860c4fdac46db09feebeb148153a  ./csv/mixed-rate50-c64-timeline.csv
 7ac10cbcc204fefe5afa04e8a8864a45275a7bd870edc84e96a09327f8bb0997  ./csv/soak-ops.csv
 9953d01b4218501b7308bc3307f6a6d461df022773f6ad1a22a6e57f97298666  ./csv/soak-timeline.csv
-00264399383dc659c8d0ea97c177388009253dbb98292ca2ae021ce496bd14e5  ./diagnostics/c128-variance/README.md
+cc5d1235562cff6f0928d9f662e97a7d89fb1cf4261a7145a66a7cfe772684f7  ./diagnostics/c128-variance/README.md
 4e3cd5dfd9287a781db6fcd9487a4f5f8331386a3d3958d80eab9c3e5db04dbe  ./diagnostics/c128-variance/a1-7204a53/ENVIRONMENT.txt
 956f3cbb1353f972e73a892cf234ea43c1cf0fd0573aba6d5cac53f72dea6d58  ./diagnostics/c128-variance/a1-7204a53/json/mixed-c1.json
 1ecb96adab820b4a0337c21352b1669d1300f241f8ed150bd0cb65fa6ea0344d  ./diagnostics/c128-variance/a1-7204a53/json/mixed-c128.json

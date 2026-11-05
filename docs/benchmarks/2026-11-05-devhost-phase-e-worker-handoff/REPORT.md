@@ -312,8 +312,8 @@ It supports, for the clean tree at `7204a53`:
   and reservation-release coverage, pass with their negative controls;
 - the micro create p50/p95 are flat in the published sample and in the
   same-SHA repeat, while delete is flat only in the published sample and
-  +6.34%/+5.90% in the repeat, so create shows no measurable per-op overhead
-  and delete overhead is unresolved;
+  +6.34%/+5.90% in the repeat, so create is flat in both samples and delete
+  overhead is unresolved;
 - every aggregate record is `OK`, the daemon logged zero `ERROR` records,
   teardown removed only its own lab VG, and the restart replay recovered
   all expected volumes;
