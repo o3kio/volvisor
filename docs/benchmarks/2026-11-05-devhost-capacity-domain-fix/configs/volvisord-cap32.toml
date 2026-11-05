@@ -1,0 +1,17 @@
+listen = "127.0.0.1:35749"
+journal_dir = "/tmp/opencode/volvisor-bench-20261105T1219Z-candidate-4290b84/lab/journal"
+provider = "lvm"
+lvm_vg_prefix = "volvisor-bench"
+device_claim_token = "<redacted>"
+lvm_state_path = "/tmp/opencode/volvisor-bench-20261105T1219Z-candidate-4290b84/lab/lvm-state.json"
+admin_token = "<redacted>"
+
+[admission]
+read_timeout_secs = 30
+# Diagnostic: a 1s queue timeout makes shedding observable at this cap.
+# The default-cap runs above keep the product default of 5s.
+queue_timeout_secs = 1
+max_concurrent_requests = 32
+rate_limit_per_second = 0
+rate_limit_burst = 0
+max_list_limit = 1000
