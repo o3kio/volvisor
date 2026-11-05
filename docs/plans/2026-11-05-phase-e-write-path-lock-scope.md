@@ -126,6 +126,10 @@ size-verifying `lvs` and the final save.
   reacquired critical section; moving that `lvremove` out is an E3 residual.
   A create whose pool shrank between its own sample and its reservation
   fails closed with `NO_SAFE_CAPACITY` instead of overcommitting.
+- Commit-message correction: the `2c5b065` message says the reservation is
+  released and then the epoch bumped. The code and this plan do the reverse
+  (bump the epoch, then drop the reservation), which is the required order;
+  see `publish_created_allocation`.
 
 **Acceptance.**
 
