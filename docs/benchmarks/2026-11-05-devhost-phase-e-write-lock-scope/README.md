@@ -83,10 +83,11 @@ These are findings, not fixes, and they are not production claims:
   their admission critical sections; the failed-create compensation's
   `lvremove` remains inside the reacquired critical section.
 - **Create/delete still run their LVM bodies inline on async workers.**
-  Grow and move use the blocking handoff; create/delete do not. At or above
-  the runtime worker count, sustained structural concurrency can pin the
-  runtime. This is pre-existing, not introduced by E1/E2, and it bounds the
-  "no longer queues every mutation" statement.
+  Only grow uses `run_blocking_body`; create, delete and move's request-path
+  CLI calls run inline. At or above the runtime worker count, sustained
+  structural concurrency can pin the runtime. This is pre-existing, not
+  introduced by E1/E2, and it bounds the "no longer queues every mutation"
+  statement.
 - **The gate tests cover same-kind duplicate refusal only.** The cross-kind
   create-vs-delete refusal rests on the shared structural drive map but is
   not directly exercised by a gate test.

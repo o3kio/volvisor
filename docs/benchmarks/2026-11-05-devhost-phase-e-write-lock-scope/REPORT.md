@@ -60,12 +60,13 @@ existence check still runs inside its first critical section; `pick_pool_vg`'s
 `vgs` sample still runs inside create admission; the failed-final-save
 compensation (`compensate_unpersisted_create`) still runs its checked
 `lvremove` inside the reacquired critical section. Separately, create and
-delete still run their synchronous LVM bodies inline on async workers (grow
-and move use the blocking handoff); with at least as many concurrent
-structural bodies as runtime workers, those workers can be pinned. This is
-pre-existing and not introduced by E1/E2, but it bounds the "no longer queues
-every mutation" statement to in-flight structural bodies below the worker
-count. It is recorded in §10.
+delete still run their synchronous LVM bodies inline on async workers (only
+grow uses `run_blocking_body`; move's request path runs its CLI calls inline
+and only its long supervision loop sleeps asynchronously); with at least as
+many concurrent structural bodies as runtime workers, those workers can be
+pinned. This is pre-existing and not introduced by E1/E2, but it bounds the
+"no longer queues every mutation" statement to in-flight structural bodies
+below the worker count. It is recorded in §10.
 
 ## 2. Test evidence at the measured SHA
 
@@ -285,11 +286,12 @@ queue improved; a capacity, SLA, durability or data-path claim; or the
   sample remain inside their admission critical sections; the failed-create
   compensation's `lvremove` remains inside the reacquired critical section;
   create and delete still run their synchronous LVM bodies inline on async
-  workers (grow/move use the blocking handoff), so sustained concurrency at
-  or above the worker count can pin the runtime — pre-existing, not
-  introduced by E1/E2; the same-kind gate tests do not directly exercise the
-  cross-kind create-vs-delete refusal; the c128 grow queue/tail remains
-  LVM-per-VG-bound and unresolved.
+  workers (only grow uses `run_blocking_body`; move's request path runs its
+  CLI calls inline), so sustained concurrency at or above the worker count
+  can pin the runtime — pre-existing, not introduced by E1/E2; the
+  same-kind gate tests do not directly exercise the cross-kind create-vs-
+  delete refusal; the c128 grow queue/tail remains LVM-per-VG-bound and
+  unresolved.
 - #62 stays open. No gate verdict changes. No production-support, SLA,
   zero-RPO, release or hardware/multi-host claim is made.
 

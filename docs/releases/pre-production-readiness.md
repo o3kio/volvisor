@@ -339,9 +339,9 @@ is a production-support, SLA, capacity, durability or hardware claim.
   admission critical sections, and the failed-create compensation's
   `lvremove` remains in the reacquired critical section. Create and delete
   also still run their synchronous LVM bodies inline on async workers
-  (grow/move use the blocking handoff), so sustained concurrency at or above
-  the worker count can pin the runtime — pre-existing, not introduced by
-  E1/E2. The gate tests exercise same-kind duplicate refusal; the cross-kind
+  (only grow uses the blocking handoff; move's request path runs its CLI
+  calls inline), so sustained concurrency at or above the worker count can
+  pin the runtime — pre-existing, not introduced by E1/E2. The gate tests exercise same-kind duplicate refusal; the cross-kind
   create-vs-delete refusal is implemented but not directly gate-tested.
   **#62 remains open** until explicitly instructed, and no gate
   verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
