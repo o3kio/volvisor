@@ -942,6 +942,29 @@ fn gated_capacity_provider_snapshot() -> (Arc<LvmProvider>, Arc<OneShotProgramGa
 fn gated_capacity_provider_inner(
     snapshot_at_entry: bool,
 ) -> (Arc<LvmProvider>, Arc<OneShotProgramGate>, Arc<FakeRunner>) {
+    let (provider, gate, runner, _world) = gated_capacity_provider_with_world(snapshot_at_entry);
+    (provider, gate, runner)
+}
+
+/// Like [`gated_capacity_provider_snapshot`], but also returns the fake
+/// LVM world so a test can inject a command failure while a grow parks.
+fn gated_capacity_provider_snapshot_with_world() -> (
+    Arc<LvmProvider>,
+    Arc<OneShotProgramGate>,
+    Arc<FakeRunner>,
+    Arc<Mutex<common::FakeLvm>>,
+) {
+    gated_capacity_provider_with_world(true)
+}
+
+fn gated_capacity_provider_with_world(
+    snapshot_at_entry: bool,
+) -> (
+    Arc<LvmProvider>,
+    Arc<OneShotProgramGate>,
+    Arc<FakeRunner>,
+    Arc<Mutex<common::FakeLvm>>,
+) {
     let state_path = common::leak_tempdir().join("state.json");
     common::seed_claimed_state(&state_path);
     let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
@@ -977,7 +1000,7 @@ fn gated_capacity_provider_inner(
         )
         .expect("provider construction"),
     );
-    (provider, gate, runner)
+    (provider, gate, runner, world)
 }
 
 /// A gate for `lvextend` that counts how many calls are inside at once.
@@ -1594,6 +1617,174 @@ async fn a_create_during_a_grow_sample_forces_a_resample() {
     assert!(
         count_program(&runner, "vgs") >= vgs_before + 2,
         "the grow must re-sample capacity after the create"
+    );
+}
+
+/// Regression for a create attempt whose `lvcreate` outcome is unknown:
+/// the command may have spent capacity even though the create returns an
+/// error. The attempt must bump the allocation epoch so a grow that
+/// sampled before it cannot reserve against the pre-attempt figure.
+///
+/// The gate returns the pre-create `vgs` snapshot. Without the bump the
+/// grow never re-samples (two `vgs` calls: its sample and the create's);
+/// with the bump it re-samples before admitting (three calls). The create
+/// fails without touching the fake world's free space, so this isolates
+/// the epoch invalidation from an actual capacity change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_create_with_an_unknown_outcome_invalidates_a_grows_capacity_sample() {
+    let (provider, gate, runner, world) = gated_capacity_provider_snapshot_with_world();
+    let _release = OneShotGateRelease(Arc::clone(&gate));
+
+    let growing = provider
+        .create_volume(&fixture_create_request("cap-unknown-grow", GIB))
+        .await
+        .expect("create growing volume");
+
+    let vgs_before = count_program(&runner, "vgs");
+    gate.arm();
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        let request = fixture_grow_request("cap-unknown-grow", 2 * GIB, growing.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_vgs(&gate).await;
+
+    // The create's `lvcreate` returns a runner error (no exit status):
+    // the outcome is unknown and the durable intent remains.
+    world
+        .lock()
+        .expect("world")
+        .fail_runner_for
+        .push("lvcreate".to_owned());
+    let err = provider
+        .create_volume(&fixture_create_request("cap-unknown-create", GIB))
+        .await
+        .expect_err("the lvcreate outcome is unknown");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    assert!(err.detail.contains("outcome is unknown"), "{err}");
+    world.lock().expect("world").fail_runner_for.clear();
+
+    gate.release();
+    let grown = tokio::time::timeout(IN_FLIGHT_TIMEOUT, grow)
+        .await
+        .expect("the grow must finish")
+        .expect("grow task join")
+        .expect("grow succeeds after re-sampling");
+    assert!(grown.backing_resized);
+    assert_eq!(grown.effective_size_bytes, 2 * GIB);
+    // Initial sample + the create attempt + the grow's post-epoch
+    // re-sample. A missing bump leaves the grow at two samples.
+    assert!(
+        count_program(&runner, "vgs") >= vgs_before + 3,
+        "an unknown lvcreate outcome must invalidate a grow's in-flight sample"
+    );
+}
+
+/// Regression for a create whose `lvcreate` exits non-zero: the clear
+/// path does not prove the LV absent, so the attempt must still bump the
+/// allocation epoch before returning. Same gate and sample-count shape as
+/// the unknown-outcome test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_create_with_a_known_failed_start_invalidates_a_grows_capacity_sample() {
+    let (provider, gate, runner, world) = gated_capacity_provider_snapshot_with_world();
+    let _release = OneShotGateRelease(Arc::clone(&gate));
+
+    let growing = provider
+        .create_volume(&fixture_create_request("cap-failed-grow", GIB))
+        .await
+        .expect("create growing volume");
+
+    let vgs_before = count_program(&runner, "vgs");
+    gate.arm();
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        let request = fixture_grow_request("cap-failed-grow", 2 * GIB, growing.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_vgs(&gate).await;
+
+    world.lock().expect("world").fail_lvcreate = true;
+    let err = provider
+        .create_volume(&fixture_create_request("cap-failed-create", GIB))
+        .await
+        .expect_err("lvcreate exits non-zero");
+    assert_eq!(err.code, ApiErrorCode::Internal, "{err}");
+    world.lock().expect("world").fail_lvcreate = false;
+
+    gate.release();
+    let grown = tokio::time::timeout(IN_FLIGHT_TIMEOUT, grow)
+        .await
+        .expect("the grow must finish")
+        .expect("grow task join")
+        .expect("grow succeeds after re-sampling");
+    assert!(grown.backing_resized);
+    assert!(
+        count_program(&runner, "vgs") >= vgs_before + 3,
+        "a failed lvcreate start must invalidate a grow's in-flight sample"
+    );
+}
+
+/// Regression for adopting a verified create intent: the retry returns
+/// early and never reaches the fresh-create bump, but the earlier attempt
+/// may already have spent capacity. Finding an intent must bump the epoch
+/// before the adoption returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_create_intent_adoption_invalidates_a_grows_capacity_sample() {
+    let (provider, gate, runner, world) = gated_capacity_provider_snapshot_with_world();
+    let _release = OneShotGateRelease(Arc::clone(&gate));
+
+    let growing = provider
+        .create_volume(&fixture_create_request("cap-adopt-grow", GIB))
+        .await
+        .expect("create growing volume");
+
+    // Leave a durable intent through an unknown lvcreate outcome, then
+    // make the intent-owned LV appear so the retry adopts it.
+    let adopted_id = volume_id("cap-adopt-create");
+    let request = fixture_create_request(adopted_id.as_str(), GIB);
+    world
+        .lock()
+        .expect("world")
+        .fail_runner_for
+        .push("lvcreate".to_owned());
+    provider
+        .create_volume(&request)
+        .await
+        .expect_err("the lvcreate outcome is unknown");
+    world.lock().expect("world").fail_runner_for.clear();
+    common::add_lv(&world, common::CLAIMED_VG, &lv_name_for(&adopted_id), GIB);
+
+    let vgs_before = count_program(&runner, "vgs");
+    gate.arm();
+    let grow = {
+        let provider = Arc::clone(&provider);
+        let volume_id = growing.volume_id.clone();
+        let request = fixture_grow_request("cap-adopt-grow", 2 * GIB, growing.generation);
+        tokio::spawn(async move { provider.grow_volume(&volume_id, &request).await })
+    };
+    wait_for_vgs(&gate).await;
+
+    // The retry adopts the verified LV and returns before the fresh-create
+    // bump; the fix bumps on finding the intent.
+    let adopted = provider
+        .create_volume(&request)
+        .await
+        .expect("the verified intent-owned LV is adopted");
+    assert_eq!(adopted.state, VolumeLifecycle::Ready);
+    assert_eq!(adopted.provisioned_bytes, GIB);
+
+    gate.release();
+    let grown = tokio::time::timeout(IN_FLIGHT_TIMEOUT, grow)
+        .await
+        .expect("the grow must finish")
+        .expect("grow task join")
+        .expect("grow succeeds after re-sampling");
+    assert!(grown.backing_resized);
+    assert!(
+        count_program(&runner, "vgs") >= vgs_before + 2,
+        "an adopted create intent must invalidate a grow's in-flight sample"
     );
 }
 

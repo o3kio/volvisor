@@ -178,8 +178,10 @@ pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 /// Maximum optimistic capacity-sample rounds for one grow admission.
 ///
 /// Each stale round costs another `vgs` call. The cap keeps a grow from
-/// looping forever under sustained allocation churn; exhaustion returns a
-/// retryable `OVERLOADED` refusal.
+/// looping forever under sustained allocation churn; exhaustion returns an
+/// `OVERLOADED` refusal. The refusal is raised inside the journaled run
+/// closure, so it is the terminal outcome for that `operation_id`: a client
+/// retry must use a new operation id.
 const GROW_ADMISSION_ATTEMPTS: usize = 32;
 
 /// Physical extent size assumed when `vgs` does not report one (LVM's
@@ -3077,6 +3079,14 @@ impl LvmProvider {
                 // reached LVM. Keep the durable intent — never clear it
                 // on an unknown outcome — and let startup recovery
                 // classify the observed LV.
+                //
+                // The command may also have allocated space before the
+                // runner lost the outcome. Bump the allocation epoch so a
+                // grow that sampled capacity before this attempt cannot
+                // reserve against a stale free-space figure. This is
+                // conservative: an attempt that never reached LVM costs
+                // one extra capacity sample, never a wrong admission.
+                self.note_capacity_change();
                 return Err(ApiError::new(
                     error.code,
                     format!(
@@ -3091,11 +3101,18 @@ impl LvmProvider {
             }
         };
         if !output.success {
-            return Err(self.clear_create_intent_after_failed_start(
+            let error = self.clear_create_intent_after_failed_start(
                 state,
                 &req.volume_id,
                 command_failed("lvcreate", &output),
-            ));
+            );
+            // A non-zero exit is a known failure on the normal path, but
+            // LVM can report failure after changing metadata, and the
+            // clear path does not prove the LV absent. Bump the epoch so
+            // a grow that sampled before this attempt re-samples rather
+            // than reserving against the pre-attempt figure.
+            self.note_capacity_change();
+            return Err(error);
         }
         // Verify against LVM's own report: a successful exit status is
         // not evidence of the requested geometry. Thick LVM rounds the
@@ -3108,6 +3125,10 @@ impl LvmProvider {
                 // The durable intent stays: startup recovery adopts the
                 // LV only if it is present and at least the requested
                 // size, so a partially-created LV cannot leak unowned.
+                // `lvcreate` exited successfully, so space may already be
+                // allocated even though the size check failed: bump the
+                // epoch before returning.
+                self.note_capacity_change();
                 Err(ApiError::new(
                     error.code,
                     format!(
@@ -3175,6 +3196,15 @@ impl LvmProvider {
         // size is a typed idempotency conflict; a matching intent either
         // adopts the verified LV or, when the LV is verifiably absent,
         // clears the intent and proceeds with a fresh create.
+        //
+        // Any retry that finds an intent must treat the allocation epoch
+        // as changed, because the earlier attempt may already have spent
+        // space: adoption returns early below, and a refusal would
+        // otherwise leave a grow's pre-attempt sample valid. Bumping on
+        // the absent-LV path too is conservative (one extra sample).
+        if state.create_intent(&req.volume_id).is_some() {
+            self.note_capacity_change();
+        }
         if let Some(response) = self.resume_create_intent(&mut state, req, &payload)? {
             return Ok(response);
         }
@@ -3983,15 +4013,15 @@ impl LvmProvider {
     /// state lock.
     ///
     /// The sample is also outside any capacity mutex: concurrent grows
-    /// must not queue behind each other's `vgs` CLI call. A diagnostic
-    /// build with a capacity mutex (non-evidence, dirty tree) still
-    /// measured the c128 collapse (about 395 ops/s grows-on versus about
-    /// 2,460 grows-off on that build); the convoy is the suspected
-    /// mechanism, and the published residual tail remains unattributed.
-    /// Safety comes from the allocation epoch instead — a sample is used
-    /// only if no create or completed `lvextend` changed free space during
-    /// it, and the reservation is inserted before the epoch is re-read so
-    /// an allocation completing in the window is still accounted for.
+    /// must not queue behind each other's `vgs` CLI call. A non-evidence
+    /// diagnostic build with a capacity mutex (dirty tree, not a published
+    /// bundle) showed the c128 collapse return when grows were enabled;
+    /// the convoy is the suspected mechanism, and the published residual
+    /// tail remains unattributed. Safety comes from the allocation epoch
+    /// instead — a sample is used only if no create attempt or completed
+    /// `lvextend` changed free space during it, and the reservation is
+    /// inserted before the epoch is re-read so an allocation completing in
+    /// the window is still accounted for.
     /// A record that moved between the two admissions is re-derived (or
     /// refused typed), never used stale. A concurrent attach or detach
     /// that lands in the sample window therefore wins: the grow is
@@ -4027,7 +4057,7 @@ impl LvmProvider {
                     format!(
                         "capacity admission for volume {volume_id} could not obtain a stable \
                          free-space sample after {GROW_ADMISSION_ATTEMPTS} attempts; retry the \
-                         grow"
+                         grow with a new operation_id"
                     ),
                 ));
             }
@@ -4188,10 +4218,32 @@ impl LvmProvider {
         // makes the sample and the reservation accounting atomic with
         // respect to completed allocations. It is held for an atomic bump
         // and a leaf-lock removal only, never across an LVM command.
-        let publish = self.lock_state_stable();
-        self.note_capacity_change();
-        drop(reservation);
-        drop(publish);
+        match self.lock_state_stable() {
+            Ok(_state) => {
+                self.note_capacity_change();
+                drop(reservation);
+            }
+            Err(error) => {
+                // `lock_state_stable` fails only on a poisoned state mutex
+                // or an unreadable alignment load. The allocation has
+                // already happened and `vgs` reports its real free space,
+                // so the epoch must still be bumped and the reservation
+                // released. Without the state guard this is the documented
+                // degraded path: create admissions that hold the mutex
+                // block rather than observe the drop, and a poisoned mutex
+                // refuses every new admission. Log it rather than
+                // swallowing the error, because the invariant "publish
+                // under the state lock" did not hold.
+                tracing::warn!(
+                    volume_id = %volume_id,
+                    error = %error,
+                    "grow publish could not take the provider state lock; capacity epoch \
+                     bumped and reservation released without the state guard"
+                );
+                self.note_capacity_change();
+                drop(reservation);
+            }
+        }
         match lvextend {
             LvextendOutcome::Extended => {}
             LvextendOutcome::Unknown(error) => {
@@ -6917,6 +6969,15 @@ fn on_multi_thread_runtime() -> bool {
 /// instead. The `ran` flag distinguishes a refused handoff (body never
 /// started, safe to run it now) from a panic *inside* the body (re-raised
 /// unchanged, never run twice).
+///
+/// The caught refusal still reaches the process-wide panic hook, so an
+/// embedder that calls grow on a `LocalSet` or current-thread runtime
+/// sees a "can call blocking only when running on the multi-threaded
+/// runtime" message on stderr for each grow. `volvisord` uses the
+/// multi-thread runtime and never takes this path. The fallback also
+/// runs the synchronous body on the caller's thread, which is the worker
+/// pinning this helper exists to avoid; it is a correctness fallback for
+/// embedders, not a throughput path.
 fn run_blocking_body<F, R>(body: F) -> R
 where
     F: FnOnce() -> R,
@@ -8509,7 +8570,9 @@ mod admission_retry_tests {
 
     /// A `vgs` that completes an allocation on every call makes every
     /// sample stale. The admission must stop after the cap with a typed
-    /// retryable refusal instead of looping forever.
+    /// refusal instead of looping forever. The refusal is journaled as
+    /// terminal for that operation id (this test exercises the provider
+    /// layer only; the journal contract is documented on the constant).
     #[test]
     fn sustained_epoch_churn_refuses_after_the_attempt_cap() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8600,11 +8663,16 @@ mod admission_retry_tests {
 mod blocking_body_tests {
     use super::*;
 
-    /// A `LocalSet` on a multi-thread runtime refuses `block_in_place`
-    /// even though the runtime flavor is multi-thread. The fallback must
-    /// run the body inline exactly once, not panic and not run it twice.
+    /// A `LocalSet` on a multi-thread runtime makes `block_in_place`
+    /// refuse the handoff even though the runtime flavor is multi-thread.
+    /// This test proves the fallback runs the body exactly once and does
+    /// not panic; it cannot observe the refusal itself, because the
+    /// refusal reaches `run_blocking_body` as a panic that is caught (the
+    /// default panic hook still prints to stderr). The `ran` flag is what
+    /// distinguishes a refusal from a body panic; the panic test below
+    /// covers the other branch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_local_set_refuses_the_handoff_and_runs_the_body_once() {
+    async fn a_local_set_runs_the_body_exactly_once() {
         let local = tokio::task::LocalSet::new();
         let runs = AtomicUsize::new(0);
         let value = local

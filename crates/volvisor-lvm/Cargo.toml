@@ -16,6 +16,7 @@ workspace = true
 integration-lvm = []
 
 [dependencies]
+tracing = { workspace = true }
 volvisor-types = { workspace = true }
 volvisor-provider = { workspace = true }
 async-trait = "0.1"
