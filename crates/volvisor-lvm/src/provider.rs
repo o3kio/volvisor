@@ -7293,18 +7293,19 @@ fn on_multi_thread_runtime() -> bool {
 /// Run a synchronous blocking body with the current async worker's core
 /// handed off to the scheduler, when the runtime permits it.
 ///
-/// `block_in_place` panics (before running the closure) on a
-/// current-thread runtime and inside a `LocalSet`, where there is no
-/// legal handoff. The panic is caught here and the body runs inline
-/// instead. The `ran` flag distinguishes a refused handoff (body never
+/// `block_in_place` panics (before running the closure) inside a
+/// `LocalSet`, where there is no legal handoff. The panic is caught here and
+/// the body runs inline instead. (A plain current-thread runtime takes the
+/// early return above and never reaches `block_in_place`.) The `ran` flag
+/// distinguishes a refused handoff (body never
 /// started, safe to run it now) from a panic *inside* the body (re-raised
 /// unchanged, never run twice).
 ///
 /// The caught refusal still reaches the process-wide panic hook, so an
-/// embedder that calls grow on a `LocalSet` or current-thread runtime
-/// sees a "can call blocking only when running on the multi-threaded
-/// runtime" message on stderr for each grow. `volvisord` uses the
-/// multi-thread runtime and never takes this path. The fallback also
+/// embedder that calls grow, create or delete on a `LocalSet` sees a "can
+/// call blocking only when running on the multi-threaded runtime" message on
+/// stderr for each call. `volvisord` uses the multi-thread runtime and never
+/// takes this path. The fallback also
 /// runs the synchronous body on the caller's thread, which is the worker
 /// pinning this helper exists to avoid; it is a correctness fallback for
 /// embedders, not a throughput path.
