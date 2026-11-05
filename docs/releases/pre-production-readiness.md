@@ -337,7 +337,12 @@ is a production-support, SLA, capacity, durability or hardware claim.
   does not support a Phase E throughput or latency gain. Residuals: delete's
   `lvs` check and create's `pick_pool_vg` `vgs` sample remain in their
   admission critical sections, and the failed-create compensation's
-  `lvremove` remains in the reacquired critical section.
+  `lvremove` remains in the reacquired critical section. Create and delete
+  also still run their synchronous LVM bodies inline on async workers
+  (grow/move use the blocking handoff), so sustained concurrency at or above
+  the worker count can pin the runtime — pre-existing, not introduced by
+  E1/E2. The gate tests exercise same-kind duplicate refusal; the cross-kind
+  create-vs-delete refusal is implemented but not directly gate-tested.
   **#62 remains open** until explicitly instructed, and no gate
   verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
   not re-drilled at this SHA here, so its `.volvisor-` message assertion is

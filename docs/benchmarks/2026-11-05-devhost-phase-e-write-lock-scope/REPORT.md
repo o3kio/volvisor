@@ -59,7 +59,13 @@ Recorded E3 residuals, unchanged by this slice: delete's short `lvs`
 existence check still runs inside its first critical section; `pick_pool_vg`'s
 `vgs` sample still runs inside create admission; the failed-final-save
 compensation (`compensate_unpersisted_create`) still runs its checked
-`lvremove` inside the reacquired critical section.
+`lvremove` inside the reacquired critical section. Separately, create and
+delete still run their synchronous LVM bodies inline on async workers (grow
+and move use the blocking handoff); with at least as many concurrent
+structural bodies as runtime workers, those workers can be pinned. This is
+pre-existing and not introduced by E1/E2, but it bounds the "no longer queues
+every mutation" statement to in-flight structural bodies below the worker
+count. It is recorded in §10.
 
 ## 2. Test evidence at the measured SHA
 
@@ -68,7 +74,7 @@ At `2c5b065`, before the run:
 - `cargo fmt --all --check` passes.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` passes.
 - `cargo test --workspace --locked` passes (`exit=0`), including the LVM
-  tests (87 + 16 + 1 + 87 + 52).
+  tests (87 + 16 + 1 + 88 + 52).
 - Deterministic gate tests park the fake `lvremove` and `lvcreate`. While
   parked, an attach on a different volume completes, the deleting/creating
   volume is fenced, grow admission honors the create's reservation, and a
@@ -76,6 +82,11 @@ At `2c5b065`, before the run:
 - Both gate tests were shown to fail on the pre-change provider as negative
   controls. The create negative control times out because another volume's
   attach waits on the state lock (`Elapsed(())`).
+- The gate tests exercise a duplicate of the *same* kind (create during
+  create, delete during delete). The cross-kind refusal (create during
+  delete, delete during create) is implemented by the shared structural
+  drive map but is not directly exercised by a gate test; that is a test
+  coverage gap, not a known behavioral gap.
 
 These are test evidence, not measurements. This harness does not inject
 crashes or kill the daemon during a create/delete.
@@ -165,21 +176,22 @@ non-grow: c8 10.374 → 10.660 ms (+2.76%), c32 82.927 → 81.996 ms (−1.12%).
 | operation | candidate p50 | comparator p50 | delta | candidate p95 | comparator p95 | delta |
 |---|---|---|---|---|---|---|
 | create | 194.991 ms | 184.771 ms | +5.53% | 215.837 ms | 195.737 ms | +10.27% |
-| delete | 154.492 ms | 144.307 ms | +7.06% | 174.464 ms | 154.612 ms | +12.83% |
-| grow | 215.407 ms | 195.463 ms | +10.21% | 235.593 ms | 215.668 ms | +9.24% |
-| attach | 1.433 ms | 1.435 ms | −0.14% | 1.717 ms | 1.621 ms | +5.92% |
-| report | 1.422 ms | 1.435 ms | −0.91% | 1.695 ms | 1.611 ms | +5.21% |
-| detach | 1.424 ms | 1.445 ms | −1.45% | 1.774 ms | 1.624 ms | +9.24% |
-| inspect | 0.124 ms | 0.115 ms | +7.83% | 0.170 ms | 0.163 ms | +4.29% |
-| list | 0.118 ms | 0.108 ms | +9.26% | 0.133 ms | 0.129 ms | +3.10% |
-| capabilities | 0.109 ms | 0.109 ms | 0.00% | 0.125 ms | 0.131 ms | −4.58% |
+| delete | 154.492 ms | 144.307 ms | +7.06% | 174.464 ms | 154.612 ms | +12.84% |
+| grow | 215.407 ms | 195.463 ms | +10.20% | 235.593 ms | 215.668 ms | +9.24% |
+| attach | 1.433 ms | 1.409 ms | +1.70% | 1.717 ms | 1.641 ms | +4.63% |
+| report | 1.422 ms | 1.410 ms | +0.85% | 1.695 ms | 1.616 ms | +4.89% |
+| detach | 1.424 ms | 1.425 ms | −0.07% | 1.774 ms | 1.593 ms | +11.36% |
+| inspect | 0.124 ms | 0.110 ms | +12.73% | 0.170 ms | 0.136 ms | +25.00% |
+| list | 0.118 ms | 0.115 ms | +2.61% | 0.133 ms | 0.137 ms | −2.92% |
+| capabilities | 0.109 ms | 0.104 ms | +4.81% | 0.125 ms | 0.130 ms | −3.85% |
 
 Create and delete are modestly higher in this single sample. A concurrency-1
 create/delete cannot benefit from releasing the state lock, and this run has
 no same-SHA repeat, so the change is reported as **neutral/unattributed**,
 neither a Phase E gain nor a proven regression. The small system-wide
-increase (inspect/list/attach p95 also higher) is consistent with run drift,
-but that is an observation, not a proven cause.
+increase is not uniform (list and capabilities p95 are lower; inspect p95 is
++25%), which is consistent with run drift, but that is an observation, not a
+proven cause.
 
 ## 6. Diagnostic probes
 
@@ -267,12 +279,17 @@ queue improved; a capacity, SLA, durability or data-path claim; or the
   for this bundle. The micro and sweep deltas are one-run observations.
 - RSS and journal are single-run observations. RSS peak is 2,492,976 KiB; a
   leak is neither proven nor ruled out. The default INFO daemon log is
-  unbounded (2.24 GiB raw here), an operational finding.
+  unbounded (2.24 GB / 2.09 GiB raw here), an operational finding.
 - The cap-32 and rate-50 probes are diagnostic shapes, not capacity results.
 - Recorded residuals: delete's `lvs` check and create's `pick_pool_vg` `vgs`
   sample remain inside their admission critical sections; the failed-create
   compensation's `lvremove` remains inside the reacquired critical section;
-  the c128 grow queue/tail remains LVM-per-VG-bound and unresolved.
+  create and delete still run their synchronous LVM bodies inline on async
+  workers (grow/move use the blocking handoff), so sustained concurrency at
+  or above the worker count can pin the runtime — pre-existing, not
+  introduced by E1/E2; the same-kind gate tests do not directly exercise the
+  cross-kind create-vs-delete refusal; the c128 grow queue/tail remains
+  LVM-per-VG-bound and unresolved.
 - #62 stays open. No gate verdict changes. No production-support, SLA,
   zero-RPO, release or hardware/multi-host claim is made.
 

@@ -184,7 +184,13 @@ deltas is attributed to E1/E2**. E3 therefore does not support a Phase E
 throughput or latency gain. The recorded residuals remain: delete's `lvs`
 check and create's `pick_pool_vg` `vgs` sample stay inside their admission
 critical sections, and the failed-create compensation's `lvremove` stays in
-the reacquired critical section. `#62` stays open; no gate verdict changes.
+the reacquired critical section. Create and delete also still run their
+synchronous LVM bodies inline on async workers (grow/move use the blocking
+handoff), so sustained structural concurrency at or above the worker count
+can pin the runtime — pre-existing, not introduced by E1/E2. The gate tests
+exercise same-kind duplicate refusal; the cross-kind create-vs-delete
+refusal is implemented by the shared map but not directly gate-tested.
+`#62` stays open; no gate verdict changes.
 
 ## Out of scope
 

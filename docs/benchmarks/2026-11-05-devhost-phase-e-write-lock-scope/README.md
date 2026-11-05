@@ -82,6 +82,14 @@ These are findings, not fixes, and they are not production claims:
   existence check and create's `pick_pool_vg` `vgs` sample remain inside
   their admission critical sections; the failed-create compensation's
   `lvremove` remains inside the reacquired critical section.
+- **Create/delete still run their LVM bodies inline on async workers.**
+  Grow and move use the blocking handoff; create/delete do not. At or above
+  the runtime worker count, sustained structural concurrency can pin the
+  runtime. This is pre-existing, not introduced by E1/E2, and it bounds the
+  "no longer queues every mutation" statement.
+- **The gate tests cover same-kind duplicate refusal only.** The cross-kind
+  create-vs-delete refusal rests on the shared structural drive map but is
+  not directly exercised by a gate test.
 - **The c128 grow queue/tail is unresolved** and LVM-per-VG-bound; this run
   did not improve it.
 - **No same-SHA repeat was run**, so the one-run micro/sweep deltas are not
