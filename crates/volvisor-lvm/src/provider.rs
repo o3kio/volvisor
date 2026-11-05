@@ -460,6 +460,13 @@ pub struct LvmProvider {
     /// and non-blocking: the second grow is refused, never queued on a
     /// runtime worker.
     grow_drives: Mutex<BTreeSet<VolumeId>>,
+    /// Volume ids with a live delete drive. A delete releases the provider
+    /// state lock across the destructive command body, so this in-memory set
+    /// refuses a second concurrent delete of the same volume instead of
+    /// letting both run `blkdiscard`/`lvremove`. It is fail-closed and
+    /// non-blocking: the duplicate is refused, never queued. The durable
+    /// delete intent (not this set) survives a restart.
+    delete_drives: Mutex<BTreeSet<VolumeId>>,
     /// Bytes promised to in-flight grow allocations, keyed by volume
     /// group. The state lock no longer serializes the long `lvextend`,
     /// so capacity admission subtracts these reservations to stay
@@ -1385,6 +1392,29 @@ impl Drop for GrowDriveGuard<'_> {
     }
 }
 
+/// RAII marker for one live delete drive.
+///
+/// The drive releases the provider state lock across `blkdiscard`/`lvremove`,
+/// so this marker prevents a second delete of the same volume from running
+/// the destructive body concurrently against the same durable intent.
+/// Removal on drop (including unwinding) is what makes the exclusion
+/// recoverable; the durable intent is the cross-restart fence.
+struct DeleteDriveGuard<'a> {
+    provider: &'a LvmProvider,
+    volume_id: VolumeId,
+}
+
+impl Drop for DeleteDriveGuard<'_> {
+    fn drop(&mut self) {
+        let mut drives = self
+            .provider
+            .delete_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drives.remove(&self.volume_id);
+    }
+}
+
 /// One in-flight allocation reservation in a volume group.
 ///
 /// Taken under the provider state lock immediately after the capacity
@@ -1520,6 +1550,7 @@ impl LvmProvider {
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
+            delete_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state),
@@ -2218,6 +2249,34 @@ impl LvmProvider {
         }
         drop(drives);
         Ok(GrowDriveGuard {
+            provider: self,
+            volume_id: volume_id.clone(),
+        })
+    }
+
+    /// Enter one live delete drive for `volume_id`, refusing a second one.
+    ///
+    /// The delete releases the provider state lock across the destructive
+    /// command body. A second concurrent delete of the same volume must not
+    /// run that body against the same durable intent, so it is refused
+    /// typed rather than queued. The guard is removed on drop, and the
+    /// durable intent remains the crash-recovery fence.
+    fn begin_delete_drive(&self, volume_id: &VolumeId) -> Result<DeleteDriveGuard<'_>, ApiError> {
+        let mut drives = self
+            .delete_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !drives.insert(volume_id.clone()) {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} already has a delete in progress; retry after it \
+                     completes or resolves"
+                ),
+            ));
+        }
+        drop(drives);
+        Ok(DeleteDriveGuard {
             provider: self,
             volume_id: volume_id.clone(),
         })
@@ -4485,21 +4544,26 @@ impl LvmProvider {
     /// generation/policy is refused. An absent LV is a loud `INTERNAL`
     /// for a non-Failed volume with no pending intent (never "deleted"
     /// as if erased). The intent is persisted before `blkdiscard`/
-    /// `lvremove`; a failed command clears it when possible (restoring
-    /// it in memory and leaving it durable when the clear fails). The
-    /// final save removes the volume and intent together; its failed
-    /// save keeps the in-memory removal only when the durable file
-    /// already records both removals, otherwise it restores the durable
-    /// shape and reports that a retry/restart completes the delete.
-    /// Foreign LVs are never touched.
+    /// `lvremove`, and the destructive body runs **without** the provider
+    /// state lock (Phase E E1); the durable intent is the fence and the
+    /// recovery anchor while it runs. The final save removes the volume and
+    /// intent together; its failed save keeps the in-memory removal only
+    /// when the durable file already records both removals, otherwise it
+    /// restores the durable shape and reports that a retry/restart
+    /// completes the delete. Foreign LVs are never touched.
     fn delete_volume_inner(
         &self,
         volume_id: &VolumeId,
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
+        // One live delete drive per volume. The destructive body runs
+        // without the provider state lock, so a second delete of the same
+        // volume must be refused instead of racing `blkdiscard`/`lvremove`
+        // against the same durable intent.
+        let _drive = self.begin_delete_drive(volume_id)?;
         let mut state = self.lock_state_stable()?;
-        let (stored_before, pending_intent) =
+        let (mut stored_before, pending_intent) =
             Self::validate_delete_request(&state, volume_id, req)?;
         let vg_name = stored_before.entry.vg_name.clone();
         let lv_name = stored_before.entry.lv_name.clone();
@@ -4541,6 +4605,13 @@ impl LvmProvider {
         )?;
 
         if lv_exists {
+            // Phase E E1 (#62): the intent is durable, so the destructive
+            // body no longer needs the provider state lock. Dropping the
+            // guard publishes the intent; the volume and its fence stay in
+            // the committed state until the final removal, so readers and
+            // structural operations see the same pending-delete truth they
+            // saw before the lock was released.
+            drop(state);
             if let Err(command_error) =
                 self.discard_and_remove_lv(&vg_name, &lv_name, intent.erasure_policy)
             {
@@ -4562,6 +4633,36 @@ impl LvmProvider {
                     ),
                 ));
             }
+            // Reacquire only for the final atomic record removal. Other
+            // volumes' mutations may have saved state while the command
+            // ran; admission alignment resolves any in-flight capture.
+            state = self.lock_state_stable()?;
+            // Fail closed if the volume or its matching authorization
+            // disappeared while the command was in flight. A different
+            // intent must never be removed under this call's authority.
+            let current = state.volume(volume_id).cloned().ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} disappeared from state while its authorized \
+                         delete of {vg_name}/{lv_name} was in flight; the LV was removed, \
+                         but the durable record cannot be cleared safely"
+                    ),
+                )
+            })?;
+            if current.entry.generation != intent.expected_generation
+                || state.delete_intent(volume_id) != Some(&intent)
+            {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} changed generation or authorization while its \
+                         delete of {vg_name}/{lv_name} was in flight; refusing to remove a \
+                         record under a mismatched delete intent"
+                    ),
+                ));
+            }
+            stored_before = current;
         }
         state.remove_volume(volume_id);
         state.remove_delete_intent(volume_id);
@@ -7444,6 +7545,7 @@ mod read_snapshot_tests {
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
             grow_drives: Mutex::new(BTreeSet::new()),
+            delete_drives: Mutex::new(BTreeSet::new()),
             capacity_reservations: Mutex::new(BTreeMap::new()),
             capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state.clone()),
@@ -8633,6 +8735,7 @@ mod admission_retry_tests {
                 move_timing: MoveTiming::default(),
                 move_observe_failures: Mutex::new(BTreeMap::new()),
                 grow_drives: Mutex::new(BTreeSet::new()),
+                delete_drives: Mutex::new(BTreeSet::new()),
                 capacity_reservations: Mutex::new(BTreeMap::new()),
                 capacity_epoch: AtomicU64::new(0),
                 state: Mutex::new(state.clone()),

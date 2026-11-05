@@ -5105,3 +5105,162 @@ async fn delete_post_rename_failure_is_the_carve_out() {
     assert!(report.missing_volumes.is_empty(), "{report:?}");
     assert!(report.foreign_lvs.is_empty(), "{report:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Phase E E1: delete releases the provider state lock
+// ---------------------------------------------------------------------------
+
+/// Wait until a one-shot program gate has recorded entry.
+async fn wait_for_gate_entered(gate: &Arc<OneShotProgramGate>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !gate.has_entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the gated LVM command must start"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A provider whose fake `lvremove` parks on the returned gate until the
+/// test releases it, plus the durable state path for post-conditions.
+fn gated_delete_provider() -> (
+    Arc<LvmProvider>,
+    Arc<OneShotProgramGate>,
+    Arc<FakeRunner>,
+    std::path::PathBuf,
+) {
+    let state_path = common::leak_tempdir().join("state.json");
+    common::seed_claimed_state(&state_path);
+    let world = Arc::new(Mutex::new(common::FakeLvm::with_claimed_pool()));
+    let gate = Arc::new(OneShotProgramGate::default());
+    let runner = {
+        let world = Arc::clone(&world);
+        let gate = Arc::clone(&gate);
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            if program == "lvremove" && gate.try_fire() {
+                gate.entered();
+                gate.wait_release();
+            }
+            let mut world = world.lock().ok()?;
+            common::script(&mut world, program, args)
+        }))
+    };
+    let provider = Arc::new(
+        LvmProvider::new(
+            Arc::clone(&runner) as Arc<dyn CommandRunner>,
+            state_path.clone(),
+            common::leak_tempdir(),
+            common::VG_PREFIX.to_owned(),
+            common::AUTH_TOKEN.to_owned(),
+        )
+        .expect("provider construction"),
+    );
+    (provider, gate, runner, state_path)
+}
+
+/// Phase E E1 (#62): a delete must release the provider state lock across
+/// `blkdiscard`/`lvremove`.
+///
+/// While `lvremove` is parked, another volume's attach must complete, the
+/// deleting volume must stay fenced by its durable intent, and a second
+/// delete of the same volume must be refused by the in-memory drive guard
+/// rather than racing the destructive body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn delete_releases_the_state_lock_across_lvremove() {
+    let (provider, gate, _runner, state_path) = gated_delete_provider();
+    let _release = OneShotGateRelease(Arc::clone(&gate));
+
+    let doomed = provider
+        .create_volume(&fixture_create_request("delete-lock", GIB))
+        .await
+        .expect("create doomed volume");
+    let other = provider
+        .create_volume(&fixture_create_request("delete-other", GIB))
+        .await
+        .expect("create other volume");
+
+    gate.arm();
+    let delete_request =
+        delete_request_with("delete-lock-op", doomed.generation, ErasurePolicy::Retain);
+    let delete = {
+        let provider = Arc::clone(&provider);
+        let volume_id = doomed.volume_id.clone();
+        tokio::spawn(async move { provider.delete_volume(&volume_id, &delete_request).await })
+    };
+    wait_for_gate_entered(&gate).await;
+
+    // A different volume's write must not queue behind this delete's
+    // ~LVM CLI call: the state lock is released for the command body.
+    let attach_other = {
+        let provider = Arc::clone(&provider);
+        let volume_id = other.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .attach_volume(
+                    &volume_id,
+                    &fixture_attach_request("delete-other", "delete-other-att", 1),
+                )
+                .await
+        })
+    };
+    let attached = tokio::time::timeout(IN_FLIGHT_TIMEOUT, attach_other)
+        .await
+        .expect("another volume's attach must not wait behind lvremove")
+        .expect("attach task join")
+        .expect("attach other volume");
+    assert_eq!(attached.volume_generation, 2);
+
+    // The deleting volume stays fenced by its durable delete intent.
+    let attach_doomed = {
+        let provider = Arc::clone(&provider);
+        let volume_id = doomed.volume_id.clone();
+        tokio::spawn(async move {
+            provider
+                .attach_volume(
+                    &volume_id,
+                    &fixture_attach_request("delete-lock", "delete-lock-att", 1),
+                )
+                .await
+        })
+    };
+    let err = tokio::time::timeout(IN_FLIGHT_TIMEOUT, attach_doomed)
+        .await
+        .expect("attach during a delete must not block on the state lock")
+        .expect("attach task join")
+        .expect_err("attach during a delete must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(err.detail.contains("durable pending delete"), "{err}");
+
+    // A second delete of the same volume is refused immediately, before it
+    // can run a second destructive body against the same intent.
+    let second = delete_request_with(
+        "delete-lock-op-second",
+        doomed.generation,
+        ErasurePolicy::Retain,
+    );
+    let err = tokio::time::timeout(
+        IN_FLIGHT_TIMEOUT,
+        provider.delete_volume(&doomed.volume_id, &second),
+    )
+    .await
+    .expect("a second delete must not block on the state lock")
+    .expect_err("a second delete of the same volume must be refused");
+    assert_eq!(err.code, ApiErrorCode::InvalidState);
+    assert!(
+        err.detail.contains("already has a delete in progress"),
+        "{err}"
+    );
+
+    gate.release();
+    delete
+        .await
+        .expect("delete task join")
+        .expect("delete completes after the gate releases");
+
+    // The final atomic save removed the volume and every stale intent.
+    let durable = LvmState::load(&state_path).expect("durable state after delete");
+    assert!(durable.volume(&doomed.volume_id).is_none());
+    assert!(durable.delete_intent(&doomed.volume_id).is_none());
+    assert!(durable.volume(&other.volume_id).is_some());
+}
