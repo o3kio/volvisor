@@ -209,7 +209,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
   tests pass.
 - **D3 — #62 write path (slice 1 and slice 2 delivered; capacity-domain grow
   admission measured at `4290b84`; per-VG sample coalescing measured at
-  `75beea3` and reverted at `59f64cc`; c128 grow tail
+  `75beea3` and reverted at `59f64cc`; Phase E create/delete lock scope
+  delivered and measured at `2c5b065`; c128 grow tail
   open).** Slice 1 code is
   in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
@@ -310,6 +311,33 @@ is a production-support, SLA, capacity, durability or hardware claim.
   repeats (non-evidence) measured c128 599.405 and 614.158 ops/s and
   aggregate write p95 7,478.820 and 7,586.304 ms, so the published sample is
   at the high end of the observed range.
+  **Phase E create/delete lock scope (2026-11-05, E1 `8cfa4c2`, E2
+  `2c5b065`).** Delete now saves its durable intent under the provider state
+  lock, drops the guard for `blkdiscard`/`lvremove`, and reacquires it only
+  to revalidate the exact intent and remove the record. Create saves its
+  durable intent under the lock, runs `lvcreate` and its size-verifying
+  `lvs` without it, and reacquires it for the final record commit. A create
+  takes the existing per-VG capacity reservation under the lock before
+  releasing it; a create/delete structural drive map refuses a concurrent
+  mutation of the same volume. Deterministic gate tests park
+  `lvcreate`/`lvremove` and fail on the pre-change provider; workspace fmt,
+  clippy and the full test suite pass at `2c5b065`. The clean-tree
+  re-measurement is published in the
+  [Phase E bundle](../benchmarks/2026-11-05-devhost-phase-e-write-lock-scope/REPORT.md)
+  (comparator `4290b84`). **The measurement is a mixed-throughput
+  regression**: c8 3,846.899 → 3,756.659 ops/s (−2.35%), c32 2,609.257 →
+  2,476.245 (−5.10%), c128 655.326 → 610.988 (−6.77%), c1 −0.14%; the
+  25-minute soak fell 7,134,530 → 6,626,734 ops (4,756.348 → 4,417.815
+  ops/s, −7.12%). c128 overall p95 fell 117.870 → 100.558 ms and read p95
+  6.584 → 4.691 ms, but the aggregate write p95 (5,078.906 → 4,297.266 ms)
+  is a grow-population quantile in both runs and grow p50/p95 rose; it is
+  not a like-for-like gain. Micro create/delete p50 rose 5.5%/7.1% in one
+  sample (neutral/unattributed). The sweep and soak contain no
+  create/delete calls, so none of these deltas is attributed to E1/E2; E3
+  does not support a Phase E throughput or latency gain. Residuals: delete's
+  `lvs` check and create's `pick_pool_vg` `vgs` sample remain in their
+  admission critical sections, and the failed-create compensation's
+  `lvremove` remains in the reacquired critical section.
   **#62 remains open** until explicitly instructed, and no gate
   verdict changes. No live evidence changed in this batch: `d5.sh` Part B was
   not re-drilled at this SHA here, so its `.volvisor-` message assertion is

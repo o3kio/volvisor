@@ -163,6 +163,29 @@ would be host/run drift, not this phase.
 The 24-hour soak remains **NOT RUN**; the run is the shortened 25-minute
 soak.
 
+**E3 result (2026-11-05).** Measured at
+`2c5b0659a68b5ce6b9286c5c1cd1df7a92f8ebb1` on a clean tree with the release
+binary SHA256
+`267283b2d0ce62b81cdc8595c8e5f2495f986e5e59a1148bf0c8a4eac5f0f682`,
+against `4290b84`. The published bundle is
+[2026-11-05-devhost-phase-e-write-lock-scope](../benchmarks/2026-11-05-devhost-phase-e-write-lock-scope/REPORT.md).
+The result is a **measured mixed-throughput regression**: c8
+3,846.899 → 3,756.659 ops/s (−2.35%), c32 2,609.257 → 2,476.245 (−5.10%),
+c128 655.326 → 610.988 (−6.77%), c1 −0.14%; the 25-minute soak
+7,134,530 → 6,626,734 ops (4,756.348 → 4,417.815 ops/s, −7.12%). The c128
+overall p95 (117.870 → 100.558 ms) and read p95 (6.584 → 4.691 ms) fell, but
+the aggregate c128 write p95 (5,078.906 → 4,297.266 ms) is a grow-population
+quantile in both runs and the candidate's grow p50/p95 rose; it is not a
+like-for-like latency gain. Micro create/delete p50 rose 5.5%/7.1% in this
+single sample and is reported as neutral/unattributed.
+
+The mixed sweep and soak contain no create/delete calls, so **none of these
+deltas is attributed to E1/E2**. E3 therefore does not support a Phase E
+throughput or latency gain. The recorded residuals remain: delete's `lvs`
+check and create's `pick_pool_vg` `vgs` sample stay inside their admission
+critical sections, and the failed-create compensation's `lvremove` stays in
+the reacquired critical section. `#62` stays open; no gate verdict changes.
+
 ## Out of scope
 
 - The online move drive (`pvmove`) and its lock scope.
