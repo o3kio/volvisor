@@ -131,10 +131,11 @@ liveness, readiness and monitoring stay available during overload.
 ## Grow-heavy workloads and the shared cap
 
 The cap counts **requests**, not LVM capacity or fairness. A grow holds its
-permit for the whole synchronous body: up to 32 capacity-sample rounds, the
-`lvextend`, and the size-verifying `lvs`, with each LVM command bounded by
-the 60-second provider watchdog. Grow completions are bounded by a per-VG
-serialized provider path, not by the daemon: the published dev-lab
+permit for the whole synchronous body: up to 32 capacity-sample attempts
+(each runs one `vgs` round or joins an in-flight one), the `lvextend`, and
+the size-verifying `lvs`, with each LVM command bounded by the 60-second
+provider watchdog. Grow completions are bounded by a per-VG serialized
+provider path, not by the daemon: the published dev-lab
 measurement at the capacity-domain fix completed 438 grows in 39.4 s with
 128 in flight (about 11.1 grows/s) while also serving reads and non-grow
 writes.
@@ -153,6 +154,11 @@ read-only [decision memo](reviews/2026-11-05-grow-tail-decision.md) accepted
 the measured envelope and added no per-VG bound; a subsequent
 [non-evidence phase diagnostic](reviews/2026-11-05-grow-tail-phase-diagnostic.md)
 attributed the largest removable share to the `vgs` sample-retry convoy.
+Option C — per-round single-flight `vgs`, with concurrent grows sharing one
+in-flight sample — is implemented locally at
+`a07203e4965aef9e5776d96d496a09b3304437a1` but is **not yet measured**.
+The numbers above describe `4290b84` only; they are not an envelope for the
+new SHA and must not be reused as evidence for it.
 Treat the envelope as an observed operating point, not a validated ceiling
 or an SLO.
 

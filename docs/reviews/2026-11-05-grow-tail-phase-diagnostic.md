@@ -124,10 +124,10 @@ The memo's own trigger is met: a diagnostic now attributes the largest
 share of the c128 tail to removable provider bookkeeping. The candidate
 fixes are, using the memo's option letters:
 
-- **Option C — coalesce capacity samples per VG (preferred).** One in-flight
-  `vgs` sample per VG/epoch, shared by concurrent grows, still validated
-  against the epoch; retries share the next sample instead of each
-  issuing its own `vgs`.
+- **Option C — coalesce capacity samples per VG (selected).** One in-flight
+  `vgs` round per VG, shared by concurrent grows and still validated against
+  the epoch; a retry joins the current round or starts a fresh one instead
+  of every attempt issuing its own `vgs`.
 - **Option B — bound per-VG grow admission.** Cap concurrent grow bodies per
   VG, converting excess concurrency into queue or a typed refusal. This
   reduces the convoy directly but changes client-visible behavior and did
@@ -141,3 +141,14 @@ Any of these is a production-code change. It requires design, tests
 review, and a **fresh clean benchmark**; the `4290b84` bundle cannot be
 reused as evidence for a new SHA. `#62` remains open and no gate verdict
 changes.
+
+## Implementation response
+
+Option C was implemented locally at
+`a07203e4965aef9e5776d96d496a09b3304437a1` as per-round single-flight (not a
+per-epoch cache): concurrent grows share one in-flight `vgs` round, each
+sample or wait consumes one admission attempt, a failed round is shared, and
+an unwind publishes a typed failure. It passed tests, lint and adversarial
+review. **It has not been benchmarked**, so this diagnostic's `4290b84`
+timings remain non-evidence for the new SHA; a fresh clean bundle is
+required before any claim about the convoy or the c128 tail after the fix.

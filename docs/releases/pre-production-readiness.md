@@ -208,7 +208,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
   only the legacy token must send it. The scoped-role matrix and tokenless
   tests pass.
 - **D3 — #62 write path (slice 1 and slice 2 delivered; capacity-domain grow
-  admission measured at `4290b84`; c128 grow tail open).** Slice 1 code is
+  admission measured at `4290b84`; per-VG sample coalescing implemented at
+  `a07203e` but unmeasured; c128 grow tail open).** Slice 1 code is
   in the tree: the single durable-writer funnel
   and initial startup sweep (`f0e5237`); the bounded hashed temp namespace,
   hardened sweep and per-state-path in-process writer gate (`a8c23d6`);
@@ -295,7 +296,10 @@ is a production-support, SLA, capacity, durability or hardware claim.
   intent, while the provider capacity-admission loop is 5.0–6.3 s mean,
   dominated by `vgs` samples invalidated by the global capacity epoch and
   retried (783–1,082 stale attempts across 409–411 grows); `lvextend`/`lvs`
-  are ~1.8–2.4 s each and the provider intent save is ~1.7–1.9 ms. Two clean same-SHA
+  are ~1.8–2.4 s each and the provider intent save is ~1.7–1.9 ms. Option C
+  (per-round single-flight `vgs`) is implemented locally at `a07203e` but
+  is **not yet measured**; the numbers above describe `4290b84` only and are
+  not evidence for the new SHA. Two clean same-SHA
   repeats (non-evidence) measured c128 599.405 and 614.158 ops/s and
   aggregate write p95 7,478.820 and 7,586.304 ms, so the published sample is
   at the high end of the observed range.

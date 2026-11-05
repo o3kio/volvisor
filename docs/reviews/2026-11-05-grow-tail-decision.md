@@ -210,15 +210,15 @@ a measured candidate, not a rejected posture. It changes client-visible
 behavior and needs the pre-journal vs post-intent decision in §4; it is not
 selected without measurement.
 
-### C. Coalesce the capacity sample (recommended next)
+### C. Coalesce the capacity sample (selected)
 
-Use one in-flight `vgs` sample per VG and capacity epoch, shared by
-concurrent grows and still validated against the epoch. Retries share the
-next sample instead of each issuing its own `vgs`. This removes redundant
-samples without weakening durable-first intent, fail-closed recovery or
-idempotency. The diagnostic attributes the largest removable cost here.
-It requires code, tests, adversarial review and a **fresh clean benchmark**;
-it is not implemented by this memo.
+Use one in-flight `vgs` sample per VG, shared by concurrent grows and still
+validated against the epoch. Retries join the current in-flight round or
+start one; a completed sample is not cached, so the next admission attempt
+samples fresh. This removes redundant samples without weakening
+durable-first intent, fail-closed recovery or idempotency. The diagnostic
+attributes the largest removable cost here. This memo did not implement it;
+the implementation status is recorded in §9.
 
 ### D. Asynchronous grow handle
 
@@ -238,10 +238,10 @@ of scope for this slice.
    5.0–6.3 s mean, and `lvextend`/`lvs` at ~1.8–2.4 s each at c128.
 3. The phase-timing diagnostic has now been run
    ([non-evidence note](2026-11-05-grow-tail-phase-diagnostic.md)). It
-   attributes the largest share to the `vgs` sample-retry convoy. No
-   production code has been changed. The next step is option C (coalesced
-   sample) or a measured option B, with tests, adversarial review and a
-   fresh clean benchmark.
+   attributes the largest share to the `vgs` sample-retry convoy. At the
+   time of this memo no production code had changed; option C was
+   subsequently implemented as recorded in §9. Tests, adversarial review
+   and a fresh clean benchmark remain conditions on any evidence claim.
 4. Keep **#62 open**. Create and delete still hold the provider state lock
    across their CLI work; the grow body is not fully independent of provider
    bookkeeping. No gate verdict changes.
@@ -279,3 +279,25 @@ of scope for this slice.
 - It does not accept any ADR, change an issue state, or change a readiness
   gate. Gate 1, 2 and 5 remain **NOT MET**; gates 3 and 4 remain **PARTIAL**;
   the overall verdict remains **NOT PRE-PRODUCTION READY**.
+
+## 9. Implementation status (addendum, 2026-11-05)
+
+Option C is implemented locally at `a07203e4965aef9e5776d96d496a09b3304437a1`
+in the native-local LVM provider. The implementation is **per round**, not a
+per-epoch cache: one caller runs `vgs` for a VG, concurrent grow admissions
+wait for exactly that round and share its success or typed failure, and a
+caller arriving after the round clears starts a fresh sample. Each call —
+sample or wait — consumes one `GROW_ADMISSION_ATTEMPTS` attempt, a waiter
+never re-samples internally, and a failed round is shared instead of retried
+once per waiter. The allocation-epoch checks are unchanged, so a shared
+sample cannot double-spend capacity; a sampling panic publishes a typed
+failure and clears the slot.
+
+The change passed the workspace tests, `cargo fmt` and workspace clippy, and
+two independent adversarial reviews (one final delta review); no Critical or
+High findings remained. **No benchmark of this SHA has been run.** The
+`4290b84` numbers in this memo describe that measured commit only and must
+not be reused as evidence for `a07203e`. A fresh clean bundle is required
+before any throughput, latency, envelope or production-support claim; until
+then this implementation is unmeasured and #62 stays open with no gate
+verdict change.
