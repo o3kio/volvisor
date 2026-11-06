@@ -12,9 +12,9 @@ data-path benchmark, **not** an SLA or durability proof, and **not** the
 - **Exact source:** `2edcecd9b3d4c555831e6d4db1337e3dbcff6a15`
   (`volvisord 2edcecd`), branch `phase-a-scaling`.
 - **Worktree at run time:** clean (`worktree_dirty: no` in
-  [ENVIRONMENT.txt](ENVIRONMENT.txt), `raw/00-orchestration.log` and every
-  raw JSON record). Publishing this bundle makes the worktree dirty now;
-  that is a publication side effect, not a property of the measured run.
+  [ENVIRONMENT.txt](ENVIRONMENT.txt) and every measured JSON record).
+  Publishing this bundle makes the worktree dirty now; that is a
+  publication side effect, not a property of the measured run.
 - **Run window:** 2026-11-06T12:20:58Z .. 2026-11-06T12:52:21Z. The release
   binary was built before the run with `CARGO_BUILD_JOBS=4 cargo build
   --release --locked -p volvisord` (exit 0); `--skip-build` was used so the
@@ -38,11 +38,15 @@ data-path benchmark, **not** an SLA or durability proof, and **not** the
 - **Non-evidence repeat:** [diagnostics/same-sha-repeat/README.md](diagnostics/same-sha-repeat/README.md)
   — a same-SHA `--skip-soak` repeat that is explicitly **NON-EVIDENCE** and
   was not used to select, replace or support the measured sample.
-- **Published measured records:** `json/` and `csv/` are byte-identical to
-  the source run directory (`diff -rq` exit 0). The final
-  `MANIFEST.sha256` is resealed after authoring and covers every file in
-  this bundle, including this page, `REPORT.md`, `SCRIPTS.txt`,
-  `comparison/` and `diagnostics/`.
+- **Published measured records:** `json/` is byte-identical to the source
+  run directory (`diff -rq` exit 0). The final `MANIFEST.sha256` is
+  resealed after authoring and after the raw logs and per-operation CSVs
+  were removed, and it covers every remaining file in this bundle,
+  including this page, `REPORT.md`, `SCRIPTS.txt`, `comparison/` and
+  `diagnostics/`.
+- **Not committed:** the raw orchestration/daemon logs and per-operation
+  `csv/` samples are intentionally omitted to keep the pull request small;
+  the `json/` aggregates and `summary/` tables retain the measured values.
 
 ## What this run verifies
 

@@ -421,8 +421,10 @@ evidence.
   before commit; the F3 run only re-confirms the committed gate tests
   pass, so it is not crash injection.
 - **Bundle.** [Phase F write-path remainder bundle](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md).
-  Both source manifests verified; the published measured `json/` and
-  `csv/` are byte-identical to the source run (`diff -rq` exit 0).
+  Both source manifests verified; the published measured `json/` is
+  byte-identical to the source run (`diff -rq` exit 0). The raw
+  orchestration/daemon logs and per-operation CSVs are intentionally not
+  committed (see the bundle's Integrity note).
 - **Micro (descriptive only).** create p50 **195.561 → 205.42 ms
   (+5.04%)**, p95 **215.488 → 225.682 (+4.73%)**; delete p50 **154.685 →
   174.612 ms (+12.88%)**, p95 **174.961 → 185.304 (+5.91%)**. The same-SHA

@@ -42,9 +42,9 @@ ENVIRONMENT.txt records the same source, dirty flag, binary path and digest.
 
 The measured run window is:
   2026-11-06T12:20:58Z .. 2026-11-06T12:52:21Z
-This is the window recorded in raw/00-orchestration.log and reflected in the
-run artifacts. `raw/00-orchestration.log` ends with a `done:` line and a
-clean lab teardown.
+This is the window recorded in the orchestration log and reflected in the
+run artifacts; that log (like the daemon log) is not committed. The
+orchestration log ended with a `done:` line and a clean lab teardown.
 
 The non-evidence repeat (see below) used the same `--skip-build` shape with
 `--skip-soak` in a separate directory:
@@ -97,6 +97,11 @@ sanitizes and compresses only; it does not alter any measured JSON or CSV.
 It exited 0, so its token-redaction check passed. It warned that REPORT.md
 was absent, which is expected at publish time.
 
+The 59.41 MiB gzipped daemon log and the per-operation `csv/` trees were
+removed from the published bundle afterwards to keep the pull request small.
+They were not measured values, and no JSON aggregate, summary table or
+comparison output was changed by the removal.
+
 scripts/bench/compare.py generated comparison/comparison.md and
 comparison/comparison.csv from this bundle and the
 2026-11-05-devhost-phase-e-worker-handoff comparator. It verified both
@@ -105,15 +110,16 @@ warning. It was post-run tooling only: it did not participate in load
 generation and does not change the measurement.
 
 The comparison, the non-evidence diagnostic, this file and the authored
-README.md/REPORT.md were written after the run from the run's raw records;
+README.md/REPORT.md were written after the run from the run's records;
 they add no measured values.
 
 Integrity
 ---------
 publish.sh wrote an initial MANIFEST.sha256 before the comparison,
 diagnostic and authored files existed. The final manifest was resealed after
-REPORT.md, README.md, the comparison and the diagnostic were added, and it
-covers every other file in this bundle, including this provenance record.
+REPORT.md, README.md, the comparison and the diagnostic were added, and
+again after the raw logs and per-operation CSVs were removed. It covers
+every remaining file in this bundle, including this provenance record.
 Verify the whole bundle from this directory with:
 
   sha256sum -c MANIFEST.sha256

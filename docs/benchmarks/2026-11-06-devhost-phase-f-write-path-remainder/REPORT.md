@@ -12,9 +12,9 @@ data-path benchmark, **not** an SLA or durability proof, and **not** the
 - **Exact source:** `2edcecd9b3d4c555831e6d4db1337e3dbcff6a15`
   (`volvisord 2edcecd`), branch `phase-a-scaling`.
 - **Worktree at run time:** clean (`worktree_dirty: no` in
-  [ENVIRONMENT.txt](ENVIRONMENT.txt), `raw/00-orchestration.log` and every
-  raw JSON record). Publishing this bundle makes the worktree dirty now;
-  that is a publication side effect, not a property of the measured run.
+  [ENVIRONMENT.txt](ENVIRONMENT.txt) and every measured JSON record).
+  Publishing this bundle makes the worktree dirty now; that is a
+  publication side effect, not a property of the measured run.
 - **Run window:** 2026-11-06T12:20:58Z .. 2026-11-06T12:52:21Z. The release
   binary was built before the run with `CARGO_BUILD_JOBS=4 cargo build
   --release --locked -p volvisord` (exit 0); `--skip-build` was used so the
@@ -37,12 +37,16 @@ data-path benchmark, **not** an SLA or durability proof, and **not** the
   `compare.py` exited 0 and emitted no warning.
 - **Manifest verification:** the source run directory and the
   pre-publication bundle manifest each passed `sha256sum -c
-  MANIFEST.sha256` before copying. The final bundle manifest is resealed
-  after authoring and covers this report, `README.md`, `SCRIPTS.txt`,
-  `comparison/` and `diagnostics/`; the resealed bundle verifies with
-  `sha256sum -c MANIFEST.sha256`.
-- **Published measured records:** `json/` and `csv/` are byte-identical to
-  the source run directory (`diff -rq` exit 0 for both).
+  MANIFEST.sha256` before copying. The final bundle manifest was resealed
+  after authoring, and again after the raw logs and per-operation CSVs were
+  removed, so it covers every remaining file in this bundle; it verifies
+  with `sha256sum -c MANIFEST.sha256`.
+- **Published measured records:** `json/` is byte-identical to the source
+  run directory (`diff -rq` exit 0); `summary/`, `records/` and
+  `comparison/` are derived from those records. The raw orchestration and
+  daemon logs and the per-operation `csv/` samples are **intentionally not
+  committed** to keep the pull request small; the `json/` aggregates and
+  `summary/` tables retain the measured values.
 
 ## 1. Scope and what changed
 
@@ -495,14 +499,21 @@ READY**.
 - `json/` — ten aggregate records (`micro`, `mixed-c1/c8/c32/c128`,
   `mixed-cap32-c128`, `mixed-rate50-c64`, `restart-pre-soak`,
   `restart-post-soak`, `soak`).
-- `csv/` — per-operation samples (each operation capped at the harness's
-  sample limit) and per-second timelines.
+- `csv/` — **not committed**: per-operation samples (each operation capped
+  at the harness's sample limit) and per-second timelines from the measured
+  run; the `json/` aggregates and `summary/` tables retain the measured
+  values.
 - `summary/` — harness tables.
 - `records/` — lab VG/loop identity and post-run VG state.
-- `raw/` — orchestration log and the gzip-compressed daemon log.
+- `raw/` — **not committed**: the orchestration log and gzip-compressed
+  daemon log from the measured run.
 - `configs/` — sanitized daemon configurations (token replaced with
   `<redacted>`).
 - `comparison/` — generated comparison against the `7204a53` bundle.
 - `diagnostics/same-sha-repeat/` — **non-evidence** same-SHA `--skip-soak`
   repeat, explicitly labeled; cited only to disclose run-to-run variance,
   never to select or support the measured sample.
+
+The `raw/` and `csv/` trees are absent from the published bundle and from
+the resealed `MANIFEST.sha256`. Their removal does not alter any measured
+JSON, summary or comparison value.
