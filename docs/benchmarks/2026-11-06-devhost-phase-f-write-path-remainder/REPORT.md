@@ -326,8 +326,8 @@ not establish a Phase F gain or a zero-regression result.
 
 ## 8. #63 verification — the retired-id filter and generation fence
 
-These are **findings, not fixes**. ADR-0012 remains `Proposed`; `#63`
-stays open.
+These are **findings, not fixes**. ADR-0012 is **Accepted** (2026-11-06,
+zoorpha); `#63` stays open.
 
 **State shape.** `crates/volvisor-lvm/src/state.rs:98` is schema v3.
 `:107` defines the 8 KiB-bit (1 KiB/volume) retired filter.
@@ -450,7 +450,7 @@ These remain open after this batch:
   this batch does not close it.
 - **`#63`** — per-volume-lifetime generation-1 reset across delete +
   same-id recreate; unbounded legacy wire vector at decode; preserved but
-  unused legacy filter. ADR-0012 remains `Proposed`.
+  unused legacy filter. ADR-0012 is **Accepted** (2026-11-06, zoorpha).
 - **`#64`** — in-flight intents never evicted; count-window rather than TTL
   expiry; unbounded log during persistent compaction failure; soft bounds
   from the 2x hysteresis and one-frame planner; 64-bit fingerprint
@@ -480,7 +480,7 @@ This bundle does **not** support:
 - multi-host, hardware fencing, host loss, witness or real-media evidence;
 - the 24-hour soak (NOT RUN) or any crash-consistency claim from load;
 - a Phase F throughput or latency gain, or a zero-regression result;
-- a claim that `#62`, `#63` or `#64` is fixed, or that ADR-0012 is accepted;
+- a claim that `#62`, `#63` or `#64` is fixed;
 - a claim that concurrent create/delete no longer pins workers or that the
   lock-scope change improves liveness under load — the timed load contains
   no create/delete/move, and the gate tests cover refusal, fencing,

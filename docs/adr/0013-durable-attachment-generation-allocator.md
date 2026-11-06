@@ -1,13 +1,13 @@
 # ADR-0013 — Make the attachment-generation allocator durable across volume lifetime
 
-Status: Proposed (decision recorded; implementation and acceptance pending
-under [#63](https://github.com/o3kio/volvisor/issues/63))
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; implementation
+pending under [#63](https://github.com/o3kio/volvisor/issues/63))
+Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Revises: [ADR-0012](0012-monotonic-attachment-generation-fence.md) — the
-generation **source**, not the report/detach fence. This is a proposed
-revision; ADR-0012 remains `Proposed` and its report/detach semantics are
-unchanged now.
+generation **source**, not the report/detach fence. This revision is
+accepted; ADR-0012's report/detach semantics are unchanged, and the
+implementation remains pending under #63.
 Related: [Volume API v2](../../contracts/volume-api-v2.md) §3,
 [ADR-0012](0012-monotonic-attachment-generation-fence.md),
 [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md),
@@ -117,11 +117,12 @@ create.**
 
 ## Implementation status
 
-Not implemented in the Phase F evidence batch. The Phase F result records the
-gap; this ADR records the decision and the required migration shape. Until it
-is implemented, the residual is listed in the readiness report and `#63`
-remains open. Any implementation must add the delete + recreate scenario to
-the default catalog before merge.
+Not implemented in the Phase F evidence batch. The decision is accepted
+(2026-11-06, zoorpha); implementation remains pending under `#63`. The Phase
+F result records the gap; this ADR records the decision and the required
+migration shape. Until it is implemented, the residual is listed in the
+readiness report and `#63` remains open. Any implementation must add the
+delete + recreate scenario to the default catalog before merge.
 
 ## Non-claims
 

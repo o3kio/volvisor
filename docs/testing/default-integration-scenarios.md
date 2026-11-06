@@ -229,6 +229,7 @@ byte trigger disabled along with the record trigger.
 - It does not prove real-backend behavior, a 24-hour soak, data-path
   durability, multi-host fencing, crash consistency on real media, or
   production capacity.
-- It does not accept ADR-0012/0013/0014/0015/0016. Those remain `Proposed`
-  until an accepting authority records a date.
+- It does not implement ADR-0013's durable allocator or ADR-0014's hard
+  ceiling. ADR-0012/0013/0014/0015/0016 are **Accepted** (2026-11-06,
+  zoorpha); acceptance does not add the scenarios still owed.
 - `#62`, `#63` and `#64` remain open.

@@ -1,15 +1,15 @@
 # ADR-0012 — Fence attachment instances by a strictly increasing generation
 
-Status: Proposed (implemented in the Phase C state-substrate slice; decision
-acceptance pending)
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; implemented in the
+Phase C state-substrate slice)
+Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-04
 Revises: [Volume API v2](../../contracts/volume-api-v2.md) §3 attachment-state
 reporting (the retired-id-tombstone mechanism, not the evidence rules)
 Related: [ADR-0003](0003-tiered-volume-virtualization.md),
-[ADR-0013](0013-durable-attachment-generation-allocator.md) (Proposed:
-would revise the generation source and the "first attach is `1`" sentence;
-the report/detach fence here is unchanged),
+[ADR-0013](0013-durable-attachment-generation-allocator.md) (Accepted:
+revises the generation source and the "first attach is `1`" sentence;
+implementation pending, the report/detach fence here is unchanged),
 [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md),
 [readiness report](../releases/pre-production-readiness.md),
 [Phase C plan](../plans/2026-11-04-phase-c-state-substrate-verification.md),

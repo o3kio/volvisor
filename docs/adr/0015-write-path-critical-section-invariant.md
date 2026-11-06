@@ -1,8 +1,8 @@
 # ADR-0015 — The provider state lock never spans an external command on a request path
 
-Status: Proposed (decision recorded; enforcement via the default scenario
-catalog pending acceptance)
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; enforced by the
+default scenario catalog)
+Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Related: [ADR-0012](0012-monotonic-attachment-generation-fence.md),
 [ADR-0013](0013-durable-attachment-generation-allocator.md),

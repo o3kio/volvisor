@@ -27,9 +27,9 @@ An audit at `8d4579a` finds that **#63 and #64 are already implemented**:
   writes a fixed-size decode-only filter, and the authoritative
   detach/report fence is the strictly increasing per-volume
   `attachment_generation` (`e08a2be`, `ec6f9df`; ADR-0012). A churned volume
-  no longer accumulates per-id state. The issue stays open because
-  ADR-0012 is still **Proposed** and the acceptance is an authority decision,
-  not a code task.
+  no longer accumulates per-id state. ADR-0012 is **Accepted** (2026-11-06,
+  zoorpha); the issue stays open because ADR-0013's durable allocator and
+  its delete + same-id recreate scenario are not implemented.
 - **#64** — the journal has bounded retention, atomic snapshot compaction,
   an exact tombstone ring, backoff for failed compactions and config wiring
   (`f38a08d`, `2eea13a`, `d0241ea`). The **RSS high-water** and the
@@ -231,7 +231,7 @@ This slice adds **evidence, not a new retention design**.
   and that the RSS high-water is not claimed fixed.
 - Update the readiness ledger and the #64 residual wording only from the
   measured bundle. Do not close #63/#64; record that their code is present
-  and ADR-0012 acceptance is pending.
+  and ADR-0012 acceptance is recorded (2026-11-06, zoorpha).
 
 **Acceptance.**
 
@@ -275,9 +275,10 @@ a clean-tree 1/8/32/128 sweep and a **shortened 25-minute soak**, not the
 24-hour soak. It is a single-host development-lab control-plane measurement
 and supports no production, data-path, SLA, durability, capacity or
 throughput claim. `#62`, `#63` and `#64` remain **open** (their code is
-present and tested; the issues are not closed), ADR-0012 remains
-`Proposed`, and no gate verdict changes: gates 1/2/5 **NOT MET**, gates 3/4
-**PARTIAL**, overall **NOT PRE-PRODUCTION READY**. The plan's earlier
+present and tested; the issues are not closed), ADR-0012 and the Phase F
+ADRs are **Accepted** (2026-11-06, zoorpha), and no gate verdict changes:
+gates 1/2/5 **NOT MET**, gates 3/4 **PARTIAL**, overall **NOT
+PRE-PRODUCTION READY**. The plan's earlier
 "No push, tag, PR…" line was the pre-authorization constraint; the branch
 was later pushed as WIP under explicit authorization, and that push is not
 evidence for this batch.

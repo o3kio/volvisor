@@ -1,9 +1,9 @@
 # ADR-0014 — Journal retention bounds are a contract, with fail-closed exhaustion
 
-Status: Proposed (decision recorded; hard-ceiling implementation and
-acceptance pending under
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; hard-ceiling
+implementation pending under
 [#64](https://github.com/o3kio/volvisor/issues/64))
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Related: [ADR-0012](0012-monotonic-attachment-generation-fence.md),
 [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md),
@@ -45,8 +45,8 @@ fail-closed, never a silent drop.**
    silently discard a possible side effect. In-flight cardinality must be
    bounded by mutation admission and by the one-frame budget. Today the
    one-frame budget bounds the snapshot, not admission: an over-budget set
-   makes compaction fail typed, and durable appends continue. **Proposed
-   work:** if the in-flight set cannot fit, startup or compaction fails
+   makes compaction fail typed, and durable appends continue. **Owed
+   implementation:** if the in-flight set cannot fit, startup or compaction fails
    closed with a typed error and the daemon refuses new mutating work until
    an operator resolves it. No best-effort eviction. Until that refusal
    lands, the current append-tolerates-a-failed-compaction behavior pinned by

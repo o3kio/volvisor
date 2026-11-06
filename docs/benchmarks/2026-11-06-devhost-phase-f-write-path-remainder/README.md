@@ -102,8 +102,8 @@ made.
   residuals in [REPORT.md](REPORT.md) — including the per-volume-lifetime
   generation-1 reset across delete + same-id recreate, the unbounded legacy
   wire vector at decode, the preserved-but-unused legacy filter, and the
-  count-window (not TTL) tombstone expiry — remain open. ADR-0012 remains
-  `Proposed`.
+  count-window (not TTL) tombstone expiry — remain open. ADR-0012 is
+  **Accepted** (2026-11-06, zoorpha); `#63` remains open.
 
 ## What it exposed (open residuals)
 

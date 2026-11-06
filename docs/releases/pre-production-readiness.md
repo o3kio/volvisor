@@ -137,8 +137,8 @@ claim.
   `attachment_generation` is now the detach/report fence; the filter is legacy
   decode-only and a legacy v1/v2 vector is still imported at load. The
   [ADR-0012](../adr/0012-monotonic-attachment-generation-fence.md) header
-  records it as **Proposed, decision acceptance pending**; the contract
-  amendment is implemented, not an accepted-policy claim.
+  records it as **Accepted** (2026-11-06, zoorpha); the contract amendment
+  is implemented.
 - **C2 — comparison tooling.** `scripts/bench/compare.py` verifies both
   `MANIFEST.sha256` files, reads the real aggregate shapes, refuses a
   tampered/missing/mismatched run, and emits CSV/Markdown with explicit
@@ -365,8 +365,8 @@ is a production-support, SLA, capacity, durability or hardware claim.
   not re-drilled at this SHA here, so its `.volvisor-` message assertion is
   code-derived until the next drill, and the symlink test panics rather than
   skips where the temp filesystem refuses symlinks.
-- **D4 — ADR-0012.** Still `Proposed`; accepting it remains an authority
-  decision, not an implementation task.
+- **D4 — ADR-0012.** Accepted on 2026-11-06 by zoorpha; this does not change
+  the Phase D evidence.
 
 No gate becomes met. Gates 1, 2 and 5 remain **NOT MET**, gates 3 and 4
 remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
@@ -471,7 +471,7 @@ evidence.
   1 if the same `attachment_id` is reused and no test covers it; the legacy
   wire vector is unbounded at decode; a non-empty legacy filter is
   preserved on save (up to 1 KiB/volume) though never consulted.
-  ADR-0012 remains **Proposed**.
+  ADR-0012 is **Accepted** (2026-11-06, zoorpha).
 - **#64 findings (not fixes).** Retention/compaction/tombstone code is
   present and tested
   (`crates/volvisor-journal/src/journal.rs:37,40,43,46,56,64,74,1412-1417,
@@ -491,44 +491,52 @@ evidence.
   `diagnostics/same-sha-repeat/` and is explicitly **NON-EVIDENCE**. It
   was not used to select, replace or support the measured sample and
   supports no performance claim.
-- **No gate change.** `#62`, `#63` and `#64` stay **open**; ADR-0012 stays
-  `Proposed`; gates 1/2/5 remain **NOT MET**, gates 3/4 **PARTIAL**, and
-  the overall status remains **NOT PRE-PRODUCTION READY**. The evidence
-  record includes no push, tag, pull request or issue-state change; the
-  branch itself was pushed earlier as WIP under explicit authorization, and
-  that push is not evidence.
+- **No gate change.** `#62`, `#63` and `#64` stay **open**; ADR-0012 is
+  **Accepted** (2026-11-06, zoorpha); gates 1/2/5 remain **NOT MET**,
+  gates 3/4 **PARTIAL**, and the overall status remains **NOT
+  PRE-PRODUCTION READY**. The evidence record includes no push, tag, pull
+  request or issue-state change; the branch itself was pushed earlier as WIP
+  under explicit authorization, and that push is not evidence.
 
 ## Post-report addendum (2026-11-06) — durable-semantics decisions and the default scenario gate
 
 This addendum records the architecture decisions and the enforceable
 regression gate created from the Phase F findings. It follows the
 [Phase F addendum](#post-report-addendum-2026-11-06--phase-f-write-path-remainder-and-6364-verification).
-**It changes no gate verdict below, accepts no ADR, and closes no issue.**
+**It changes no gate verdict below and closes no issue.**
 It is a documentation, CI and test-enforcement batch: it changes no
 provider, journal or daemon behavior, so it does not alter the semantics of
 a running system or any existing durable file.
 
-- **ADR-0013 — durable attachment-generation allocator (Proposed).**
-  Records the `#63` finding that the generation fence is per volume lifetime:
-  `create_volume` writes generation `1` and delete removes the record, so a
-  delete + same-id recreate restarts at `1`. The decision is one durable
+- **Decision acceptance.** ADR-0012, ADR-0013, ADR-0014, ADR-0015 and
+  ADR-0016 are **Accepted** (2026-11-06, zoorpha). Acceptance covers the
+  decisions only: ADR-0013's durable allocator, ADR-0014's hard ceiling and
+  cannot-fit refusal, and the scenarios still owed below are not
+  implemented by it. `#62`, `#63` and `#64` remain open.
+- **ADR-0013 — durable attachment-generation allocator (Accepted;
+  implementation pending).** Records the `#63` finding that the generation
+  fence is per volume lifetime: `create_volume` writes generation `1` and
+  delete removes the record, so a delete + same-id recreate restarts at
+  `1`. The decision is one durable
   monotonic `next_attachment_generation: u64` in LVM state (schema v4), never
   reset, seeded from the maximum persisted volume/attachment generation on v3
   decode, failing closed at `u64::MAX`. The one residual the v3 file cannot
   close is a volume deleted before the upgrade: its consumed generations are
   gone, so a delayed report from that pre-upgrade incarnation can still match
   during the upgrade window. **Not implemented.**
-- **ADR-0014 — journal bounds and exhaustion contract (Proposed).** Records
-  that terminal retention is bounded and in-flight intents are never evicted,
-  but expiry is a count window, configured values are soft targets, and a
-  persistent compaction failure can still grow the log. The decision adds a
+- **ADR-0014 — journal bounds and exhaustion contract (Accepted;
+  hard-ceiling implementation pending).** Records that terminal retention is
+  bounded and in-flight intents are never evicted, but expiry is a count
+  window, configured values are soft targets, and a persistent compaction
+  failure can still grow the log. The decision adds a
   hard ceiling above the byte trigger with a typed `JOURNAL_FULL`/503 refusal
-  while reads and replay continue, plus refusal metrics; it also proposes
+  while reads and replay continue, plus refusal metrics; it also requires
   refusing new mutating work when in-flight intents cannot be snapshotted.
   **The hard ceiling, the cannot-fit mutation refusal and their metrics are
   not implemented.**
-- **ADR-0015 — write-path critical-section invariant (Proposed).** Records
-  the Phase E/F invariant: the provider state lock may span validation,
+- **ADR-0015 — write-path critical-section invariant (Accepted; enforced by
+  the default catalog).** Records the Phase E/F invariant: the provider state
+  lock may span validation,
   reservation, durable save and commit, but never an external `lvcreate`,
   `lvremove`, `lvs`, `vgs`, `pvs`, `pvmove` or `lvextend` on a request path.
   The durable intent plus revalidation is the cross-command fence. The
@@ -536,8 +544,9 @@ a running system or any existing durable file.
   single-threaded startup recovery lock, and move's inline CLI worker
   handoff remain accepted exceptions/residuals. This proves the existing
   lock scope; it is not a new narrowing.
-- **ADR-0016 — semantic-change and default-scenario gate (Proposed).**
-  Requires any durable-semantics change to carry an ADR or amendment, a
+- **ADR-0016 — semantic-change and default-scenario gate (Accepted; gate
+  enforced in CI).** Requires any durable-semantics change to carry an ADR
+  or amendment, a
   compatibility/migration and rollback statement, a fail-closed refusal path,
   an exact-name default scenario, rollback/replay evidence and a green
   default suite before merge.
@@ -564,9 +573,9 @@ a running system or any existing durable file.
   also owes a cannot-fit refusal scenario (amending `JR-04`, which pins the
   current append-never-fails behavior for a failed compaction). They must be
   added with their implementations before those ADRs can be considered met.
-- **No gate change and no acceptance.** ADR-0012, ADR-0013, ADR-0014,
-  ADR-0015 and ADR-0016 remain **Proposed**; accepting them needs an
-  accepting authority and date. `#62`, `#63` and `#64` remain **open**.
+- **No gate change.** ADR-0012, ADR-0013, ADR-0014, ADR-0015 and ADR-0016
+  are **Accepted** (2026-11-06, zoorpha); acceptance does not implement the
+  owed work or close issues. `#62`, `#63` and `#64` remain **open**.
   Gates 1/2/5 remain **NOT MET**, gates 3/4 **PARTIAL**, and the overall
   status remains **NOT PRE-PRODUCTION READY**. This batch creates no
   production-support, SLA, zero-RPO, durability, capacity, hardware,
@@ -650,7 +659,7 @@ READY**.
 | [Per-VG grow capacity-sample coalescing, 2026-11-05](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md) | `75beea3` (code-identical to `a07203e`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after per-VG single-flight `vgs`; c128 throughput 655.326 → 508.225 ops/s (−22.45 %), grow p50 8,338.505 → 11,335.103 ms while p95 19,633.371 → 12,396.977 ms, soak −4.48 %; measured regression, reverted locally at `59f64cc` | Data path, real backends, 24 h soak, production capacity/SLA, a throughput or envelope improvement, an adopted change |
 | [Phase E create/delete lock scope, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-write-lock-scope/REPORT.md) | `2c5b065` (E1 `8cfa4c2`, E2 `2c5b065`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the state lock across `lvcreate`/`lvremove`; deterministic create/delete gate tests; c8/c32/c128 −2.35/−5.10/−6.77 %, soak −7.12 %; sweep and soak contain no create/delete, so no delta is attributed to E1/E2 | Data path, real backends, 24 h soak, production capacity/SLA, a Phase E gain, a zero-regression result, concurrent create/delete load |
 | [Phase E create/delete worker handoff, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md) | `7204a53`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after routing create/delete bodies through `run_blocking_body`; create p50/p95 flat in both same-SHA samples, delete flat in the measured sample but +6.34 %/+5.90 % in an explicitly non-evidence repeat; gate tests for cross-kind refusal and reservation release with negative controls; c128 −24.24 % measured but not attributed (timed load has no create/delete; non-evidence A/B spans 427.5–626.0 ops/s across four runs of both arms, A 439.5–626.0 and B 427.5–432.8) | Data path, real backends, 24 h soak, production capacity/SLA, a handoff gain, a zero-regression result, concurrent create/delete load, a resolved delete overhead |
-| [Phase F write-path remainder, 2026-11-06](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md) | `2edcecd`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and shortened 25-min soak at the Phase F SHA; deterministic lock-scope gate tests for move/delete/create/failed-create compensation; #63 schema-v3/decode-only filter + generation-fence tests and #64 retention/compaction/tombstone/config tests pass (code present, issues not closed); c1/c8/c32/c128 −0.63/−2.11/−5.14/−9.29 % and soak −1.005 % measured but **not attributed** because the timed load has no create/delete/move (c128 p99 11,800.496 ms and 43.425 s duration recorded); RSS high-water 2,762,300 KiB and journal high-water 75,497,904 B recorded | Data path, real backends, 24 h soak, production capacity/SLA, a Phase F throughput or zero-regression result, that #62/#63/#64 are fixed, ADR-0012 acceptance |
+| [Phase F write-path remainder, 2026-11-06](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md) | `2edcecd`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and shortened 25-min soak at the Phase F SHA; deterministic lock-scope gate tests for move/delete/create/failed-create compensation; #63 schema-v3/decode-only filter + generation-fence tests and #64 retention/compaction/tombstone/config tests pass (code present, issues not closed); c1/c8/c32/c128 −0.63/−2.11/−5.14/−9.29 % and soak −1.005 % measured but **not attributed** because the timed load has no create/delete/move (c128 p99 11,800.496 ms and 43.425 s duration recorded); RSS high-water 2,762,300 KiB and journal high-water 75,497,904 B recorded | Data path, real backends, 24 h soak, production capacity/SLA, a Phase F throughput or zero-regression result, that #62/#63/#64 are fixed |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of

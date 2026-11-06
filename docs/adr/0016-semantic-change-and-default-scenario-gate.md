@@ -1,8 +1,8 @@
 # ADR-0016 — Durable-semantics changes require an ADR, a migration and a default scenario
 
-Status: Proposed (decision recorded; enforcement via the default scenario
-catalog and CI pending acceptance)
-Decision-accepted: pending (record acceptance date and accepting authority here)
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; enforced by the
+default scenario catalog and CI)
+Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Related: [ADR-0012](0012-monotonic-attachment-generation-fence.md),
 [ADR-0013](0013-durable-attachment-generation-allocator.md),
