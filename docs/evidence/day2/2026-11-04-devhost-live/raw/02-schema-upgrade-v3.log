@@ -1,0 +1,196 @@
+# drill: 02-schema-upgrade
+# start: 2026-11-04T14:58:16Z
+# invocation: docs/runbooks/day-2/scripts/d2.sh
+# harness_sha256: fb9fc4c5bb9a98a9932c650326da726b409203fac1a7c02f6560751209b41d68
+# lib_sha256: 0a3343d533250a463f4291de28fec20903df2bc551a1b75810cbade5b74c3df7
+# host: dev
+# kernel: 6.8.0-142-generic
+# source_sha: aad17201f03bfdfcec4b74d863b805bc7fa47c76
+# worktree_dirty: yes
+# runner: uid=0
+
+
+### 2026-11-04T14:58:16Z repository schema compatibility test (populated directory, all covered stores) host=dev
+
+### 2026-11-04T14:58:16Z cargo test schema_upgrade host=dev
+$ cargo test --manifest-path /root/git/volvisor-phase-a/Cargo.toml --locked -p volvisord --test schema_upgrade -- --nocapture
+   Compiling volvisord v0.1.0 (/root/git/volvisor-phase-a/crates/volvisord)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.39s
+     Running tests/schema_upgrade.rs (target/debug/deps/schema_upgrade-7ba7ae4c7f18079c)
+
+running 4 tests
+test each_covered_store_refuses_a_newer_schema_on_open ... ok
+test a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write ... ok
+test a_v2_stamped_n_minus_one_lvm_state_imports_tombstones_and_upgrades_on_write ... ok
+test a_populated_pre_versioning_state_directory_upgrades_in_place ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+exit=0
+
+### 2026-11-04T14:58:19Z record the v3 drill binary identity (version, sha256, dirty flag) host=dev
+$ cat /tmp/opencode/volvisor-d2-final3-20261104T145816Z/records/d2-binaries.txt
+binary_path=/root/git/volvisor-phase-a/target/debug/volvisord
+binary_version=volvisord aad1720-dirty
+binary_sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+caller_worktree_dirty=yes
+source_sha=aad17201f03bfdfcec4b74d863b805bc7fa47c76
+exit=0
+  Physical volume "/dev/loop0" successfully created.
+  Volume group "vg-d2lab" successfully created
+lab setup tag=d2 loop=/dev/loop0 vg=vg-d2lab state=/tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+
+### 2026-11-04T14:58:19Z record the pre-versioning state (no schema_version; attachment + tombstones) host=dev
+$ cat /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+{
+  "volumes": {
+    "vol-upgrade-n1": {
+      "entry": {
+        "vg_name": "vg-d2lab",
+        "lv_name": "vol-vol-upgrade-n1-abcd1234",
+        "size_bytes": 2147483648,
+        "requested_size_bytes": 2147483648,
+        "generation": 7,
+        "data_epoch": 3,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-upgrade-n1",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 5,
+          "access_mode": "single_writer",
+          "vmm_disk_id": "disk-n1",
+          "state": "active",
+          "state_revision": 3,
+          "evidence": "guest_confirmed",
+          "reporter": "consumer-upgrade",
+          "recorded_at_ms": 1700000000123
+        }
+      }
+    },
+    "vol-upgrade-tombstone": {
+      "entry": {
+        "vg_name": "vg-d2lab",
+        "lv_name": "vol-vol-upgrade-tombstone-abcd1234",
+        "size_bytes": 1073741824,
+        "requested_size_bytes": 1073741824,
+        "generation": 9,
+        "data_epoch": 4,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Ready",
+        "attachment": null,
+        "retired_attachment_ids": [
+          "att-retired-oldest",
+          "att-retired-newer"
+        ]
+      }
+    }
+  },
+  "devices": {
+    "dev-d2b01": {
+      "stable_identity": "day2-lab-d2",
+      "path": "/dev/loop0",
+      "vg_name": "vg-d2lab",
+      "role": "native_pool",
+      "owner_generation": 1
+    }
+  },
+  "moves": {}
+}
+exit=0
+
+### 2026-11-04T14:58:19Z create the fixture LVs so the pre-versioning records reconcile host=dev
+$ lvcreate --yes -n vol-vol-upgrade-n1-abcd1234 -L 2G vg-d2lab
+  Logical volume "vol-vol-upgrade-n1-abcd1234" created.
+exit=0
+
+### 2026-11-04T14:58:19Z create the fixture LV for the tombstone volume host=dev
+$ lvcreate --yes -n vol-vol-upgrade-tombstone-abcd1234 -L 1G vg-d2lab
+  Logical volume "vol-vol-upgrade-tombstone-abcd1234" created.
+exit=0
+
+### 2026-11-04T14:58:19Z state has no schema_version before startup host=dev
+$ jq has\(\"schema_version\"\) /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+false
+exit=0
+
+### 2026-11-04T14:58:19Z pre-upgrade state checksum host=dev
+$ sha256sum /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+9cfa5a87bf7aba17c5bcf90ebbbb2ed07c12adfca9f6daaac26467255d748773  /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+exit=0
+daemon d2-daemon healthy pid=2397128 port=36113 bin=/root/git/volvisor-phase-a/target/debug/volvisord sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+HTTP 200 (want 200) POST http://127.0.0.1:36113/v2/volumes
+stopped d2-daemon pid=2397128 sig=TERM
+ASSERT PASS: stopped state has no writer before reading the upgraded file (journal lock is free)
+
+### 2026-11-04T14:58:20Z after the first successful write the file carries schema_version 3 host=dev
+$ jq .schema_version /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+3
+exit=0
+
+### 2026-11-04T14:58:20Z the attachment state/revision survived the upgrade-on-write host=dev
+$ jq .volumes\[\"vol-upgrade-n1\"\].runtime.attachment\ \|\ \{state\,state_revision\,evidence\} /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+{
+  "state": "active",
+  "state_revision": 3,
+  "evidence": "guest_confirmed"
+}
+exit=0
+
+### 2026-11-04T14:58:20Z the v2 tombstone vector was imported into the v3 filter host=dev
+$ jq .volumes\[\"vol-upgrade-tombstone\"\].runtime\ \|\ \{legacy_vector:\ \(.retired_attachment_ids\ //\ \"absent\"\)\,\ filter_inserted:\ .retired_attachment_filter.inserted\} /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+{
+  "legacy_vector": "absent",
+  "filter_inserted": 2
+}
+exit=0
+ASSERT PASS: upgraded schema_version == 3
+ASSERT PASS: upgraded attachment state == active
+ASSERT PASS: upgraded attachment state_revision == 3
+ASSERT PASS: legacy tombstone vector is not rewritten == absent
+ASSERT PASS: tombstones imported into the v3 filter == 2
+
+### 2026-11-04T14:58:20Z live refusal of a newer schema: construct a hand-edited synthetic v4 copy and start the daemon host=dev
+$ jq .schema_version\ =\ 4 /tmp/opencode/volvisor-d2-final3-20261104T145816Z/records/d2-state-supported.json > /tmp/opencode/volvisor-d2-final3-20261104T145816Z/records/d2-state-v4.json
+
+### 2026-11-04T14:58:20Z future schema file checksum before startup host=dev
+$ sha256sum /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+ab281239dd30e17e52429bc9774696890b3e78443d16fbe58c9675cfdfb7ea39  /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json
+exit=0
+future-schema startup exit=1
+
+### 2026-11-04T14:58:20Z future-schema daemon stderr host=dev
+$ cat /tmp/opencode/volvisor-d2-final3-20261104T145816Z/raw/d2-future.daemon.log
+{"timestamp":"2026-11-04T14:58:20.625590Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:36113","provider":"Lvm"}}
+Error: Config("lvm provider construction failed: INTERNAL: unsupported durable-state schema version: lvm state /tmp/opencode/volvisor-d2-final3-20261104T145816Z/lab-d2/journal/lvm-state.json declares schema_version 4, but this build supports at most 3; refusing to open it partially (install a matching or newer build, or restore a pre-upgrade backup)")
+exit=0
+ASSERT PASS: future schema startup exit status == 1
+ASSERT PASS: typed future-schema refusal contains unsupported\ durable-state\ schema\ version
+ASSERT PASS: future-schema refusal names the v3 ceiling contains supports\ at\ most\ 3
+ASSERT PASS: future schema file untouched == ab281239dd30e17e52429bc9774696890b3e78443d16fbe58c9675cfdfb7ea39
+
+### 2026-11-04T14:58:20Z restore the supported schema and prove the same binary starts host=dev
+daemon d2-daemon healthy pid=2397577 port=36113 bin=/root/git/volvisor-phase-a/target/debug/volvisord sha256=80105b9f4c820fe86d61bfc92def788f88d803724e9f250b9921a73e1deda0e9
+HTTP 200 (want 200) GET http://127.0.0.1:36113/v2/volumes/vol-upgrade-n1
+ASSERT PASS: restored volume is served as Attached, not Failed == Attached
+{"allocated_bytes":2147483648,"attachment_ids":["att-upgrade-n1"],"attachments":[{"access_mode":"single_writer","attachment_generation":5,"attachment_id":"att-upgrade-n1","evidence":"guest_confirmed","frontend":{"virtio_blk":{"host_device_path":"/dev/vg-d2lab/vol-vol-upgrade-n1-abcd1234"}},"host_id":"host-upgrade","recorded_at_ms":1700000000123,"reporter":"consumer-upgrade","state":"active","state_revision":3,"vm_id":"vm-upgrade","vmm_disk_id":"disk-n1"}],"backend_class":"native-local","backend_health":"Unknown","current_writer":"att-upgrade-n1","effective_protection":{"local":"none","remote":"none"},"evidence_status":"prototype_only","failure_domain":"host","generation":7,"health":"Unknown","project_id":"tenant-upgrade","provisioned_bytes":2147483648,"state":"Attached","volume_id":"vol-upgrade-n1"}stopped d2-daemon pid=2397577 sig=TERM
+ASSERT PASS: stopped state has no writer before teardown (journal lock is free)
+  Logical volume "vol-vol-upgrade-n1-abcd1234" successfully removed.
+  Logical volume "vol-vol-upgrade-tombstone-abcd1234" successfully removed.
+  Logical volume "vol-vol-d2-new-a05c5bf2" successfully removed.
+  Volume group "vg-d2lab" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=d2 loop=/dev/loop0 vg=vg-d2lab
+
+# end: 2026-11-04T14:58:21Z
+ASSERT SUMMARY: 0 failures
+D2 COMPLETE

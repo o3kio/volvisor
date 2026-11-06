@@ -25,9 +25,9 @@
 //! - monotonic consumer attachment-state reports (a report never advances
 //!   the attachment generation, never downgrades, and an equal/lower report
 //!   is an idempotent no-op);
-//! - tombstone rejection for retired attachment ids, wherever consumer
-//!   reports are advertised, so per-id evidence is never misattributed to a
-//!   new instance.
+//! - a strictly increasing per-volume attachment generation as the
+//!   detach/report fence, so per-id evidence is never misattributed to a
+//!   new instance even when a consumer reuses an attachment id.
 //!
 //! Backend-specific and deliberately *not* generalized here:
 //!
@@ -36,8 +36,9 @@
 //! - ownership proofs and foreign-state classification;
 //! - DRBD writer-authority leases, fencing and migration cuts;
 //! - Ceph mapping/zombie reconciliation and LVM online-move records;
-//! - the tombstone persistence layout (LVM stores a list, the fake a set)
-//!   and whether a backend advertises consumer reports at all (Ceph/DRBD
+//! - the optional legacy tombstone layout (a bounded filter remains in the
+//!   LVM v3 shape for decode compatibility) and whether a backend advertises
+//!   consumer reports at all (Ceph/DRBD
 //!   do not).
 
 use volvisor_types::request::{
@@ -147,8 +148,11 @@ pub fn ensure_expected_generation(expected: u64, current: u64) -> Result<(), Api
 /// Fence an attachment-level mutation (detach or a state report) against the
 /// recorded attachment generation.
 ///
-/// The attachment generation is the detach token; a consumer report validates
-/// it but never advances it.
+/// The attachment generation is the detach/report token. It is **strictly
+/// increasing per volume**: each new instance records a generation greater
+/// than every earlier instance on that volume, so a delayed detach or report
+/// from a retired instance is fenced even if a consumer reuses its id. A
+/// consumer report validates the token but never advances it.
 ///
 /// # Errors
 /// `STALE_GENERATION` when `expected` does not equal `current`.
@@ -169,24 +173,6 @@ pub fn ensure_no_active_attachment(
             ApiErrorCode::WriterAlreadyActive,
             format!("volume {volume_id} already has an active attachment"),
         ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Refuse reuse of an attachment id the volume already consumed.
-///
-/// The tombstone exists so a delayed report from a retired instance can never
-/// label a new one.
-///
-/// # Errors
-/// `IDEMPOTENCY_CONFLICT` when `retired` is true.
-pub fn ensure_attachment_id_not_retired(
-    retired: bool,
-    attachment_id: &AttachmentId,
-) -> Result<(), ApiError> {
-    if retired {
-        Err(ApiError::attachment_id_conflict(attachment_id))
     } else {
         Ok(())
     }
@@ -440,25 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn single_writer_and_tombstone_are_typed() {
+    fn single_writer_admission_is_typed() {
         let volume_id = VolumeId::new("vol-1").expect("valid volume id");
-        let attachment_id = AttachmentId::new("att-1").expect("valid attachment id");
         assert_eq!(ensure_no_active_attachment(false, &volume_id), Ok(()));
         assert_eq!(
             ensure_no_active_attachment(true, &volume_id)
                 .expect_err("writer active")
                 .code,
             ApiErrorCode::WriterAlreadyActive
-        );
-        assert_eq!(
-            ensure_attachment_id_not_retired(false, &attachment_id),
-            Ok(())
-        );
-        assert_eq!(
-            ensure_attachment_id_not_retired(true, &attachment_id)
-                .expect_err("retired id")
-                .code,
-            ApiErrorCode::IdempotencyConflict
         );
     }
 

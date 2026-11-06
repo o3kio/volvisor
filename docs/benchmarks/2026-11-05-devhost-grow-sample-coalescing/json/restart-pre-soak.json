@@ -1,0 +1,108 @@
+{
+  "argv": [
+    "/root/git/volvisor-phase-a/scripts/bench/bench.py",
+    "restart",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "56955",
+    "--token-file",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/configs/token",
+    "--out-dir",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105",
+    "--journal",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/lab/journal/journal.log",
+    "--state",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/lab/lvm-state.json",
+    "--repo",
+    "/root/git/volvisor-phase-a",
+    "--binary",
+    "/root/git/volvisor-phase-a/target/release/volvisord",
+    "--config",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/configs/volvisord.toml",
+    "--daemon-log",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/raw/daemon.daemon.log",
+    "--pidfile",
+    "/tmp/opencode/volvisor-bench-coalesce-20261105/records/daemon.pid",
+    "--daemon-pid",
+    "1553411",
+    "--restart-iterations",
+    "3",
+    "--label",
+    "pre-soak"
+  ],
+  "generated_utc": "2026-11-05T14:28:22Z",
+  "healthy_seconds": {
+    "count": 3,
+    "max_ms": 102.0,
+    "mean_ms": 88.667,
+    "min_ms": 81.0,
+    "p50_ms": 83.0,
+    "p95_ms": 102.0,
+    "p99_ms": 102.0
+  },
+  "host": "dev",
+  "iterations": 3,
+  "kernel": "6.8.0-142-generic",
+  "python": "3.12.3",
+  "records": [
+    {
+      "after": {
+        "journal_bytes": 563927,
+        "list_status": 200,
+        "listed_volumes": 0,
+        "state_bytes": 198
+      },
+      "before": {
+        "journal_bytes": 563927,
+        "pid": 1553411,
+        "state_bytes": 198
+      },
+      "healthy_seconds": 0.083,
+      "iteration": 1,
+      "new_pid": 1556661,
+      "started_utc": "2026-11-05T14:28:22Z",
+      "stop_seconds": 0.02
+    },
+    {
+      "after": {
+        "journal_bytes": 563927,
+        "list_status": 200,
+        "listed_volumes": 0,
+        "state_bytes": 198
+      },
+      "before": {
+        "journal_bytes": 563927,
+        "pid": 1556661,
+        "state_bytes": 198
+      },
+      "healthy_seconds": 0.102,
+      "iteration": 2,
+      "new_pid": 1556687,
+      "started_utc": "2026-11-05T14:28:22Z",
+      "stop_seconds": 0.003
+    },
+    {
+      "after": {
+        "journal_bytes": 563927,
+        "list_status": 200,
+        "listed_volumes": 0,
+        "state_bytes": 198
+      },
+      "before": {
+        "journal_bytes": 563927,
+        "pid": 1556687,
+        "state_bytes": 198
+      },
+      "healthy_seconds": 0.081,
+      "iteration": 3,
+      "new_pid": 1556713,
+      "started_utc": "2026-11-05T14:28:22Z",
+      "stop_seconds": 0.003
+    }
+  ],
+  "scenario": "restart-pre-soak",
+  "source_sha": "75beea399e593c561104d4d0bb473c88d4d8b93e",
+  "status": "OK",
+  "worktree_dirty": false
+}

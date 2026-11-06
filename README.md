@@ -56,29 +56,40 @@ Local SSD protection (e.g. a qualified local mirror) and remote host replication
 
 ## Implementation (prototype)
 
-A Rust workspace implements the P0 control plane (stable IDs, device claiming,
-single-volume API/attachments, provider conformance — SPEC-0002 section 12)
-plus the native-local LVM slice, the external Ceph RBD adapter slice and the
-DRBD 9 nearline baseline slice:
+A Rust workspace implements the Volume API v2 control plane (stable IDs,
+journaled and idempotent mutations, admission/auth/audit, provider
+conformance) plus the native-local LVM, external Ceph RBD, DRBD 9 nearline,
+witness/fencing, and migration/handoff slices. The workspace has 13 members:
 
 ```text
-crates/volvisor-types      typed domain vocabulary (Volume API v2 mirror)
-crates/volvisor-journal    durable intent journal + idempotency registry
-crates/volvisor-provider   engine-neutral provider trait, command runner,
-                           fake provider + conformance kit
-crates/volvisor-lvm        native-local LVM provider (thick LV, P1 slice)
-crates/volvisor-ceph       ceph-rbd adapter for an existing external Ceph
-                           cluster (P2 slice, ADR-0005 Phase A)
-crates/volvisor-drbd       DRBD 9 nearline baseline: the local end of a
-                           single-primary replicated resource over an
-                           operator-designated VG (P3 slice, ADR-0007)
-crates/volvisor-api        HTTP/JSON Volume API v2 server
-crates/volvisord           daemon binary
+crates/volvisor-types          typed domain vocabulary (Volume API v2 mirror)
+crates/volvisor-journal        durable intent journal + idempotency registry
+crates/volvisor-provider       engine-neutral provider trait, command runner,
+                               fake provider + conformance kit
+crates/volvisor-lvm            native-local LVM provider
+crates/volvisor-ceph           ceph-rbd adapter for an existing external cluster
+crates/volvisor-drbd           DRBD 9 nearline: local end of a replicated resource
+crates/volvisor-drbd-testkit   test-only fake DRBD+LVM world
+crates/volvisor-witness        writer-authority (epoch/lease) service core
+crates/volvisor-campaign       test-only failure-campaign harness + summary binary
+crates/volvisor-handoff        migration state machine + durable migration records
+crates/volvisor-api            Volume API v2 router and journal-before-mutate pipeline
+crates/volvisor-tls            shared rustls server/client configuration
+crates/volvisord               composition root + volvisord/volvisor-witnessd binaries
 ```
 
-Build and test: `cargo build`, `cargo test --workspace`,
-`cargo clippy --all-targets` (CI denies warnings). Real-backend suites have
-one-command gates with typed, loud failures when their rig is missing:
+`volvisor-drbd-testkit` and `volvisor-campaign` are test-only; no production
+crate depends on them. The crate dependency direction, API request flow,
+witness/peer/migration paths, invariants, failure model and authoritative
+state locations are in [ARCHITECTURE.md](ARCHITECTURE.md). Build, test-tier,
+review and schema-change procedures are in [CONTRIBUTING.md](CONTRIBUTING.md);
+ownership and bus-factor risks are tracked in
+[docs/bus-factor.md](docs/bus-factor.md).
+
+Build and test: `cargo build --locked`, `cargo test --workspace --locked`,
+`cargo clippy --workspace --locked --all-targets -- -D warnings` (CI denies
+warnings). Real-backend suites have one-command gates with typed, loud
+failures when their rig is missing:
 
 ```sh
 sudo ./scripts/test-lvm.sh          # locally runnable (root + lvm2 + loop + tmpfs mount)
@@ -103,12 +114,13 @@ production-support claim is made or implied (AGENTS rule 12).
 Day-2 recovery procedures and their drill results are in the
 [day-2 runbook index](docs/runbooks/day-2/README.md). The executable drills and
 raw records are in the
-[2026-11-03 single-host evidence bundle](docs/evidence/day2/2026-11-03-devhost/).
+[2026-11-03 single-host bundle](docs/evidence/day2/2026-11-03-devhost/) and the
+[2026-11-04 D1/D2 day-2 bundle](docs/evidence/day2/2026-11-04-devhost-live/).
 
 | Area | Recorded verdict |
 |---|---|
-| Control-plane backup/restore with attachment state, revision and tombstones | **DRILLED** |
-| Schema compatibility, upgrade-on-write and future-version refusal | **PARTIAL** — live old-binary → new-binary upgrade/rollback not run |
+| Control-plane backup/restore with attachment state and revision | **DRILLED** (2026-11-04 bundle, pre-ADR-0012; current harness asserts the attachment-generation fence) |
+| Schema compatibility, upgrade-on-write and future-version refusal | **DRILLED (single-host lab)** — real old-binary → new-binary upgrade and restore-based rollback; no rolling multi-host/package drill |
 | Lost/unreachable witness service | **PARTIAL** — storage-side DRBD fencing not run |
 | Torn journal tail and corrupt state file | **DRILLED** |
 | ENOSPC on journal/state writes | **DRILLED**; the state-save finding ([#58](https://github.com/o3kio/volvisor/issues/58)) is fixed in code ([PR #69](https://github.com/o3kio/volvisor/pull/69)), post-fix path covered by a regression test |
@@ -161,7 +173,7 @@ The full class-by-provider view is [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md).
 | `ceph-rbd` | Adapter for an **existing, externally operated** Ceph cluster: FSID/pool fail-closed startup, ownership metadata, `exclusive-lock` single-writer attach, growth, delete policy, health/capacity reflection. | Unit, `FakeCeph`, and provider-conformance tests in [crates/volvisor-ceph](crates/volvisor-ceph); the real-Ceph suite is a release-scope **`not-run`** provider ([release-scope.toml](release-scope.toml)). No committed real-cluster evidence bundle exists. | Real-cluster create/map/unmap, auth loss, OSD loss, host loss, Ceph degraded/full, upgrade, and live migration are **not run**. ceph-rbd is explicitly **not claimed**: no green Ceph rig run exists, and publish is blocked if it is flipped to `supported` without a passing suite ([#39](https://github.com/o3kio/volvisor/issues/39)). |
 | Rook-cell managed Ceph (experimental deployment mode, not a volume class) | Device-lending/reclaim/quarantine surface and the design plus example manifests. | Daemon-level Tier S tests for the six lending invariants ([lending contract](contracts/rook-cell-experimental-v0.md)); [POC design and GO/NO-GO matrix](docs/poc/rook-cells/README.md). No real-device result. | The three-physical-host POC [#38](https://github.com/o3kio/volvisor/issues/38) has **never been executed; there is no GO**. ADR-0008 remains **production NO-GO**; VFIO, CRUSH physical-host placement, and host loss are unproven. |
 | Daemons and packages | `volvisord` / `volvisor-witnessd`, `--version`/`--check-config`, systemd units, deb/rpm metadata, install smoke. | Local build, package, `--check-config`, and container-smoke results are recorded in the [v0.1.0 checklist](docs/releases/v0.1.0-checklist.md); CI has package-build/package-smoke jobs. | No signed tag or GitHub release exists. Packaging does not prove unit start under the packaged install, upgrade/downgrade transitions, or any architecture other than x86_64. |
-| API transport, authentication and audit | Native rustls TLS and optional mTLS on the API and witness listeners; HTTPS witness/peer clients; non-loopback plain HTTP refused unless `allow_insecure = true`; scoped admin/operator/read-only credentials; read authorization when scoped credentials exist; structured audit attribution. | Tests in [crates/volvisor-tls](crates/volvisor-tls), [crates/volvisor-api](crates/volvisor-api) and [crates/volvisord](crates/volvisord); same-host netns/veth capture showing certificate verification, insecure-bind refusal, an encrypted pcap with no token/path/header plaintext, and audit attribution ([bundle](docs/evidence/transport-tls/2026-11-02-devhost-netns/)). Deployment guidance is in [docs/security/deployment.md](docs/security/deployment.md). | Cross-host TLS, peer/witness hops on separate physical hosts, live certificate rotation, HSM/TPM key storage and external terminators are **not run**. The capture is same-host and its bundle records a dirty-tree run at base `a6591d9`. The legacy `admin_token`-only mode leaves reads open; configure scoped credentials and TLS on any shared network. |
+| API transport, authentication and audit | Native rustls TLS and optional mTLS on the API and witness listeners; HTTPS witness/peer clients; non-loopback plain HTTP refused unless `allow_insecure = true`; scoped admin/operator/read-only credentials; read authorization whenever any credential is configured (including the legacy `admin_token`); structured audit attribution. | Tests in [crates/volvisor-tls](crates/volvisor-tls), [crates/volvisor-api](crates/volvisor-api) and [crates/volvisord](crates/volvisord); same-host netns/veth capture showing certificate verification, insecure-bind refusal, an encrypted pcap with no token/path/header plaintext, and audit attribution ([bundle](docs/evidence/transport-tls/2026-11-02-devhost-netns/)). Deployment guidance is in [docs/security/deployment.md](docs/security/deployment.md). | Cross-host TLS, peer/witness hops on separate physical hosts, live certificate rotation, HSM/TPM key storage and external terminators are **not run**. The capture is same-host and its bundle records a dirty-tree run at base `a6591d9`. Any configured credential, including the legacy `admin_token`, now protects reads; configure TLS on any shared network. |
 
 Tier R gates are recorded as **skipped** in the campaign report, not passed.
 Tier V is not production support: it verifies the VMM seam at recorded

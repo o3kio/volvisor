@@ -6,15 +6,68 @@
 //! groups. It is never exposed to tenants (the API surface derives all
 //! responses from it).
 //!
-//! Persistence is atomic: [`LvmState::save`] writes `<path>.tmp`, fsyncs
-//! the file, renames it over the target and fsyncs the parent directory,
-//! so a crash can never leave a torn or half-renamed state file. A missing
-//! file loads as an empty state (first start).
+//! Persistence is atomic: [`LvmState::save`] writes a unique sibling
+//! temp file, fsyncs it, renames it over the target and fsyncs the parent
+//! directory, so a crash can never leave a torn or half-renamed state
+//! file. A missing file loads as an empty state (first start).
+//!
+//! # Bounded, hashed temp files and the startup sweep
+//!
+//! Every physical write uses its own bounded temp name,
+//! `.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, where the
+//! hash is a stable FNV-1a 64-bit hash of the canonical state-path
+//! identity (the canonicalized parent plus the file name; raw `OsStr`
+//! bytes on unix, lossy UTF-8 elsewhere) and the sequence is a
+//! process-wide atomic counter. The name does not grow with the state
+//! file name, so a long state name cannot exceed `NAME_MAX`. Two
+//! writers — even in the same process — therefore never share, truncate
+//! or delete each other's temp file, and a failed save removes only the
+//! temp path it allocated for that attempt.
+//!
+//! A process that died mid-save leaves its temp file behind. The
+//! provider constructor sweeps them before it loads or writes state
+//! (`sweep_stale_temps`). The sweep only inspects the state file's own
+//! parent directory and only considers the exact legacy `<path>.tmp`
+//! name plus this state path's hashed namespace. It never removes a temp
+//! registered as in flight in this process; it removes a same-pid
+//! unregistered temp immediately (pid reuse), and removes a foreign-pid
+//! temp only after a one-hour grace. A regular legacy `<path>.tmp` has no
+//! pid component and is treated like a foreign writer: it is removed only
+//! when its mtime is older than that grace, because a fresh one may
+//! belong to an old binary during a rolling restart or to an operator's
+//! copy; non-regular entries are skipped. A foreign-pid or legacy temp
+//! whose mtime is in the future is never swept (`duration_since` fails),
+//! which is the conservative fail-safe; a same-pid unregistered temp is
+//! still removed immediately regardless of mtime. The real guarantee is
+//! therefore: active temps
+//! are never removed, stale same-pid temps are removed, and a foreign
+//! process's recent temp (or a fresh legacy temp) is left alone.
+//!
+//! Two intermediate temp shapes were never released: `f0e5237`'s
+//! `<path>.<pid>.<sequence>.tmp` and `a8c23d6`'s lexical-path-hash
+//! namespace. For an already-canonical spelling (the common case) the
+//! final sweep recognizes the `a8c23d6` namespace, so already-stale
+//! same-pid or aged leftovers are removed under the pid/grace policy; a
+//! fresh foreign-pid leftover still waits out the one-hour grace. Only a
+//! leftover created through a non-canonical spelling (symlink, `./`, `..`
+//! or a bare relative path) is orphaned by the canonical-identity hash
+//! change. The `f0e5237` shape is genuinely never recognized. Those
+//! unrecognized leftovers need manual removal; do not broaden the sweep to
+//! add the `f0e5237` shape or the orphaned non-canonical `a8c23d6`
+//! spelling.
+//!
+//! This sweep is not cross-process writer exclusion. Cross-process
+//! exclusion is the journal flock; two daemons must not alias one state
+//! path (including a custom `lvm_state_path`). The sweep only cleans
+//! crash leftovers and cannot make two live writers safe.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use volvisor_types::crash::{STORE_LVM_STATE, StoreCrashHooks, StoreSavePoint};
@@ -32,14 +85,237 @@ use volvisor_types::{
 /// missing `schema_version` decodes as
 /// [`volvisor_types::BASELINE_SCHEMA_VERSION`]). Version 2 adds the
 /// durable `pending_creates`/`pending_grows`/`pending_deletes` intent
-/// maps introduced for issue #70. Because that is an additive
-/// serialized-shape change, the version is bumped per the
+/// maps introduced for issue #70. Version 3 replaces the unbounded
+/// `retired_attachment_ids` vector with the fixed-size
+/// [`RetiredAttachmentFilter`] introduced for issue #63. Version 4 adds
+/// the durable `next_attachment_generation` allocator required by
+/// [ADR-0013](../../../docs/adr/0013-durable-attachment-generation-allocator.md):
+/// attachment generations are allocated from one provider-wide,
+/// never-reset counter, so a delete + same-id recreate cannot reuse a
+/// generation. Because each is an additive serialized-shape change, the
+/// version is bumped per the
 /// [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
-/// v1 files still load (the maps default empty) and are upgraded on
-/// the first successful save, while an older binary refuses a v2 file
-/// with the typed unsupported-version error instead of failing on an
-/// unknown field.
-pub const LVM_STATE_SCHEMA_VERSION: u32 = 2;
+/// older files still load (the intent maps default empty; the legacy
+/// retired-id vector is imported into the filter; the allocator is
+/// seeded from the persisted generations) and are upgraded on the first
+/// successful save, while an older binary refuses a newer file with the
+/// typed unsupported-version error instead of failing on an unknown
+/// field.
+pub const LVM_STATE_SCHEMA_VERSION: u32 = 4;
+
+/// Sentinel meaning "the attachment-generation allocator has not been
+/// seeded yet". A valid allocated generation is never zero.
+pub const NEXT_ATTACHMENT_GENERATION_UNSEEDED: u64 = 0;
+
+/// Number of bits in one volume's retired-attachment tombstone filter.
+///
+/// One kibibyte per volume. The filter is only materialized once a
+/// volume has retired its first attachment id, so the common
+/// never-attached volume costs no bytes. See
+/// [`RetiredAttachmentFilter`] for the saturation/fail-closed
+/// trade-off.
+pub const RETIRED_ATTACHMENT_FILTER_BITS: usize = 8 * 1024;
+
+/// Number of double-hash probes per inserted attachment id.
+const RETIRED_ATTACHMENT_FILTER_HASHES: u64 = 7;
+
+/// Byte length of [`RETIRED_ATTACHMENT_FILTER_BITS`].
+const RETIRED_ATTACHMENT_FILTER_BYTES: usize = RETIRED_ATTACHMENT_FILTER_BITS / 8;
+
+/// Fixed-size Bloom filter for a volume's consumed attachment ids.
+///
+/// **Legacy schema-v3 shape, no longer authoritative.** This filter was
+/// introduced for issue #63 to bound the schema-v1/v2
+/// `retired_attachment_ids` vector, but it is unsound as a refusal
+/// mechanism: once a churned volume fills it, every fresh id is a false
+/// positive and is refused as `IDEMPOTENCY_CONFLICT`, making the volume
+/// unusable. It has **no false negatives** (`true` is "consumed or a false
+/// positive"), which is why it must never be used to reject a request. The
+/// current provider keeps the type only to decode a v3 file without losing
+/// data and never inserts into or consults it; delayed reports are fenced
+/// by the strictly increasing attachment generation.
+///
+/// Bits are set from SHA-256 double hashing over the id's bytes, so the
+/// on-disk representation is stable across process restarts and
+/// architectures. `inserted` is the legacy saturation metric. The number of
+/// bits and probes are schema properties; changing either requires another
+/// schema bump.
+///
+/// The filter is serialized as an object holding the bit array as a
+/// lowercase hex string plus the insertion counter (not a JSON number
+/// array) so the whole-state file stays compact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredAttachmentFilter {
+    bits: Vec<u8>,
+    inserted: u64,
+}
+
+impl Default for RetiredAttachmentFilter {
+    fn default() -> Self {
+        Self {
+            bits: vec![0; RETIRED_ATTACHMENT_FILTER_BYTES],
+            inserted: 0,
+        }
+    }
+}
+
+impl RetiredAttachmentFilter {
+    /// Whether no id has ever been inserted (the compact on-disk shape).
+    ///
+    /// Requires both the counter and every bit to be clear. A state file
+    /// with set bits but a zero counter is not canonical, but treating it as
+    /// empty would omit the filter on the next save and silently lose
+    /// tombstones (a false negative for every lost id), so it is preserved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inserted == 0 && self.bits.iter().all(|byte| *byte == 0)
+    }
+
+    /// Number of attachment ids ever inserted (including duplicates).
+    #[must_use]
+    pub fn inserted(&self) -> u64 {
+        self.inserted
+    }
+
+    /// Fraction of filter bits currently set, in `0.0..=1.0`.
+    ///
+    /// Serialized alongside the bit array so an operator can inspect creep
+    /// toward saturation in the durable state file; a saturated filter keeps
+    /// refusing correctly (no false negatives), but every new id is also
+    /// refused (false positives). This revision exposes no metric or log
+    /// line for it.
+    // `RETIRED_ATTACHMENT_FILTER_BITS` is 8192, exactly representable in
+    // `f64`; the fraction is a diagnostic, never a control-flow input.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn saturation(&self) -> f64 {
+        let set: u32 = self.bits.iter().map(|byte| byte.count_ones()).sum();
+        f64::from(set) / RETIRED_ATTACHMENT_FILTER_BITS as f64
+    }
+
+    /// Record that `id` was consumed by this volume.
+    ///
+    /// Idempotent in the bit array: re-inserting the same id sets the same
+    /// bits and leaves [`RetiredAttachmentFilter::saturation`] unchanged;
+    /// the `inserted` counter still advances.
+    pub fn insert(&mut self, id: &AttachmentId) {
+        for index in filter_indices(id.as_str()) {
+            self.bits[index / 8] |= 1 << (index % 8);
+        }
+        self.inserted = self.inserted.saturating_add(1);
+    }
+
+    /// Whether `id` may have been consumed by this volume.
+    ///
+    /// `false` is definitive (never consumed). `true` means "consumed or a
+    /// false positive", so it is **diagnostic only**: treating it as an
+    /// authoritative refusal would reject fresh ids once the filter fills.
+    /// The attachment generation is the fence.
+    #[must_use]
+    pub fn maybe_contains(&self, id: &AttachmentId) -> bool {
+        filter_indices(id.as_str()).all(|index| self.bits[index / 8] & (1 << (index % 8)) != 0)
+    }
+}
+
+/// The double-hashed bit indices for one attachment id.
+fn filter_indices(id: &str) -> impl Iterator<Item = usize> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(id.as_bytes());
+    let mut first = [0u8; 8];
+    let mut second = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    second.copy_from_slice(&digest[8..16]);
+    let h1 = u64::from_le_bytes(first);
+    // An even stride would visit at most half the filter; force odd.
+    let h2 = u64::from_le_bytes(second) | 1;
+    (0..RETIRED_ATTACHMENT_FILTER_HASHES).map(move |probe| {
+        let index = h1.wrapping_add(probe.wrapping_mul(h2));
+        // `index % 8192` always fits `usize` on every supported target; the
+        // conversion cannot fail, and the fallback only keeps the helper
+        // panic-free without weakening the filter (a wrong-but-valid bit
+        // would add a fail-closed false positive).
+        usize::try_from(index % RETIRED_ATTACHMENT_FILTER_BITS as u64).unwrap_or_default()
+    })
+}
+
+impl Serialize for RetiredAttachmentFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RetiredAttachmentFilter", 2)?;
+        state.serialize_field("bits", &encode_hex(&self.bits))?;
+        state.serialize_field("inserted", &self.inserted)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredAttachmentFilterWire {
+    bits: String,
+    inserted: u64,
+}
+
+impl<'de> Deserialize<'de> for RetiredAttachmentFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let wire = RetiredAttachmentFilterWire::deserialize(deserializer)?;
+        // Reject a wrong-length `bits` string before allocating the
+        // decoded buffer: a corrupt file can otherwise make the decoder
+        // allocate proportional to an arbitrarily large hex field.
+        let expected_hex_len = RETIRED_ATTACHMENT_FILTER_BYTES * 2;
+        if wire.bits.len() != expected_hex_len {
+            return Err(D::Error::custom(format!(
+                "invalid retired-attachment filter: {} hex bytes, expected {}",
+                wire.bits.len(),
+                expected_hex_len
+            )));
+        }
+        let bits = decode_hex(&wire.bits).map_err(|detail| {
+            D::Error::custom(format!("invalid retired-attachment filter: {detail}"))
+        })?;
+        if bits.len() != RETIRED_ATTACHMENT_FILTER_BYTES {
+            return Err(D::Error::custom(format!(
+                "invalid retired-attachment filter: {} bytes, expected {}",
+                bits.len(),
+                RETIRED_ATTACHMENT_FILTER_BYTES
+            )));
+        }
+        Ok(Self {
+            bits,
+            inserted: wire.inserted,
+        })
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err("odd-length hex string".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    let raw = text.as_bytes();
+    for pair in raw.chunks_exact(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "non-hex character".to_owned())?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "non-hex character".to_owned())?;
+        // Two hex digits always fit a byte; the conversion cannot fail and
+        // the fallback only keeps the decoder panic-free. A corrupted byte
+        // is still rejected by the exact-length check above.
+        bytes.push(u8::try_from(high * 16 + low).unwrap_or_default());
+    }
+    Ok(bytes)
+}
 
 /// The volume→LV cross-reference plus the durable volume attributes.
 ///
@@ -119,18 +395,58 @@ impl<'de> Deserialize<'de> for VolumeEntry {
 }
 
 /// The mutable runtime portion of a stored volume.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VolumeRuntime {
     /// Current lifecycle state.
     pub state: VolumeLifecycle,
     /// The single recorded attachment, if any (single-writer P0 profile).
     pub attachment: Option<AttachmentRecord>,
-    /// Attachment ids this volume consumed earlier in its lifetime. A
-    /// report-capable provider refuses to reuse one: per-id evidence
-    /// (`state_revision`) must never be applied to a different instance.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired_attachment_ids: Vec<AttachmentId>,
+    /// **Legacy schema-v3 tombstones**, retained only so a v3 state file
+    /// decodes without loss. The current provider never inserts into or
+    /// consults this filter: a delayed report is fenced by the strictly
+    /// increasing attachment generation, and refusing a Bloom-filter hit
+    /// would reject fresh ids once the filter fills (issue #63). Omitted
+    /// while empty so a never-attached volume stays compact.
+    #[serde(
+        rename = "retired_attachment_filter",
+        default,
+        skip_serializing_if = "RetiredAttachmentFilter::is_empty"
+    )]
+    pub retired_attachments: RetiredAttachmentFilter,
+}
+
+/// Wire shape for [`VolumeRuntime`].
+///
+/// `retired_attachment_ids` is the unbounded schema-v1/v2 vector: it is
+/// accepted on load (and folded into [`RetiredAttachmentFilter`]) but
+/// never written again. `retired_attachment_filter` is the schema-v3
+/// shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeRuntimeWire {
+    state: VolumeLifecycle,
+    attachment: Option<AttachmentRecord>,
+    #[serde(default)]
+    retired_attachment_ids: Vec<AttachmentId>,
+    #[serde(default)]
+    retired_attachment_filter: Option<RetiredAttachmentFilter>,
+}
+
+impl<'de> Deserialize<'de> for VolumeRuntime {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = VolumeRuntimeWire::deserialize(deserializer)?;
+        let mut retired_attachments = wire.retired_attachment_filter.unwrap_or_default();
+        // Import a legacy v1/v2 vector. Inserting into an existing
+        // filter as well is a safe superset (never a false negative).
+        for id in wire.retired_attachment_ids {
+            retired_attachments.insert(&id);
+        }
+        Ok(Self {
+            state: wire.state,
+            attachment: wire.attachment,
+            retired_attachments,
+        })
+    }
 }
 
 /// A volume as stored in provider state: durable entry + runtime.
@@ -316,11 +632,9 @@ pub struct DeleteIntent {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LvmState {
     /// Durable schema version; absent in pre-versioning files (baseline 1).
-    #[serde(default = "volvisor_types::baseline_schema_version")]
     schema_version: u32,
     volumes: BTreeMap<VolumeId, StoredVolume>,
     devices: BTreeMap<DeviceId, DeviceEntry>,
@@ -344,6 +658,55 @@ pub struct LvmState {
     /// a state with no pending delete serializes without the map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_deletes: BTreeMap<VolumeId, DeleteIntent>,
+    /// Provider-wide allocator for attachment generations (ADR-0013,
+    /// schema v4). Never reset by create or delete. Zero is the
+    /// "unseeded" sentinel accepted only from older files; decode seeds
+    /// it from the persisted generations. It is always serialized so a
+    /// restart reads the durable value instead of re-deriving it.
+    #[serde(default)]
+    next_attachment_generation: u64,
+}
+
+/// Wire shape for [`LvmState`]; identical fields plus the schema-v4
+/// allocator, which older files omit.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LvmStateWire {
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    schema_version: u32,
+    volumes: BTreeMap<VolumeId, StoredVolume>,
+    devices: BTreeMap<DeviceId, DeviceEntry>,
+    #[serde(default)]
+    moves: BTreeMap<VolumeId, MoveRecord>,
+    #[serde(default)]
+    pending_creates: BTreeMap<VolumeId, CreateIntent>,
+    #[serde(default)]
+    pending_grows: BTreeMap<VolumeId, GrowIntent>,
+    #[serde(default)]
+    pending_deletes: BTreeMap<VolumeId, DeleteIntent>,
+    #[serde(default)]
+    next_attachment_generation: u64,
+}
+
+impl<'de> Deserialize<'de> for LvmState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LvmStateWire::deserialize(deserializer)?;
+        let mut state = Self {
+            schema_version: wire.schema_version,
+            volumes: wire.volumes,
+            devices: wire.devices,
+            moves: wire.moves,
+            pending_creates: wire.pending_creates,
+            pending_grows: wire.pending_grows,
+            pending_deletes: wire.pending_deletes,
+            next_attachment_generation: wire.next_attachment_generation,
+        };
+        state.seed_attachment_generation();
+        Ok(state)
+    }
 }
 
 impl Default for LvmState {
@@ -356,11 +719,80 @@ impl Default for LvmState {
             pending_creates: BTreeMap::new(),
             pending_grows: BTreeMap::new(),
             pending_deletes: BTreeMap::new(),
+            // A fresh provider starts its global allocator at 1. It is
+            // not derived from a volume entry generation: a fresh state
+            // has no history to protect.
+            next_attachment_generation: 1,
         }
     }
 }
 
 impl LvmState {
+    /// Seed the schema-v4 attachment-generation allocator from durable
+    /// records.
+    ///
+    /// A schema-v1/v2/v3 file has no allocator, and a v4 file may carry
+    /// the zero sentinel. Seeding takes
+    /// `max(volume entry generations, attachment generations) + 1`, so
+    /// an upgrade cannot reissue a generation that is still recoverable
+    /// from a live volume or attachment record. A persisted non-zero
+    /// allocator is authoritative; it is only raised to stay above a
+    /// persisted attachment generation (defence against a hand-edited or
+    /// downgraded file), never inflated by the volume-entry counter on
+    /// every restart.
+    fn seed_attachment_generation(&mut self) {
+        let highest_attachment = self
+            .volumes
+            .values()
+            .filter_map(|stored| {
+                stored
+                    .runtime
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| attachment.generation)
+            })
+            .max()
+            .unwrap_or(0);
+        if self.next_attachment_generation == NEXT_ATTACHMENT_GENERATION_UNSEEDED {
+            let highest_entry = self
+                .volumes
+                .values()
+                .map(|stored| stored.entry.generation)
+                .max()
+                .unwrap_or(0);
+            self.next_attachment_generation = highest_entry
+                .max(highest_attachment)
+                .saturating_add(1)
+                .max(1);
+        } else {
+            self.next_attachment_generation = self
+                .next_attachment_generation
+                .max(highest_attachment.saturating_add(1));
+        }
+    }
+
+    /// Allocate the next provider-wide attachment generation (ADR-0013).
+    ///
+    /// The value is opaque to consumers: it is strictly increasing for
+    /// every later attachment on a volume **and** across delete + same-id
+    /// recreate. At `u64::MAX` the allocator fails closed rather than
+    /// wrapping; this is a recorded bound, not a realistic path.
+    pub(crate) fn allocate_attachment_generation(&mut self) -> Result<u64, ApiError> {
+        if self.next_attachment_generation == NEXT_ATTACHMENT_GENERATION_UNSEEDED {
+            self.seed_attachment_generation();
+        }
+        if self.next_attachment_generation == u64::MAX {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "attachment-generation allocator is exhausted at u64::MAX; refusing to wrap \
+                 and reissue a retired generation",
+            ));
+        }
+        let generation = self.next_attachment_generation;
+        self.next_attachment_generation = self.next_attachment_generation.saturating_add(1);
+        Ok(generation)
+    }
+
     /// Load the state from `path`.
     ///
     /// A missing file is an empty state (first start). A corrupt file, an
@@ -404,11 +836,12 @@ impl LvmState {
     /// Persist the state atomically.
     ///
     /// Takes `&mut self` to mark the intent to persist a mutation: write
-    /// `<path>.tmp` (mode `0600` on unix — the state names devices and
-    /// volume placements, so it is owner-only), fsync, rename over
-    /// `path`, fsync the directory. If any step fails, the temporary
-    /// file is removed and an `INTERNAL` error is returned; the previous
-    /// state file remains intact.
+    /// a unique bounded `.volvisor-<hash>.<pid>.<sequence>.tmp` (mode
+    /// `0600` on unix — the state names devices and volume placements, so
+    /// it is owner-only), fsync, rename over `path`, fsync the directory.
+    /// If any step fails, the temp file this call allocated is removed and
+    /// an `INTERNAL` error is returned; the previous state file remains
+    /// intact and another writer's temp file is never touched.
     pub fn save(&mut self, path: &Path) -> Result<(), ApiError> {
         self.save_with_hooks(path, None)
     }
@@ -426,20 +859,78 @@ impl LvmState {
         path: &Path,
         crash: Option<&StoreCrashHooks>,
     ) -> Result<(), ApiError> {
-        let tmp_path = sibling_tmp_path(path);
-        let result = self.save_to(&tmp_path, path, crash);
-        if result.is_err() {
-            // Best-effort cleanup: never leave a stale .tmp behind.
+        let data = self.encode_for_save()?;
+        Self::save_encoded_with_hooks(&data, path, crash)
+    }
+
+    /// Encode the state for a durable save, advancing the schema version
+    /// to the version this build writes.
+    ///
+    /// Split out from [`Self::save_with_hooks`] so the provider's coalesced
+    /// writer can capture the exact bytes under its state lock and perform
+    /// the physical write later (Phase D D3 slice 2, #62). The encoding
+    /// shape is unchanged: compact JSON of the whole state.
+    pub(crate) fn encode_for_save(&mut self) -> Result<Vec<u8>, ApiError> {
+        // A successful open may have decoded an older file; every save
+        // writes the current version so an upgrade becomes durable on the
+        // first mutation (or the startup reconcile's first save).
+        self.schema_version = LVM_STATE_SCHEMA_VERSION;
+        // Enforce the ADR-0013 invariant before persisting: the allocator
+        // must remain above every attachment generation that is still
+        // durably recoverable. A state assembled without the allocator (a
+        // migration, a test fixture, a hand-restored file) is normalized
+        // here, never reset. A non-zero allocator is otherwise unchanged.
+        self.seed_attachment_generation();
+        // Issue #62: the state file is internal, whole-file rewritten and
+        // fsynced on every mutation. Compact JSON roughly halves the bytes
+        // written and fsynced versus pretty-printing, without changing the
+        // decoded shape or schema.
+        serde_json::to_vec(self).map_err(|e| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                format!("failed to serialize provider state: {e}"),
+            )
+        })
+    }
+
+    /// Write already-encoded state bytes through the existing atomic save
+    /// sequence.
+    ///
+    /// This is the physical half of [`Self::save_with_hooks`]: one unique
+    /// bounded sibling temp, the four crash consults in their established
+    /// order, fsync, rename and directory fsync. It takes bytes rather than
+    /// `&mut self` so the provider's coalesced writer can commit a capture
+    /// it reserved earlier while another caller owns the state reference
+    /// (Phase D D3 slice 2, #62). The temp namespace, permissions, cleanup
+    /// and error strings are unchanged from slice 1.
+    pub(crate) fn save_encoded_with_hooks(
+        data: &[u8],
+        path: &Path,
+        crash: Option<&StoreCrashHooks>,
+    ) -> Result<(), ApiError> {
+        let tmp_path = unique_sibling_tmp_path(path);
+        // Register before `create_new` and keep the guard for the whole
+        // attempt (including the error cleanup). A panic/unwind drops it
+        // too, so the startup sweep can never mistake a temp this process
+        // is still writing for a crash leftover.
+        let _registration = TempRegistration::register(&tmp_path);
+        // Track whether this call actually created the temp file: cleanup
+        // must never remove a file that already existed at the allocated
+        // name (for example a stale file the startup sweep did not see).
+        let mut created = false;
+        let result = Self::save_encoded_to(data, &tmp_path, path, crash, &mut created);
+        if result.is_err() && created {
             drop(fs::remove_file(&tmp_path));
         }
         result
     }
 
-    fn save_to(
-        &mut self,
+    fn save_encoded_to(
+        data: &[u8],
         tmp_path: &Path,
         path: &Path,
         crash: Option<&StoreCrashHooks>,
+        created: &mut bool,
     ) -> Result<(), ApiError> {
         let internal = |detail: String| ApiError::new(ApiErrorCode::Internal, detail);
         let tmp_display = tmp_path.display();
@@ -458,15 +949,12 @@ impl LvmState {
             }
             Ok(())
         };
-        // A successful open may have decoded an older file; every save
-        // writes the current version so an upgrade becomes durable on the
-        // first mutation (or the startup reconcile's first save).
-        self.schema_version = LVM_STATE_SCHEMA_VERSION;
-        let data = serde_json::to_vec_pretty(self)
-            .map_err(|e| internal(format!("failed to serialize provider state: {e}")))?;
         let mut file = create_owner_only(tmp_path)
             .map_err(|e| internal(format!("failed to create {tmp_display}: {e}")))?;
-        file.write_all(&data)
+        // The unique temp name did not exist (create_new); this call now
+        // owns it until the rename consumes it.
+        *created = true;
+        file.write_all(data)
             .map_err(|e| internal(format!("failed to write {tmp_display}: {e}")))?;
         consult(StoreSavePoint::AfterTmpWrite)?;
         file.sync_all()
@@ -478,6 +966,9 @@ impl LvmState {
                 "failed to rename {tmp_display} to {path_display}: {e}"
             ))
         })?;
+        // The rename consumed the temp; it is now the target file and
+        // must never be cleaned up as a temp on a later error.
+        *created = false;
         consult(StoreSavePoint::AfterRename)?;
         // The directory-fsync boundary: the rename has landed, so a
         // rig-injected failure here leaves the NEW file as the durable
@@ -652,37 +1143,328 @@ impl LvmState {
     }
 }
 
-/// The `<path>.tmp` sibling used for atomic saves.
-fn sibling_tmp_path(path: &Path) -> PathBuf {
-    let mut os_name = path.as_os_str().to_owned();
-    os_name.push(".tmp");
-    PathBuf::from(os_name)
+/// The process-wide sequence for [`unique_sibling_tmp_path`].
+///
+/// The process id makes the name unique across live processes; the
+/// atomic sequence makes it unique across every write in this process,
+/// including concurrent writers. A stale file from a previous process
+/// with a recycled pid is removed by the startup sweep before this
+/// process writes.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Bounded prefix of this implementation's temp names.
+const TEMP_PREFIX: &str = ".volvisor-";
+
+/// Suffix shared by the bounded namespace and the legacy fixed name.
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// Number of lowercase hex digits in the canonical path-identity hash.
+const TEMP_HASH_HEX_LEN: usize = 16;
+
+/// A foreign process's temp must be at least this old before the sweep
+/// assumes it is a crash leftover rather than an active writer.
+const FOREIGN_TEMP_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Stable FNV-1a 64-bit hash. The algorithm is part of the on-disk temp
+/// namespace, so it must not change casually.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
+    }
+    hash
 }
 
-/// Create (or truncate) `path` for writing with owner-only permissions.
+/// Hash of the canonical state-path identity bytes: raw `OsStr` bytes on
+/// unix, lossy UTF-8 bytes elsewhere.
 ///
-/// On unix the file is created with mode `0600`; other platforms fall
-/// back to the platform default for [`fs::File::create`].
+/// The identity is [`canonical_state_identity`] (the canonicalized parent
+/// plus the file name), so a restart that spells the same file through a
+/// symlink, `..` or `./` still recognizes its predecessor's temp files.
+#[cfg(unix)]
+fn state_hash(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    fnv1a64(canonical_state_identity(path).as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn state_hash(path: &Path) -> u64 {
+    fnv1a64(canonical_state_identity(path).to_string_lossy().as_bytes())
+}
+
+/// One parsed temp name in this implementation's bounded namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TempName {
+    hash: u64,
+    pid: u64,
+    sequence: u64,
+}
+
+fn decimal_component(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Parse the bounded namespace strictly:
+/// `.volvisor-<16 lowercase hex>.<decimal pid>.<decimal sequence>.tmp`.
+///
+/// The hash must be exactly 16 lowercase hex digits, there must be
+/// exactly three dot-separated components, and both numeric components
+/// must be non-empty decimal. Anything else is not ours.
+fn parse_temp_name(name: &str) -> Option<TempName> {
+    let core = name.strip_prefix(TEMP_PREFIX)?.strip_suffix(TEMP_SUFFIX)?;
+    let mut components = core.split('.');
+    let (Some(hash), Some(pid), Some(sequence), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return None;
+    };
+    if hash.len() != TEMP_HASH_HEX_LEN
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(TempName {
+        hash: u64::from_str_radix(hash, 16).ok()?,
+        pid: decimal_component(pid)?,
+        sequence: decimal_component(sequence)?,
+    })
+}
+
+/// A fresh, collision-free temp path for one physical save of `path`.
+///
+/// The bounded name is
+/// `.volvisor-<16-lowercase-hex-fnv1a64>.<pid>.<sequence>.tmp`, built
+/// from a stable hash of this state path's canonical identity plus the
+/// process id and a process-wide atomic sequence. The name never grows
+/// with the state file name, so a long state name cannot exceed
+/// `NAME_MAX`, and no other writer can receive the same name.
+pub(crate) fn unique_sibling_tmp_path(path: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "{TEMP_PREFIX}{:016x}.{}.{sequence}{TEMP_SUFFIX}",
+        state_hash(path),
+        std::process::id()
+    );
+    state_parent(path).join(name)
+}
+
+/// The parent directory a state path's temp files live in.
+fn state_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Canonical identity used by the process-wide writer-gate registry:
+/// canonicalize the parent when possible, then append the file name;
+/// fall back to the given path.
+pub(crate) fn canonical_state_identity(path: &Path) -> PathBuf {
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    state_parent(path)
+        .canonicalize()
+        .map_or_else(|_| path.to_path_buf(), |parent| parent.join(file_name))
+}
+
+fn in_flight_temps() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static IN_FLIGHT: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn lock_in_flight() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    in_flight_temps()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// RAII registration for one in-flight temp file.
+///
+/// Registered before `create_new` and removed on drop, including on
+/// panic/unwind, so the startup sweep can never remove a temp this
+/// process is still writing.
+struct TempRegistration {
+    identity: PathBuf,
+}
+
+impl TempRegistration {
+    fn register(path: &Path) -> Self {
+        let identity = canonical_state_identity(path);
+        lock_in_flight().insert(identity.clone());
+        Self { identity }
+    }
+}
+
+impl Drop for TempRegistration {
+    fn drop(&mut self) {
+        lock_in_flight().remove(&self.identity);
+    }
+}
+
+fn temp_is_registered(path: &Path) -> bool {
+    lock_in_flight().contains(&canonical_state_identity(path))
+}
+
+/// Whether `candidate` is the exact legacy `<state>.tmp` name of
+/// `path`.
+///
+/// Compares constructed `OsStr` values, so a non-UTF-8 state file name
+/// still has a sweepable legacy temp.
+fn is_legacy_temp_name(path: &Path, candidate: &std::ffi::OsStr) -> bool {
+    let Some(state_file_name) = path.file_name() else {
+        return false;
+    };
+    let mut legacy = state_file_name.to_os_string();
+    legacy.push(TEMP_SUFFIX);
+    candidate == legacy
+}
+
+/// Whether `candidate` is provably a temp file of the state at `path`.
+///
+/// Accepts only the exact legacy `<state>.tmp` name (this build never
+/// writes it) and this state's hash in the bounded new namespace.
+/// Anything else — another state's hash, a malformed hash, a
+/// non-numeric middle, extra components, or a different suffix — is
+/// not ours and is never removed.
+fn is_stale_temp_name(path: &Path, state_hash: u64, candidate: &std::ffi::OsStr) -> bool {
+    if is_legacy_temp_name(path, candidate) {
+        return true;
+    }
+    candidate
+        .to_str()
+        .and_then(parse_temp_name)
+        .is_some_and(|temp| temp.hash == state_hash)
+}
+
+/// Every temp path in `path`'s namespace in its own parent directory,
+/// sorted for deterministic callers/tests.
+///
+/// The scan is deliberately shallow (one directory, no recursion) and
+/// name-gated by [`is_stale_temp_name`], so it never deletes an
+/// arbitrary file. This is the candidate list; [`sweep_stale_temps`]
+/// applies the live-writer policy before removing anything.
+pub(crate) fn stale_temp_paths(path: &Path) -> Vec<PathBuf> {
+    let own_hash = state_hash(path);
+    let Ok(entries) = fs::read_dir(state_parent(path)) else {
+        return Vec::new();
+    };
+    let mut stale: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| is_stale_temp_name(path, own_hash, &entry.file_name()))
+        .map(|entry| entry.path())
+        .collect();
+    stale.sort();
+    stale
+}
+
+/// Whether one candidate temp may be removed without touching a live
+/// writer.
+///
+/// A temp registered as in flight is never removed. A same-pid
+/// unregistered temp is pid reuse and is removed immediately. A
+/// foreign-pid temp and a regular legacy `<state>.tmp` (which has no pid
+/// component, so it is treated exactly like a foreign writer) are removed
+/// only after [`FOREIGN_TEMP_GRACE`]. A non-regular entry is skipped.
+fn temp_may_be_swept(candidate: &Path, current_pid: u64, now: SystemTime) -> bool {
+    if temp_is_registered(candidate) {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    // A directory or other non-regular entry that merely looks like a
+    // temp is never ours to delete.
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    // `stale_temp_paths` already proved the name is ours. A `None`
+    // parse here is the legacy fixed name, which may be non-UTF-8.
+    let parsed = candidate
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(parse_temp_name);
+    match parsed {
+        Some(temp) if temp.pid == current_pid => {
+            // Same pid but not registered: this incarnation cannot be
+            // writing it, so it is pid reuse or a lost registration.
+            true
+        }
+        // A foreign-pid temp or the legacy fixed name: a live writer in
+        // another process (or an older binary during a rolling restart /
+        // an operator's copy) may have just created it. Only a file
+        // older than the grace is presumed stale.
+        Some(_) | None => metadata.modified().is_ok_and(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age > FOREIGN_TEMP_GRACE)
+        }),
+    }
+}
+
+/// Remove stale sibling temp files left by a crashed save of `path`.
+///
+/// Best-effort by design: a state directory that cannot be read or a
+/// temp entry that cannot be removed is skipped, never an arbitrary
+/// recursive delete and never a startup failure. Returns the number of
+/// files removed.
+///
+/// The provider constructor calls this before loading or writing state.
+/// Active temps registered by this process are never removed; a
+/// same-pid unregistered temp is removed regardless of age (pid reuse);
+/// a foreign-pid temp and a regular legacy `<state>.tmp` (no pid
+/// component, treated like a foreign writer) are removed only after
+/// [`FOREIGN_TEMP_GRACE`]; a non-regular entry is skipped. Cross-process
+/// exclusion is the journal flock, not this sweep: two daemons must not
+/// alias one state path.
+pub(crate) fn sweep_stale_temps(path: &Path) -> usize {
+    let current_pid = u64::from(std::process::id());
+    let now = SystemTime::now();
+    stale_temp_paths(path)
+        .into_iter()
+        .filter(|candidate| temp_may_be_swept(candidate, current_pid, now))
+        .filter(|candidate| fs::remove_file(candidate).is_ok())
+        .count()
+}
+
+/// Create `path` for writing with owner-only permissions.
+///
+/// The call uses `create_new`, so it never truncates an existing file:
+/// the caller's unique temp name is its own, and a pre-existing file at
+/// that name is not silently adopted or removed. On unix the file is
+/// created with mode `0600`; other platforms use the platform default
+/// creation mode.
 fn create_owner_only(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
     }
     #[cfg(not(unix))]
     {
-        fs::File::create(path)
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use volvisor_types::crash::CRASH_PANIC_PREFIX;
 
     const N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n1.json");
     const N2_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v1-n2.json");
@@ -719,7 +1501,7 @@ mod tests {
                 },
                 runtime: VolumeRuntime {
                     state: VolumeLifecycle::Ready,
-                    retired_attachment_ids: Vec::new(),
+                    retired_attachments: RetiredAttachmentFilter::default(),
                     attachment: Some(AttachmentRecord {
                         id: AttachmentId::new("att-1").expect("valid id"),
                         vm_id: "vm-1".to_owned(),
@@ -765,12 +1547,16 @@ mod tests {
         state.save(&path).expect("save");
         let text = fs::read_to_string(&path).expect("read state");
         assert!(
-            text.contains("\"schema_version\": 2"),
+            text.contains("\"schema_version\":4"),
             "the current schema version is stamped: {text}"
         );
         assert!(
             !text.contains("pending_creates"),
             "an empty state must not gain a create-intent map: {text}"
+        );
+        assert!(
+            !text.contains("retired_attachment_filter"),
+            "an empty state must not gain a retired-id filter: {text}"
         );
         assert!(
             !text.contains("pending_grows"),
@@ -870,13 +1656,513 @@ mod tests {
         let mut state = sample_state();
         state.save(&path).expect("save");
         assert!(path.exists());
-        assert!(!sibling_tmp_path(&path).exists(), "no .tmp residue");
+        assert!(
+            stale_temp_paths(&path).is_empty(),
+            "no temp-file residue after a successful save"
+        );
 
         // Overwriting an existing state also leaves no residue.
         state.save(&path).expect("save again");
-        assert!(!sibling_tmp_path(&path).exists());
+        assert_eq!(stale_temp_paths(&path), Vec::<PathBuf>::new());
         let reloaded = LvmState::load(&path).expect("reload");
         assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn unique_tmp_names_do_not_collide_across_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        // Two independent writers in the same process must never receive
+        // the same temp name, even when they generate concurrently.
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                (0..64)
+                    .map(|_| unique_sibling_tmp_path(&path))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let names: BTreeSet<PathBuf> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("writer thread"))
+            .collect();
+        assert_eq!(names.len(), 128, "every generated temp name is unique");
+        for name in names {
+            let file_name = name
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("name");
+            let parsed =
+                parse_temp_name(file_name).expect("generated name is in the bounded namespace");
+            assert_eq!(
+                parsed.hash,
+                state_hash(&path),
+                "the generated name carries this state path's hash"
+            );
+        }
+    }
+
+    #[test]
+    fn temp_hash_follows_the_canonical_parent_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let dot = dir.path().join(".").join("state.json");
+        let child = dir.path().join("child");
+        fs::create_dir(&child).expect("child directory");
+        let dotdot = child.join("..").join("state.json");
+
+        assert_eq!(state_hash(&path), state_hash(&dot));
+        assert_eq!(state_hash(&path), state_hash(&dotdot));
+        let temp = unique_sibling_tmp_path(&dotdot);
+        let parsed = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_temp_name)
+            .expect("generated temp is in the bounded namespace");
+        assert_eq!(
+            parsed.hash,
+            state_hash(&path),
+            "a differently spelled parent carries the same canonical hash"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_shares_the_temp_namespace_and_a_leftover_is_swept() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real");
+        fs::create_dir(&real_parent).expect("real parent");
+        let link_parent = dir.path().join("link");
+        symlink(&real_parent, &link_parent).expect("symlinked parent");
+
+        let real = real_parent.join("state.json");
+        let via_link = link_parent.join("state.json");
+        assert_eq!(
+            state_hash(&real),
+            state_hash(&via_link),
+            "a symlinked parent spelling hashes to the real parent's identity"
+        );
+
+        let leftover = temp_path_for(&via_link, u64::from(std::process::id()), 1);
+        fs::write(&leftover, b"stale through the symlink").expect("stale via symlink");
+        assert_eq!(
+            sweep_stale_temps(&real),
+            1,
+            "the real spelling sweeps a leftover named through the symlink"
+        );
+        assert!(
+            !real_parent
+                .join(leftover.file_name().expect("temp name"))
+                .exists(),
+            "the leftover is gone from the real directory"
+        );
+    }
+
+    #[test]
+    fn temp_name_stays_bounded_for_a_long_state_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("{}.json", "s".repeat(240)));
+        let temp = unique_sibling_tmp_path(&path);
+        let name = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name");
+        assert!(
+            name.len() < 128,
+            "the temp name must not grow with the state file name: {name}"
+        );
+        assert!(name.len() < 255, "NAME_MAX safety: {name}");
+    }
+
+    fn temp_path_for(path: &Path, pid: u64, sequence: u64) -> PathBuf {
+        state_parent(path).join(format!(
+            "{TEMP_PREFIX}{:016x}.{pid}.{sequence}{TEMP_SUFFIX}",
+            state_hash(path)
+        ))
+    }
+
+    fn age_file(path: &Path, age: Duration) {
+        use std::fs::FileTimes;
+
+        let modified = SystemTime::now()
+            .checked_sub(age)
+            .expect("test age fits the platform clock");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file to age")
+            .set_times(FileTimes::new().set_modified(modified))
+            .expect("age the file");
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_this_state_paths_stale_temps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+
+        let first = unique_sibling_tmp_path(&path);
+        let second = unique_sibling_tmp_path(&path);
+        fs::write(&first, b"stale").expect("first stale temp");
+        fs::write(&second, b"stale").expect("second stale temp");
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&legacy, b"legacy stale").expect("legacy temp");
+        age_file(&legacy, FOREIGN_TEMP_GRACE + Duration::from_secs(1));
+
+        // Files that are *not* provably this state's temp namespace.
+        let foreign = dir.path().join("other.json.123.456.tmp");
+        fs::write(&foreign, b"foreign").expect("foreign file");
+        let foreign_hash = state_parent(&path).join(format!(
+            "{TEMP_PREFIX}{:016x}.123.456{TEMP_SUFFIX}",
+            state_hash(&path) ^ 1
+        ));
+        fs::write(&foreign_hash, b"other state's hashed temp").expect("foreign hash temp");
+        let malformed = dir.path().join("state.json.notnumeric.tmp");
+        fs::write(&malformed, b"not ours").expect("malformed file");
+        let wrong_suffix = dir.path().join("state.json.123.456.tmp.bak");
+        fs::write(&wrong_suffix, b"wrong suffix").expect("wrong-suffix file");
+
+        assert_eq!(sweep_stale_temps(&path), 3);
+        assert!(!first.exists(), "the first unique temp is swept");
+        assert!(!second.exists(), "the second unique temp is swept");
+        assert!(!legacy.exists(), "the legacy fixed temp is swept");
+        assert!(foreign.exists(), "another state file's temp is untouched");
+        assert!(
+            foreign_hash.exists(),
+            "a different state hash is not this state's temp"
+        );
+        assert!(malformed.exists(), "a non-numeric middle is untouched");
+        assert!(wrong_suffix.exists(), "a non-.tmp suffix is untouched");
+    }
+
+    #[test]
+    fn registered_active_temp_survives_a_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let active = unique_sibling_tmp_path(&path);
+        fs::write(&active, b"in-flight").expect("active temp");
+
+        let registration = TempRegistration::register(&active);
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "the sweep must not remove a registered in-flight temp"
+        );
+        assert!(active.exists(), "the active temp survives");
+
+        // Once the writer has unwound, the same-pid leftover is swept.
+        drop(registration);
+        assert_eq!(sweep_stale_temps(&path), 1);
+        assert!(!active.exists(), "an unregistered same-pid temp is swept");
+    }
+
+    #[test]
+    fn same_pid_unregistered_temp_is_swept_even_when_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let temp = unique_sibling_tmp_path(&path);
+        fs::write(&temp, b"fresh leftover").expect("fresh temp");
+
+        assert_eq!(sweep_stale_temps(&path), 1);
+        assert!(
+            !temp.exists(),
+            "a same-pid unregistered temp is pid reuse, not a live writer"
+        );
+    }
+
+    #[test]
+    fn foreign_pid_temp_is_kept_until_the_grace_elapses() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let foreign_pid = u64::from(std::process::id()) + 1;
+        let fresh = temp_path_for(&path, foreign_pid, 1);
+        let old = temp_path_for(&path, foreign_pid, 2);
+        fs::write(&fresh, b"possibly live").expect("fresh foreign temp");
+        fs::write(&old, b"stale foreign temp").expect("old foreign temp");
+        let old_time = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .expect("open old foreign temp")
+            .set_times(FileTimes::new().set_modified(old_time))
+            .expect("age the foreign temp");
+
+        assert_eq!(sweep_stale_temps(&path), 1);
+        assert!(
+            fresh.exists(),
+            "a fresh foreign-pid temp may belong to a live writer"
+        );
+        assert!(
+            !old.exists(),
+            "a foreign-pid temp older than the grace is swept"
+        );
+    }
+
+    #[test]
+    fn future_mtime_temp_is_never_swept() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let future = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+        let foreign_pid = u64::from(std::process::id()) + 1;
+        let hashed = temp_path_for(&path, foreign_pid, 1);
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&hashed, b"future foreign temp").expect("future hashed temp");
+        fs::write(&legacy, b"future legacy temp").expect("future legacy temp");
+        for candidate in [&hashed, &legacy] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(candidate)
+                .expect("open future temp")
+                .set_times(FileTimes::new().set_modified(future))
+                .expect("set future mtime");
+        }
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "a future mtime is treated as not provably stale and is never swept"
+        );
+        assert!(hashed.exists(), "a future hashed temp is never swept");
+        assert!(legacy.exists(), "a future legacy temp is never swept");
+    }
+
+    #[test]
+    fn same_pid_future_temp_is_still_swept() {
+        use std::fs::FileTimes;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let temp = temp_path_for(&path, u64::from(std::process::id()), 1);
+        fs::write(&temp, b"future same-pid temp").expect("future same-pid temp");
+        let future = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .expect("open future same-pid temp")
+            .set_times(FileTimes::new().set_modified(future))
+            .expect("set future mtime");
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            1,
+            "same-pid is pid reuse and is swept regardless of age"
+        );
+        assert!(!temp.exists(), "the future same-pid temp is swept");
+    }
+
+    #[test]
+    fn fresh_legacy_temp_survives_a_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let legacy = dir.path().join("state.json.tmp");
+        fs::write(&legacy, b"possibly an old binary or an operator copy")
+            .expect("fresh legacy temp");
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "a fresh legacy temp has no pid component and may belong to a live old binary"
+        );
+        assert!(
+            legacy.exists(),
+            "the fresh legacy temp must not be removed before the grace"
+        );
+    }
+
+    #[test]
+    fn directory_shaped_legacy_temp_survives_a_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let legacy = dir.path().join("state.json.tmp");
+        fs::create_dir(&legacy).expect("directory-shaped legacy temp");
+
+        assert_eq!(
+            sweep_stale_temps(&path),
+            0,
+            "a non-regular entry is never removed"
+        );
+        assert!(
+            legacy.is_dir(),
+            "the directory survives the best-effort sweep"
+        );
+    }
+
+    #[test]
+    fn create_owner_only_refuses_an_existing_file_without_truncating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing.tmp");
+        fs::write(&path, b"keep me").expect("pre-existing file");
+
+        let error = create_owner_only(&path).expect_err("create_new must refuse an existing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&path).expect("existing content"),
+            b"keep me",
+            "refusal must not truncate the existing file"
+        );
+    }
+
+    #[test]
+    fn create_owner_only_reports_a_missing_parent_without_creating_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_parent = dir.path().join("missing");
+        let path = missing_parent.join("state.tmp");
+
+        let error =
+            create_owner_only(&path).expect_err("a missing parent must fail the temp create");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing parent is a real pre-rename I/O failure: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "the failed create must not leave a temp file"
+        );
+        assert!(
+            !missing_parent.exists(),
+            "the failed create must not create the parent"
+        );
+    }
+
+    #[test]
+    fn create_owner_only_refuses_a_directory_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("directory-shaped.tmp");
+        fs::create_dir(&path).expect("directory target");
+
+        let error = create_owner_only(&path).expect_err("a directory target must fail the create");
+        #[cfg(unix)]
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::IsADirectory | std::io::ErrorKind::AlreadyExists
+            ),
+            "the Unix create error is EISDIR or EEXIST: {error}"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Other
+            ),
+            "the platform reports the directory target as an existing/permission error: {error}"
+        );
+        assert!(path.is_dir(), "the directory target must not be modified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_state_path_temp_is_swept() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_name = std::ffi::OsString::from_vec(b"state-\xff.json".to_vec());
+        let path = dir.path().join(state_name);
+        let temp = unique_sibling_tmp_path(&path);
+        fs::write(&temp, b"stale").expect("non-UTF-8 state temp");
+
+        let mut legacy_name = path.file_name().expect("file name").to_os_string();
+        legacy_name.push(".tmp");
+        let legacy = dir.path().join(legacy_name);
+        fs::write(&legacy, b"legacy").expect("non-UTF-8 legacy temp");
+        age_file(&legacy, FOREIGN_TEMP_GRACE + Duration::from_secs(1));
+
+        let candidates = stale_temp_paths(&path);
+        assert!(
+            candidates.contains(&temp),
+            "hashed temp missing from candidates: {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&legacy),
+            "legacy temp missing from candidates: {candidates:?}"
+        );
+        assert_eq!(sweep_stale_temps(&path), 2);
+        assert!(!temp.exists(), "the hashed temp is swept");
+        assert!(!legacy.exists(), "the legacy temp is swept");
+    }
+
+    #[test]
+    fn a_failed_save_does_not_remove_another_writers_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let other_writer = unique_sibling_tmp_path(&path);
+        fs::write(&other_writer, b"another writer's in-flight temp").expect("foreign temp");
+
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite, 0);
+        let mut state = sample_state();
+        let err = state
+            .save_with_hooks(&path, Some(&hooks))
+            .expect_err("the armed save must fail");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+
+        assert!(
+            other_writer.exists(),
+            "a failed save removes only its own uniquely-named temp"
+        );
+        assert_eq!(
+            fs::read(&other_writer).expect("foreign temp content"),
+            b"another writer's in-flight temp"
+        );
+        assert_eq!(
+            stale_temp_paths(&path),
+            vec![other_writer],
+            "only the failed call's own temp was cleaned up"
+        );
+    }
+
+    #[test]
+    fn save_with_hooks_maps_a_missing_temp_parent_to_internal_without_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_parent = dir.path().join("missing");
+        let path = missing_parent.join("state.json");
+        let mut state = sample_state();
+        let entries_before: BTreeSet<PathBuf> = fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+
+        let error = state
+            .save_with_hooks(&path, Some(&StoreCrashHooks::new()))
+            .expect_err("a missing parent must fail the temp create before the write");
+
+        assert_eq!(
+            error.code,
+            ApiErrorCode::Internal,
+            "a pre-rename create failure is a typed INTERNAL: {error}"
+        );
+        assert!(
+            error.detail.contains("failed to create"),
+            "the error names the failed temp create: {error}"
+        );
+        assert!(
+            !missing_parent.exists(),
+            "the failed create must not create the parent or leave a temp there"
+        );
+        assert!(
+            !path.exists(),
+            "the failed create must not leave a state file"
+        );
+        let entries_after: BTreeSet<PathBuf> = fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            entries_after, entries_before,
+            "the failed temp create must leave no residue in the state parent's parent directory"
+        );
     }
 
     #[test]
@@ -908,8 +2194,8 @@ mod tests {
         assert!(err.detail.contains("injected state save failure"), "{err}");
         assert!(err.detail.contains("AfterRenameBeforeDirFsync"), "{err}");
         assert!(
-            !sibling_tmp_path(&path).exists(),
-            "no .tmp residue after the injected failure"
+            stale_temp_paths(&path).is_empty(),
+            "no temp-file residue after the injected failure"
         );
         let loaded = LvmState::load(&path).expect("load the post-rename state");
         assert_eq!(
@@ -931,7 +2217,7 @@ mod tests {
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.detail.contains("injected state save failure"), "{err}");
         assert!(
-            !sibling_tmp_path(&path).exists(),
+            stale_temp_paths(&path).is_empty(),
             "the tmp cleanup removes the unrenamed file"
         );
         let loaded = LvmState::load(&path).expect("load the old state");
@@ -940,6 +2226,40 @@ mod tests {
             4,
             "a pre-rename failure leaves the old file untouched"
         );
+    }
+
+    #[test]
+    fn every_store_save_crash_seam_fires_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        // Phase D D3 slice 2: the bytes-only writer must keep consulting
+        // all four save points in the established order.
+        for point in [
+            StoreSavePoint::AfterTmpWrite,
+            StoreSavePoint::AfterFsyncBeforeRename,
+            StoreSavePoint::AfterRename,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+        ] {
+            let hooks = StoreCrashHooks::new();
+            hooks.arm(STORE_LVM_STATE, point);
+            let mut state = sample_state();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = state.save_with_hooks(&path, Some(&hooks));
+            }))
+            .expect_err("an armed save point must fire");
+            let payload = payload
+                .downcast_ref::<String>()
+                .expect("the crash payload is the marked string");
+            assert!(
+                payload.starts_with(CRASH_PANIC_PREFIX),
+                "the seam at {point:?} must carry the filter prefix: {payload}"
+            );
+            // A killed save leaves its unique temp behind; clean it up so
+            // the next seam starts from the same directory shape.
+            for temp in stale_temp_paths(&path) {
+                let _ = fs::remove_file(temp);
+            }
+        }
     }
 
     #[test]
@@ -965,8 +2285,8 @@ mod tests {
         state.save(&path).expect("save again");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        // A failed save never leaves a .tmp residue behind.
-        assert!(!sibling_tmp_path(&path).exists());
+        // A failed save never leaves a temp-file residue behind.
+        assert_eq!(stale_temp_paths(&path), Vec::<PathBuf>::new());
     }
 
     // -----------------------------------------------------------------
@@ -996,9 +2316,9 @@ mod tests {
         );
         assert_eq!(attachment.reporter.as_deref(), Some("consumer-upgrade"));
         assert_eq!(attachment.recorded_at_ms, Some(1_700_000_000_123));
-        assert_eq!(
-            volume.runtime.retired_attachment_ids,
-            Vec::<AttachmentId>::new()
+        assert!(
+            volume.runtime.retired_attachments.is_empty(),
+            "a pre-tombstone file has no retired ids"
         );
 
         let device_id = DeviceId::new("dev-upgrade01").expect("valid id");
@@ -1042,9 +2362,9 @@ mod tests {
             state.delete_intents().is_empty(),
             "a pre-intent fixture has no delete intents"
         );
-        assert_eq!(
-            volume.runtime.retired_attachment_ids,
-            Vec::<AttachmentId>::new()
+        assert!(
+            volume.runtime.retired_attachments.is_empty(),
+            "a pre-tombstone file has no retired ids"
         );
         // The initial format had only the effective size; the requested
         // size backfills from it rather than defaulting to zero.
@@ -1058,17 +2378,224 @@ mod tests {
         let state = LvmState::load(&path).expect("tombstone state loads");
         let volume_id = VolumeId::new("vol-upgrade-tombstone").expect("valid id");
         let volume = state.volume(&volume_id).expect("volume preserved");
-        let retired: Vec<&str> = volume
-            .runtime
-            .retired_attachment_ids
-            .iter()
-            .map(AsRef::as_ref)
-            .collect();
-        assert_eq!(retired, vec!["att-retired-oldest", "att-retired-newer"]);
+        let filter = &volume.runtime.retired_attachments;
+        assert!(
+            filter.maybe_contains(&AttachmentId::new("att-retired-oldest").expect("id")),
+            "the legacy vector was imported into the filter"
+        );
+        assert!(
+            filter.maybe_contains(&AttachmentId::new("att-retired-newer").expect("id")),
+            "the legacy vector was imported into the filter"
+        );
+        assert!(
+            !filter.maybe_contains(&AttachmentId::new("att-never-used").expect("id")),
+            "an unused id does not match"
+        );
+        assert_eq!(filter.inserted(), 2);
     }
 
     #[test]
-    fn v2_n_minus_one_fixture_loads_and_upgrades_to_v2() {
+    fn retired_attachment_filter_has_no_false_negatives_and_is_bounded() {
+        let mut filter = RetiredAttachmentFilter::default();
+        assert!(filter.is_empty());
+        let ids: Vec<AttachmentId> = (0..2_000)
+            .map(|index| AttachmentId::new(format!("att-{index}")).expect("id"))
+            .collect();
+        for id in &ids {
+            filter.insert(id);
+        }
+        for id in &ids {
+            assert!(filter.maybe_contains(id), "no false negatives: {id}");
+        }
+        assert_eq!(filter.inserted(), 2_000);
+        assert!(filter.saturation() > 0.0 && filter.saturation() <= 1.0);
+        // Re-inserting is idempotent in the bit array (only the
+        // saturation counter advances).
+        let before = filter.saturation();
+        filter.insert(&ids[0]);
+        assert_eq!(filter.saturation(), before);
+
+        // The serialized form is a fixed-size hex string plus the
+        // saturation counter, independent of how many ids were added.
+        let json = serde_json::to_string(&filter).expect("serialize filter");
+        assert!(json.len() < 3_000, "bounded on disk: {} bytes", json.len());
+        let back: RetiredAttachmentFilter =
+            serde_json::from_str(&json).expect("deserialize filter");
+        assert_eq!(back, filter);
+        for id in &ids {
+            assert!(back.maybe_contains(id));
+        }
+    }
+
+    #[test]
+    fn malformed_retired_attachment_filter_is_rejected() {
+        let short = r#"{"bits":"00","inserted":1}"#;
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(short).is_err());
+        let non_hex = format!(
+            r#"{{"bits":"{}","inserted":1}}"#,
+            "zz".repeat(RETIRED_ATTACHMENT_FILTER_BYTES)
+        );
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(&non_hex).is_err());
+        let odd = format!(
+            r#"{{"bits":"{}","inserted":1}}"#,
+            "0".repeat(RETIRED_ATTACHMENT_FILTER_BYTES * 2 + 1)
+        );
+        assert!(serde_json::from_str::<RetiredAttachmentFilter>(&odd).is_err());
+    }
+
+    #[test]
+    fn a_legacy_vector_is_merged_into_an_existing_filter_without_false_negatives() {
+        // A hand-written or transitional file may carry both shapes. The
+        // merge must be a superset: neither the filter's ids nor the
+        // legacy vector's ids (duplicates included) may be lost.
+        let mut filter = RetiredAttachmentFilter::default();
+        let filtered = AttachmentId::new("att-already-filtered").expect("id");
+        filter.insert(&filtered);
+        let json = serde_json::json!({
+            "state": "Ready",
+            "attachment": null,
+            "retired_attachment_ids": ["att-legacy", "att-legacy"],
+            "retired_attachment_filter": filter,
+        });
+        let runtime: VolumeRuntime = serde_json::from_value(json).expect("both shapes decode");
+        assert!(runtime.retired_attachments.maybe_contains(&filtered));
+        assert!(
+            runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-legacy").expect("id"))
+        );
+        assert_eq!(runtime.retired_attachments.inserted(), 3);
+    }
+
+    #[test]
+    fn a_noncanonical_filter_with_set_bits_is_never_treated_as_empty() {
+        // Defense in depth: if a state file carries set bits but a zero
+        // counter, omitting the filter on the next save would drop real
+        // tombstones and create false negatives. It must be preserved.
+        let bits = format!("01{}", "00".repeat(RETIRED_ATTACHMENT_FILTER_BYTES - 1));
+        let json = format!(r#"{{"bits":"{bits}","inserted":0}}"#);
+        let filter: RetiredAttachmentFilter =
+            serde_json::from_str(&json).expect("noncanonical filter decodes");
+        assert!(!filter.is_empty());
+        let encoded = serde_json::to_string(&filter).expect("serialize");
+        assert!(encoded.contains("\"inserted\":0"));
+        assert!(encoded.len() > 2_000, "the bit array is preserved");
+    }
+
+    const V3_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v3-n1.json");
+    const V4_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v4-n1.json");
+
+    #[test]
+    fn v4_n_minus_one_fixture_seeds_the_attachment_allocator_and_upgrades_on_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "lvm-state-v4-n1.json", V4_N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("v3 state loads in v4");
+        // Entry generation 7 and attachment generation 5: the allocator
+        // seeds above both, so an upgrade cannot reissue generation 5.
+        assert_eq!(state.next_attachment_generation, 8);
+
+        let target = dir.path().join("upgraded-v4.json");
+        state.save(&target).expect("upgrade-on-write");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\":4"),
+            "the first save stamps schema v4: {text}"
+        );
+        assert!(
+            text.contains("\"next_attachment_generation\":8"),
+            "the seeded allocator is persisted: {text}"
+        );
+        let reloaded = LvmState::load(&target).expect("reload");
+        assert_eq!(
+            reloaded.next_attachment_generation, 8,
+            "a persisted allocator is authoritative and is not inflated per restart"
+        );
+        assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn attachment_generation_allocator_is_monotonic_and_fails_closed_at_max() {
+        let mut state = LvmState::default();
+        assert_eq!(state.next_attachment_generation, 1);
+        assert_eq!(
+            state
+                .allocate_attachment_generation()
+                .expect("first generation"),
+            1
+        );
+        assert_eq!(
+            state
+                .allocate_attachment_generation()
+                .expect("second generation"),
+            2
+        );
+        state.next_attachment_generation = u64::MAX;
+        let err = state
+            .allocate_attachment_generation()
+            .expect_err("the allocator must not wrap");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("u64::MAX"), "{err}");
+        assert_eq!(
+            state.next_attachment_generation,
+            u64::MAX,
+            "a refused allocation never advances past the bound"
+        );
+    }
+
+    #[test]
+    fn v3_n_minus_one_fixture_imports_legacy_ids_and_upgrades_to_v3() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "lvm-state-v3-n1.json", V3_N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("v2 state loads in v3");
+        let volume_id = VolumeId::new("vol-upgrade-tombstone").expect("valid id");
+        let volume = state.volume(&volume_id).expect("v2 volume preserved");
+        assert_eq!(volume.entry.generation, 9);
+        assert!(
+            volume
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-oldest").expect("id")),
+            "the v2 retired-id vector was imported"
+        );
+        assert!(
+            volume
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-newer").expect("id"))
+        );
+
+        let target = dir.path().join("upgraded-v3.json");
+        state.save(&target).expect("upgrade-on-write");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\":4"),
+            "the first save stamps schema v4: {text}"
+        );
+        assert!(
+            !text.contains("retired_attachment_ids"),
+            "the legacy unbounded vector is never written again: {text}"
+        );
+        assert!(
+            text.contains("retired_attachment_filter"),
+            "the bounded filter is written: {text}"
+        );
+        let reloaded = LvmState::load(&target).expect("reload");
+        assert_eq!(
+            reloaded, state,
+            "no retired id is lost by the v2→v3 upgrade"
+        );
+        assert!(
+            reloaded
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .retired_attachments
+                .maybe_contains(&AttachmentId::new("att-retired-newer").expect("id"))
+        );
+    }
+
+    #[test]
+    fn v2_n_minus_one_fixture_loads_and_upgrades_to_v3() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = write_fixture(&dir, "lvm-state-v2-n1.json", V2_N1_FIXTURE);
         let mut state = LvmState::load(&source).expect("v1 state loads in v2");
@@ -1095,12 +2622,12 @@ mod tests {
             "a v1 file has no intent maps"
         );
 
-        let target = dir.path().join("upgraded-v2.json");
+        let target = dir.path().join("upgraded-v3.json");
         state.save(&target).expect("upgrade-on-write");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\": 2"),
-            "the first save stamps schema v2: {text}"
+            text.contains("\"schema_version\":4"),
+            "the first save stamps schema v4: {text}"
         );
         assert!(
             !text.contains("pending_creates")
@@ -1111,7 +2638,7 @@ mod tests {
         assert_eq!(
             LvmState::load(&target).expect("reload"),
             state,
-            "no durable field is lost by the v1→v2 upgrade"
+            "no durable field is lost by the v1→v3 upgrade"
         );
     }
 
@@ -1124,7 +2651,7 @@ mod tests {
         state.save(&target).expect("save");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\": 2"),
+            text.contains("\"schema_version\":4"),
             "upgrade-on-write stamps the current schema version: {text}"
         );
         assert_eq!(
@@ -1139,14 +2666,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let future = N1_FIXTURE.replacen(
             '{',
-            "{\n  \"schema_version\": 3,\n  \"future_field\": true,",
+            "{\n  \"schema_version\": 5,\n  \"future_field\": true,",
             1,
         );
         let path = write_fixture(&dir, "future.json", &future);
         let err = LvmState::load(&path).expect_err("future version must be refused");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.is_unsupported_schema_version(), "{err}");
-        assert!(err.detail.contains("schema_version 3"), "{err}");
+        assert!(err.detail.contains("schema_version 5"), "{err}");
         assert_eq!(
             fs::read_to_string(&path).expect("read refused file"),
             future,

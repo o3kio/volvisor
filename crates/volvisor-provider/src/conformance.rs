@@ -25,7 +25,7 @@
 //! compares decision classes against both the shared expected fixture and the
 //! in-memory reference provider. Attach replay additionally compares the
 //! response projection (generation, frontend and state), so a fabricated
-//! replay cannot pass on class alone. The report/tombstone branch is
+//! replay cannot pass on class alone. The report/generation-fence branch is
 //! capability-conditional: providers advertising
 //! [`Capability::AttachmentStateReport`] must implement the positive contract,
 //! and a provider without it must fail closed. `provider_conformance_tests!`
@@ -384,8 +384,8 @@ pub async fn check_attach_single_writer(provider: &dyn VolumeProvider) -> Result
         .await
         .map_err(|e| format!("first attach: {e}"))?;
     require(
-        first.attachment_generation == 1,
-        "a fresh attachment starts at generation 1",
+        first.attachment_generation >= 1,
+        "a fresh attachment records a positive, opaque attachment generation",
     )?;
     require(
         first.volume_generation == 2,
@@ -888,11 +888,12 @@ pub async fn check_move_contract(provider: &dyn VolumeProvider) -> Result<(), St
 ///
 /// A provider advertising [`Capability::AttachmentStateReport`] must:
 /// advance evidence monotonically (`prepared < advertised < active`),
-/// keep `attachment_generation` fixed as the detach fence, answer a
+/// keep `attachment_generation` fixed across reports, answer a
 /// repeated/lower report as an idempotent no-op (`applied=false` without
 /// downgrading), refuse a stale instance generation, expose the full
 /// per-attachment view on inspect, answer `NOT_FOUND` after detach, and
-/// refuse reuse of a consumed attachment id (`IDEMPOTENCY_CONFLICT`).
+/// record a strictly greater generation for a re-attach so a delayed
+/// report carrying the retired generation is `STALE_GENERATION`.
 /// A provider without the capability is skipped; its typed `NOT_FOUND` is
 /// the default trait behavior, and the capability-gated path is covered by
 /// the fake's `report_requires_the_capability` test.
@@ -920,6 +921,15 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         attached.state == AttachmentState::Prepared,
         "attach must report the provider-recorded prepared state",
     )?;
+    // ADR-0013: the attachment generation is an opaque, provider-scoped
+    // value. It is not necessarily 1 on a shared provider instance; the
+    // contract is that it is positive, stable across reports, and strictly
+    // increasing across attachment incarnations.
+    let generation = attached.attachment_generation;
+    require(
+        generation >= 1,
+        "the attachment generation must be positive",
+    )?;
 
     let inspected = provider
         .inspect_volume(&create.volume_id)
@@ -935,8 +945,8 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         "a fresh attachment must project prepared at revision 1",
     )?;
     require(
-        view.attachment_generation == 1,
-        "the initial attachment generation must be 1",
+        view.attachment_generation == generation,
+        "inspect must project the generation the attach recorded",
     )?;
     require(
         view.evidence.is_none() && view.reporter.is_none(),
@@ -949,7 +959,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Advertised,
                 AttachmentEvidence::VmmConfigured,
             ),
@@ -962,7 +972,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         "advertised must project revision 2",
     )?;
     require(
-        advertised.attachment_generation == 1,
+        advertised.attachment_generation == generation,
         "a report must never advance attachment_generation",
     )?;
     require(
@@ -977,7 +987,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1001,7 +1011,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1033,7 +1043,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             && observed.evidence == Some(AttachmentEvidence::GuestConfirmed)
             && observed.reporter.as_deref() == Some("conformance-vmm")
             && observed.recorded_at_ms == active.recorded_at_ms
-            && observed.attachment_generation == 1,
+            && observed.attachment_generation == generation,
         "inspect must project the applied evidence verbatim at the unchanged generation",
     )?;
 
@@ -1043,7 +1053,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Advertised,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1061,7 +1071,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                2,
+                generation.wrapping_add(1),
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1077,22 +1087,22 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         Ok(_) => return Err("a stale report generation must not succeed".to_owned()),
     }
 
-    // Detach still fences on generation 1 (reports never moved it), and a
+    // Detach still fences on the generation reports never moved, and a
     // report against the detached instance is NOT_FOUND for a new operation.
     provider
         .detach_volume(
             &create.volume_id,
             &attach.attachment_id,
-            &fixture_detach_request(attachment_id, 1),
+            &fixture_detach_request(attachment_id, generation),
         )
         .await
-        .map_err(|e| format!("detach at the unchanged generation 1: {e}"))?;
+        .map_err(|e| format!("detach at the unchanged generation: {e}"))?;
     match provider
         .report_attachment_state(
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1108,19 +1118,43 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         Ok(_) => return Err("a report after detach must not succeed".to_owned()),
     }
 
-    // A report-capable provider must refuse to reuse the consumed id: a
-    // delayed report from the old instance must never label a new one.
+    // A re-attach records a strictly greater generation. A delayed report
+    // from the retired instance must never label the new one, even when the
+    // consumer reuses the attachment id: its old generation is stale.
+    let retired_generation = generation;
     let after_detach = provider
         .inspect_volume(&create.volume_id)
         .await
         .map_err(|e| format!("inspect_volume after detach: {e}"))?;
     let reattach = fixture_attach_request(volume_id, attachment_id, after_detach.generation);
-    match provider.attach_volume(&create.volume_id, &reattach).await {
-        Err(e) if e.code == ApiErrorCode::IdempotencyConflict => Ok(()),
+    let reattached = provider
+        .attach_volume(&create.volume_id, &reattach)
+        .await
+        .map_err(|e| format!("re-attach after detach: {e}"))?;
+    require(
+        reattached.attachment_generation > retired_generation,
+        "a re-attach must record a strictly greater attachment generation",
+    )?;
+    match provider
+        .report_attachment_state(
+            &create.volume_id,
+            &fixture_report_request(
+                attachment_id,
+                retired_generation,
+                AttachmentState::Active,
+                AttachmentEvidence::GuestConfirmed,
+            ),
+        )
+        .await
+    {
+        Err(e) if e.code == ApiErrorCode::StaleGeneration => Ok(()),
         Err(e) => Err(format!(
-            "reusing a consumed attachment id must fail with IDEMPOTENCY_CONFLICT, got {e}"
+            "a delayed report from the retired generation must fail with STALE_GENERATION, got {e}"
         )),
-        Ok(_) => Err("reusing a consumed attachment id must not succeed".to_owned()),
+        Ok(_) => Err(
+            "a delayed report from the retired generation must not label the new instance"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1143,6 +1177,9 @@ pub enum ParityOutcome {
     /// An identical attach replay returned a different projection than the
     /// recorded instance (a replay-fidelity failure, never a valid class).
     ReplayDiverged,
+    /// A re-attach did not record a generation strictly greater than the
+    /// retired instance (a broken attachment fence, never a valid class).
+    GenerationNotAdvanced,
     /// Attach succeeded.
     Attached,
     /// Detach succeeded.
@@ -1411,18 +1448,18 @@ pub async fn run_universal_parity(provider: &dyn VolumeProvider) -> Vec<ParitySt
     steps
 }
 
-/// The expected report/tombstone parity sequence.
+/// The expected report/attachment-generation parity sequence.
 ///
 /// Report-capable providers apply consumer reports monotonically, keep the
-/// attachment generation fixed, answer repeated/lower reports as no-ops,
-/// refuse a stale generation, and retire the attachment id. Providers that do
-/// not advertise [`Capability::AttachmentStateReport`] must fail closed with
-/// `NOT_FOUND` instead of synthesizing evidence.
+/// attachment generation fixed across reports, answer repeated/lower reports
+/// as no-ops, refuse a stale generation, and record a strictly greater
+/// generation on re-attach, so a delayed report from the retired generation
+/// is stale. Providers that do not advertise
+/// [`Capability::AttachmentStateReport`] must fail closed with `NOT_FOUND`
+/// instead of synthesizing evidence.
 #[must_use]
 pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
-    use ParityOutcome::{
-        Applied, Attached, Conflict, Created, Deleted, Detached, NoOp, NotFound, Stale,
-    };
+    use ParityOutcome::{Applied, Attached, Created, Deleted, Detached, NoOp, NotFound, Stale};
     if report_capable {
         vec![
             step("create", Created),
@@ -1434,7 +1471,9 @@ pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
             step("report-stale", Stale),
             step("detach", Detached),
             step("report-after-detach", NotFound),
-            step("reattach-retired-id", Conflict),
+            step("reattach-new-generation", Attached),
+            step("reattach-generation-advanced", Attached),
+            step("report-retired-generation", Stale),
         ]
     } else {
         vec![
@@ -1448,7 +1487,7 @@ pub fn expected_report_parity(report_capable: bool) -> Vec<ParityStep> {
     }
 }
 
-/// Run the report/tombstone parity sequence against `provider`.
+/// Run the report/attachment-generation parity sequence against `provider`.
 ///
 /// The driver branches on the advertised capability so the same fixture
 /// states the positive contract (fake/LVM) and the fail-closed contract
@@ -1607,11 +1646,36 @@ pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep>
             "parity-report-attachment",
             generation_after_detach,
         );
+        let reattached = provider.attach_volume(&create.volume_id, &reattach).await;
+        let reattached_generation = reattached
+            .as_ref()
+            .map_or(0, |response| response.attachment_generation);
         steps.push(step(
-            "reattach-retired-id",
-            outcome(
-                provider.attach_volume(&create.volume_id, &reattach).await,
-                ParityOutcome::Attached,
+            "reattach-new-generation",
+            outcome(reattached, ParityOutcome::Attached),
+        ));
+        steps.push(step(
+            "reattach-generation-advanced",
+            if reattached_generation > attachment_generation {
+                ParityOutcome::Attached
+            } else {
+                ParityOutcome::GenerationNotAdvanced
+            },
+        ));
+        steps.push(step(
+            "report-retired-generation",
+            report_outcome(
+                provider
+                    .report_attachment_state(
+                        &create.volume_id,
+                        &fixture_report_request(
+                            "parity-report-attachment",
+                            attachment_generation,
+                            AttachmentState::Active,
+                            AttachmentEvidence::GuestConfirmed,
+                        ),
+                    )
+                    .await,
             ),
         ));
     } else {
@@ -1646,9 +1710,9 @@ pub async fn run_report_parity(provider: &dyn VolumeProvider) -> Vec<ParityStep>
 /// Run the cross-provider parity suite against `provider`.
 ///
 /// Fails when the provider's decision classes diverge from either the shared
-/// expected fixture or the in-memory reference provider. The report/tombstone
-/// branch is capability-conditional: capable providers must match the positive
-/// contract, non-capable providers must fail closed.
+/// expected fixture or the in-memory reference provider. The
+/// report/generation-fence branch is capability-conditional: capable providers
+/// must match the positive contract, non-capable providers must fail closed.
 ///
 /// # Errors
 /// A description of the first divergent sequence.
@@ -1678,7 +1742,7 @@ pub async fn assert_parity(provider: &dyn VolumeProvider) -> Result<(), String> 
     let expected_reports = expected_report_parity(report_capable);
     if reports != expected_reports {
         return Err(format!(
-            "report/tombstone parity does not match the shared fixture:\n  expected: \
+            "report/generation-fence parity does not match the shared fixture:\n  expected: \
              {expected_reports:?}\n  provider: {reports:?}"
         ));
     }
@@ -1686,7 +1750,7 @@ pub async fn assert_parity(provider: &dyn VolumeProvider) -> Result<(), String> 
         let reference_reports = run_report_parity(&reference).await;
         if reports != reference_reports {
             return Err(format!(
-                "report/tombstone parity diverges from the reference provider:\n  reference: \
+                "report/generation-fence parity diverges from the reference provider:\n  reference: \
                  {reference_reports:?}\n  provider:  {reports:?}"
             ));
         }

@@ -19,6 +19,28 @@ The nearest executable evidence is
 [nearline multi-host campaign](../nearline-multihost-campaign.md). D3 does not
 prove storage-side fencing and does not survive a host loss.
 
+## Preflight (a report, not a result)
+
+Run the D8 prerequisite preflight before scheduling a real rig. It is
+read-only and never powers anything off:
+
+```sh
+bash docs/runbooks/day-2/scripts/preflight.sh --only d8
+```
+
+It reports `PASS` / `NOT RUN` for at least three distinct data hosts, SSH
+reachability, a witness URL, an independent oracle host, BMC/power tooling,
+the storage backend and its shared-storage assumption, and the DRBD module
+when `D8_STORAGE_BACKEND=drbd`. Documented overrides are `D8_HOSTS`,
+`D8_WITNESS_URL`, `D8_ORACLE_HOST`, `D8_BMC_TOOL`, `D8_BMC_HOST`,
+`D8_STORAGE_BACKEND`, `D8_DRBD_VG` or `D8_CEPH_POOL`. `--strict` exits
+nonzero when a selected prerequisite is missing; use it on the real rig.
+
+On 2026-11-04 this host reported `D8: NOT RUN` for every item; the run is
+recorded in the [D2 live evidence bundle](../../evidence/day2/2026-11-04-devhost-live/REPORT.md).
+A preflight pass would still not be host-loss evidence: the procedure below
+must actually run.
+
 ## Scope and non-goals
 
 This is the procedure for **unplanned loss of one data host** in a

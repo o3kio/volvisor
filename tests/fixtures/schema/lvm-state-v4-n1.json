@@ -1,0 +1,36 @@
+{
+  "schema_version": 3,
+  "volumes": {
+    "vol-upgrade-v4": {
+      "entry": {
+        "vg_name": "vg-volvisor",
+        "lv_name": "vol-vol-upgrade-v4-abcd1234",
+        "size_bytes": 2147483648,
+        "requested_size_bytes": 2147483648,
+        "generation": 7,
+        "data_epoch": 3,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "creation_payload": "{\"class\":\"native-local\"}"
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-upgrade-v4",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 5,
+          "access_mode": "single_writer",
+          "vmm_disk_id": "disk-n1",
+          "state": "active",
+          "state_revision": 3,
+          "evidence": "guest_confirmed",
+          "reporter": "consumer-upgrade",
+          "recorded_at_ms": 1700000000123
+        }
+      }
+    }
+  },
+  "devices": {},
+  "moves": {}
+}

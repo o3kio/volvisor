@@ -110,7 +110,7 @@ rb_assert_no_skip_note lvm "skipping real-LVM integration test"
 for test_name in \
     lvm_lifecycle_on_loop_device \
     lvm_non_aligned_create_rounds_up_and_absent_lv_delete_succeeds \
-    lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart \
+    lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart \
     lvm_move_evacuates_under_concurrent_io \
     lvm_move_restart_mid_move_re_attaches_and_completes \
     lvm_move_aborted_out_of_band_while_down_parks_in_doubt \

@@ -1,0 +1,87 @@
+# benchmark: 00-orchestration
+# start: 2026-11-04T23:10:12Z
+# host: dev
+# kernel: 6.8.0-142-generic
+# repo: /root/git/volvisor-phase-a
+# source_sha: c4b0b1303594c494bb26d3643d952434eda8ec34
+# worktree_dirty: no
+# binary: /root/git/volvisor-phase-a/target/release/volvisord
+# binary_sha256: 1f86136093792c161e85d9c8924bc965b635e54d157d975a9780a2d2ddc81bf6
+# runner: uid=0 gid=0
+
+
+### 2026-11-04T23:10:12Z benchmark run dir: /tmp/opencode/volvisor-bench-slice2-20261104T231012Z
+
+### 2026-11-04T23:10:12Z source sha: c4b0b1303594c494bb26d3643d952434eda8ec34
+
+### 2026-11-04T23:10:13Z worktree: clean
+
+### 2026-11-04T23:10:13Z recording pre-existing volume groups
+
+### 2026-11-04T23:10:13Z config check
+
+### 2026-11-04T23:10:13Z check-config
+$ /root/git/volvisor-phase-a/target/release/volvisord --check-config --config /tmp/opencode/volvisor-bench-slice2-20261104T231012Z/configs/volvisord.toml
+{"timestamp":"2026-11-04T23:10:13.336511Z","level":"INFO","fields":{"message":"volvisord configuration check passed","summary":"config ok: listen 127.0.0.1:51811, provider lvm, journal_dir /tmp/opencode/volvisor-bench-slice2-20261104T231012Z/lab/journal, transport plain-http loopback, read-auth open (legacy), no witness, migration disabled"}}
+exit=0
+
+### 2026-11-04T23:10:13Z creating disposable loop-backed LVM lab
+$ pvcreate --yes /dev/loop0
+  Physical volume "/dev/loop0" successfully created.
+$ vgcreate --yes vgb-1793833813 /dev/loop0
+  Volume group "vgb-1793833813" successfully created
+lab setup tag=main loop=/dev/loop0 vg=vgb-1793833813 state=/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/lab/lvm-state.json
+daemon daemon healthy pid=3707928 port=51811
+
+### 2026-11-04T23:10:13Z micro benchmarks: create/delete, attach/report/detach, grow, inspect
+{"scenario": "micro", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/micro.json"}
+
+### 2026-11-04T23:10:40Z restart replay after the micro journal
+{"scenario": "restart-pre-soak", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/restart-pre-soak.json"}
+
+### 2026-11-04T23:10:40Z mixed concurrency sweep: 1 in-flight, 30s
+{"scenario": "mixed-c1", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-c1.json"}
+
+### 2026-11-04T23:11:11Z mixed concurrency sweep: 8 in-flight, 30s
+{"scenario": "mixed-c8", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-c8.json"}
+
+### 2026-11-04T23:11:43Z mixed concurrency sweep: 32 in-flight, 30s
+{"scenario": "mixed-c32", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-c32.json"}
+
+### 2026-11-04T23:12:22Z mixed concurrency sweep: 128 in-flight, 30s
+{"scenario": "mixed-c128", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-c128.json"}
+
+### 2026-11-04T23:13:32Z admission shedding probe: cap=32, 1s queue timeout, 128 in-flight, 15s (diagnostic, not the default cap)
+stopped daemon pid=3711096 sig=TERM
+daemon daemon healthy pid=3723717 port=51811
+{"scenario": "mixed-cap32-c128", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-cap32-c128.json"}
+
+### 2026-11-04T23:14:29Z rate-limit shedding probe: 50 rps burst 50, 64 in-flight, 15s (diagnostic)
+stopped daemon pid=3723717 sig=TERM
+daemon daemon healthy pid=3729579 port=51811
+{"scenario": "mixed-rate50-c64", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/mixed-rate50-c64.json"}
+stopped daemon pid=3729579 sig=TERM
+daemon daemon healthy pid=3732238 port=51811
+
+### 2026-11-04T23:15:05Z shortened soak: 25 minutes, 4 workers, restart after 12 minutes
+{"scenario": "soak", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/soak.json"}
+
+### 2026-11-04T23:40:30Z restart replay after the shortened soak journal
+{"scenario": "restart-post-soak", "status": "OK", "json": "/tmp/opencode/volvisor-bench-slice2-20261104T231012Z/json/restart-post-soak.json"}
+stopped daemon pid=3758482 sig=TERM
+
+### 2026-11-04T23:40:32Z recording post-run volume groups
+
+### 2026-11-04T23:40:32Z lab teardown
+  Volume group "vgb-1793833813" successfully removed
+  Labels on physical volume "/dev/loop0" successfully wiped.
+lab teardown tag=main loop=/dev/loop0 vg=vgb-1793833813
+
+### 2026-11-04T23:40:32Z summarizing raw results
+summary written: /tmp/opencode/volvisor-bench-slice2-20261104T231012Z/summary
+
+### 2026-11-04T23:40:32Z done: /tmp/opencode/volvisor-bench-slice2-20261104T231012Z
+
+### 2026-11-04T23:40:32Z raw JSON, CSV, environment and MANIFEST.sha256 are in the run directory
+
+# end: 2026-11-04T23:40:32Z

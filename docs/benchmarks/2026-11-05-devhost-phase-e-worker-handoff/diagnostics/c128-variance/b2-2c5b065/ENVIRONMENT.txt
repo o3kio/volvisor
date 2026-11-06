@@ -1,0 +1,84 @@
+Volvisor benchmark environment
+==============================
+Run window start: 2026-11-05T21:47:28Z
+Host: dev (single development host; not a multi-host lab)
+Runner: uid=0 gid=0
+
+Run-time source identity
+------------------------
+source_sha:      2c5b0659a68b5ce6b9286c5c1cd1df7a92f8ebb1
+worktree_dirty:  no
+binary:          /tmp/opencode/volvisor-ab-2c5b065/target/release/volvisord
+binary_sha256:   58b43d5ed6306924817706a15d5778cb6ff2f672883bd508980196fad17d27e9
+binary_version:  volvisord 2c5b065
+build_profile:   release (cargo build --release --locked -p volvisord)
+
+Operating system and toolchain
+------------------------------
+uname:   Linux dev 6.8.0-142-generic #142-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:24:27 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+os:      PRETTY_NAME="Ubuntu 24.04.5 LTS" NAME="Ubuntu" 
+rustc:   rustc 1.99.0 (b940084d7 2026-09-28)
+cargo:   cargo 1.99.0 (5f94df478 2026-08-27)
+lvm:       LVM version:     2.03.16(2) (2022-05-18)   Library version: 1.02.185 (2022-05-18)   Driver version:  4.48.0   Configuration:   ./configure --build=x86_64-linux-gnu --prefix=/usr --includedir=${prefix}/include --mandir=${prefix}/share/man --infodir=${prefix}/share/info --sysconfdir=/etc --localstatedir=/var --disable-option-checking --disable-silent-rules --libdir=${prefix}/lib/x86_64-linux-gnu --runstatedir=/run --disable-maintainer-mode --disable-dependency-tracking --prefix=/usr --exec-prefix=/usr --with-usrlibdir=/usr/lib/x86_64-linux-gnu --with-optimisation=-O2 --with-cache=internal --with-device-uid=0 --with-device-gid=6 --with-device-mode=0660 --with-default-pid-dir=/run --with-default-run-dir=/run/lvm --with-default-locking-dir=/run/lock/lvm --with-thin=internal --with-thin-check=/usr/sbin/thin_check --with-thin-dump=/usr/sbin/thin_dump --with-thin-repair=/usr/sbin/thin_repair --enable-applib --enable-blkid_wiping --enable-cmdlib --enable-dmeventd --enable-editline --enable-lvmlockd-dlm --enable-lvmlockd-sanlock --enable-lvmpolld --enable-notify-dbus --enable-pkgconfig --enable-udev_rules --enable-udev_sync --disable-readline 
+jq:      jq-1.7
+python3: Python 3.12.3
+curl:    curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10
+losetup: losetup from util-linux 2.39.3
+CPUs:    16
+CPU model: AMD EPYC 9554P 64-Core Processor
+Memory:  31.3 GiB
+
+Disk layout (read-only observation)
+-----------------------------------
+NAME      TYPE   SIZE SERIAL      WWN MODEL
+sda       disk 528.5G drive-scsi0     QEMU HARDDISK
+├─sda1    part 527.5G                 
+├─sda14   part     4M                 
+├─sda15   part   106M                 
+└─sda16   part   913M                 
+sdb       disk   100G drive-scsi2     QEMU HARDDISK
+sdc       disk   100G drive-scsi1     QEMU HARDDISK
+sr0       rom      4M QM00003         QEMU DVD-ROM
+nbd0      disk   3.5G                 
+├─nbd0p1  part   2.5G                 
+├─nbd0p14 part     4M                 
+├─nbd0p15 part   106M                 
+└─nbd0p16 part   913M                 
+nbd1      disk     0B                 
+nbd2      disk     0B                 
+nbd3      disk     0B                 
+nbd4      disk     0B                 
+nbd5      disk     0B                 
+nbd6      disk     0B                 
+nbd7      disk     0B                 
+nbd8      disk     0B                 
+nbd9      disk     0B                 
+nbd10     disk     0B                 
+nbd11     disk     0B                 
+nbd12     disk     0B                 
+nbd13     disk     0B                 
+nbd14     disk     0B                 
+nbd15     disk     0B                 
+
+Pre-existing volume groups (read-only observation at start)
+-----------------------------------------------------------
+
+Absent capabilities (blockers, not silent skips)
+------------------------------------------------
+drbdadm: not found
+rbd: not found
+ceph: not found
+fio: not found
+Second physical host: none. Every client and daemon runs on 127.0.0.1.
+Real Ceph/DRBD/physical-disk LVM: not available on this host.
+
+Lab construction
+----------------
+- Loop-backed LVM VG created only for this run; the VG name is
+  recorded in records/lab.vg and teardown names only that VG.
+- The LVM provider skips loop devices in discovery, so lvm-state.json
+  is pre-seeded with a lab-only operator device claim pointing at the
+  loop device. This is a lab scaffold, not a production claim path.
+- Journal and provider state live under the run directory on the same
+  ext4 filesystem as the loop image; every acknowledged append uses
+  the daemon implementation (fsync), never a mock.

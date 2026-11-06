@@ -1,0 +1,12 @@
+old_bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-old/debug/volvisord
+old_version=volvisord 8c2fc1a
+old_sha256=ec6211874560c7b5cfeb4e38c72fb23bdc77a63d81692374da904fc1237672ab
+new_bin=/tmp/opencode/volvisor-d2live-final3-20261104T151044Z/target-new/debug/volvisord
+new_version=volvisord aad1720
+new_sha256=6ebac3f9c5bf3bee53caa7764ccffdbd8ebeea146a164a9aa511c6beaac633ab
+old_commit=8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+new_commit=aad17201f03bfdfcec4b74d863b805bc7fa47c76
+old_worktree_sha=8c2fc1a5f8bac1fe8d02844191fc9bd9cb61cd9c
+caller_worktree_dirty=yes
+new_worktree_dirty_at_build=0
+new_worktree_sha=aad17201f03bfdfcec4b74d863b805bc7fa47c76

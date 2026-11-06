@@ -14,6 +14,10 @@ mkdir -p "$RUN/raw" "$RUN/records" "$RUN/configs" "$RUN/certs"
 LOG=""
 START_UTC=""
 ASSERT_FAILS=0
+# Per-drill registry of binary paths this drill may signal. A path registered
+# by one drill must never authorize signalling another drill's daemon, so the
+# filename includes the drill name (set by begin_drill).
+DAEMON_PATHS_FILE=""
 
 now() { date -u +%FT%TZ; }
 
@@ -21,9 +25,17 @@ begin_drill() {
   local name="$1"
   LOG="$RUN/raw/$name.log"
   START_UTC="$(now)"
+  DAEMON_PATHS_FILE="$RUN/records/daemon-paths-$name.txt"
+  # Bind the retained log to the exact script bytes that produced it. The
+  # harness and shared library are not part of the product commit, so the
+  # digest is the only run-time proof of which logic ran.
+  local harness="${BASH_SOURCE[1]:-$0}" lib="${BASH_SOURCE[0]}"
   {
     printf '# drill: %s\n' "$name"
     printf '# start: %s\n' "$START_UTC"
+    printf '# invocation: %s\n' "$harness"
+    printf '# harness_sha256: %s\n' "$(sha256sum "$harness" | cut -d' ' -f1)"
+    printf '# lib_sha256: %s\n' "$(sha256sum "$lib" | cut -d' ' -f1)"
     printf '# host: %s\n' "$(uname -n)"
     printf '# kernel: %s\n' "$(uname -r)"
     printf '# source_sha: %s\n' "$(git -C "$REPO" rev-parse HEAD)"
@@ -42,7 +54,7 @@ end_drill() {
   printf 'ASSERT SUMMARY: 0 failures\n' | tee -a "$LOG"
 }
 
-say() { printf '\n### %s host=%s\n' "$(now)" "$(uname -n)" | tee -a "$LOG"; }
+say() { printf '\n### %s %s host=%s\n' "$(now)" "$1" "$(uname -n)" | tee -a "$LOG"; }
 
 # cap <tag> <command...>: run, record exact argv/stdout/stderr/exit status.
 # CAP_EXPECT_RC (default 0) is the status the command is expected to return;
@@ -99,13 +111,6 @@ cap_stdin() {
   return "$rc"
 }
 
-# record_file <tag> <path>: copy a file's exact bytes into the raw log.
-record_file() {
-  local tag="$1" path="$2"
-  say "$tag ($path)"
-  { printf -- '--- %s ---\n' "$path"; cat "$path"; printf -- '--- end %s ---\n' "$path"; } 2>&1 | tee -a "$LOG"
-}
-
 assert_eq() {
   local got="$1" want="$2" what="$3"
   if [[ "$got" == "$want" ]]; then
@@ -123,6 +128,17 @@ assert_contains() {
     printf 'ASSERT PASS: %s contains %q\n' "$what" "$needle" | tee -a "$LOG"
   else
     printf 'ASSERT FAIL: %s does not contain %q\n' "$what" "$needle" | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    return 1
+  fi
+}
+
+assert_not_contains() {
+  local haystack="$1" needle="$2" what="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    printf 'ASSERT PASS: %s does not contain %q\n' "$what" "$needle" | tee -a "$LOG"
+  else
+    printf 'ASSERT FAIL: %s unexpectedly contains %q\n' "$what" "$needle" | tee -a "$LOG"
     ASSERT_FAILS=$((ASSERT_FAILS + 1))
     return 1
   fi
@@ -154,16 +170,35 @@ wait_health() {
 
 # start_volvisord <name> <config> <port>: start directly, wait for health.
 start_volvisord() {
-  local name="$1" cfg="$2" port="$3"
+  start_volvisord_bin "$BIN/volvisord" "$@"
+}
+
+# Register a binary path this drill is allowed to signal. start_volvisord_bin
+# does this automatically; a cross-binary drill can register an extra path.
+register_daemon_path() {
+  local path="$1"
+  mkdir -p "$(dirname "$DAEMON_PATHS_FILE")"
+  touch "$DAEMON_PATHS_FILE"
+  grep -Fxq "$path" "$DAEMON_PATHS_FILE" 2>/dev/null || printf '%s\n' "$path" >>"$DAEMON_PATHS_FILE"
+}
+
+# start_volvisord_bin <binary> <name> <config> <port>: start an explicitly
+# named volvisord build (D2 live starts both an old and a new binary), wait
+# for health.
+start_volvisord_bin() {
+  local bin="$1" name="$2" cfg="$3" port="$4"
   local log="$RUN/raw/$name.daemon.log"
-  "$BIN/volvisord" --config "$cfg" >"$log" 2>&1 &
+  register_daemon_path "$bin"
+  "$bin" --config "$cfg" >"$log" 2>&1 &
   echo "$!" >"$RUN/records/$name.pid"
   if ! wait_health "http://127.0.0.1:$port" 30; then
     printf 'DAEMON FAILED TO BECOME HEALTHY: %s (pid %s)\n' "$name" "$(cat "$RUN/records/$name.pid")" | tee -a "$LOG"
     tail -40 "$log" | tee -a "$LOG"
     return 1
   fi
-  printf 'daemon %s healthy pid=%s port=%s\n' "$name" "$(cat "$RUN/records/$name.pid")" "$port" | tee -a "$LOG"
+  printf 'daemon %s healthy pid=%s port=%s bin=%s sha256=%s\n' "$name" \
+    "$(cat "$RUN/records/$name.pid")" "$port" "$bin" \
+    "$(sha256sum "$bin" | cut -d' ' -f1)" | tee -a "$LOG"
 }
 
 pid_is_drill_daemon() {
@@ -171,8 +206,10 @@ pid_is_drill_daemon() {
   [[ -r "/proc/$pid/cmdline" ]] || return 1
   cmd="$(tr '\0' '\n' <"/proc/$pid/cmdline" | head -n 1)"
   # Exact path only: a basename match would signal another drill's daemon
-  # after PID reuse. Both daemons this harness starts are accepted.
-  [[ "$cmd" == "$BIN/volvisord" || "$cmd" == "$BIN/volvisor-witnessd" ]]
+  # after PID reuse. The default binaries and every binary registered by *this
+  # drill* are accepted; a process executing any other path is not.
+  [[ "$cmd" == "$BIN/volvisord" || "$cmd" == "$BIN/volvisor-witnessd" ]] && return 0
+  [[ -f "$DAEMON_PATHS_FILE" ]] && grep -Fxq "$cmd" "$DAEMON_PATHS_FILE"
 }
 
 stop_pidfile() {
@@ -193,21 +230,49 @@ stop_pidfile() {
     kill -0 "$pid" 2>/dev/null || { rm -f "$pidfile"; printf 'stopped %s pid=%s sig=%s\n' "$name" "$pid" "$sig" | tee -a "$LOG"; return 0; }
     sleep 0.1
   done
-  printf 'WARNING: %s pid %s still alive after %s\n' "$name" "$pid" "$sig" | tee -a "$LOG"
+  printf 'ASSERT FAIL: %s pid %s still alive after %s\n' "$name" "$pid" "$sig" | tee -a "$LOG"
+  ASSERT_FAILS=$((ASSERT_FAILS + 1))
   return 1
+}
+
+# stop_or_exit <name>: stop a daemon and refuse to continue if it is still
+# alive. A backup or restore taken while a writer survives is not a
+# consistency point, so this is a hard stop rather than an accumulated assert.
+stop_or_exit() {
+  local name="$1"
+  if ! stop_pidfile "$name" TERM; then
+    printf 'REFUSING to continue: %s did not stop\n' "$name" | tee -a "$LOG"
+    exit 1
+  fi
+}
+
+# assert_no_writer <journal-dir> <what>: prove no process holds the journal
+# lock before treating the directory as a stopped-state consistency point.
+assert_no_writer() {
+  local journal="$1" what="$2"
+  if flock -n "$journal/journal.lock" -c true 2>/dev/null; then
+    printf 'ASSERT PASS: %s (journal lock is free)\n' "$what" | tee -a "$LOG"
+  else
+    printf 'ASSERT FAIL: %s (a writer still holds %s/journal.lock)\n' "$what" "$journal" | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    return 1
+  fi
 }
 
 # api <curl-config> <method> <url> [body-file] -> stdout, status in $RUN/records/last.status
 api() {
   local cfg="$1" method="$2" url="$3" body="${4:-}"
   local out status
+  # curl's --show-error diagnostics go straight to the drill log: the
+  # returned body only carries stdout + status, so a transport failure would
+  # otherwise leave the retained evidence with just status 000.
   if [[ -n "$body" ]]; then
     out="$(curl --silent --show-error --config "$cfg" --request "$method" \
       --header 'content-type: application/json' --data-binary @"$body" \
-      --write-out $'\n%{http_code}' "$url")"
+      --write-out $'\n%{http_code}' "$url" 2>>"$LOG")"
   else
     out="$(curl --silent --show-error --config "$cfg" --request "$method" \
-      --write-out $'\n%{http_code}' "$url")"
+      --write-out $'\n%{http_code}' "$url" 2>>"$LOG")"
   fi
   status="${out##*$'\n'}"
   out="${out%$'\n'*}"

@@ -580,8 +580,10 @@ impl World {
 struct Daemon {
     addr: SocketAddr,
     /// The provider (the crash row arms its store seam between
-    /// requests; the retry row drives its reconcile pass).
-    provider: Arc<LvmProvider>,
+    /// requests; the retry row drives its reconcile pass). Dropped by
+    /// [`Daemon::stop`] so a simulated process restart cannot reuse the
+    /// dead incarnation's poisoned per-state-path writer gate.
+    provider: Option<Arc<LvmProvider>>,
     serve: Option<JoinHandle<()>>,
 }
 
@@ -604,9 +606,14 @@ impl Daemon {
         });
         Daemon {
             addr,
-            provider,
+            provider: Some(provider),
             serve: Some(serve),
         }
+    }
+
+    /// This incarnation's provider (only while the daemon is serving).
+    fn provider(&self) -> &Arc<LvmProvider> {
+        self.provider.as_ref().expect("daemon is serving")
     }
 
     /// Launch over `world` with the move retry task running at
@@ -615,7 +622,7 @@ impl Daemon {
     /// tick instead of the 5 s production one).
     async fn launch_with_move_retry(world: Arc<World>, tick: Duration) -> (Daemon, JoinHandle<()>) {
         let daemon = Self::launch(world).await;
-        let provider = Arc::clone(&daemon.provider);
+        let provider = Arc::clone(daemon.provider());
         let retry = tokio::spawn(async move {
             loop {
                 let provider = Arc::clone(&provider);
@@ -630,17 +637,21 @@ impl Daemon {
     /// crash row: the next `lvm_state` save at that point dies
     /// in-band, after firing `kill`).
     fn arm_store_crash(&self, point: StoreSavePoint, kill: KillSwitch) {
-        let hooks = self.provider.store_crash_hooks();
+        let hooks = self.provider().store_crash_hooks();
         hooks.set_kill_switch(kill);
         hooks.arm(STORE_LVM_STATE, point);
     }
 
-    /// Stop serving (the journal flock frees with the serve task).
+    /// Stop serving (the journal flock frees with the serve task) and
+    /// drop this incarnation's provider. The stop/launch pair is the
+    /// in-process shape of process death: the killed incarnation must
+    /// not leave its poisoned writer gate to the fresh one.
     async fn stop(&mut self) {
         if let Some(serve) = self.serve.take() {
             serve.abort();
             let _ = serve.await;
         }
+        self.provider = None;
     }
 }
 

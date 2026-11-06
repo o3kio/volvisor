@@ -37,8 +37,10 @@ procedure and the create-specific tails.
 Historical evidence (pre-fix D5):
 [D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
 [Report D5](../../evidence/day2/2026-11-03-devhost/REPORT.md#d5--enospc-on-journal-and-provider-state-writes).
-Post-fix coverage: `lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
-in `crates/volvisor-lvm/tests/integration_lvm.rs`.
+Post-fix coverage: `lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart`
+in `crates/volvisor-lvm/tests/integration_lvm.rs` (real ENOSPC on the
+durable create intent before `lvcreate`; post-`lvcreate` save-failure
+compensation is covered by the deterministic FC tests).
 
 ## Scope and non-goals
 
@@ -117,6 +119,13 @@ The detail distinguishes the two paths: `failed to write journal record` vs
 instead report `failed to fsync journal record` after the bytes were written;
 treat it as "the frame may already be durable on disk", not as "nothing
 happened".
+
+> **Temp-name update (since `a8c23d6`).** New writes use
+> `.volvisor-<16-hex>.<pid>.<seq>.tmp` in the state file's directory, so a
+> current failure reads `failed to write .../.volvisor-...tmp`. The legacy
+> `<state>.tmp` name can still appear during an upgrade (an older binary or a
+> leftover). Match both when grepping. The observed messages above are
+> historical drill output and are left unchanged.
 
 ## B. Journal filesystem ENOSPC
 
@@ -204,7 +213,9 @@ lvs --noheadings -o lv_name,vg_name,lv_size
 ## C. Provider-state filesystem ENOSPC
 
 The save is atomic up to the rename: a failure before it preserves the old
-`lvm-state.json` and removes the `.tmp`. Since #70 a create has **two** save
+`lvm-state.json` and removes its own temp file (since `a8c23d6`, the bounded
+`.volvisor-*` name; the legacy `<state>.tmp` may still appear during an
+upgrade). Since #70 a create has **two** save
 boundaries — the durable create intent before `lvcreate`, then the volume
 record after it. After the #58 fix, an uncommitted final save is compensated
 with a checked `lvremove` and the in-memory entry is rolled back. Six
@@ -415,6 +426,11 @@ create 500, old state unchanged, in-memory GET 200, LV present, restart GET
 **Post-fix re-drill (normal uncommitted-save path), product `1863a7a` /
 harness `940722e`:**
 
+> The Part B messages quoted below name the historical fixed
+> `lvm-state.json.tmp`. Since `a8c23d6` a current build names the bounded
+> `.volvisor-<16-hex>.<pid>.<seq>.tmp` instead; the legacy name may still
+> appear during an upgrade. The drilled evidence is left unchanged.
+
 - Part A re-confirmed: journal 12060 bytes with 228 bytes of slack, SHA256
   `41bcc95aa1a34a1f39aada03e9f805117f7bf3756a7cc718a55ee5f2c247e172`;
   tmpfs filled (filler 249856 bytes); create 500/`INTERNAL` with
@@ -447,11 +463,12 @@ harness `940722e`:**
   [post-fix report](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 
 The post-fix state path is also exercised by
-`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
-in the real-LVM suite (256 KiB tmpfs, real ENOSPC, real `lvremove`, restart
-and retry), plus deterministic tests for the cleanup-failure, carve-out and
-unreadable-reread branches. Those are code-level regression tests, not a
-full re-run of every branch.
+`lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart`
+in the real-LVM suite (256 KiB tmpfs, real ENOSPC on the durable create
+intent before `lvcreate`, restart and retry); post-`lvcreate` rollback is
+covered by deterministic injected-save tests, including the cleanup-failure,
+carve-out and unreadable-reread branches. Those are code-level regression
+tests, not a full re-run of every branch.
 
 **Limits:** filesystem ENOSPC only (not inode/thin-pool/metadata); fake
 provider for the journal; loop LVM for state; single host; no concurrent

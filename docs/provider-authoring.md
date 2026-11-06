@@ -43,7 +43,8 @@ contains the decisions that must be indistinguishable across backends:
 - attach replay by identity (`AttachmentIdentity`,
   `attachment_payload_matches`, `resolve_attachment_replay`);
 - single-writer admission (`ensure_no_active_attachment`);
-- retired attachment-id rejection (`ensure_attachment_id_not_retired`);
+- a strictly increasing per-volume attachment generation as the detach/report
+  fence;
 - monotonic consumer-report application (`apply_attachment_report`).
 
 The core is pure: it performs no I/O and does not serialize records. Providers
@@ -77,9 +78,15 @@ ensure_no_active_attachment(has_attachment, volume_id)?;
 ### Detach and reports
 
 Detach fences `expected_attachment_generation`; a consumer report validates the
-same generation but never advances it. After a detach, the attachment id is
-retired for the volume's lifetime wherever reports are advertised, so a delayed
-report from the old instance can never label a new one.
+same generation but never advances it. Each new attachment instance records a
+**strictly greater generation** than every earlier instance on the volume, so a
+delayed report from a retired instance is `STALE_GENERATION` against the new
+one even if the consumer reuses its id (ADR-0012). Do not hard-code `1`, and do
+not retain an unbounded per-id tombstone: an exact tombstone grows with every
+attach, and a fixed-size probabilistic one refuses fresh ids once it fills
+(issue #63). A re-attach of a consumed id must succeed as a new instance;
+`IDEMPOTENCY_CONFLICT` is only for a live instance with the same id and a
+different payload. A diagnostic tombstone must never gate attach.
 
 ## 3. Backend-specific behavior (do not generalize)
 
@@ -90,7 +97,8 @@ Keep these in your provider; they are not shared semantics:
 - ownership proofs and foreign-state classification;
 - DRBD writer-authority leases, fencing, and migration cuts;
 - Ceph mapping/zombie reconciliation and LVM online-move records;
-- tombstone persistence layout (LVM stores a list, the fake a set);
+- the legacy tombstone persistence layout (LVM's schema-v3 filter is
+  decode-only; the fake retains none);
 - whether `attachment_state_report` is advertised at all (Ceph and DRBD do
   not advertise it today).
 
@@ -159,11 +167,12 @@ assert_eq!(volvisor_provider::conformance::assert_parity(provider).await, Ok(())
   same-id different-payload conflict, second-writer refusal, detach and delete
   fencing, `NOT_FOUND` after delete. The observed sequence must equal both the
   shared fixture and the in-memory reference provider.
-- **report/tombstone** (capability-conditional): providers advertising
+- **report/generation fence** (capability-conditional): providers advertising
   `attachment_state_report` must apply reports monotonically, answer
-  equal/lower reports as no-ops, refuse stale generations, and reject reuse of
-  a retired id. Providers without the capability must answer the report route
-  with `NOT_FOUND`.
+  equal/lower reports as no-ops, refuse stale generations, and record a
+  strictly greater generation on a re-attach so a delayed report from the
+  retired generation is `STALE_GENERATION`. Providers without the capability
+  must answer the report route with `NOT_FOUND`.
 
 Add the parity test next to the conformance test in your crate (the generated
 macro test above does this automatically; call `assert_parity` directly for a
@@ -185,8 +194,9 @@ cluster, versions and failure evidence.
 - [ ] Attach replay resolves before the generation fence.
 - [ ] Single-writer, stale-generation and replay-conflict behavior is unchanged
       or stricter.
-- [ ] Reports never advance the attachment generation, never downgrade, and
-      retired ids are rejected.
+- [ ] Reports never advance the attachment generation, never downgrade, and a
+      re-attach records a strictly greater generation (a retired instance's
+      generation is stale).
 - [ ] No HTTP payload or on-disk schema change; strict decode preserved.
 - [ ] Conformance and parity tests pass for the simulated world.
 - [ ] Real-backend runs are either reported with evidence or explicitly marked

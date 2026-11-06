@@ -1,0 +1,16 @@
+listen = "127.0.0.1:34531"
+journal_dir = "/tmp/opencode/volvisor-bench-fix-8029df8-20261105T092939Z/lab/journal"
+provider = "lvm"
+lvm_vg_prefix = "volvisor-bench"
+device_claim_token = "<redacted>"
+lvm_state_path = "/tmp/opencode/volvisor-bench-fix-8029df8-20261105T092939Z/lab/lvm-state.json"
+admin_token = "<redacted>"
+
+[admission]
+read_timeout_secs = 30
+queue_timeout_secs = 5
+max_concurrent_requests = 256
+# Diagnostic: deterministic shedding at 50 requests/s per principal.
+rate_limit_per_second = 50
+rate_limit_burst = 50
+max_list_limit = 1000

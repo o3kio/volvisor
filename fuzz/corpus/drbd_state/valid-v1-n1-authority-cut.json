@@ -1,0 +1,47 @@
+{
+  "volumes": {
+    "vol-drbd-n1": {
+      "entry": {
+        "resource_name": "vol-vol-drbd-n1-abcd1234",
+        "vg_name": "vgdrbd",
+        "lv_name": "vol-vol-drbd-n1-abcd1234",
+        "minor": 9,
+        "port": 7903,
+        "size_bytes": 2147483648,
+        "requested_size_bytes": 2147483648,
+        "generation": 6,
+        "project_id": "tenant-upgrade",
+        "block_size": 4096,
+        "replication_mode": "A",
+        "creation_payload": "{\"class\":\"nearline-replicated\"}",
+        "created_at": 1700000000
+      },
+      "runtime": {
+        "state": "Attached",
+        "attachment": {
+          "id": "att-drbd-n1",
+          "vm_id": "vm-upgrade",
+          "host_id": "host-upgrade",
+          "generation": 3,
+          "access_mode": "single_writer",
+          "device": "/dev/drbd9"
+        },
+        "seeded": true,
+        "authority": {
+          "epoch": 11,
+          "lease_id": 41,
+          "lease_proof_ref": 41,
+          "authority_commit_index": 41,
+          "acquired_at": 1700000000,
+          "deadline_at": 1700000030
+        },
+        "migration": {
+          "migration_id": "mig-drbd-n1",
+          "suspended_at": 1700000100
+        }
+      }
+    }
+  },
+  "next_minor": 10,
+  "next_port": 7904
+}

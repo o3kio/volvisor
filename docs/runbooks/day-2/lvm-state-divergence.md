@@ -53,8 +53,15 @@ Not covered:
 
 Every privileged mutation writes a **durable intent** and fsyncs it before the
 allocating or destructive step, then commits the resulting volume record in a
-second atomic save. A save is `write .tmp` → `fsync file` → `rename` →
-`fsync directory`; an error can therefore land on either side of the rename:
+second atomic save. A save is `write a sibling temp file` → `fsync file` →
+`rename` → `fsync directory`; an error can therefore land on either side of
+the rename. Since `a8c23d6` the temp is
+`.volvisor-<16-hex>.<pid>.<seq>.tmp` in the state file's directory; the legacy
+`<state>.tmp` may still appear during upgrades. A foreign-pid or legacy temp
+whose mtime is in the future is never swept (the conservative fail-safe), so a
+clock-skewed leftover of those kinds needs manual removal; a same-pid
+unregistered leftover is swept immediately regardless of mtime. The two sides
+are:
 
 - **pre-rename:** the old durable file is intact, and the world step may or may
   not have run;
@@ -66,12 +73,15 @@ A 5xx alone never proves "nothing happened". Startup reconciliation is the
 authority: it re-reads the durable intents and classifies them against `lvs`.
 
 The intent maps (`pending_creates`, `pending_grows`, `pending_deletes`) are
-defaulted and omitted when empty. Adding them is a durable-shape change, so
-`LVM_STATE_SCHEMA_VERSION` is **2**: v1 files load with empty maps and are
-upgraded by the first successful save, while an older binary refuses a v2
+defaulted and omitted when empty. Adding them was a durable-shape change that
+introduced `LVM_STATE_SCHEMA_VERSION` **2**: v1 files load with empty maps and
+are upgraded by the first successful save, while an older binary refuses a v2
 file with the typed unsupported-version error instead of failing on an
-unknown field. A state with a pending intent is therefore a supported v2
-file; see the
+unknown field. The current LVM schema is **4**: v3 replaced the unbounded
+retired-id vector with the fixed-size retired-id filter, and v4 added the
+attachment-generation allocator. A state file with a pending intent was
+therefore a supported v2 file; current files are v4, and an older binary
+refuses a v4 file the same way. See the
 [durable-state schema compatibility policy](../../schema-compatibility.md).
 The v1-stamped N-1 fixture is `tests/fixtures/schema/lvm-state-v2-n1.json`,
 loaded by the `volvisor-lvm` unit test and the daemon-store test
@@ -122,8 +132,11 @@ Four cross-cutting rules:
 ## A. Detect
 
 A failed persist surfaces as an `INTERNAL` 500 whose detail names the state
-path/`.tmp` write, the failed rename/fsync, or an injected test fault. Look for
-the mutation's own wording:
+path/temp-file write (since `a8c23d6`, `failed to create .../.volvisor-*` for
+a temp-create failure and `failed to write .../.volvisor-*` for a write
+failure; the legacy `<state>.tmp` may still appear during upgrades), the
+failed rename/fsync, or an injected test fault. Look for the mutation's own
+wording:
 
 - create intent: `the create intent ... could not be made durable`
 - create command outcome unknown (runner error): `the lvcreate outcome is unknown`

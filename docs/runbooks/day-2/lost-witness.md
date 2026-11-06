@@ -12,6 +12,23 @@
   losing the witness, and what is the data-loss window? — is **not** proven.
   **Do not cite this page as a split-brain proof.**
 
+Storage-side preflight (report only, not a result):
+
+```sh
+bash docs/runbooks/day-2/scripts/preflight.sh --only d3
+```
+
+It reports `PASS` / `NOT RUN` for the DRBD 9 kernel module, `drbdadm`, a peer
+host (`D3_PEER_HOST` or `NEARLINE_PEER_HOST`), a witness URL
+(`D3_WITNESS_URL` or `WITNESS_URL`), the resource name
+(`D3_DRBD_RESOURCE`) and distinct failure domains
+(`D3_LOCAL_FAILURE_DOMAIN`, `D3_PEER_FAILURE_DOMAIN`). On 2026-11-04 every D3
+storage-side item was `NOT RUN` (no module, no `drbdadm`, no peer/witness
+configuration); the output is in the
+[D2 live evidence bundle](../../evidence/day2/2026-11-04-devhost-live/REPORT.md).
+`--strict` makes a missing prerequisite exit nonzero on a real rig. The
+preflight does not freeze, promote or write to a DRBD resource.
+
 Read [configuration.md](../../configuration.md) for the witness and DRBD fields,
 and the [P4a witness/fencing plan](../../plans/2026-10-09-p4-witness-fencing-authority.md)
 for the authority model.

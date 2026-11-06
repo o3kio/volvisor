@@ -78,9 +78,8 @@ pub use provider::VolumeProvider;
 pub use runner::{CommandOutput, CommandRunner, FakeRunner, Invocation, RealRunner};
 pub use semantics::{
     AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
-    attachment_payload_matches, ensure_attachment_id_not_retired,
-    ensure_expected_attachment_generation, ensure_expected_generation, ensure_no_active_attachment,
-    resolve_attachment_replay,
+    attachment_payload_matches, ensure_expected_attachment_generation, ensure_expected_generation,
+    ensure_no_active_attachment, resolve_attachment_replay,
 };
 pub use vmm::{
     ChRemoteConfig, ChRemoteVmm, DeviceHook, DiskMapping, FakeFailKnobs, FakeResizeCall, FakeVmm,

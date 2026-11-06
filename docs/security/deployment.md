@@ -49,7 +49,7 @@ The controls above do **not** protect against:
   intentionally full control;
 - denial of service, resource exhaustion, traffic analysis or metadata
   leakage at the network layer. Application-level admission control
-  ([admission control](admission-control.md)) bounds per-principal request
+  ([admission control](../admission-control.md)) bounds per-principal request
   rate, in-flight concurrency and body size, but it is not a network-level
   DDoS defense;
 - a misconfigured external TLS terminator that forwards plaintext to an
@@ -71,21 +71,27 @@ read-only < operator < admin.
 | Surface | Required role |
 |---|---|
 | `GET /healthz`, `GET /v2/healthz`, `GET /readyz`, `GET /v2/readyz` | public |
-| `GET /v2/capabilities`, `GET /metrics` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
-| `GET /v2/volumes`, `GET /v2/volumes/{volume_id}` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
-| `GET /v2/migrations/{migration_id}` | read-only when scoped credentials exist; otherwise open in the legacy/tokenless posture |
+| `GET /v2/capabilities`, `GET /metrics` | read-only when any credential is configured (including the legacy `admin_token`); open only in the tokenless posture |
+| `GET /v2/volumes`, `GET /v2/volumes/{volume_id}` | read-only when any credential is configured (including the legacy `admin_token`); open only in the tokenless posture |
+| `GET /v2/migrations/{migration_id}` | read-only when any credential is configured (including the legacy `admin_token`); open only in the tokenless posture |
 | `POST/DELETE` volume lifecycle routes, attach, detach, attachment-state, grow, move-backing | operator or admin |
 | Migration prepare, transfer and abort | operator or admin |
 | All `/v2/admin/*` routes, including admin `GET`s | admin |
 | `POST /v2/vms/{vm_id}/check-mobility` | admin |
 | `/v2/internal/peer/*` | the separate daemon-to-daemon peer token, not an API role |
 
-The compatibility posture matters: if only the legacy `admin_token` is
-configured, read routes remain open, exactly as before scoped credentials
-existed. A tokenless daemon leaves reads open too but fails closed for every
-mutation and admin route, and may bind loopback only. In both modes, **do not
-expose the listener to an untrusted network**. For any non-loopback
-deployment, configure scoped credentials and TLS.
+The read posture follows the credential set: **any** configured credential
+(including the legacy top-level `admin_token`) protects reads, so a read
+client must send that bearer token. A tokenless daemon leaves reads open but
+fails closed for every mutation and admin route, and may bind loopback only.
+A non-loopback listener requires TLS, and configuring scoped credentials is
+still the recommended shape because it gives reads their own least-privilege
+principal. **Do not expose a tokenless listener to an untrusted network.**
+
+Upgrading a legacy-token deployment: add the `Authorization: Bearer <token>`
+header to read calls (`GET /v2/volumes`, inspect, capabilities, metrics and
+migration inspection) before or with the upgrade; anonymous reads now return
+`401 UNAUTHORIZED`.
 
 Scoped credentials are declared as named entries:
 
@@ -309,6 +315,6 @@ them.
 - [ ] The audit sink is protected and retained.
 - [ ] `[admission]` limits and timeouts are sized to provider capacity;
       `429`/`503` responses are monitored and clients honour `Retry-After`
-      ([admission control](admission-control.md)).
+      ([admission control](../admission-control.md)).
 - [ ] `--check-config` passes for every daemon, then a real TLS startup and
       request are exercised before production traffic.

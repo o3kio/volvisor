@@ -1,7 +1,7 @@
 # Start here
 
 Status: **implemented prototype; no production support**
-Date: 2026-11-02
+Date: 2026-11-02 (last evidence update: 2026-11-04)
 Intended release: `v0.1.0` — **not tagged, not published**
 
 Volvisor is a Rust workspace that implements a volume virtualization control
@@ -36,10 +36,26 @@ The implementation and its in-repo tests cover:
   `volvisor-witnessd` build from source, answer `--version`, validate their
   example configurations with `--check-config`, and have deb/rpm metadata
   plus systemd units.
+- **Evidence tooling that fails closed on its own claims**: committed JSON
+  traces are validated for structure, `operation_id` correlation and secret
+  hygiene by a normal test and script; the day-2 harness has a real
+  cross-binary D2 live drill plus a D2/D3/D8 prerequisite preflight; and a
+  stdlib-only flake-rate calculator evaluates the 14-night criterion from
+  campaign artifacts. These are automation and single-host lab tools, not
+  production evidence.
 - **Test evidence that is real within its tier**: the Tier S simulated fault
   campaign, and four bounded Tier V scenarios against real Cloud Hypervisor
   v51.1 on one physical development host (storage simulated). See
   [the evidence index](../SUPPORT_MATRIX.md#evidence-index).
+- **Bounded state under attachment churn (single-host measurement)**: the
+  [2026-11-04 post-fix control-plane bundle](benchmarks/2026-11-04-devhost-postfix/REPORT.md)
+  at `aab773b` records 0 HTTP errors and 0 attachment conflicts, a ~3 KB
+  provider state file, and a bounded journal over a 25-minute soak. This is
+  not the 24-hour soak and not capacity evidence; RSS high-water (≈2.22 GiB)
+  and log retention remain open findings. The measured 2.57 GB file was an
+  unrotated stdout capture over ~30 minutes; per-request acceptance and
+  successful provider-completion lines are now DEBUG, while audit and
+  failures stay INFO.
 
 A `--check-config` pass proves the binary runs and accepts a configuration.
 It does **not** prove that the configured storage exists, that a provider
@@ -70,13 +86,17 @@ can mutate it, or that a volume is safe to use.
   `allow_insecure`, scoped admin/operator/read-only credentials, read
   authorization and audit attribution. The recorded capture is a same-host
   netns/veth pair, not a second physical host or a cross-host witness/peer
-  hop. The legacy `admin_token`-only mode still leaves reads open; configure
-  scoped credentials and TLS for any shared network. See the
+  hop. Any configured credential, including the legacy `admin_token`, now
+  protects reads; only a tokenless daemon leaves them open. Configure TLS and
+  scoped credentials for any shared network. See the
   [security deployment guide](security/deployment.md).
-- **CHV is not pinned to a tagged Volvisor build.** CHV reports at most
-  `advertised` (never `active` without guest confirmation); the pin update
-  is [#48](https://github.com/o3kio/volvisor/issues/48) and waits for a
-  tagged release.
+- **CHV is not pinned to a tagged Volvisor build.** The Volvisor-side CAP
+  negotiation, attachment-state report route, consumer conformance test and
+  [integration guide](integrations/chv.md) are delivered. CHV reports at most
+  `advertised` (never `active` without guest confirmation); no CHV/Volvisor
+  pair is pinned, and the pin update
+  ([#48](https://github.com/o3kio/volvisor/issues/48)) waits for a tagged
+  release.
 - **Attached `native-local` volumes are not live-migratable.** The mobility
   surface is wired only for the `drbd` provider.
 - **There is no tag and no GitHub release.** v0.1.0 is a draft; the tag is
@@ -179,8 +199,10 @@ separately:
 - **Pre-production exit gate (milestone
   [#36](https://github.com/o3kio/volvisor/issues/36)):** still requires the
   real runs (#37/#38/#39 where claimed), cross-host transport validation
-  beyond #40's same-host capture, day-2 runbooks (#46), the CHV consumer
-  path and pin (#48), and the exit review. A distribution tag does not
+  beyond #40's same-host capture, day-2 runbooks and the remaining D3/D8
+  work (#46; D2 live is now drilled single-host), a tagged release plus the
+  CHV consumer path and pin (#48; the Volvisor-side contract and guide exist,
+  the pin does not), and the exit review. A distribution tag does not
   satisfy this gate.
 
 No tag or GitHub release may be created in this workstream.

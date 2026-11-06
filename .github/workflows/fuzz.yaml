@@ -1,0 +1,155 @@
+name: fuzz
+
+# Coverage-guided fuzzing for the parsers that consume durable or
+# untrusted bytes (issue #49).
+#
+# Triggers:
+#   * schedule          -- one bounded nightly run per target;
+#   * workflow_dispatch -- an operator can widen the per-target budget.
+#
+# This workflow is deliberately NOT a required pull-request gate: a
+# fuzz campaign is nondeterministic and must not block unrelated work.
+# Every target's committed seed corpus also runs deterministically in
+# `cargo test --workspace` via the `fuzz_corpus` integration tests, so a
+# regression in a known input is caught on every change.
+#
+# A green run is one bounded campaign sample. It is not a 14-night
+# flake-rate claim and is not production-support evidence.
+
+on:
+  schedule:
+    # 02:17 UTC daily (offset from the other scheduled workflows).
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Per-target fuzz budget in seconds (30..=1800)"
+        required: false
+        type: string
+        default: "300"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - ceph_state
+          - drbd_state
+          - journal_frame
+          - journal_record
+          - lvm_state
+          - request_validation
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the nightly toolchain cargo-fuzz needs
+        # Deliberately floats: the campaign is non-required, and
+        # cargo-fuzz's `-Zsanitizer` plumbing tracks recent nightly.
+        # A regression here fails the non-gating fuzz job visibly; pin a
+        # date deliberately if reproducibility matters more than reach.
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-fuzz-${{ runner.os }}-0.13.2
+      - name: Install cargo-fuzz
+        # Pinned for reproducibility; bump deliberately with a review of
+        # the upstream changelog.
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Validate the per-target budget
+        env:
+          # Never use `SECONDS`: bash binds that name to the elapsed
+          # time of the current shell, so an unset/empty scheduled
+          # input would silently read as `0` instead of the default.
+          FUZZ_SECONDS: ${{ inputs.seconds }}
+        run: |
+          set -eu
+          seconds="${FUZZ_SECONDS:-300}"
+          case "$seconds" in
+            ''|*[!0-9]*)
+              echo "fuzz budget must be a whole number of seconds" >&2
+              exit 1
+              ;;
+          esac
+          # Bash arithmetic is 64-bit and wraps: a huge all-digit input
+          # such as 2^64+30 would pass the range comparison. Bound the
+          # digits first (the range is four digits at most).
+          if [ "${#seconds}" -gt 4 ]; then
+            echo "fuzz budget must be between 30 and 1800 seconds" >&2
+            exit 1
+          fi
+          if [ "$seconds" -lt 30 ] || [ "$seconds" -gt 1800 ]; then
+            echo "fuzz budget must be between 30 and 1800 seconds" >&2
+            exit 1
+          fi
+      - name: Run the bounded fuzz campaign
+        working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ inputs.seconds }}
+          # `rust-toolchain.toml` pins the stable toolchain for the
+          # workspace; cargo-fuzz needs nightly (it passes `-Zsanitizer`).
+          # Force the nightly toolchain for every nested cargo invocation.
+          RUSTUP_TOOLCHAIN: nightly
+        # cargo-fuzz uses corpus/<target> by default (the committed seeds)
+        # and writes new coverage inputs back into it; artifacts are
+        # uploaded even on failure.
+        run: |
+          set -eu
+          seconds="${FUZZ_SECONDS:-300}"
+          cargo fuzz run "$TARGET" -- \
+            -max_total_time="$seconds" \
+            -rss_limit_mb=4096 \
+            -print_final_stats=1
+      - name: Record the campaign result in the run summary
+        if: always()
+        env:
+          FUZZ_SECONDS: ${{ inputs.seconds }}
+        run: |
+          {
+            echo "## fuzz: ${{ matrix.target }}"
+            echo
+            echo "- job result: ${{ job.status }}"
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- budget: ${FUZZ_SECONDS:-300}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload crash artifacts and the evolved corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate:
+    name: fuzz (gate)
+    needs: fuzz
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce every target's result
+        env:
+          RESULT: ${{ needs.fuzz.result }}
+        run: |
+          set -eu
+          if [ "$RESULT" != "success" ]; then
+            echo "fuzz gate: at least one target did not complete cleanly ($RESULT)." >&2
+            echo "A crash, a cancelled run and an infrastructure failure all fail the gate." >&2
+            exit 1
+          fi
+          echo "fuzz gate: every target completed its bounded campaign."

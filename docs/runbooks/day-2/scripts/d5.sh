@@ -7,17 +7,44 @@
 # B: LVM provider state on a 256 KiB tmpfs with the journal on ordinary
 #    storage, so only the state save hits ENOSPC after lvcreate. Post-#58
 #    the failure is compensated: 500 INTERNAL carrying the original save
-#    error (state .tmp path and "No space left on device"), the old state
-#    file byte-identical, the just-created LV removed, the in-memory entry
-#    rolled back, and no .tmp residue. The same process reports the volume
-#    404; after a restart it is still 404, a replay of the same
-#    operation_id stays the recorded 500 (terminal failure), a fresh
-#    operation_id succeeds exactly once, and state/LVM agree throughout.
+#    error (the state temp path and "No space left on device"), the old
+#    state file byte-identical, the just-created LV removed, the in-memory
+#    entry rolled back, and no temp residue. Since a8c23d6 the temp name is
+#    `.volvisor-<16-hex>.<pid>.<seq>.tmp`; the legacy `<state>.tmp` names
+#    are kept only for historical drilled evidence and upgrades. The same
+#    process reports the volume 404; after a restart it is still 404, a
+#    replay of the same operation_id stays the recorded 500 (terminal
+#    failure), a fresh operation_id succeeds exactly once, and state/LVM
+#    agree throughout.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d5"
 begin_drill "05-enospc"
-trap 'stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-daemon" KILL >/dev/null 2>&1 || true; stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || stop_pidfile "$TAG-lvm-daemon" KILL >/dev/null 2>&1 || true; umount "$RUN/lab-$TAG/journalfs" 2>/dev/null || umount -l "$RUN/lab-$TAG/journalfs" 2>/dev/null || true; umount "$RUN/lab-$TAG/statefs" 2>/dev/null || umount -l "$RUN/lab-$TAG/statefs" 2>/dev/null || true; lvm_lab_teardown "$TAG-lvm" >/dev/null 2>&1 || true' EXIT
+D5_CLEANED=0
+cleanup() {
+  [[ "$D5_CLEANED" -eq 1 ]] && return 0
+  D5_CLEANED=1
+  stop_pidfile "$TAG-daemon" TERM >/dev/null 2>&1 || {
+    stop_pidfile "$TAG-daemon" KILL >/dev/null 2>&1 || true
+  }
+  stop_pidfile "$TAG-lvm-daemon" TERM >/dev/null 2>&1 || {
+    stop_pidfile "$TAG-lvm-daemon" KILL >/dev/null 2>&1 || true
+  }
+  local fs
+  for fs in "$RUN/lab-$TAG/journalfs" "$RUN/lab-$TAG/statefs"; do
+    umount "$fs" 2>/dev/null || umount -l "$fs" 2>/dev/null || true
+    if mountpoint -q "$fs"; then
+      printf 'ASSERT FAIL: %s is still mounted after teardown\n' "$fs" | tee -a "$LOG"
+      ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    fi
+  done
+  if ! lvm_lab_teardown "$TAG-lvm"; then
+    printf 'ASSERT FAIL: lab teardown incomplete (loop/VG may still exist)\n' | tee -a "$LOG"
+    ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  fi
+}
+trap cleanup EXIT
 
 # fill_fs <dir> <name>: write chunks (shrinking from 4 KiB to 1 byte)
 # until the filesystem refuses, leaving effectively zero free bytes. The
@@ -79,6 +106,7 @@ stop_daemon() {
     stop_pidfile "$name" KILL || true
     printf 'FAIL: %s did not stop on TERM\n' "$name" | tee -a "$LOG"
     ASSERT_FAILS=$((ASSERT_FAILS + 1))
+    cleanup
     end_drill || true
     exit 1
   fi
@@ -89,6 +117,9 @@ stop_daemon() {
 fail_drill() {
   printf 'FAIL: %s\n' "$1" | tee -a "$LOG"
   ASSERT_FAILS=$((ASSERT_FAILS + 1))
+  # Teardown can add failures; run it before the summary so the printed count
+  # includes them. The EXIT trap then re-enters cleanup, which is idempotent.
+  cleanup
   end_drill || true
   exit 1
 }
@@ -195,7 +226,7 @@ printf 'journal before the failed append: size=%s sha=%s\n' "$JOURNAL_SIZE_BEFOR
 
 cap "a create whose intent append hits ENOSPC is refused" \
   api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-full.json" 500 "$RUN/records/$TAG-create-full.resp.json"
-cat "$RUN/records/$TAG-create-full.resp.json" | tee -a "$LOG"
+tee -a "$LOG" < "$RUN/records/$TAG-create-full.resp.json"
 printf '\n' | tee -a "$LOG"
 assert_eq "$(jq -r '.code' "$RUN/records/$TAG-create-full.resp.json")" "INTERNAL" "journal ENOSPC code"
 assert_contains "$(cat "$RUN/records/$TAG-create-full.resp.json")" "No space left on device" "journal ENOSPC detail"
@@ -308,7 +339,12 @@ FAIL_CODE="$(jq -r '.code' "$FAIL_RESP")"
 FAIL_MSG="$(jq -r '.message' "$FAIL_RESP")"
 assert_eq "$FAIL_CODE" "INTERNAL" "state save ENOSPC error code"
 assert_contains "$FAIL_MSG" "No space left on device" "state save ENOSPC message names the OS error"
-assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the exact state tmp path"
+if [[ "$FAIL_MSG" == *".volvisor-"* ]]; then
+  assert_contains "$FAIL_MSG" "${SFS}/.volvisor-" "state save ENOSPC message names the hashed state temp path in the state filesystem"
+else
+  # Historical pre-a8c23d6 shape, kept so an old drill log can still be replayed.
+  assert_contains "$FAIL_MSG" "$LSTATE.tmp" "state save ENOSPC message names the legacy state tmp path"
+fi
 assert_not_contains "$FAIL_MSG" "manual lvremove" "compensating lvremove succeeded (no manual remediation named)"
 assert_not_contains "$FAIL_MSG" "were kept" "failure is the uncommitted-save compensation, not the post-rename carve-out"
 
@@ -406,6 +442,7 @@ TMP_AFTER_SUCCESS="$(find "$SFS" -maxdepth 1 -name '*.tmp' -print)"
 printf '.tmp residue after the successful create: %s\n' "${TMP_AFTER_SUCCESS:-<none>}" | tee -a "$LOG"
 assert_eq "$TMP_AFTER_SUCCESS" "" "no .tmp residue after the successful create"
 stop_daemon "$TAG-lvm-daemon"
+cleanup
 
 if end_drill; then
   printf 'D5 COMPLETE\n'

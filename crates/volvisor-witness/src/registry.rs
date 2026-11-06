@@ -3411,4 +3411,48 @@ mod tests {
         // the later grant's (4).
         assert_eq!(view.retirements[1].commit_index, 3);
     }
+
+    /// Issue #64: the witness folds the complete record history, so a
+    /// compacted (snapshot-based) journal must be refused, never folded as
+    /// if its truncated prefix were the whole authority state.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_compacted_journal_is_refused_rather_than_folded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut journal = volvisor_journal::Journal::open_with_retention(
+                dir.path(),
+                volvisor_journal::JournalRetention {
+                    max_retained_operations: 1,
+                    max_tombstones: 8,
+                    max_log_records: 2,
+                    max_log_bytes: None,
+                    hard_ceiling_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .expect("control-plane journal opens");
+            journal
+                .append_checkpoint("trigger a snapshot")
+                .expect("checkpoint");
+            journal
+                .append_checkpoint("trigger a snapshot")
+                .expect("checkpoint");
+            assert!(
+                journal.compactions() >= 1,
+                "the record threshold must have compacted the log"
+            );
+        }
+
+        let Err(error) = WitnessCore::open(dir.path(), test_config()) else {
+            panic!("a history-folding witness must refuse a compacted journal");
+        };
+        assert!(
+            error.detail.contains("compacted"),
+            "the refusal names the cause: {error}"
+        );
+        assert!(
+            error.detail.contains("complete record history"),
+            "the refusal names the consumer contract: {error}"
+        );
+    }
 }

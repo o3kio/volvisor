@@ -7,6 +7,7 @@
 # B: replace the configured PEM files without restarting: the served
 #    certificate fingerprint is unchanged (no hot reload). Restart and the
 #    new certificate is served.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d7"

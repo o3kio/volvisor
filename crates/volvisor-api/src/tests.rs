@@ -15,13 +15,14 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use volvisor_journal::Journal;
+use volvisor_journal::{Journal, JournalRetention};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::conformance::{
     fixture_attach_request, fixture_create_request, fixture_create_request_in_project,
@@ -207,6 +208,12 @@ fn with_bearer(mut request: Request<Body>, token: &str) -> Request<Body> {
     request
 }
 
+/// GET authenticated as the configured test admin: reads are protected
+/// whenever any credential is configured (including the legacy token).
+fn get(uri: &str) -> Request<Body> {
+    with_bearer(request(Method::GET, uri), TEST_TOKEN)
+}
+
 /// Raw broken-JSON request, authenticated as the test admin (auth must not
 /// mask body-level rejections in the malformed-body tests).
 fn broken_json_request(uri: &str, body: &'static str) -> Request<Body> {
@@ -277,7 +284,7 @@ async fn full_lifecycle_over_http() {
     assert_eq!(created["current_writer"], Value::Null);
 
     // Inspect round-trips the create response.
-    let (status, inspected) = send_json(&app, request(Method::GET, "/v2/volumes/vol-life")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-life")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inspected, created);
 
@@ -291,15 +298,11 @@ async fn full_lifecycle_over_http() {
     let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &other)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, listed_all) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed_all) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed_all["volumes"].as_array().map(Vec::len), Some(2));
 
-    let (status, listed_b) = send_json(
-        &app,
-        request(Method::GET, "/v2/volumes?project_id=project-b"),
-    )
-    .await;
+    let (status, listed_b) = send_json(&app, get("/v2/volumes?project_id=project-b")).await;
     assert_eq!(status, StatusCode::OK);
     let volumes_b = listed_b["volumes"].as_array().expect("volumes array");
     assert_eq!(
@@ -309,11 +312,8 @@ async fn full_lifecycle_over_http() {
     );
     assert_eq!(volumes_b[0]["volume_id"], json!("vol-life-b"));
 
-    let (status, listed_a) = send_json(
-        &app,
-        request(Method::GET, "/v2/volumes?project_id=conformance-project"),
-    )
-    .await;
+    let (status, listed_a) =
+        send_json(&app, get("/v2/volumes?project_id=conformance-project")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed_a["volumes"].as_array().map(Vec::len), Some(1));
     assert_eq!(listed_a["volumes"][0]["volume_id"], json!("vol-life"));
@@ -399,7 +399,7 @@ async fn full_lifecycle_over_http() {
     assert_eq!(deleted, json!({ "deleted": "vol-life" }));
 
     // Inspect after delete: typed NOT_FOUND.
-    let (status, missing) = send_json(&app, request(Method::GET, "/v2/volumes/vol-life")).await;
+    let (status, missing) = send_json(&app, get("/v2/volumes/vol-life")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], json!("NOT_FOUND"));
 }
@@ -423,7 +423,7 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(status, StatusCode::OK);
 
     // Inspect exposes the full per-attachment projection at prepared/1.
-    let (status, inspected) = send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-report")).await;
     assert_eq!(status, StatusCode::OK);
     let views = inspected["attachments"]
         .as_array()
@@ -527,8 +527,7 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(equal_body["recorded_at_ms"], active_body["recorded_at_ms"]);
 
     // Inspect re-projects the applied evidence verbatim.
-    let (status, after_report) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-report")).await;
+    let (status, after_report) = send_json(&app, get("/v2/volumes/vol-report")).await;
     assert_eq!(status, StatusCode::OK);
     let view = &after_report["attachments"][0];
     assert_eq!(view["state"], json!("active"));
@@ -653,19 +652,38 @@ async fn attachment_state_report_is_monotonic_and_never_moves_the_generation() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(gone["code"], json!("NOT_FOUND"));
 
-    // A consumed attachment id cannot be re-attached under a new operation:
-    // per-id evidence must never be misattributed to a new instance.
+    // Reusing the consumed id is a new instance with a strictly greater
+    // generation, not a refusal: a churned volume stays usable.
     let mut reattach =
         serde_json::to_value(fixture_attach_request("vol-report", "att-report-1", 3))
             .expect("serialize attach fixture");
     reattach["operation_id"] = json!("op-reattach-consumed-id");
-    let (status, reuse_body) = send_json(
+    let (status, reattached) = send_json(
         &app,
         json_request(Method::POST, "/v2/volumes/vol-report/attach", &reattach),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        reattached["attachment_generation"].as_u64().unwrap_or(0) > 1,
+        "the new instance must fence the retired one by generation: {reattached}"
+    );
+
+    // A delayed report from the retired instance still carries generation 1
+    // and is refused; per-id evidence never labels the new instance.
+    let mut delayed = lower.clone();
+    delayed["operation_id"] = json!("op-report-retired-generation");
+    let (status, retired_body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/volumes/vol-report/attachment-state",
+            &delayed,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(reuse_body["code"], json!("IDEMPOTENCY_CONFLICT"));
+    assert_eq!(retired_body["code"], json!("STALE_GENERATION"));
 }
 
 /// Report envelope rejections happen before the journal: no record, and
@@ -1466,8 +1484,7 @@ async fn move_refuses_unqualified_providers_typed() {
 
     // The volume is untouched by the refusal: same generation, no
     // state change (the extents were never a party to it).
-    let (status, inspected) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-move-refuse")).await;
+    let (status, inspected) = send_json(&app, get("/v2/volumes/vol-move-refuse")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inspected["generation"], json!(1));
 }
@@ -1747,7 +1764,7 @@ async fn concurrent_same_operation_id_creates_exactly_once() {
 
     // The final state shows exactly one volume.
     let app = app(&state);
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(1));
     assert_eq!(listed["volumes"][0]["volume_id"], json!("vol-concurrent"));
@@ -1845,7 +1862,7 @@ async fn concurrent_failed_operation_replays_status_compatible() {
 
     // No volume was created.
     let app = app(&state);
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    let (status, listed) = send_json(&app, get("/v2/volumes")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(0));
 }
@@ -1910,7 +1927,7 @@ async fn outcome_append_failure_returns_truthful_success_then_fails_closed() {
     assert!(body.contains("vol-fault-outcome"));
 
     // The volume really exists (truthful success).
-    let (status, _) = send_json(&app, request(Method::GET, "/v2/volumes/vol-fault-outcome")).await;
+    let (status, _) = send_json(&app, get("/v2/volumes/vol-fault-outcome")).await;
     assert_eq!(status, StatusCode::OK);
 
     // A retry of the same operation cannot know the outcome: fail closed.
@@ -1939,8 +1956,7 @@ async fn intent_append_failure_prevents_the_provider_mutation() {
     assert_eq!(error["code"], json!("INTERNAL"));
 
     // No provider mutation happened and nothing was journaled.
-    let (status, missing) =
-        send_json(&app, request(Method::GET, "/v2/volumes/vol-fault-intent")).await;
+    let (status, missing) = send_json(&app, get("/v2/volumes/vol-fault-intent")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], json!("NOT_FOUND"));
     assert_eq!(journal_record_count(&state), 0);
@@ -1974,13 +1990,26 @@ async fn mutations_require_the_admin_bearer_token_when_configured() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created["volume_id"], json!("vol-auth"));
 
-    // Read-only routes stay open in P0.
-    let (status, listed) = send_json(&app, request(Method::GET, "/v2/volumes")).await;
+    // The legacy token protects reads as well as mutations: an anonymous
+    // caller cannot enumerate volume metadata or scrape metrics.
+    for uri in ["/v2/volumes", "/v2/capabilities", "/metrics"] {
+        let (status, unauthorized) = send_json(&app, request(Method::GET, uri)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous {uri}");
+        assert_eq!(unauthorized["code"], json!("UNAUTHORIZED"));
+    }
+    let (status, listed) = send_json(
+        &app,
+        with_bearer(request(Method::GET, "/v2/volumes"), TEST_TOKEN),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["volumes"].as_array().map(Vec::len), Some(1));
-    let (status, health) = send_json(&app, request(Method::GET, "/healthz")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(health, json!({ "status": "ok" }));
+
+    // Probes stay public (readiness may legitimately be 503, never 401).
+    for uri in ["/healthz", "/v2/healthz", "/readyz", "/v2/readyz"] {
+        let (status, _) = send_json(&app, request(Method::GET, uri)).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "public probe {uri}");
+    }
 }
 
 /// No token configured: mutations (and the admin surface) fail closed; a
@@ -2733,7 +2762,7 @@ async fn invalid_volume_id_in_path_is_an_invalid_request() {
     let app = app(&state);
 
     // '!' is outside the ID charset.
-    let (status, body) = send_json(&app, request(Method::GET, "/v2/volumes/bad!id")).await;
+    let (status, body) = send_json(&app, get("/v2/volumes/bad!id")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 }
@@ -2773,8 +2802,7 @@ async fn malformed_bodies_are_typed_invalid_requests() {
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 
     // An invalid project_id query value is rejected, not ignored.
-    let (status, body) =
-        send_json(&app, request(Method::GET, "/v2/volumes?project_id=bad!id")).await;
+    let (status, body) = send_json(&app, get("/v2/volumes?project_id=bad!id")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], json!("INVALID_REQUEST"));
 }
@@ -2788,7 +2816,7 @@ async fn capabilities_expose_the_provider_advertisement() {
     let (state, provider, _dir) = setup();
     let app = app(&state);
 
-    let (status, body) = send_json(&app, request(Method::GET, "/v2/capabilities")).await;
+    let (status, body) = send_json(&app, get("/v2/capabilities")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["provider"], json!(provider.name()));
     let advertised: Vec<String> = provider
@@ -2817,7 +2845,7 @@ async fn metrics_serve_prometheus_text() {
     let (state, _provider, _dir) = setup();
     let app = app(&state);
 
-    let (status, _) = send_json(&app, request(Method::GET, "/healthz")).await;
+    let (status, _) = send_json(&app, get("/healthz")).await;
     assert_eq!(status, StatusCode::OK);
 
     // A param route must be labeled by its pattern, not the concrete path.
@@ -2825,10 +2853,10 @@ async fn metrics_serve_prometheus_text() {
         .expect("serialize create fixture");
     let (status, _) = send_json(&app, json_request(Method::POST, "/v2/volumes", &create)).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send_json(&app, request(Method::GET, "/v2/volumes/vol-metrics")).await;
+    let (status, _) = send_json(&app, get("/v2/volumes/vol-metrics")).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = send(&app, request(Method::GET, "/metrics")).await;
+    let (status, body) = send(&app, get("/metrics")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("# TYPE http_requests_total counter"));
     assert!(body.contains("# TYPE operations_total counter"));
@@ -3489,6 +3517,10 @@ struct FakeHandoffSurface {
     targets: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
     /// Every replica verification the surface saw (assertion input).
     target_checks: std::sync::Mutex<Vec<volvisor_types::VolumeId>>,
+    /// Optional latency injected into the two read-only observation
+    /// seams (`handoff_eligibility` and `verify_target_replica`), used
+    /// by the admission-timeout tests to hold a bounded POST route.
+    observation_delay: std::sync::Mutex<Option<Duration>>,
 }
 
 impl FakeHandoffSurface {
@@ -3499,6 +3531,19 @@ impl FakeHandoffSurface {
             cleared: std::sync::Mutex::new(Vec::new()),
             targets: std::sync::Mutex::new(Vec::new()),
             target_checks: std::sync::Mutex::new(Vec::new()),
+            observation_delay: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Make both read-only observation seams sleep before answering.
+    fn set_observation_delay(&self, delay: Duration) {
+        *self.observation_delay.lock().expect("observation delay") = Some(delay);
+    }
+
+    async fn observe(&self) {
+        let delay = *self.observation_delay.lock().expect("observation delay");
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -3554,6 +3599,7 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         &self,
         vm_id: &str,
     ) -> Result<volvisor_provider::EligibilityReport, ApiError> {
+        self.observe().await;
         self.eligibility
             .lock()
             .expect("eligibility")
@@ -3646,6 +3692,7 @@ impl volvisor_provider::HandoffSurface for FakeHandoffSurface {
         volume_id: &volvisor_types::VolumeId,
         _expected_lineage: &[String],
     ) -> Result<(), ApiError> {
+        self.observe().await;
         self.target_checks
             .lock()
             .expect("target checks")
@@ -3718,6 +3765,38 @@ async fn check_mobility_reads_the_handoff_surface() {
     );
     // Read-only: no journal record for an eligibility answer.
     assert_eq!(journal_record_count(&state), 0);
+}
+
+#[tokio::test]
+async fn check_mobility_post_is_bounded_by_the_read_timeout() {
+    // `check-mobility` is a read-only POST: it must be bounded like a
+    // GET even though its method is `POST`, or a hung provider pins the
+    // connection indefinitely. This drives the real router/middleware.
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open(dir.path()).expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let handoff = Arc::new(FakeHandoffSurface::new());
+    handoff.set_observation_delay(Duration::from_millis(250));
+    let state = Arc::new(
+        AppState::new(provider, None, journal, Some(TEST_TOKEN.to_owned())).with_handoff(handoff),
+    );
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(40),
+        ..ApiConfig::default()
+    };
+    let app = router_with_config(state, &config);
+
+    let (status, body) = send_json(
+        &app,
+        json_request(
+            Method::POST,
+            "/v2/vms/vm-c-1/check-mobility",
+            &json!({"target_host": "dst-host"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
 }
 
 /// The clear-cut-marker request body (no fencing proof — sufficient
@@ -4871,6 +4950,37 @@ async fn peer_verify_lineage_re_runs_the_replica_gate_read_only() {
         before,
         "the observation journals nothing"
     );
+}
+
+#[tokio::test]
+async fn verify_lineage_post_is_bounded_by_the_read_timeout() {
+    // The barrier-time lineage re-check is another read-only POST: a
+    // hung target-replica observation must be cut with the typed
+    // `504 REQUEST_TIMEOUT`, not held open indefinitely.
+    let kit = setup_peer();
+    kit.handoff
+        .set_observation_delay(Duration::from_millis(250));
+    let config = ApiConfig {
+        read_timeout: Duration::from_millis(40),
+        ..ApiConfig::default()
+    };
+    let app = router_with_config(kit.state.clone(), &config);
+
+    let (status, body) = send_json(
+        &app,
+        peer_request(
+            Method::POST,
+            "/v2/internal/peer/verify-lineage",
+            &json!({
+                "migration_id": "mig-vl-timeout",
+                "volume_ids": ["vol-vl1"],
+                "expected_lineages": [["fake-lineage-vol-vl1"]],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], json!("REQUEST_TIMEOUT"));
 }
 
 #[tokio::test]
@@ -6768,4 +6878,90 @@ fn crash_hooks_default_to_inert_and_fire_only_when_armed() {
     hooks.clear();
     hooks.consult(OP_CREATE_VOLUME, CrashPoint::BeforeOutcome);
     assert_eq!(fired.load(Ordering::SeqCst), 1, "cleared entries are inert");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #64: OPERATION_EXPIRED over the real HTTP surface
+// ---------------------------------------------------------------------------
+
+/// An operation evicted by the bounded journal retention window answers the
+/// typed `410 OPERATION_EXPIRED` and is never re-executed. This pins the
+/// end-to-end contract: `append_intent`'s fail-closed refusal propagates
+/// through [`ops::execute`] without falling through to the provider.
+#[tokio::test]
+async fn an_expired_operation_answers_410_and_is_never_re_executed() {
+    let dir = tempfile::tempdir().expect("temporary journal directory");
+    let journal = Journal::open_with_retention(
+        dir.path(),
+        JournalRetention {
+            max_retained_operations: 1,
+            max_tombstones: 8,
+            max_log_records: 1_000,
+            max_log_bytes: None,
+            hard_ceiling_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .expect("journal open");
+    let provider = Arc::new(FakeProvider::new());
+    let admin: Arc<dyn volvisor_provider::AdminSurface> = provider.clone();
+    let state = Arc::new(AppState::new(
+        provider,
+        Some(admin),
+        journal,
+        Some(TEST_TOKEN.to_owned()),
+    ));
+    let app = app(&state);
+
+    let first = serde_json::to_value(fixture_create_request("vol-expired-1", GIB))
+        .expect("serialize create fixture");
+    let (first_status, _) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &first)).await;
+    assert!(first_status.is_success(), "{first_status}");
+
+    // A second completed operation crosses the retention bound and evicts
+    // the first one from the registry (into the tombstone ring).
+    let second = serde_json::to_value(fixture_create_request("vol-expired-2", GIB))
+        .expect("serialize create fixture");
+    let (second_status, _) =
+        send_json(&app, json_request(Method::POST, "/v2/volumes", &second)).await;
+    assert!(second_status.is_success(), "{second_status}");
+
+    // A retry of the evicted operation is a typed terminal refusal.
+    let (status, body) = send_json(&app, json_request(Method::POST, "/v2/volumes", &first)).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "OPERATION_EXPIRED");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retention window")),
+        "{body}"
+    );
+
+    // Exactly the two original creates executed; the refused retry never
+    // reached the provider.
+    let metrics = state.metrics.render();
+    assert!(
+        metrics.contains("operations_total{kind=\"create_volume\",outcome=\"success\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("operations_total{kind=\"create_volume\",outcome=\"expired\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("journal_append_failures_total{kind=\"create_volume\",stage=\"intent\"}"),
+        "an expired operation is a retention refusal, not a journal I/O failure: {metrics}"
+    );
+
+    // The pipeline's eviction pin is released on every exit path, including
+    // this fail-closed refusal.
+    assert_eq!(
+        state
+            .journal
+            .lock()
+            .expect("journal lock")
+            .pinned_operations(),
+        0,
+        "no operation may stay pinned after a request completes"
+    );
 }

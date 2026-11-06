@@ -624,8 +624,10 @@ impl MoveRig {
 struct Daemon {
     addr: SocketAddr,
     /// The provider (the rows arm its store seam between requests
-    /// and drive its reconcile pass).
-    provider: Arc<LvmProvider>,
+    /// and drive its reconcile pass). Dropped by [`Daemon::stop`] so a
+    /// simulated process restart cannot reuse the dead incarnation's
+    /// poisoned per-state-path writer gate.
+    provider: Option<Arc<LvmProvider>>,
     /// The journal-append crash hooks (armed between requests).
     journal_crash: Arc<volvisor_api::CrashHooks>,
     serve: Option<JoinHandle<()>>,
@@ -654,10 +656,15 @@ impl Daemon {
         });
         Daemon {
             addr,
-            provider,
+            provider: Some(provider),
             journal_crash,
             serve: Some(serve),
         }
+    }
+
+    /// This incarnation's provider (only while the daemon is serving).
+    fn provider(&self) -> &Arc<LvmProvider> {
+        self.provider.as_ref().expect("daemon is serving")
     }
 
     /// Arm the journal-append seam for one operation kind (the
@@ -671,17 +678,21 @@ impl Daemon {
     /// request or pass dies in-band at the point, after firing
     /// `kill`).
     fn arm_store(&self, point: StoreSavePoint, kill: KillSwitch) {
-        let hooks = self.provider.store_crash_hooks();
+        let hooks = self.provider().store_crash_hooks();
         hooks.set_kill_switch(kill);
         hooks.arm(STORE_LVM_STATE, point);
     }
 
-    /// Stop serving (the journal flock frees with the serve task).
+    /// Stop serving (the journal flock frees with the serve task) and
+    /// drop this incarnation's provider. The rig's stop/launch pair is
+    /// the in-process shape of process death: the killed incarnation's
+    /// provider (and its poisoned writer gate) must not outlive it.
     async fn stop(&mut self) {
         if let Some(serve) = self.serve.take() {
             serve.abort();
             let _ = serve.await;
         }
+        self.provider = None;
     }
 }
 
@@ -1085,7 +1096,7 @@ async fn move_pass_killed_at_verification() {
     let (killed, kill) = marking_kill();
     daemon.arm_store(StoreSavePoint::AfterFsyncBeforeRename, kill);
     rig.lvm.lock().expect("world").hold_moves = false;
-    let passes = drive_passes_until_kill(&daemon.provider).await;
+    let passes = drive_passes_until_kill(daemon.provider()).await;
     assert!(killed.load(Ordering::SeqCst), "the kill fired in-band");
     assert!(
         passes >= 2,
@@ -1165,7 +1176,7 @@ async fn move_pass_killed_after_complete_save() {
     let (killed, kill) = marking_kill();
     daemon.arm_store(StoreSavePoint::AfterRename, kill);
     rig.lvm.lock().expect("world").hold_moves = false;
-    let _passes = drive_passes_until_kill(&daemon.provider).await;
+    let _passes = drive_passes_until_kill(daemon.provider()).await;
     assert!(killed.load(Ordering::SeqCst), "the kill fired in-band");
 
     // The durable truth at the death: COMPLETE with the bump.
@@ -1284,7 +1295,7 @@ async fn move_aborted_out_of_band_while_down() {
     // — the known outcome, journaled with the typed reason, no bump.
     let volume_id = VolumeId::new(VOLUME).expect("valid volume id");
     let pass = tokio::task::spawn_blocking({
-        let provider = Arc::clone(&fresh.provider);
+        let provider = Arc::clone(fresh.provider());
         move || provider.move_reconcile_pass()
     })
     .await

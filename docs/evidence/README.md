@@ -29,9 +29,26 @@ working directory. Read this page before adding a bundle or citing one.
   control-plane backup/restore, schema policy, witness service restart, torn
   journal/corrupt state, ENOSPC, SIGKILL crash loop/lock contention, and
   restart-based credential/certificate rotation. It is not multi-host, not
-  storage-side DRBD fencing, not a live binary upgrade, and not a data-plane
-  backup. Total host loss/re-admission is **NOT RUN**. Procedures:
+  storage-side DRBD fencing, and not a data-plane backup. Total host
+  loss/re-admission is **NOT RUN**. Procedures:
   [day-2 runbooks](../runbooks/day-2/README.md).
+- **D1 v3 backup/restore evidence exists** under
+  [`docs/evidence/day2/2026-11-04-devhost-live/`](day2/2026-11-04-devhost-live/).
+  A stopped whole-directory backup was taken; the live directory was then
+  drifted destructively and moved aside, and the backup was restored
+  byte-identically and verified for attachment state/revision/evidence, the
+  bounded v3 tombstone filter, a behavioral `409 IDEMPOTENCY_CONFLICT` on the
+  retired id, and absence of the post-backup volume. Single host, loop-device
+  LVM, caller worktree dirty; not a data-plane restore.
+- **D2 live cross-binary evidence exists** under
+  [`docs/evidence/day2/2026-11-04-devhost-live/`](day2/2026-11-04-devhost-live/).
+  A real old binary (`8c2fc1a`, LVM schema 2) upgraded a stopped v2 state
+  directory to schema 3 with the new binary (`aad1720`), refused the newer
+  state/journal typed, and restored the v2 directory so the old binary served
+  the original volume again. It is **single-host, loop-device LVM, debug-build**
+  evidence; it is not a rolling multi-host or packaged upgrade, not D3
+  storage-side fencing, and not D8 total host loss. The bundle also records
+  D1, the same-binary v3 policy drill and the D2/D3/D8 preflight output.
 - **D5 post-fix re-drill exists** under
   [`docs/evidence/day2/2026-11-03-d5-redrill/`](day2/2026-11-03-d5-redrill/).
   It re-runs D5 (ENOSPC) on the same single development host with product

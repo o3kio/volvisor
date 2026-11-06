@@ -401,6 +401,15 @@ where
     // secret references.
     redact(&mut payload);
 
+    // Pin this operation against bounded-retention eviction for the whole
+    // pipeline. A retry may be re-driving a previously failed terminal
+    // operation; compaction in a concurrent request must not evict it between
+    // the lookup and the replacement outcome, or that outcome would be
+    // refused after the mutation already landed. An already-evicted/unknown
+    // operation is unaffected: the pin cannot resurrect it, and the tombstone
+    // check still fails closed.
+    let _pin = OperationPin::acquire(state, &operation_id)?;
+
     // (2) Resolve idempotency from the replay-derived registry.
     let recorded = {
         let journal = lock_journal(state)?;
@@ -473,9 +482,21 @@ where
         let append = match append {
             Ok(append) => append,
             Err(error) => {
-                state
-                    .metrics
-                    .record_journal_append_failure("intent", op_kind);
+                if error.code == ApiErrorCode::OperationExpired {
+                    // A bounded-retention refusal is not a journal I/O
+                    // failure: the journal is healthy and refused to
+                    // re-execute a possibly-completed operation.
+                    state.metrics.record_operation(op_kind, "expired");
+                } else if error.code == ApiErrorCode::JournalFull {
+                    // Bounded admission (ADR-0014) is not an I/O failure:
+                    // the journal is healthy but refuses new durable work at
+                    // its hard ceiling or cannot-fit admission point.
+                    state.metrics.record_operation(op_kind, "journal_full");
+                } else {
+                    state
+                        .metrics
+                        .record_journal_append_failure("intent", op_kind);
+                }
                 return Err(error);
             }
         };
@@ -571,14 +592,28 @@ where
     state
         .metrics
         .record_provider_operation(op_kind, outcome, elapsed);
-    tracing::info!(
-        parent: &provider_span,
-        kind = op_kind,
-        operation_id = %operation_id,
-        outcome,
-        elapsed_ms = %elapsed.as_millis(),
-        "provider call completed"
-    );
+    // Success is high-volume: the metrics histogram already carries the
+    // latency, so only a failure stays at INFO. The request audit line is
+    // unaffected (issue #64's log-volume residual).
+    if result.is_ok() {
+        tracing::debug!(
+            parent: &provider_span,
+            kind = op_kind,
+            operation_id = %operation_id,
+            outcome,
+            elapsed_ms = %elapsed.as_millis(),
+            "provider call completed"
+        );
+    } else {
+        tracing::info!(
+            parent: &provider_span,
+            kind = op_kind,
+            operation_id = %operation_id,
+            outcome,
+            elapsed_ms = %elapsed.as_millis(),
+            "provider call completed"
+        );
+    }
     finish_outcome(state, op_kind, &operation_id, result, success_status)
 }
 
@@ -615,18 +650,16 @@ where
             // the campaign's after-outcome crash point.
             consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
-                state
-                    .metrics
-                    .record_journal_append_failure("outcome", op_kind);
                 // The mutation DID succeed and the caller must learn the
                 // truth; only the replay fidelity is compromised, and any
                 // later replay fails closed as in-doubt.
-                tracing::error!(
-                    kind = op_kind,
-                    operation_id = %operation_id,
-                    error = %journal_error,
+                note_outcome_append_failure(
+                    state,
+                    op_kind,
+                    operation_id,
+                    &journal_error,
                     "mutation succeeded but its outcome could not be journaled; \
-                     replays of this operation will fail closed as in-doubt"
+                     replays of this operation will fail closed as in-doubt",
                 );
             }
             state.metrics.record_operation(op_kind, "success");
@@ -649,15 +682,13 @@ where
             };
             consult_crash(state, op_kind, CrashPoint::AfterOutcome);
             if let Err(journal_error) = journaled {
-                state
-                    .metrics
-                    .record_journal_append_failure("outcome", op_kind);
-                tracing::error!(
-                    kind = op_kind,
-                    operation_id = %operation_id,
-                    error = %journal_error,
+                note_outcome_append_failure(
+                    state,
+                    op_kind,
+                    operation_id,
+                    &journal_error,
                     "failed outcome could not be journaled; replays of this \
-                     operation will fail closed as in-doubt"
+                     operation will fail closed as in-doubt",
                 );
             }
             state.metrics.record_operation(op_kind, "failure");
@@ -741,15 +772,13 @@ where
                 )
             };
             if let Err(journal_error) = journaled {
-                state
-                    .metrics
-                    .record_journal_append_failure("outcome", op_kind);
-                tracing::error!(
-                    kind = op_kind,
-                    operation_id = %operation_id,
-                    error = %journal_error,
+                note_outcome_append_failure(
+                    state,
+                    op_kind,
+                    operation_id,
+                    &journal_error,
                     "the inspection proved the act landed but its outcome \
-                     could not be journaled; retries will re-resolve by inspection"
+                     could not be journaled; retries will re-resolve by inspection",
                 );
             }
             // The resolved outcome is durable (the campaign's
@@ -784,6 +813,56 @@ where
     }
 }
 
+/// Record a failed post-mutation outcome append without lying about its
+/// cause. A bounded-retention `OPERATION_EXPIRED` refusal is not journal I/O
+/// failure (the journal is healthy); anything else is.
+fn note_outcome_append_failure(
+    state: &SharedState,
+    op_kind: &'static str,
+    operation_id: &OperationId,
+    journal_error: &ApiError,
+    detail: &'static str,
+) {
+    if journal_error.code == ApiErrorCode::OperationExpired {
+        tracing::warn!(
+            kind = op_kind,
+            operation_id = %operation_id,
+            error = %journal_error,
+            detail,
+            "the outcome was refused because bounded retention had already \
+             evicted the operation; this is not a journal I/O failure"
+        );
+        return;
+    }
+    if journal_error.code == ApiErrorCode::JournalFull {
+        // The mutation landed but its outcome could not be journaled because
+        // bounded admission refused the record (ADR-0014). The journal is
+        // healthy; the operation is in doubt until an operator restores
+        // capacity. This is not an I/O failure and must not inflate the
+        // append-failure counter's I/O meaning.
+        state.metrics.record_operation(op_kind, "journal_full");
+        tracing::error!(
+            kind = op_kind,
+            operation_id = %operation_id,
+            error = %journal_error,
+            detail,
+            "the outcome was refused at the journal hard ceiling; the mutation \
+             landed but its outcome is not durable (in doubt until capacity is restored)"
+        );
+        return;
+    }
+    state
+        .metrics
+        .record_journal_append_failure("outcome", op_kind);
+    tracing::error!(
+        kind = op_kind,
+        operation_id = %operation_id,
+        error = %journal_error,
+        detail,
+        "the outcome could not be journaled"
+    );
+}
+
 /// Lock the journal for a short, synchronous critical section.
 ///
 /// Poisoning (a panic while a journal operation was in flight) fails closed:
@@ -796,6 +875,40 @@ fn lock_journal(state: &SharedState) -> Result<MutexGuard<'_, Journal>, ApiError
             "journal mutex poisoned; refusing further mutations (fail closed)",
         )
     })
+}
+
+/// RAII pin keeping one operation out of the bounded-retention eviction set
+/// for the lifetime of a mutation pipeline (issue #64).
+///
+/// The pin is acquired before the idempotency lookup and released on every
+/// exit path, including early returns and panics. It is in-memory only: a
+/// crash while pinned leaves the durable intent/outcome records exactly as
+/// written, which normal replay and retention handle.
+struct OperationPin {
+    state: SharedState,
+    operation_id: OperationId,
+}
+
+impl OperationPin {
+    fn acquire(state: &SharedState, operation_id: &OperationId) -> Result<Self, ApiError> {
+        let mut journal = lock_journal(state)?;
+        journal.pin_operation(operation_id);
+        drop(journal);
+        Ok(Self {
+            state: state.clone(),
+            operation_id: operation_id.clone(),
+        })
+    }
+}
+
+impl Drop for OperationPin {
+    fn drop(&mut self) {
+        // A poisoned mutex means the journal is already unusable and every
+        // later mutation fails closed; there is nothing safe to unpin there.
+        if let Ok(mut journal) = self.state.journal.lock() {
+            journal.unpin_operation(&self.operation_id);
+        }
+    }
 }
 
 /// Consult the daemon's armed crash hook (P5 plan §3.1) at `point` of

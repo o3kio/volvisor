@@ -11,15 +11,20 @@
 //! - `http_requests_in_flight`: requests currently being served (gauge);
 //! - `operations_total{kind,outcome}`: volume operations by kind
 //!   (`create_volume`, ...) and outcome (`success`, `failure`, `replayed`,
-//!   `in_doubt`, `conflict`, `resolved`, `re_drive`) (counter);
+//!   `in_doubt`, `conflict`, `resolved`, `re_drive`, `expired`,
+//!   `journal_full`) (counter);
 //! - `provider_operation_duration_seconds{kind,outcome}`: the provider call
 //!   latency of operations that actually executed, by operation kind and the
 //!   fixed outcome (`success` or `failure`) (histogram);
 //! - `journal_append_failures_total{stage,kind}`: journal append failures by
 //!   stage (`intent`, `outcome`) and operation kind (counter);
-//! - `journal_records`, `journal_log_bytes`, `journal_open`: the journal's
-//!   replayed/appended record count, log file size, and whether the daemon
-//!   still holds an open journal (gauges, sampled from the live journal);
+//! - `journal_records`, `journal_log_bytes`, `journal_open`, and the ADR-0014
+//!   bounds (`journal_max_log_bytes`, `journal_hard_ceiling_bytes`,
+//!   `journal_in_flight_operations`, `journal_terminal_operations`,
+//!   `journal_tombstones`, `journal_tombstone_capacity`,
+//!   `journal_cannot_fit`): sampled from the live journal (gauges/counters);
+//! - `journal_refusals_total{reason}`: durable appends refused by bounded
+//!   admission (`ceiling` or `cannot_fit`) (counter);
 //! - `reconcile_age_seconds{scope}`: seconds since the last completed
 //!   reconcile pass (`startup`, and the `grow`/`move` background passes on
 //!   a daemon that runs them) (gauge);
@@ -65,6 +70,33 @@ pub struct JournalSnapshot {
     pub records: Option<u64>,
     /// Size of the journal log file in bytes, when it can be stat'ed.
     pub log_bytes: Option<u64>,
+    /// Successful compactions since open.
+    pub compactions: Option<u64>,
+    /// Failed compaction attempts since open. A persistently non-zero value
+    /// means the log is not being bounded.
+    pub compaction_failures: Option<u64>,
+    /// Terminal plus in-flight operations currently retained.
+    pub retained_operations: Option<u64>,
+    /// In-flight intents (no outcome yet); never evicted.
+    pub in_flight_operations: Option<u64>,
+    /// Terminal operations currently tracked in terminal order.
+    pub terminal_operations: Option<u64>,
+    /// Exact tombstone fingerprints currently retained.
+    pub tombstones: Option<u64>,
+    /// Configured tombstone window bound.
+    pub tombstone_capacity: Option<u64>,
+    /// Configured compaction byte trigger; `None`/0 means disabled.
+    pub max_log_bytes: Option<u64>,
+    /// Configured hard ceiling above which appends are refused.
+    pub hard_ceiling_bytes: Option<u64>,
+    /// Compaction attempts since open (successes plus failures).
+    pub compaction_attempts: Option<u64>,
+    /// Durable appends refused at the hard ceiling since open.
+    pub ceiling_refusals: Option<u64>,
+    /// New intents refused because the in-flight set cannot fit one frame.
+    pub cannot_fit_refusals: Option<u64>,
+    /// Whether new-intent admission is currently closed by cannot-fit.
+    pub cannot_fit: Option<bool>,
     /// Whether the daemon still holds an open journal.
     pub open: bool,
 }
@@ -479,6 +511,114 @@ fn render_journal(out: &mut String, journal: JournalSnapshot) {
         out.push_str("# HELP journal_log_bytes Size of the journal log file in bytes.\n");
         out.push_str("# TYPE journal_log_bytes gauge\n");
         let _ = writeln!(out, "journal_log_bytes {bytes}");
+    }
+    if let Some(compactions) = journal.compactions {
+        out.push_str(
+            "# HELP journal_compactions_total Successful journal compactions since open.\n",
+        );
+        out.push_str("# TYPE journal_compactions_total counter\n");
+        let _ = writeln!(out, "journal_compactions_total {compactions}");
+    }
+    if let Some(failures) = journal.compaction_failures {
+        out.push_str(
+            "# HELP journal_compaction_failures_total Failed journal compaction attempts \
+             since open; a sustained increase means the log is not being bounded.\n",
+        );
+        out.push_str("# TYPE journal_compaction_failures_total counter\n");
+        let _ = writeln!(out, "journal_compaction_failures_total {failures}");
+    }
+    if let Some(retained) = journal.retained_operations {
+        out.push_str(
+            "# HELP journal_retained_operations Terminal plus in-flight operations retained \
+             in the idempotency registry.\n",
+        );
+        out.push_str("# TYPE journal_retained_operations gauge\n");
+        let _ = writeln!(out, "journal_retained_operations {retained}");
+    }
+    if let Some(in_flight) = journal.in_flight_operations {
+        out.push_str(
+            "# HELP journal_in_flight_operations In-flight intents (no outcome yet); these \
+             are never evicted.\n",
+        );
+        out.push_str("# TYPE journal_in_flight_operations gauge\n");
+        let _ = writeln!(out, "journal_in_flight_operations {in_flight}");
+    }
+    if let Some(terminal) = journal.terminal_operations {
+        out.push_str(
+            "# HELP journal_terminal_operations Terminal operations currently tracked in \
+             terminal order.\n",
+        );
+        out.push_str("# TYPE journal_terminal_operations gauge\n");
+        let _ = writeln!(out, "journal_terminal_operations {terminal}");
+    }
+    if let Some(tombstones) = journal.tombstones {
+        out.push_str(
+            "# HELP journal_tombstones Exact evicted-operation fingerprints in the tombstone \
+             ring.\n",
+        );
+        out.push_str("# TYPE journal_tombstones gauge\n");
+        let _ = writeln!(out, "journal_tombstones {tombstones}");
+    }
+    if let Some(capacity) = journal.tombstone_capacity {
+        out.push_str("# HELP journal_tombstone_capacity Configured tombstone ring bound.\n");
+        out.push_str("# TYPE journal_tombstone_capacity gauge\n");
+        let _ = writeln!(out, "journal_tombstone_capacity {capacity}");
+    }
+    render_journal_bounds(out, &journal);
+}
+
+/// Render the ADR-0014 bounds and refusal counters.
+fn render_journal_bounds(out: &mut String, journal: &JournalSnapshot) {
+    if let Some(trigger) = journal.max_log_bytes {
+        out.push_str(
+            "# HELP journal_max_log_bytes Configured compaction byte trigger; 0 disables the \
+             byte trigger.\n",
+        );
+        out.push_str("# TYPE journal_max_log_bytes gauge\n");
+        let _ = writeln!(out, "journal_max_log_bytes {trigger}");
+    }
+    if let Some(ceiling) = journal.hard_ceiling_bytes {
+        out.push_str(
+            "# HELP journal_hard_ceiling_bytes Configured hard ceiling above which durable \
+             appends are refused.\n",
+        );
+        out.push_str("# TYPE journal_hard_ceiling_bytes gauge\n");
+        let _ = writeln!(out, "journal_hard_ceiling_bytes {ceiling}");
+    }
+    if let Some(attempts) = journal.compaction_attempts {
+        out.push_str(
+            "# HELP journal_compaction_attempts_total Journal compaction attempts since open \
+             (successes plus failures).\n",
+        );
+        out.push_str("# TYPE journal_compaction_attempts_total counter\n");
+        let _ = writeln!(out, "journal_compaction_attempts_total {attempts}");
+    }
+    if let Some(cannot_fit) = journal.cannot_fit {
+        out.push_str(
+            "# HELP journal_cannot_fit Whether new-intent admission is closed because the \
+             in-flight set cannot fit one snapshot frame.\n",
+        );
+        out.push_str("# TYPE journal_cannot_fit gauge\n");
+        let _ = writeln!(out, "journal_cannot_fit {}", u8::from(cannot_fit));
+    }
+    if journal.ceiling_refusals.is_some() || journal.cannot_fit_refusals.is_some() {
+        out.push_str(
+            "# HELP journal_refusals_total Durable appends refused by bounded admission, by \
+             reason (ceiling or cannot_fit).\n",
+        );
+        out.push_str("# TYPE journal_refusals_total counter\n");
+        if let Some(ceiling) = journal.ceiling_refusals {
+            let _ = writeln!(
+                out,
+                "journal_refusals_total{{reason=\"ceiling\"}} {ceiling}"
+            );
+        }
+        if let Some(cannot_fit) = journal.cannot_fit_refusals {
+            let _ = writeln!(
+                out,
+                "journal_refusals_total{{reason=\"cannot_fit\"}} {cannot_fit}"
+            );
+        }
     }
 }
 

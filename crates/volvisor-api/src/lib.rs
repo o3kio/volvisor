@@ -142,7 +142,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use config::ApiConfig;
+pub use config::{ApiConfig, RouteTimeouts};
 pub use crash::{CRASH_PANIC_PREFIX, CrashHooks, CrashPoint, KillSwitch};
 pub use metrics::Metrics;
 pub use router::{router, router_with_config};

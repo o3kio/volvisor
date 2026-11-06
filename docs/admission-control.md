@@ -44,28 +44,69 @@ What a client should do instead:
 **Explicitly not implemented:** a resumable operation handle / async job
 surface. Issue #45's long-operation checkbox that asks for such a handle
 stays unchecked; this document records the synchronous model instead of
-claiming a capability the daemon does not have.
+claiming a capability the daemon does not have. A
+[Proposed, not-accepted, not-normative contract amendment](../contracts/volume-api-v2-amendment-1-long-operations.md)
+records a future opt-in observation handle and per-route mutation response
+budgets; the capability is not implemented and the synchronous model above
+remains current.
 
 ## Read-route timeout
 
-A **single** configurable value, `admission.read_timeout_secs` (default
-`30`), bounds every read-only provider call. There are no distinct per-route
-timeout values; the same wall-clock bound applies uniformly to each route
-listed below. On expiry the daemon answers:
+`admission.read_timeout_secs` (default `30`) is the **fallback** bound for
+every read-only provider call. The optional `[admission.route_timeouts]`
+table overrides it per route. Keys name the axum **matched path** (the route
+pattern, not the request URI); a read-only route without an override falls
+back to `read_timeout_secs`, so the default is unchanged.
+
+| Override key | Matched path | Route |
+|---|---|---|
+| `list_volumes_secs` | `/v2/volumes` | `GET /v2/volumes` |
+| `inspect_volume_secs` | `/v2/volumes/{volume_id}` | `GET /v2/volumes/{volume_id}` |
+| `capabilities_secs` | `/v2/capabilities` | `GET /v2/capabilities` |
+| `observe_migration_secs` | `/v2/migrations/{migration_id}` | `GET /v2/migrations/{migration_id}` |
+| `list_devices_secs` | `/v2/admin/devices` | `GET /v2/admin/devices` |
+| `device_ownership_secs` | `/v2/admin/devices/{device_id}/ownership` | `GET /v2/admin/devices/{device_id}/ownership` |
+| `check_mobility_secs` | `/v2/vms/{vm_id}/check-mobility` | `POST /v2/vms/{vm_id}/check-mobility` (read-only) |
+| `peer_health_secs` | `/v2/internal/peer/health` | `GET /v2/internal/peer/health` |
+| `verify_lineage_secs` | `/v2/internal/peer/verify-lineage` | `POST /v2/internal/peer/verify-lineage` (read-only) |
+
+Two of these routes are `POST` but **read-only**: `check-mobility` and
+`verify-lineage` never journal and are observations, so they are bounded
+like `GET`/`HEAD`. Journaled mutations are never bounded.
+
+Every key is optional; each value is whole seconds in `1..=3600`, the same
+range as `read_timeout_secs`. Unknown keys are refused at startup
+(`deny_unknown_fields`), and overlapping routes are not possible because the
+key space is the matched path exactly.
+
+```toml
+[admission]
+read_timeout_secs = 30
+
+[admission.route_timeouts]
+list_volumes_secs = 60          # large listings may legitimately be slow
+inspect_volume_secs = 10        # a single metadata read should be quick
+check_mobility_secs = 120       # provider-wide eligibility observation
+verify_lineage_secs = 120       # barrier-time DRBD lineage observation
+```
+
+On expiry the daemon answers `504 REQUEST_TIMEOUT`, naming the matched route
+and the **effective** limit (the override if one matched, otherwise the
+fallback):
 
 ```http
 HTTP/1.1 504 Gateway Timeout
 Content-Type: application/json
 
-{"code":"REQUEST_TIMEOUT","message":"read-only route ... exceeded its 30s timeout"}
+{"code":"REQUEST_TIMEOUT","message":"read-only route /v2/volumes exceeded its 60s timeout"}
 ```
 
-The bound applies to `GET /v2/volumes`, `GET /v2/volumes/{volume_id}`,
-`GET /v2/capabilities`, `GET /v2/migrations/{migration_id}`,
-`GET /v2/admin/devices`, `GET /v2/admin/devices/{device_id}/ownership`,
-`POST /v2/vms/{vm_id}/check-mobility` and the read-only peer health route.
 `/healthz`, `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` are local
-and unbounded. Mutations are never bounded by this value (see above).
+and unbounded. Mutations are never bounded by any entry, including when a
+mutating method shares a matched path with an overridden read route (for
+example `POST /v2/volumes` versus `GET /v2/volumes`): the selector first
+admits only `GET`/`HEAD` and the read-only `check-mobility` and
+`verify-lineage` routes, then looks up an override.
 
 `HEAD` requests are bounded exactly like `GET` (axum routes `HEAD` to the
 `GET` handler), so a hung provider cannot pin a `HEAD` request past the
@@ -91,6 +132,74 @@ of permits; it cannot create unbounded tasks or connections. `/healthz`,
 `/v2/healthz`, `/readyz`, `/v2/readyz` and `/metrics` bypass the cap so
 liveness, readiness and monitoring stay available during overload.
 
+## Grow-heavy workloads and the shared cap
+
+The cap counts **requests**, not LVM capacity or fairness. A grow holds its
+permit for the whole synchronous body: up to 32 capacity-sample attempts
+(each runs one `vgs` round or joins an in-flight one), the `lvextend`, and
+the size-verifying `lvs`, with each LVM command bounded by the 60-second
+provider watchdog. Grow completions are bounded by a per-VG serialized
+provider path, not by the daemon: the published dev-lab
+measurement at the capacity-domain fix completed 438 grows in 39.4 s with
+128 in flight (about 11.1 grows/s) while also serving reads and non-grow
+writes.
+
+The measured single-VG envelope is **~11–12 grow completions/s** at c8, c32
+and c128, with grow latency approximated by `in-flight × 83–93 ms`. At c128
+the **operation journal intent** in `ops::execute` lands a median of **2 ms**
+after the request starts, but that is not the provider's capacity-admission
+cost. The provider's `prepare_grow_admission` loop takes **5.0–6.3 s mean**,
+dominated by `vgs` capacity samples that are invalidated by the global
+capacity epoch and retried (783–1,082 stale attempts across 409–411 grows,
+tail to 20 attempts). `lvextend` and the verifying `lvs` are **~1.8–2.4 s
+each**; the provider's own durable grow-intent save is **~1.7–1.9 ms**, the
+state commit ~65–72 ms, and the journal outcome append **< 1 ms**. A
+read-only [decision memo](reviews/2026-11-05-grow-tail-decision.md) accepted
+the measured envelope and added no per-VG bound; a subsequent
+[non-evidence phase diagnostic](reviews/2026-11-05-grow-tail-phase-diagnostic.md)
+attributed the largest removable share to the `vgs` sample-retry convoy.
+Option C — per-round single-flight `vgs` — was implemented at `a07203e` and
+measured at `75beea3` in the
+[grow-sample-coalescing bundle](benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md).
+**That measurement is a c128 regression**: aggregate throughput
+**655.326 → 508.225 ops/s (−22.45%)**, grow p50 **8,338.505 → 11,335.103 ms**,
+and the 25-minute soak **4,756.348 → 4,543.361 ops/s (−4.48%)**. The grow
+upper tail narrowed (p95 **19,633.371 → 12,396.977 ms**; max **34,044.828 →
+15,251.096 ms**), but the grow completion rate fell **11.118 → 10.615/s**,
+at or below the accepted **~11–12/s** band. `4290b84` therefore remains the
+prior measured envelope: the change was not adopted on throughput or envelope
+grounds and was reverted locally at
+`59f64cceaa9483760500ed3b68ca7da89ece8ee3`, so the current code has the
+`4290b84` grow behavior. The numbers above describe `4290b84` only.
+Treat the envelope as an observed operating point, not a validated ceiling
+or an SLO.
+
+Consequences an operator must plan for:
+
+- A sustained grow flood can fill the cap with journaled mutations. Reads
+  and attaches then wait `queue_timeout_secs` (default 5) and are shed with
+  `503 OVERLOADED`; probes and `/metrics` remain available. The cap reserves
+  nothing for reads or for non-grow mutations.
+- `max_concurrent_requests` accepts up to 65536 and is not cross-checked
+  against LVM, process or thread capacity. Raising it raises the number of
+  concurrent grow bodies, child processes and converted runtime workers.
+  The measured envelope is 128 in-flight and 256 admitted; that is an
+  observed operating point, not a validated ceiling.
+- Per-principal rate limiting is the intended control for a shared or
+  untrusted network. It is disabled by default; enable it before exposing a
+  grow-heavy workload to clients that can burst.
+- The provider-level grow retry cap returns `OVERLOADED` after 32 stale
+  capacity samples. It is raised after the journal intent, so the refusal is
+  the **terminal** outcome for that request's `operation_id`; a retry must
+  carry a new id.
+- The removed provider-level grow semaphore was an internal bulkhead, not a
+  fairness mechanism: a same-commit A/B diagnostic (non-evidence) showed it
+  added queue delay without raising the per-VG completion rate. The
+  admission cap is the remaining count bound, with the limits above.
+- Grow throughput scales with the number of independently lockable VGs, not
+  with in-flight requests. Adding daemon concurrency beyond the measured
+  envelope does not raise the per-VG completion rate.
+
 ## Per-principal rate limits (opt-in)
 
 Per-principal rate limiting is **disabled by default**: both
@@ -109,8 +218,10 @@ bucket. **Bearer tokens are never used as keys and never logged.**
 
 A request rejected by authentication or authorization is charged to the
 `anonymous` bucket before its `401`/`403` is returned, so a credential
-brute-force flood is rate-limited rather than bypassing the limiter. When
-the anonymous bucket is exhausted the rejection becomes `429 RATE_LIMITED`.
+brute-force flood is rate-limited rather than bypassing the limiter — this
+includes denials on the otherwise admission-exempt probe and `/metrics`
+routes. When the anonymous bucket is exhausted the rejection becomes
+`429 RATE_LIMITED`.
 
 Enable it in the daemon config:
 
@@ -190,14 +301,20 @@ not reach the provider.
   legitimate **read**. It must not impose a timeout that silently abandons a
   journaled mutation that the daemon is still running.
 - The daemon does not implement slowloris defense at the application layer;
-  bound request headers/body timing at the listener or proxy as well.
+  bound request headers/body timing at the listener or proxy as well. This
+  matters most for authenticated mutating requests: a permit is acquired
+  before the body is read, and mutations are deliberately never
+  wall-clock-bounded, so `max_concurrent_requests` connections that dribble
+  a body can exhaust the cap and turn every other request (reads included)
+  into `503 OVERLOADED`. Size client/proxy body timeouts accordingly.
 
 ## Defaults at a glance
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `max_body_bytes` | `1048576` | Request body ceiling (sized and streamed). |
-| `admission.read_timeout_secs` | `30` | Single read-only timeout applied to every read route (`504 REQUEST_TIMEOUT`). |
+| `admission.read_timeout_secs` | `30` | Fallback read-only timeout; a matching `[admission.route_timeouts]` override wins (`504 REQUEST_TIMEOUT`). |
+| `admission.route_timeouts` | empty | Optional per-route overrides (matched-path keys, each `1..=3600` seconds); unset keys fall back. |
 | `admission.queue_timeout_secs` | `5` | Concurrency-permit wait (`503 OVERLOADED`). |
 | `admission.max_concurrent_requests` | `256` | Global in-flight cap (probes/metrics exempt). |
 | `admission.rate_limit_per_second` | `0` (disabled) | Per-principal refill rate; opt-in, `0` keeps legacy behavior. |

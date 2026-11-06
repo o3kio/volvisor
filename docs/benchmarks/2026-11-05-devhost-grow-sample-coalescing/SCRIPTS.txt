@@ -1,0 +1,109 @@
+Benchmark harness scripts: provenance record
+============================================
+
+The measurement ran at source_sha
+75beea399e593c561104d4d0bb473c88d4d8b93e on branch phase-a-scaling. The
+harness scripts are tracked in scripts/bench/ at that commit. This file
+records the SHA256 of each script as executed or used post-run.
+
+SHA256 at 75beea3
+-----------------
+09d7dec3c0d68299bd25f0975c642e00e801e95211b9dc9e7040c29f6f14704a  lib.sh
+ff2699387ef9d9a3866545a3313c2a117c04cb1fd2a4b466064abb63e55a15da  run-all.sh
+02c75aa3d4f95d8a21edf861b5511f22e46066a626d0586f731be76041de0afb  bench.py
+eea4e14ab8dd81864c9b69d69d79094699af852b50124d6abc7d0e5ba4b99153  summarize.py
+96654c9c5c08a94628885ea730ab8e09f1c513e5071c6136f007c5e6fe8f2153  publish.sh
+6786cb4c7f72c0aa8d6604de7b44ec6574ba105070d92ba4ead126794c82226c  compare.py
+
+The harness was not modified between the 2026-11-05 capacity-domain run
+(4290b84) and this run; the hashes above match that bundle and the earlier
+8029df8 bundle. The measured code change is entirely in crates/
+(volvisor-lvm), not in scripts/bench/.
+
+Execution shape
+---------------
+The run used the committed harness directly:
+
+  sudo scripts/bench/run-all.sh \
+    --run-dir /tmp/opencode/volvisor-bench-coalesce-20261105 \
+    --skip-build --sweep-seconds 30 --soak-minutes 25
+
+The release binary was built before the harness started with
+`CARGO_BUILD_JOBS=4 cargo build --release -p volvisord --locked` from the
+clean tree at 75beea3. `--skip-build` therefore recorded the source at
+75beea3 and executed a binary built from the same tree, rather than a
+binary rebuilt inside the harness.
+
+The executed binary was target/release/volvisord, version `volvisord
+75beea3`, SHA256
+d00ef55419b5b13d353c5051923d6443040259c0b122af37fe038d41a50293f4.
+ENVIRONMENT.txt records the same source, dirty flag, binary path and digest.
+
+The run window was 2026-11-05T14:27:48Z .. 2026-11-05T14:58:52Z.
+`raw/00-orchestration.log` ends with a `done:` line and a clean lab
+teardown, and records no failure.
+
+Provenance checks performed
+---------------------------
+- `ENVIRONMENT.txt` records `worktree_dirty: no` and source_sha 75beea3.
+- Every raw JSON aggregate records the same source_sha, worktree_dirty=no,
+  harness argv and generated_utc timestamp.
+- All ten aggregate records have status `OK`.
+- The lab teardown log names only the VG this run created
+  (vgb-1793888868 on /dev/loop0) and records its successful removal.
+- The raw daemon log has 0 records at level ERROR; the WARN records are
+  grow-notification retries for attachments without a vmm_disk_id.
+
+Code identity
+-------------
+75beea3 is a documentation-only commit on top of
+a07203e4965aef9e5776d96d496a09b3304437a1, the commit that implements
+per-VG single-flight capacity sampling. The two trees are code-identical;
+no production file differs between them.
+
+Superseded measurement
+----------------------
+Every earlier grow-path measurement (4290b84, 6519068, 8029df8, c4b0b13)
+predates this production-code change and is **not** evidence for this tree.
+The 4290b84 bundle is used here only as the before/comparator, not as
+evidence for 75beea3.
+
+Repetition
+----------
+One further clean sweep at the same SHA and binary with the same cumulative
+sequence but `--skip-soak` was run after the published run. It is
+**non-evidence**, is not part of this bundle, and is cited only in
+REPORT.md §11.3 to show the single-sample sensitivity. The published sample
+was not selected from it.
+
+Post-run tools
+--------------
+scripts/bench/publish.sh copied the run directory into this bundle, redacted
+the run token in configs/, and gzip-compressed the oversized daemon log
+(2.2 GiB raw) with `gzip -9 -n`. It does not alter any measured JSON or
+summary CSV. The per-operation CSV samples are not committed; the JSON
+aggregates and summary tables retain the measured values.
+
+scripts/bench/compare.py generated comparison/comparison.md and
+comparison/comparison.csv from this bundle and the
+2026-11-05-devhost-capacity-domain-fix bundle. It verified both
+MANIFEST.sha256 files before reading records. It was not part of the load
+generation and does not change the measurement.
+
+The authored README.md, REPORT.md and this file were written after the run
+from the run's raw records; they add no measured values.
+
+Measurement caveat
+------------------
+This is a single-host, loop-backed-LVM control-plane run, not production
+capacity, SLA, durability or data-path evidence. The mixed sweep is not a
+fixed-dataset comparison. The 24-hour soak is NOT RUN. The c128 aggregate
+write p95 is composition- and run-sensitive and is not a like-for-like
+comparison with the 4290b84 bundle; see REPORT.md §6.1.
+
+Integrity
+---------
+MANIFEST.sha256 in this directory covers every other file, including this
+provenance record and the authored README/REPORT. Verify with:
+
+  sha256sum -c MANIFEST.sha256

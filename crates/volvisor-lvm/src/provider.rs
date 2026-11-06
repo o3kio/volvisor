@@ -10,6 +10,38 @@
 //! are always verified against `lvs` output — a successful exit status
 //! alone is never trusted as evidence (honest reporting).
 //!
+//! # Coalescing durable writer
+//!
+//! Every production save of the provider state — volume, move, admin
+//! claim/release and every compensation path — goes through one writer
+//! (Phase D D3 slices 1–2, #62). A caller captures the exact bytes and
+//! snapshot and reserves a monotonic sequence **under** the provider state
+//! lock, so capture order equals sequence order. Attach, detach and an
+//! applied attachment report then release that lock before waiting for
+//! durability; synchronous mutations keep it and lead inline. One leader
+//! performs a single physical write of the latest pending capture and
+//! marks every covered sequence durable, so concurrent attach/detach/
+//! report saves coalesce instead of writing once per caller.
+//!
+//! Watermarks are permanent and per provider lineage: `durable_seq` and
+//! `failed_through` only advance, and a waiter resolves through them or
+//! the terminal poison — there is no transient barrier. On an unprovable
+//! write failure (readable-but-different or unreadable durable) every
+//! outstanding sequence fails and admission must re-align with the
+//! durable file; only a leader panic, abandonment or a poisoned mutex
+//! poisons the writer. The leader never takes the provider state lock.
+//!
+//! The physical-write gate is per canonical state path in this process,
+//! so two live providers aliasing one path serialize their writes while
+//! different paths proceed independently. Two live providers aliasing one
+//! path are **unsupported**: their sequence spaces are per lineage even
+//! though their gate is shared. Each write uses a unique bounded
+//! `.volvisor-<hash>.<pid>.<sequence>.tmp`, so writers can never truncate
+//! or delete each other's temp file. The constructor sweeps stale sibling
+//! temp files from a crashed save before it loads or writes state (see
+//! [`crate::state`]). Cross-process exclusion remains the journal flock;
+//! two daemons must not alias a custom `lvm_state_path`.
+//!
 //! # Durable mutation contracts
 //!
 //! Every privileged mutation journals a durable intent before the
@@ -84,9 +116,16 @@
 //! health are `Unknown` until proven; `evidence_status` is
 //! `PrototypeOnly`.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -94,8 +133,8 @@ use std::time::{Duration, Instant};
 use volvisor_provider::VolumeProvider;
 use volvisor_provider::semantics::{
     AttachmentIdentity, AttachmentRecordView, AttachmentStateRecord, apply_attachment_report,
-    ensure_attachment_id_not_retired, ensure_expected_attachment_generation,
-    ensure_expected_generation, ensure_no_active_attachment, resolve_attachment_replay,
+    ensure_expected_attachment_generation, ensure_expected_generation, ensure_no_active_attachment,
+    resolve_attachment_replay,
 };
 use volvisor_types::domain::{
     AccessMode, AttachmentEvidence, EffectiveProtection, EvidenceStatus, FailureDomain, Frontend,
@@ -118,8 +157,8 @@ use volvisor_types::{
 
 use crate::report::{LvRow, VgRow};
 use crate::state::{
-    AttachmentRecord, CreateIntent, DeleteIntent, GrowIntent, LvmState, StoredVolume, VolumeEntry,
-    VolumeRuntime,
+    AttachmentRecord, CreateIntent, DeleteIntent, GrowIntent, LvmState, RetiredAttachmentFilter,
+    StoredVolume, VolumeEntry, VolumeRuntime,
 };
 use crate::{CommandOutput, CommandRunner};
 
@@ -136,6 +175,23 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// always be written (`NO_SAFE_CAPACITY` is reported before the VG fills).
 pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 
+/// Maximum optimistic capacity-sample rounds for one grow admission.
+///
+/// Each stale round costs another `vgs` call. The cap keeps a grow from
+/// looping forever under sustained allocation churn; exhaustion returns an
+/// `OVERLOADED` refusal. The refusal is raised inside the journaled run
+/// closure, so it is the terminal outcome for that `operation_id`: a client
+/// retry must use a new operation id.
+const GROW_ADMISSION_ATTEMPTS: usize = 32;
+
+/// Maximum optimistic capacity-sample rounds for one create admission.
+///
+/// Same liveness guard as [`GROW_ADMISSION_ATTEMPTS`]: each stale round
+/// costs another `vgs` call, so sustained allocation churn must not keep one
+/// create looping forever. Exhaustion returns an `OVERLOADED` refusal and the
+/// client retries with a new operation id.
+const CREATE_ADMISSION_ATTEMPTS: usize = 32;
+
 /// Physical extent size assumed when `vgs` does not report one (LVM's
 /// own default; bigger arrays legitimately use bigger extents).
 const DEFAULT_EXTENT_BYTES: u64 = 4 << 20;
@@ -151,6 +207,67 @@ struct VgCapacity {
     free_bytes: u64,
     /// Physical extent bytes reported by `vgs` (4 MiB when absent).
     extent_bytes: u64,
+}
+
+/// The outcome of one grow-preparation attempt under the state lock.
+///
+/// `SampleStale` means an allocation completed after the `vgs` sample was
+/// taken; the reservation has been released and the caller must re-sample.
+enum GrowPrepare<'a> {
+    Prepared {
+        grow_intent: GrowIntent,
+        reservation: CapacityReservation<'a>,
+    },
+    SampleStale,
+}
+
+/// The outcome of one create-preparation attempt under the state lock.
+///
+/// `SampleStale` means an allocation completed after the `vgs` sample was
+/// taken; the reservation has been released and the caller must re-sample.
+enum CreatePrepare<'a> {
+    Prepared {
+        intent: CreateIntent,
+        reservation: CapacityReservation<'a>,
+    },
+    SampleStale,
+}
+
+/// The volume fields one grow admission derives under the state lock and
+/// re-validates after the capacity sample releases and reacquires it.
+struct GrowAdmission {
+    vg_name: String,
+    lv_name: String,
+    current_size: u64,
+    current_generation: u64,
+    has_attachment: bool,
+}
+
+/// A grow admission that has sampled capacity, reserved it, and made its
+/// recovery intent durable.
+///
+/// The [`CapacityReservation`] must stay alive until the `lvextend` answer
+/// arrives; the capacity admission domain itself is released when
+/// [`LvmProvider::prepare_grow_admission`] returns.
+struct PreparedGrow<'a> {
+    grow_intent: GrowIntent,
+    reservation: CapacityReservation<'a>,
+    vg_name: String,
+    lv_name: String,
+    current_size: u64,
+    current_generation: u64,
+    has_attachment: bool,
+}
+
+/// The outcome of grow admission: either a pending grow that the world
+/// already proves landed (answer without another `lvextend`), or a drive
+/// ready to extend.
+enum GrowAdmissionOutcome<'a> {
+    Finalized {
+        has_attachment: bool,
+        effective_size_bytes: u64,
+    },
+    Prepared(PreparedGrow<'a>),
 }
 
 /// The space `size` bytes effectively occupy on a VG with `extent`-byte
@@ -309,6 +426,16 @@ pub struct MoveReconcileReport {
     /// Records skipped: the world could not be observed this pass
     /// (retried on the next tick; never resolved destructively).
     pub unobservable: Vec<VolumeId>,
+    /// Records whose verified completion this pass deferred because the
+    /// volume has a live grow. A completion bumps the volume generation
+    /// without touching the grow's durable intent, so recording it while
+    /// the resize is in flight would make the intent look stale to
+    /// recovery; the pass must skip this record and keep classifying the
+    /// rest, not abort. Retried on the next tick (the grow normally
+    /// resolves well inside one tick; a durable intent with no live drive
+    /// — an unknown `lvextend` outcome — can defer until a same-request
+    /// retry or a restart classifies it, without starving other records).
+    pub deferred_while_growing: Vec<VolumeId>,
 }
 
 /// The native-local LVM provider.
@@ -333,6 +460,10 @@ pub struct LvmProvider {
     /// The state file's store-save crash seam (inert unless a rig
     /// arms it — the move fault rows' kill surface).
     store_crash: Arc<StoreCrashHooks>,
+    /// The coalescing durable writer every production save uses (Phase D
+    /// D3 slice 2, #62). Per provider lineage: a rig that drops and
+    /// rebuilds the provider after a crash gets a fresh sequence space.
+    writer: Arc<WriterCore>,
     /// The move drive's timing (production defaults; overridable for
     /// the deterministic fake world only).
     move_timing: MoveTiming,
@@ -342,7 +473,1036 @@ pub struct LvmProvider {
     /// bound). In-memory and per-incarnation: it never persists, and
     /// a successful observation clears it.
     move_observe_failures: Mutex<BTreeMap<VolumeId, u32>>,
+    /// Volume ids with a live grow drive. A grow releases the provider
+    /// state lock across the long `lvextend`/`lvs` commands, so this
+    /// in-memory set prevents a second grow of the same volume from
+    /// resuming the same durable intent concurrently. It is fail-closed
+    /// and non-blocking: the second grow is refused, never queued on a
+    /// runtime worker.
+    grow_drives: Mutex<BTreeSet<VolumeId>>,
+    /// Volume ids with a live create or delete drive. Both paths release the
+    /// provider state lock across external LVM commands, so this map refuses
+    /// a concurrent structural mutation of the same volume instead of
+    /// letting two bodies race (or spend the same capacity). It is
+    /// fail-closed and non-blocking: the duplicate is refused, never queued.
+    /// The durable intent (not this map) survives a restart.
+    volume_drives: Mutex<BTreeMap<VolumeId, StructuralDriveKind>>,
+    /// Bytes promised to in-flight grow and create allocations, keyed by
+    /// volume group. The state lock no longer serializes the long
+    /// `lvextend`/`lvcreate`, so capacity admission subtracts these
+    /// reservations to stay honest: a create (or another grow) that takes
+    /// the state lock while an allocation runs must not spend the same free
+    /// space twice. The entry is removed when the command returns, after
+    /// which `vgs` reports the real free space. Leaf lock: never held while
+    /// taking the provider state lock.
+    capacity_reservations: Mutex<BTreeMap<String, u64>>,
+    /// Counts completed allocations (create `lvcreate`, grow `lvextend`)
+    /// that may have reduced free space.
+    ///
+    /// Grow admission samples `vgs` without any admission lock so
+    /// concurrent grows do not serialize on the LVM CLI. A sample is used
+    /// only if this counter is unchanged across the whole sample and the
+    /// reservation insertion; a create or a completed `lvextend` bumps it
+    /// (under the state lock for a create) and forces a re-sample. Moves
+    /// allocate outside this protocol (pre-existing residual).
+    capacity_epoch: AtomicU64,
+    /// The writer view: every mutation is admitted under this mutex.
+    /// Attach/detach/report capture and reserve under it, then release it
+    /// before waiting for durability; the synchronous multi-save paths
+    /// still hold it across their save. Readers do **not** take it.
     state: Mutex<LvmState>,
+    /// The last committed read view (issue #62). Published by the writer
+    /// after durability (and by a lock-holding synchronous guard on drop),
+    /// so `GET`/list/inspect never wait behind another request's whole-file
+    /// fsync or LVM CLI call. Readers clone the `Arc` only; the lock is
+    /// held for that clone, never for the duration of a read.
+    read_snapshot: Arc<RwLock<Arc<LvmState>>>,
+}
+
+/// The detail of a physical-write gate poisoned by an earlier panic. The
+/// exact string is part of the slice-1 fail-closed evidence.
+const GATE_POISON_DETAIL: &str = "LVM provider durable writer lock poisoned by a previous failure";
+
+/// The detail of a writer poisoned by a leader panic, abandonment or a
+/// poisoned writer-state mutex.
+const WRITER_POISON_DETAIL: &str = "LVM provider durable writer poisoned by a previous failure";
+
+/// The detail returned when a capture is attempted before admission has
+/// re-aligned in-memory state with the durable file.
+const NEEDS_ALIGNMENT_DETAIL: &str =
+    "LVM provider durable writer requires admission alignment before another save";
+
+/// The detail returned when a leader quiesces without a permanent
+/// watermark resolving its own capture. That is an internal invariant
+/// violation, so it fails closed instead of reporting an unproven success.
+const UNRESOLVED_LEADER_DETAIL: &str =
+    "LVM provider durable writer leader could not prove its save durable or failed";
+
+/// One reserved capture: the exact bytes and snapshot a caller wants
+/// durable, plus the monotonic sequence assigned under the provider state
+/// lock so capture order equals sequence order.
+struct Capture {
+    /// Encoded state bytes for this capture.
+    encoded: Arc<[u8]>,
+    /// In-memory snapshot this capture commits.
+    snapshot: Arc<LvmState>,
+}
+
+/// The coalescing writer's bookkeeping (Phase D D3 slice 2, #62).
+///
+/// Watermarks are permanent and monotonic: a waiter resolves only when
+/// `durable_seq` covers it (success), `failed_through` covers it (the
+/// recorded failure), or the writer is poisoned (typed `INTERNAL`). There
+/// is no transient barrier flag.
+struct WriterState {
+    /// Next sequence to assign (starts at one).
+    next_seq: u64,
+    /// The newest capture awaiting a physical write. Older captures are
+    /// dropped: in-memory state is monotonic, so the newest snapshot is a
+    /// superset and one write of it covers every earlier sequence. Keeping
+    /// only the newest bounds retained memory to one encoded state plus one
+    /// snapshot regardless of how many callers coalesce.
+    latest: Option<(u64, Capture)>,
+    /// Highest sequence proven durable by a completed physical write.
+    durable_seq: u64,
+    /// Highest sequence published to the read view.
+    published_seq: u64,
+    /// Highest sequence that has been terminally failed.
+    failed_through: u64,
+    /// The failure recorded for `failed_through`.
+    failure: Option<(ApiErrorCode, String)>,
+    /// Whether a leader currently owns the physical write loop.
+    leader_active: bool,
+    /// A hard failure requires the next admission to re-align in-memory
+    /// state with the durable file before another capture is accepted.
+    needs_alignment: bool,
+    /// Terminal poison (leader panic, abandonment, or poisoned mutex).
+    poisoned: Option<String>,
+}
+
+impl Default for WriterState {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            latest: None,
+            durable_seq: 0,
+            published_seq: 0,
+            failed_through: 0,
+            failure: None,
+            leader_active: false,
+            needs_alignment: false,
+            poisoned: None,
+        }
+    }
+}
+
+/// The result of one physical write attempt, kept distinct from the
+/// panic payload so an armed crash seam can be re-raised in band.
+enum WriteOutcome {
+    /// The write completed.
+    Saved,
+    /// The write returned a typed error (possibly after the rename).
+    Failed(ApiError),
+    /// The write panicked (an armed crash seam).
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// One leader-loop decision, taken under a single writer-lock critical
+/// section so the no-pending-capture check and leadership release are
+/// atomic.
+enum LeaderStep {
+    /// The writer is terminally poisoned.
+    Poisoned(String),
+    /// Write the latest pending capture.
+    Write {
+        /// Sequence of the capture to write.
+        seq: u64,
+        /// Pre-encoded bytes of the latest capture.
+        encoded: Arc<[u8]>,
+        /// Snapshot the latest capture commits.
+        snapshot: Arc<LvmState>,
+    },
+    /// Nothing is pending: leadership has been released.
+    Quiesce,
+}
+
+/// RAII leadership guard: a leader that panics or is abandoned before
+/// clearing leadership poisons the writer and wakes/fails every waiter.
+struct LeaderToken {
+    /// The writer whose leadership this token owns.
+    core: Arc<WriterCore>,
+    /// Set once the leader has completed normally (or already poisoned).
+    armed: bool,
+}
+
+impl LeaderToken {
+    /// Disarm the token after the leader has resolved leadership.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaderToken {
+    fn drop(&mut self) {
+        if self.armed {
+            self.core.abandon_leader();
+        }
+    }
+}
+
+/// One caller's reservation. The leader owns a [`LeaderToken`]; a waiter
+/// resolves only through the permanent watermarks.
+pub(crate) struct Reservation {
+    /// The caller's reserved sequence.
+    seq: u64,
+    /// Whether this caller leads the physical write or waits.
+    role: ReservationRole,
+}
+
+/// The two reservation roles.
+enum ReservationRole {
+    /// This caller owns the physical write loop (RAII-guarded).
+    Leader(LeaderToken),
+    /// This caller waits for a watermark.
+    Waiter,
+}
+
+/// One admission-gate decision, read atomically under the writer mutex.
+///
+/// An admission may only derive an answer from the in-memory state when
+/// this returns [`AdmissionGate::Ready`]: every reserved capture has then
+/// resolved, so the in-memory view is the durable view. The variants are
+/// checked in this order because a capture can coexist with
+/// `needs_alignment` (for example an encode failure while an older
+/// capture is still outstanding); that capture must resolve before the
+/// durable file is reloaded.
+enum AdmissionGate {
+    /// No capture is outstanding and no alignment is required.
+    Ready,
+    /// A capture is outstanding; wait for its permanent watermark.
+    Wait(u64),
+    /// No capture is outstanding, but a failure requires reloading the
+    /// durable file before this admission may proceed.
+    Align,
+}
+
+/// The coalescing durable writer for one provider lineage.
+///
+/// Phase D D3 slice 2 (#62): attach/detach/report reserve a sequence under
+/// the provider state lock, release it, and wait. The leader writes the
+/// latest pending capture once and marks every covered sequence durable.
+///
+/// The physical-write gate is **per canonical state path in this process**,
+/// so two live providers aliasing one state path serialize their writes,
+/// while different paths get independent gates. Watermarks and pending
+/// captures are **per provider lineage**, not shared across instances: a
+/// rig that drops the old provider on restart gets a fresh sequence space.
+/// Two live providers aliasing one state path are unsupported (cross-process
+/// exclusion remains the journal flock).
+///
+/// Lock order is provider state lock, then this writer's state mutex. The
+/// leader loop never takes the provider state lock, so a synchronous waiter
+/// may hold it safely.
+struct WriterCore {
+    /// Canonical state file path.
+    path: PathBuf,
+    /// Per-canonical-path physical-write gate.
+    gate: Arc<Mutex<()>>,
+    /// The store-save crash seam shared with the provider.
+    crash: Arc<StoreCrashHooks>,
+    /// The read view the leader publishes after durability.
+    read_snapshot: Arc<RwLock<Arc<LvmState>>>,
+    /// The writer watermark/pending bookkeeping.
+    state: Mutex<WriterState>,
+    /// Wakes synchronous waiters (permanent watermark checks).
+    wake: Condvar,
+    /// Wakes asynchronous waiters; subscribe-before-check prevents a lost
+    /// wake between the check and the await.
+    notify: tokio::sync::Notify,
+    /// Test-only count of physical write attempts (coalescing evidence).
+    #[cfg(test)]
+    physical_writes: AtomicUsize,
+    /// Test-only hook that runs inside the leader's quiesce critical
+    /// section, so a regression test can hold a reservation at the exact
+    /// leadership-handoff boundary.
+    #[cfg(test)]
+    handoff_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Process-wide gates keyed by canonical state-path identity. A `Weak`
+/// lets a dropped provider's gate go away; dead entries are pruned on
+/// every lookup.
+static WRITER_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+impl WriterCore {
+    /// Build the per-lineage writer around the provider's read view and
+    /// crash seam. The gate itself is shared per canonical state path.
+    fn new(
+        path: &Path,
+        crash: Arc<StoreCrashHooks>,
+        read_snapshot: Arc<RwLock<Arc<LvmState>>>,
+    ) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            gate: Self::gate_for(path),
+            crash,
+            read_snapshot,
+            state: Mutex::new(WriterState::default()),
+            wake: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            physical_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            handoff_hook: Mutex::new(None),
+        }
+    }
+
+    /// The physical-write gate shared by every writer on `path` in this
+    /// process.
+    fn gate_for(path: &Path) -> Arc<Mutex<()>> {
+        let identity = crate::state::canonical_state_identity(path);
+        let mut gates = WRITER_GATES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        gates
+            .get(&identity)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(identity, Arc::downgrade(&gate));
+                gate
+            })
+    }
+
+    /// Lock the writer bookkeeping, converting a poisoned mutex into the
+    /// terminal poison state (so waiters cannot park forever).
+    fn lock_writer(&self) -> MutexGuard<'_, WriterState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                if guard.poisoned.is_none() {
+                    guard.poisoned = Some(WRITER_POISON_DETAIL.to_owned());
+                }
+                guard.needs_alignment = true;
+                guard
+            }
+        }
+    }
+
+    /// Wake both waiter classes. Always call both: a notify with no
+    /// current async waiter is harmless because waiters subscribe before
+    /// re-checking the watermarks.
+    fn wake_all(&self) {
+        self.wake.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    /// Resolve one sequence against the permanent watermarks.
+    fn resolution(state: &WriterState, seq: u64) -> Option<Result<(), ApiError>> {
+        if state.durable_seq >= seq {
+            return Some(Ok(()));
+        }
+        if state.failed_through >= seq {
+            let (code, detail) = state.failure.clone().unwrap_or((
+                ApiErrorCode::Internal,
+                "LVM provider durable writer failed without a recorded cause".to_owned(),
+            ));
+            return Some(Err(ApiError::new(code, detail)));
+        }
+        if let Some(reason) = &state.poisoned {
+            return Some(Err(ApiError::new(ApiErrorCode::Internal, reason.clone())));
+        }
+        None
+    }
+
+    /// Reserve a sequence for one capture. Poison and admission
+    /// alignment are checked here, under the writer mutex, before the
+    /// caller releases the provider state lock.
+    fn reserve(
+        self: &Arc<Self>,
+        encoded: Arc<[u8]>,
+        snapshot: Arc<LvmState>,
+    ) -> Result<Reservation, ApiError> {
+        let mut state = self.lock_writer();
+        if let Some(reason) = state.poisoned.clone() {
+            // A caller refused here may already hold an uncommitted
+            // in-memory mutation (async attach/detach mutate before they
+            // reserve). Force the next admission to re-align with the
+            // durable file so that mutation can never be replayed as a
+            // phantom success.
+            state.needs_alignment = true;
+            return Err(ApiError::new(ApiErrorCode::Internal, reason));
+        }
+        if state.needs_alignment {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                NEEDS_ALIGNMENT_DETAIL,
+            ));
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.latest = Some((seq, Capture { encoded, snapshot }));
+        let role = if state.leader_active {
+            ReservationRole::Waiter
+        } else {
+            state.leader_active = true;
+            ReservationRole::Leader(LeaderToken {
+                core: Arc::clone(self),
+                armed: true,
+            })
+        };
+        Ok(Reservation { seq, role })
+    }
+
+    /// Wait synchronously for a permanent watermark.
+    fn wait_sync(&self, seq: u64) -> Result<(), ApiError> {
+        let mut state = self.lock_writer();
+        loop {
+            if let Some(result) = Self::resolution(&state, seq) {
+                return result;
+            }
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Wait asynchronously for a permanent watermark using
+    /// subscribe-before-check, so a wake between the check and the await
+    /// is never lost.
+    async fn wait_async(&self, seq: u64) -> Result<(), ApiError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.lock_writer();
+                if let Some(result) = Self::resolution(&state, seq) {
+                    return result;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Mark a sequence durable and publish its snapshot when it is newer
+    /// than the last published one.
+    fn mark_durable(&self, seq: u64, snapshot: &Arc<LvmState>) {
+        {
+            let mut state = self.lock_writer();
+            state.durable_seq = state.durable_seq.max(seq);
+            // The written capture covers every sequence up to `seq`. Drop
+            // it if it is the one that was just written; keep a newer
+            // capture for the next loop iteration.
+            if state
+                .latest
+                .as_ref()
+                .is_some_and(|(latest_seq, _)| *latest_seq <= seq)
+            {
+                state.latest = None;
+            }
+        }
+        self.publish_if_newer(seq, snapshot);
+    }
+
+    /// Publish `snapshot` only when `seq` is newer than the published
+    /// sequence; a lower sequence never replaces a higher snapshot.
+    fn publish_if_newer(&self, seq: u64, snapshot: &Arc<LvmState>) {
+        let publish = {
+            let mut state = self.lock_writer();
+            if seq > state.published_seq {
+                state.published_seq = seq;
+                true
+            } else {
+                false
+            }
+        };
+        if publish {
+            match self.read_snapshot.write() {
+                Ok(mut current) => *current = Arc::clone(snapshot),
+                // A poisoned reader-view lock must not wedge every future
+                // read: recover the inner value (the snapshot holds no
+                // cross-field invariant that a panic could tear).
+                Err(poisoned) => *poisoned.into_inner() = Arc::clone(snapshot),
+            }
+        }
+    }
+
+    /// Poison the writer and fail every outstanding sequence. Used by the
+    /// RAII leadership guard when a leader is abandoned before resolving.
+    fn abandon_leader(&self) {
+        self.poison(WRITER_POISON_DETAIL);
+    }
+
+    /// Set the terminal poison, fail everything pending through the
+    /// permanent watermark, and wake all waiters.
+    fn poison(&self, detail: &str) {
+        {
+            let mut state = self.lock_writer();
+            let max_pending = state
+                .latest
+                .as_ref()
+                .map_or(state.failed_through, |(seq, _)| *seq);
+            state.failed_through = state.failed_through.max(max_pending);
+            state.latest = None;
+            // Keep the first terminal poison: a later re-raise (for
+            // example `commit_async` observing the leader's panic join)
+            // must not replace the failure every waiter already sees.
+            if state.poisoned.is_none() {
+                state.poisoned = Some(detail.to_owned());
+                state.failure = Some((ApiErrorCode::Internal, detail.to_owned()));
+            }
+            state.needs_alignment = true;
+            state.leader_active = false;
+        }
+        self.wake_all();
+    }
+
+    /// Resolve the leader's own sequence after the pending queue is empty.
+    fn finish_leader(&self, own_seq: u64, own_error: Option<ApiError>) -> Result<(), ApiError> {
+        if let Some(error) = own_error {
+            return Err(error);
+        }
+        let state = self.lock_writer();
+        if let Some(result) = Self::resolution(&state, own_seq) {
+            return result;
+        }
+        // The leader's own capture was reserved before leadership began,
+        // so one of the watermarks above must resolve it. If none does,
+        // the invariant is broken: never report success for a save whose
+        // durability is unproven. Fail closed and force the next
+        // admission to re-align.
+        drop(state);
+        self.require_alignment();
+        Err(ApiError::new(
+            ApiErrorCode::Internal,
+            UNRESOLVED_LEADER_DETAIL,
+        ))
+    }
+
+    /// The leader loop: take the latest pending capture, perform one
+    /// physical write under the per-path gate, then advance the watermark
+    /// or fail/poison.
+    ///
+    /// Must never take the provider state lock: a synchronous waiter may
+    /// hold it while this runs.
+    fn run_leader(&self, own_seq: u64, token: &mut LeaderToken) -> Result<(), ApiError> {
+        let mut own_error: Option<ApiError> = None;
+        loop {
+            let (seq, encoded, snapshot) = match self.leader_step() {
+                LeaderStep::Poisoned(reason) => {
+                    self.finish_poisoned(token);
+                    return Err(ApiError::new(ApiErrorCode::Internal, reason));
+                }
+                LeaderStep::Quiesce => {
+                    self.wake_all();
+                    token.disarm();
+                    return self.finish_leader(own_seq, own_error);
+                }
+                LeaderStep::Write {
+                    seq,
+                    encoded,
+                    snapshot,
+                } => (seq, encoded, snapshot),
+            };
+
+            #[cfg(test)]
+            self.physical_writes.fetch_add(1, Ordering::SeqCst);
+
+            let outcome = match self.write_pending(&encoded) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    token.disarm();
+                    return Err(error);
+                }
+            };
+            match outcome {
+                WriteOutcome::Saved => {
+                    self.mark_durable(seq, &snapshot);
+                    self.wake_all();
+                }
+                WriteOutcome::Failed(error) => {
+                    // The rename is the commit point. A readable durable
+                    // file that equals the attempted snapshot proves this
+                    // capture landed even though the save returned an
+                    // error (the `AfterRenameBeforeDirFsync` class).
+                    let landed =
+                        LvmState::load(&self.path).is_ok_and(|durable| durable == *snapshot);
+                    if landed {
+                        self.mark_durable(seq, &snapshot);
+                        // The leader caller still receives the original
+                        // save error, matching the single-save behavior.
+                        own_error.get_or_insert(error);
+                        self.wake_all();
+                        continue;
+                    }
+                    // Readable-but-different or unreadable: the capture
+                    // cannot be proven durable. Fail every outstanding
+                    // sequence, publish nothing, and require the next
+                    // admission to re-align. Never poison here: the
+                    // existing sync compensation tests classify these
+                    // strings per caller.
+                    self.fail_unproven(seq, &error);
+                    self.wake_all();
+                    token.disarm();
+                    return match own_error {
+                        Some(leader_error) => Err(leader_error),
+                        None => Err(error),
+                    };
+                }
+                WriteOutcome::Panicked(payload) => {
+                    self.fail_panicked(seq);
+                    self.wake_all();
+                    token.disarm();
+                    resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    /// Choose the leader's next step under one writer-lock critical
+    /// section.
+    ///
+    /// The no-pending-capture check and the leadership release must be atomic:
+    /// if they were separate, a reservation between them would observe
+    /// `leader_active == true`, enqueue itself as a waiter, and then wait
+    /// forever after this leader clears leadership and exits.
+    fn leader_step(&self) -> LeaderStep {
+        let mut state = self.lock_writer();
+        if let Some(reason) = state.poisoned.clone() {
+            return LeaderStep::Poisoned(reason);
+        }
+        let next = state.latest.as_ref().map(|(seq, capture)| {
+            (
+                *seq,
+                Arc::clone(&capture.encoded),
+                Arc::clone(&capture.snapshot),
+            )
+        });
+        if let Some((seq, encoded, snapshot)) = next {
+            LeaderStep::Write {
+                seq,
+                encoded,
+                snapshot,
+            }
+        } else {
+            // Test-only seam: run the probe while the writer mutex is
+            // held. A reservation attempted here must block until
+            // leadership is released atomically below; it can then
+            // only become the next leader, never a stranded waiter.
+            #[cfg(test)]
+            let hook = self
+                .handoff_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            state.leader_active = false;
+            LeaderStep::Quiesce
+        }
+    }
+
+    /// One physical write under the per-path gate. A poisoned gate is a
+    /// terminal writer poison; the caller returns the typed error.
+    fn write_pending(&self, encoded: &[u8]) -> Result<WriteOutcome, ApiError> {
+        if let Ok(gate) = self.gate.lock() {
+            let outcome = match catch_unwind(AssertUnwindSafe(|| {
+                LvmState::save_encoded_with_hooks(encoded, &self.path, Some(&self.crash))
+            })) {
+                Ok(Ok(())) => WriteOutcome::Saved,
+                Ok(Err(error)) => WriteOutcome::Failed(error),
+                Err(payload) => WriteOutcome::Panicked(payload),
+            };
+            // Drop the gate before touching writer bookkeeping or
+            // re-raising a panic; the gate is a leaf.
+            drop(gate);
+            Ok(outcome)
+        } else {
+            // A poisoned physical-write gate is itself a terminal writer
+            // poison: no save can be serialized safely.
+            self.poison(GATE_POISON_DETAIL);
+            Err(ApiError::new(ApiErrorCode::Internal, GATE_POISON_DETAIL))
+        }
+    }
+
+    /// Clear leadership and fail every pending sequence after the writer
+    /// was already poisoned.
+    fn finish_poisoned(&self, token: &mut LeaderToken) {
+        self.lock_writer().leader_active = false;
+        self.wake_all();
+        token.disarm();
+    }
+
+    /// Record an unproven physical-write failure: cover every outstanding
+    /// sequence through the permanent failure watermark, publish nothing,
+    /// and require admission alignment. Never poison.
+    fn fail_unproven(&self, seq: u64, error: &ApiError) {
+        let mut state = self.lock_writer();
+        let max_seq = state
+            .latest
+            .as_ref()
+            .map_or(seq, |(latest_seq, _)| *latest_seq)
+            .max(seq);
+        state.failed_through = state.failed_through.max(max_seq);
+        state.latest = None;
+        state.failure = Some((error.code, error.detail.clone()));
+        state.needs_alignment = true;
+        state.leader_active = false;
+    }
+
+    /// Record a leader panic: cover every outstanding sequence, poison the
+    /// writer, and require admission alignment before any restart.
+    fn fail_panicked(&self, seq: u64) {
+        let mut state = self.lock_writer();
+        let max_seq = state
+            .latest
+            .as_ref()
+            .map_or(seq, |(latest_seq, _)| *latest_seq)
+            .max(seq);
+        state.failed_through = state.failed_through.max(max_seq);
+        state.latest = None;
+        state.failure = Some((ApiErrorCode::Internal, WRITER_POISON_DETAIL.to_owned()));
+        state.poisoned = Some(WRITER_POISON_DETAIL.to_owned());
+        state.needs_alignment = true;
+        state.leader_active = false;
+    }
+
+    /// Commit a reservation from an async caller: the leader runs its
+    /// blocking write loop on `spawn_blocking`; a waiter awaits the
+    /// permanent watermarks via `Notify` without pinning a worker.
+    async fn commit_async(self: &Arc<Self>, reservation: Reservation) -> Result<(), ApiError> {
+        match reservation.role {
+            ReservationRole::Leader(mut token) => {
+                let core = Arc::clone(self);
+                let own_seq = reservation.seq;
+                let joined = tokio::task::spawn_blocking(move || {
+                    let result = core.run_leader(own_seq, &mut token);
+                    token.disarm();
+                    result
+                })
+                .await;
+                match joined {
+                    Ok(result) => result,
+                    Err(join_error) => {
+                        let detail = if join_error.is_panic() {
+                            "LVM provider durable writer leader panicked"
+                        } else {
+                            "LVM provider durable writer leader task was cancelled"
+                        };
+                        self.poison(detail);
+                        if join_error.is_panic() {
+                            // Keep the armed-kill payload in band for the
+                            // campaign rigs.
+                            resume_unwind(join_error.into_panic());
+                        }
+                        Err(ApiError::new(ApiErrorCode::Internal, detail))
+                    }
+                }
+            }
+            ReservationRole::Waiter => self.wait_async(reservation.seq).await,
+        }
+    }
+
+    /// The admission alignment check (read under the provider state lock).
+    fn needs_alignment(&self) -> bool {
+        self.lock_writer().needs_alignment
+    }
+
+    /// Whether admission must reload the durable file now: a failure is
+    /// pending and no capture is outstanding.
+    ///
+    /// Alignment must never happen while a capture is outstanding: that
+    /// capture's snapshot may be newer than the durable file, so loading
+    /// the file first would point in-memory state below a snapshot that is
+    /// about to be published. The caller holds the provider state lock, so
+    /// no new capture can be reserved between this read and the clear.
+    fn needs_idle_alignment(&self) -> bool {
+        let state = self.lock_writer();
+        state.needs_alignment && state.latest.is_none()
+    }
+
+    /// The current admission gate, read atomically under the writer mutex.
+    ///
+    /// The caller must hold the provider state lock: that guarantees no
+    /// new capture can be reserved while the returned decision is acted
+    /// on. `Ready` therefore cannot be invalidated by a later failure,
+    /// because a failure requires an outstanding capture and there is
+    /// none.
+    fn admission_gate(&self) -> AdmissionGate {
+        let state = self.lock_writer();
+        if let Some((seq, _)) = state.latest.as_ref() {
+            AdmissionGate::Wait(*seq)
+        } else if state.needs_alignment {
+            AdmissionGate::Align
+        } else {
+            AdmissionGate::Ready
+        }
+    }
+
+    /// Clear the alignment flag after `lock_state` has replaced the guard
+    /// with a readable durable file. No capture can be reserved between
+    /// the flag observation and this clear: `reserve` holds the same
+    /// mutex and refuses while the flag is set.
+    ///
+    /// The clear is refused while a capture is still outstanding: the
+    /// durable file that was just loaded may predate that capture, so the
+    /// next admission must wait for the capture and align again.
+    fn clear_needs_alignment(&self) {
+        let mut state = self.lock_writer();
+        if state.latest.is_none() {
+            state.needs_alignment = false;
+        }
+    }
+
+    /// Require the next admission to re-align in-memory state with the
+    /// durable file before accepting another capture. Used when a caller
+    /// may still hold an uncommitted mutation (a refused reservation or
+    /// an unproven leader result).
+    fn require_alignment(&self) {
+        self.lock_writer().needs_alignment = true;
+    }
+}
+
+/// A writer view of [`LvmState`].
+///
+/// On drop it publishes the resulting in-memory state as the new read
+/// snapshot if the guard was used mutably. This keeps the reader view
+/// exactly as consistent with in-memory state as the old design (where
+/// reads took the same mutex), without making reads wait for the writer's
+/// fsync.
+pub(crate) struct StateGuard<'a> {
+    guard: MutexGuard<'a, LvmState>,
+    writer: &'a Arc<WriterCore>,
+    dirty: bool,
+}
+
+impl Deref for StateGuard<'_> {
+    type Target = LvmState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
+        &mut self.guard
+    }
+}
+
+impl StateGuard<'_> {
+    /// Discard this guard's in-memory mutation after a failed durable
+    /// save and suppress publication on drop.
+    ///
+    /// A failed save must never be observable as committed: without
+    /// this, a subsequent read would report the mutation the caller
+    /// just saw fail (and a same-id retry could replay it from memory
+    /// instead of re-executing the durable write). Restoring the last
+    /// published snapshot keeps reads and the provider's idempotency
+    /// view aligned with what is actually durable.
+    ///
+    /// **Precondition: at most one successful durable save per guard.**
+    /// The published snapshot is updated on guard drop, not per save, so
+    /// reverting after a later failed save would also discard an earlier
+    /// successful save that is already durable. Every current caller
+    /// either performs one save or classifies the durable file explicitly;
+    /// a future multi-save caller must not use this method.
+    pub(crate) fn revert(&mut self) {
+        let committed = match self.writer.read_snapshot.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        *self.guard = (*committed).clone();
+        self.dirty = false;
+    }
+
+    /// Capture the current state and reserve a durable sequence without
+    /// publishing; the caller must drop this guard before it waits.
+    ///
+    /// Phase D D3 slice 2 (#62): attach/detach/report use this to capture
+    /// `(sequence, encoded bytes, snapshot)` **under** the state lock, so
+    /// reservation order equals mutation order, then drop the guard and
+    /// wait for durability without holding the provider state lock.
+    /// Publication is the writer's job after the physical write; dropping
+    /// this guard does not publish.
+    ///
+    /// On an encode or reservation error the guard restores the last
+    /// durable view, suppresses publication, and forces the next admission
+    /// to align to the durable file. That is what prevents an uncommitted
+    /// in-memory mutation (for example an attach the caller saw fail) from
+    /// being replayed as a phantom success by a same-id retry.
+    pub(crate) fn capture_and_reserve(&mut self) -> Result<Reservation, ApiError> {
+        let encoded = match self.guard.encode_for_save() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.revert();
+                self.writer.require_alignment();
+                return Err(error);
+            }
+        };
+        let snapshot = Arc::new(self.guard.clone());
+        let reserved = self.writer.reserve(Arc::from(encoded), snapshot);
+        if let Err(error) = reserved {
+            // A refused reservation (poison or a prior hard failure) must
+            // never leave this mutation where a later admission can see
+            // it. Restore the last published view and require admission
+            // alignment.
+            self.revert();
+            self.writer.require_alignment();
+            return Err(error);
+        }
+        // The writer publishes after durability; this guard must not.
+        self.dirty = false;
+        reserved
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        // A panicking writer may have left a half-applied mutation; the
+        // mutex poisons (every later writer fails), and readers keep the
+        // last good snapshot instead of observing torn state.
+        if !self.dirty || std::thread::panicking() {
+            return;
+        }
+        // Drop-publication is kept for lock-holding synchronous callers.
+        // It cannot regress a writer-published snapshot: while this guard
+        // holds the state lock no later capture can be reserved, so its
+        // in-memory state is at least as new as every in-flight capture
+        // the writer could publish. The async capture path uses
+        // `capture_and_reserve` plus an explicit drop, which clears `dirty`.
+        let published = Arc::new(self.guard.clone());
+        match self.writer.read_snapshot.write() {
+            Ok(mut current) => *current = published,
+            // A poisoned reader-view lock must not wedge every future
+            // read: recover the inner value (the snapshot holds no
+            // cross-field invariant that a panic could tear).
+            Err(poisoned) => *poisoned.into_inner() = published,
+        }
+    }
+}
+
+/// RAII marker for one live grow drive.
+///
+/// The drive releases the provider state lock across `lvextend`, so this
+/// marker is what prevents a second grow of the same volume from
+/// concurrently resuming that volume's durable intent. Removal on drop
+/// (including unwinding) is what makes the exclusion recoverable.
+struct GrowDriveGuard<'a> {
+    provider: &'a LvmProvider,
+    volume_id: VolumeId,
+}
+
+impl Drop for GrowDriveGuard<'_> {
+    fn drop(&mut self) {
+        let mut drives = self
+            .provider
+            .grow_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drives.remove(&self.volume_id);
+    }
+}
+
+/// Which structural drive currently holds a volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuralDriveKind {
+    Create,
+    Delete,
+}
+
+impl StructuralDriveKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// RAII marker for one live create or delete drive.
+///
+/// Both paths release the provider state lock across external LVM commands,
+/// so this marker prevents a concurrent structural mutation of the same
+/// volume from racing the durable intent or spending the same capacity.
+/// Removal on drop (including unwinding) is what makes the exclusion
+/// recoverable; the durable intent is the cross-restart fence.
+struct StructuralDriveGuard<'a> {
+    provider: &'a LvmProvider,
+    volume_id: VolumeId,
+}
+
+impl Drop for StructuralDriveGuard<'_> {
+    fn drop(&mut self) {
+        let mut drives = self
+            .provider
+            .volume_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drives.remove(&self.volume_id);
+    }
+}
+
+/// A pool choice and the `vgs` sample it was admitted against.
+struct PickedPool {
+    vg_name: String,
+    /// Free bytes the sample reported, before subtracting in-flight
+    /// capacity reservations.
+    sampled_free: u64,
+    /// Extent-rounded bytes this allocation needs.
+    demand: u64,
+}
+
+/// The outcome of running `lvcreate` without the provider state lock.
+enum CreateCommandOutcome {
+    /// The LV exists at or above the requested size; commit it.
+    Created { effective: u64 },
+    /// The command runner returned no exit status: the outcome is unknown.
+    Unknown(ApiError),
+    /// `lvcreate` reported a non-zero exit: a failed start to classify.
+    StartFailed(ApiError),
+    /// `lvcreate` succeeded but LVM's own report disagrees with the request.
+    VerifyFailed(ApiError),
+}
+
+/// One in-flight allocation reservation in a volume group.
+///
+/// Taken under the provider state lock immediately after the capacity
+/// admission that promised the bytes, and released when the allocation
+/// command returns (after which `vgs` reports the truth). Removal on drop
+/// covers every error and unwinding path.
+struct CapacityReservation<'a> {
+    provider: &'a LvmProvider,
+    vg_name: String,
+    bytes: u64,
+}
+
+impl Drop for CapacityReservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .provider
+            .capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let remove = match reserved.get_mut(&self.vg_name) {
+            Some(total) => {
+                *total = total.saturating_sub(self.bytes);
+                *total == 0
+            }
+            None => false,
+        };
+        if remove {
+            reserved.remove(&self.vg_name);
+        }
+    }
 }
 
 /// The phase-1 admission outcome for a move request.
@@ -363,6 +1523,18 @@ enum MoveAdmission {
     },
 }
 
+/// The result of a verified move completion attempt.
+enum MoveCompletion {
+    /// The completion was recorded (or already was): the response to
+    /// answer.
+    Completed(MoveVolumeBackingResponse),
+    /// A live grow holds the volume's durable recovery anchor, so
+    /// recording the completion now would void it. The error detail
+    /// names the in-flight grow; the reconcile pass records the
+    /// deferral and classifies the remaining records.
+    Deferred(ApiError),
+}
+
 /// What a pending grow intent says about this grow request.
 enum GrowResume {
     /// No pending intent: a fresh grow must persist one.
@@ -373,6 +1545,23 @@ enum GrowResume {
     /// The grow already landed: the record was finalized from the
     /// observed effective size and the response reports it.
     Finalized(u64),
+}
+
+/// The result of one `lvextend` invocation, kept distinct so the caller
+/// can classify a known start failure (clear the intent) from an unknown
+/// outcome (keep it for recovery) after the provider state lock has been
+/// released for the command.
+enum LvextendOutcome {
+    /// The command reported success; the size is verified separately.
+    Extended,
+    /// A non-zero exit status from `lvextend`. Whether the command
+    /// resized the LV is **not** assumed here: `settle_failed_lvextend`
+    /// re-verifies the observed size before clearing the intent, so an
+    /// exit status alone never proves the LV did not move.
+    StartFailed(ApiError),
+    /// The command runner returned an error with no exit status: the
+    /// command may have reached LVM, so the outcome is unknown.
+    Unknown(ApiError),
 }
 
 impl LvmProvider {
@@ -395,18 +1584,38 @@ impl LvmProvider {
         vg_prefix: String,
         expected_auth_token: String,
     ) -> Result<Self, ApiError> {
+        // Remove temps a crashed previous incarnation left in this state
+        // path's namespace before loading or writing. This runs before the
+        // writer can allocate a name, so a recycled pid cannot collide with
+        // a stale file; other files in the directory are never touched.
+        crate::state::sweep_stale_temps(&state_path);
         let state = LvmState::load(&state_path)?;
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
         let provider = Self {
             runner,
             state_path,
             sysfs_root,
             vg_prefix,
             expected_auth_token,
-            store_crash: Arc::new(StoreCrashHooks::new()),
+            store_crash,
+            writer,
             move_timing: MoveTiming::default(),
             move_observe_failures: Mutex::new(BTreeMap::new()),
+            grow_drives: Mutex::new(BTreeSet::new()),
+            volume_drives: Mutex::new(BTreeMap::new()),
+            capacity_reservations: Mutex::new(BTreeMap::new()),
+            capacity_epoch: AtomicU64::new(0),
             state: Mutex::new(state),
+            read_snapshot,
         };
+        // Startup reconciliation persists its result through the writer
+        // guard, which publishes the post-reconcile reader view on drop.
         provider.reconcile()?;
         Ok(provider)
     }
@@ -428,12 +1637,67 @@ impl LvmProvider {
         &self.store_crash
     }
 
-    /// Persist the in-memory state through the crash-hooked atomic
-    /// save (every internal mutation — volume, move and admin claim —
-    /// routes through here, so the armed seam sees every commit
-    /// boundary of the state file).
+    /// Persist the in-memory state through the coalescing durable writer.
+    ///
+    /// Every production mutation — volume, move, admin claim/release and
+    /// every compensation path — routes through here, so the armed crash
+    /// seam sees every commit boundary of the state file and no class
+    /// keeps a second direct-file path (Phase D D3 slices 1–2, #62).
+    ///
+    /// The caller holds the provider state lock, so capture and sequence
+    /// reservation happen under it (capture order equals sequence order).
+    /// If another caller already leads, this call waits on the permanent
+    /// watermarks while still holding the lock; the leader never takes that
+    /// lock, so the wait cannot deadlock.
     pub(crate) fn persist(&self, state: &mut LvmState) -> Result<(), ApiError> {
-        state.save_with_hooks(&self.state_path, Some(&self.store_crash))
+        let encoded = state.encode_for_save()?;
+        let snapshot = Arc::new(state.clone());
+        let reservation = self.writer.reserve(Arc::from(encoded), snapshot)?;
+        match reservation.role {
+            ReservationRole::Leader(mut token) => {
+                self.writer.run_leader(reservation.seq, &mut token)
+            }
+            ReservationRole::Waiter => self.writer.wait_sync(reservation.seq),
+        }
+    }
+
+    /// Reconcile in-memory state after its durable save returned an error,
+    /// keeping the per-caller classification slice 1 had.
+    ///
+    /// A readable durable file that equals `state` means the mutation is
+    /// durable and memory is already aligned. Otherwise state returns to
+    /// the last published snapshot (today's behavior), never to an
+    /// arbitrary readable file: the caller still classifies its own save
+    /// error. The writer's `needs_alignment` flag clears only when the
+    /// resulting state is aligned to a readable durable file; an unreadable
+    /// file leaves it set so admission retries (fail-closed), and an
+    /// unaligned readable file leaves it set for the next `lock_state`.
+    ///
+    /// **Precondition: at most one successful durable save per guard.**
+    /// The published snapshot is updated on guard drop, not per save, so
+    /// reverting after a later failed save would also discard an earlier
+    /// successful save that is already durable. Every current caller either
+    /// performs one save or classifies the durable file explicitly; a
+    /// future multi-save caller must not use this method.
+    pub(crate) fn reconcile_failed_save(&self, state: &mut StateGuard<'_>) {
+        match LvmState::load(&self.state_path) {
+            Ok(durable) => {
+                if durable != **state {
+                    // Restore the last published view and suppress this
+                    // guard's publication, so a later leader snapshot is
+                    // never regressed. Callers still classify the error.
+                    state.revert();
+                }
+                if durable == **state {
+                    self.writer.clear_needs_alignment();
+                }
+            }
+            Err(_) => {
+                // Keep the existing per-caller classification: an
+                // unreadable re-read reverts and does not clear alignment.
+                state.revert();
+            }
+        }
     }
 
     /// Count one more consecutive world-observe failure for a move
@@ -458,14 +1722,119 @@ impl LvmProvider {
         }
     }
 
-    /// Lock the in-memory state, mapping poisoning to `INTERNAL`.
-    pub(crate) fn lock_state(&self) -> Result<MutexGuard<'_, LvmState>, ApiError> {
-        self.state.lock().map_err(|_| {
+    /// Lock the writer state, mapping poisoning to `INTERNAL`, and align
+    /// in-memory state with the durable file when a writer failure left
+    /// `needs_alignment` set and no capture is outstanding.
+    ///
+    /// This is the alignment point (Phase D D3 slice 2, #62). The durable
+    /// file is loaded under the provider state lock; a successful load
+    /// replaces the guard and clears the flag. An unreadable file returns a
+    /// typed `INTERNAL` and leaves the flag set, so later admissions retry
+    /// instead of serving state that may not match disk.
+    ///
+    /// Alignment is deliberately skipped while a capture is outstanding:
+    /// that capture's snapshot may be newer than the durable file. Callers
+    /// must consult [`WriterCore::admission_gate`] before deriving an
+    /// answer from the returned state; [`Self::lock_state_stable`] does
+    /// that for the synchronous callers, and the async
+    /// attach/detach/report admissions wait without holding this lock.
+    pub(crate) fn lock_state(&self) -> Result<StateGuard<'_>, ApiError> {
+        let mut guard = self.state.lock().map_err(|_| {
             ApiError::new(
                 ApiErrorCode::Internal,
                 "LVM provider state lock poisoned by a previous failure",
             )
+        })?;
+        if self.writer.needs_idle_alignment() {
+            let durable = LvmState::load(&self.state_path).map_err(|error| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "LVM provider requires admission alignment but the durable state \
+                         could not be read: {}",
+                        error.detail
+                    ),
+                )
+            })?;
+            *guard = durable;
+            self.writer.clear_needs_alignment();
+        }
+        Ok(StateGuard {
+            guard,
+            writer: &self.writer,
+            dirty: false,
         })
+    }
+
+    /// Admission for synchronous callers: hold the provider state lock and
+    /// wait for every outstanding capture before returning a view that a
+    /// decision may rely on.
+    ///
+    /// The wait is synchronous, but it cannot deadlock: the leader never
+    /// takes the provider state lock, and holding that lock prevents any
+    /// new capture from being reserved, so the sequence being waited for
+    /// is already in flight. A covering failure resolves the wait, then
+    /// the loop re-enters [`Self::lock_state`] so the failure's durable
+    /// alignment replaces the uncommitted view before the caller decides
+    /// anything.
+    pub(crate) fn lock_state_stable(&self) -> Result<StateGuard<'_>, ApiError> {
+        loop {
+            let guard = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => return Ok(guard),
+                AdmissionGate::Align => {
+                    // `needs_alignment` was set after `lock_state` read
+                    // it; re-enter so the durable file is reloaded.
+                    drop(guard);
+                }
+                AdmissionGate::Wait(seq) => {
+                    // Resolve the covering capture, then re-enter and
+                    // check for a newer one (there cannot be one while
+                    // this guard holds the state lock, but the failure
+                    // path also needs the re-entry to align).
+                    let _ = self.writer.wait_sync(seq);
+                    drop(guard);
+                }
+            }
+        }
+    }
+
+    /// Lock the writer state without the admission-alignment load.
+    ///
+    /// The failed-create compensation has already classified the durable
+    /// file explicitly; when that file is unreadable it leaves
+    /// `needs_alignment` set, so [`Self::lock_state_stable`] refuses to hand
+    /// back a view. The compensation still needs to attempt its clear save
+    /// and classify that attempt's outcome (the existing fail-closed
+    /// direction), so this raw guard bypasses only the alignment load. A
+    /// poisoned mutex still fails here.
+    fn lock_state_compensation(&self) -> Result<StateGuard<'_>, ApiError> {
+        let guard = self.state.lock().map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "LVM provider state lock poisoned by a previous failure",
+            )
+        })?;
+        Ok(StateGuard {
+            guard,
+            writer: &self.writer,
+            dirty: false,
+        })
+    }
+
+    /// The committed read view (issue #62).
+    ///
+    /// Clones the published `Arc` under a short read lock; the caller
+    /// then reads without any provider-state lock, so a concurrent
+    /// mutation's whole-file fsync or LVM CLI call cannot block it.
+    /// Publication happens after the writer proves a capture durable (or
+    /// when a lock-holding synchronous guard drops, preserving the
+    /// pre-#62 read behavior).
+    pub(crate) fn state_snapshot(&self) -> Arc<LvmState> {
+        match self.read_snapshot.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
     }
 
     /// The attachment enumeration the daemon's grow-notification
@@ -481,7 +1850,7 @@ impl LvmProvider {
     pub fn grow_attachment_facts(
         &self,
     ) -> Result<BTreeMap<VolumeId, volvisor_provider::AttachmentForGrow>, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         Ok(state
             .volumes()
             .iter()
@@ -664,9 +2033,10 @@ impl LvmProvider {
     /// failed), the volume is never erased from memory while its LV
     /// remains: the durable record is restored and the volume is served.
     /// Neither failure ever masks the original save error.
+    #[allow(clippy::too_many_lines)] // one compensation/durable-classification narrative
     fn compensate_unpersisted_create(
         &self,
-        state: &mut LvmState,
+        mut state: StateGuard<'_>,
         volume_id: &VolumeId,
         vg_name: &str,
         lv_name: &str,
@@ -679,11 +2049,59 @@ impl LvmProvider {
             return Self::create_already_durable_error(volume_id, vg_name, lv_name, save_error);
         }
 
+        // The failed final save may have left the writer requiring
+        // admission alignment. This caller's compensation is the next
+        // save in the same critical section, so reconcile here (never
+        // inside `persist`): adopt a landed save, otherwise revert, and
+        // leave the flag set when the durable file is unreadable.
+        if self.writer.needs_alignment() {
+            self.reconcile_failed_save(&mut state);
+        }
+        // Roll the uncommitted in-memory edit (volume inserted, intent
+        // removed) back to the last published durable view before the guard
+        // is released: a failed save must never become visible as a phantom
+        // volume when the guard drops. The intent is removed from memory
+        // only after the compensating removal below, then cleared durably.
+        state.revert();
+
+        // The compensating `lvremove` is an external CLI call, so run it
+        // without the provider state lock; the durable-file classification
+        // above stays under the lock, and the in-memory rollback plus clear
+        // save below reacquire it. Phase F F2c (#62).
+        drop(state);
         let removed = self
             .runner
             .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])
             .is_ok_and(|output| output.success);
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            // The durable-file classification above already ran. When that
+            // file is unreadable, alignment cannot load it and
+            // `lock_state_stable` refuses; fall back to the raw guard so the
+            // clear save is still attempted and its failure is classified
+            // by the existing re-read (never a silent success). A poisoned
+            // mutex fails here too and is reported below.
+            Err(_align_error) => match self.lock_state_compensation() {
+                Ok(state) => state,
+                Err(lock_error) => {
+                    // The removal already ran (or its outcome is unknown) and
+                    // the create intent could not be cleared. Never mask the
+                    // original save error: report both and leave the durable
+                    // intent for recovery to classify.
+                    return Self::compensation_relock_error(
+                        save_error,
+                        vg_name,
+                        lv_name,
+                        removed,
+                        &lock_error,
+                    );
+                }
+            },
+        };
         state.remove_volume(volume_id);
+        // Reconciliation may have restored the durable intent; the clear
+        // save below is what removes it durably.
+        state.remove_create_intent(volume_id);
         let mut detail = save_error.detail.clone();
         if !removed {
             detail.push_str(
@@ -702,7 +2120,7 @@ impl LvmProvider {
         // outlives the compensation. Classify the clear's own failure:
         // the rename may have landed, in which case the durable intent
         // is gone and the compensation is complete.
-        if let Err(clear_error) = self.persist(state) {
+        if let Err(clear_error) = self.persist(&mut state) {
             // If the durable file may still hold the create intent, put
             // it back in memory: a later successful save from this
             // provider must not erase an authorization startup
@@ -800,6 +2218,36 @@ impl LvmProvider {
         ApiError::new(save_error.code, detail)
     }
 
+    /// Report a compensation whose durable-file classification completed but
+    /// whose state lock could not be reacquired after the compensating
+    /// `lvremove`.
+    ///
+    /// The original save error is never masked: its code and detail lead, and
+    /// the removal outcome plus the re-lock failure are appended so recovery
+    /// can classify the durable intent.
+    fn compensation_relock_error(
+        save_error: &ApiError,
+        vg_name: &str,
+        lv_name: &str,
+        removed: bool,
+        lock_error: &ApiError,
+    ) -> ApiError {
+        let mut detail = save_error.detail.clone();
+        detail.push_str("; the compensating lvremove ");
+        detail.push_str(if removed {
+            "removed the LV"
+        } else {
+            "could not remove the LV"
+        });
+        detail.push_str(
+            ", but the provider state lock could not be reacquired to clear the create intent (",
+        );
+        detail.push_str(&lock_error.to_string());
+        detail.push_str("): ");
+        Self::push_create_recovery_note(&mut detail, vg_name, lv_name, removed);
+        ApiError::new(save_error.code, detail)
+    }
+
     /// The carve-out's already-durable answer: the final save's rename
     /// landed, so the durable file (and the LV) agree the volume exists.
     fn create_already_durable_error(
@@ -870,7 +2318,193 @@ impl LvmProvider {
         Ok(())
     }
 
-    /// Run the destructive delete steps for one LV: the
+    /// Refuse a structural mutation of a volume whose durable grow intent
+    /// is still in flight.
+    ///
+    /// A grow releases the provider state lock across `lvextend` (so the
+    /// long LVM resize no longer stalls every other volume). The durable
+    /// intent is the anchor that startup recovery uses to roll the grow
+    /// forward, and it records the generation the grow was authorized
+    /// against. Allowing an attach, detach, move start or delete to change
+    /// that generation (or remove the LV) while the resize is in flight
+    /// would make a crash between `lvextend` and the final commit look
+    /// like a stale authorization, so those mutations are refused until
+    /// the grow resolves. A report is *not* refused: it only advances the
+    /// attachment record and never moves the volume generation.
+    fn ensure_no_pending_grow(state: &LvmState, volume_id: &VolumeId) -> Result<(), ApiError> {
+        Self::pending_grow_error(state, volume_id).map_or(Ok(()), Err)
+    }
+
+    /// The typed refusal for a live simultaneous grow, if one exists.
+    ///
+    /// Split from [`Self::ensure_no_pending_grow`] so the move
+    /// completion can *defer* to a grow (recording the refusal in the
+    /// reconcile report) instead of aborting the whole pass.
+    fn pending_grow_error(state: &LvmState, volume_id: &VolumeId) -> Option<ApiError> {
+        state.grow_intent(volume_id).map(|intent| {
+            ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} has a durable grow in progress (operation {}, \
+                     generation {}); retry after that grow completes or resolves",
+                    intent.operation_id, intent.expected_generation
+                ),
+            )
+        })
+    }
+
+    /// Refuse a grow while an online move leaves the volume's placement
+    /// unsettled.
+    ///
+    /// A completed move bumps the volume generation. A grow that ran
+    /// across that completion would hold a durable intent whose recorded
+    /// generation no longer matches a crash-time recovery read, so the
+    /// two structural operations are mutually excluded.
+    fn ensure_no_unsettled_move(state: &LvmState, volume_id: &VolumeId) -> Result<(), ApiError> {
+        if let Some(record) = state.move_record(volume_id) {
+            if Self::move_blocks_delete(record) {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "volume {volume_id} has an unsettled online move in state {:?}; \
+                         resolve the move before growing the volume",
+                        record.state
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enter one live grow drive for `volume_id`, refusing a second one.
+    ///
+    /// The guard is removed on drop, so a completed, failed or unwound
+    /// drive never leaves the volume permanently un-growable. The durable
+    /// intent (not this set) is what survives a process restart.
+    fn begin_grow_drive(&self, volume_id: &VolumeId) -> Result<GrowDriveGuard<'_>, ApiError> {
+        let mut drives = self
+            .grow_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !drives.insert(volume_id.clone()) {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} already has a grow in progress; retry after it \
+                     completes or resolves"
+                ),
+            ));
+        }
+        drop(drives);
+        Ok(GrowDriveGuard {
+            provider: self,
+            volume_id: volume_id.clone(),
+        })
+    }
+
+    /// Enter one live create or delete drive for `volume_id`, refusing a
+    /// concurrent structural mutation of the same volume.
+    ///
+    /// Both paths release the provider state lock across external LVM
+    /// commands. A second create/delete must not run that body against the
+    /// same volume, so it is refused typed rather than queued. The guard is
+    /// removed on drop, and the durable intent remains the crash-recovery
+    /// fence.
+    fn begin_structural_drive(
+        &self,
+        volume_id: &VolumeId,
+        kind: StructuralDriveKind,
+    ) -> Result<StructuralDriveGuard<'_>, ApiError> {
+        let mut drives = self
+            .volume_drives
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = drives.get(volume_id) {
+            let existing = existing.as_str();
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "volume {volume_id} already has a {existing} in progress; retry after it \
+                     completes or resolves"
+                ),
+            ));
+        }
+        drives.insert(volume_id.clone(), kind);
+        drop(drives);
+        Ok(StructuralDriveGuard {
+            provider: self,
+            volume_id: volume_id.clone(),
+        })
+    }
+
+    /// Read the allocation epoch.
+    ///
+    /// This is a protocol counter, not a lock: readers compare it before
+    /// and after a `vgs` sample and again after inserting their
+    /// reservation. Bumps are release-ordered with the allocation they
+    /// record; a grow needs the sample and the reservation insertion to
+    /// observe the same epoch.
+    fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that an allocation completed and may have reduced free
+    /// space. A create and a grow both call this under the state lock when
+    /// the command returns, before releasing their reservation.
+    fn note_capacity_change(&self) {
+        self.capacity_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Bytes currently promised to in-flight structural allocations in
+    /// `vg_name`.
+    fn reserved_capacity(&self, vg_name: &str) -> u64 {
+        self.capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(vg_name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Atomically check and promise `demand` bytes of `vg_name`'s free
+    /// space, given a `vgs` sample.
+    ///
+    /// The check and the insertion happen under the reservation leaf lock,
+    /// so concurrent allocations cannot both spend the same sampled free
+    /// bytes (grow admission samples without the state lock, so grow-grow
+    /// and grow-create exclusion rests on this leaf during the sample
+    /// window).
+    /// Returns the bytes already reserved for the VG on refusal so the
+    /// typed refusal can report the honest accounting.
+    ///
+    /// Called under the provider state lock. Both create and grow subtract
+    /// these reservations while the other command runs, so the freed-lock
+    /// window cannot spend the same extents twice.
+    fn try_reserve_capacity(
+        &self,
+        vg_name: &str,
+        sampled_free: u64,
+        demand: u64,
+    ) -> Result<CapacityReservation<'_>, (u64, u64)> {
+        let mut reserved = self
+            .capacity_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let already = reserved.get(vg_name).copied().unwrap_or_default();
+        let free = sampled_free.saturating_sub(already);
+        if demand.saturating_add(VG_HEADROOM_BYTES) > free {
+            return Err((free, already));
+        }
+        let total = reserved.entry(vg_name.to_owned()).or_insert(0);
+        *total = total.saturating_add(demand);
+        drop(reserved);
+        Ok(CapacityReservation {
+            provider: self,
+            vg_name: vg_name.to_owned(),
+            bytes: demand,
+        })
+    }
+
     /// `ZeroDiscard` `blkdiscard` first (never followed by `lvremove`
     /// when it fails — the caller asked for erased data and must learn
     /// the truth), then the checked `lvremove`. Shared by the live
@@ -920,7 +2554,7 @@ impl LvmProvider {
             runtime: VolumeRuntime {
                 state: VolumeLifecycle::Ready,
                 attachment: None,
-                retired_attachment_ids: Vec::new(),
+                retired_attachments: RetiredAttachmentFilter::default(),
             },
         }
     }
@@ -1093,16 +2727,37 @@ impl LvmProvider {
     /// Pick the first claimed native-pool volume group with enough free
     /// space for the **extent-rounded** demand (headroom included);
     /// `NO_SAFE_CAPACITY` when none qualifies.
-    fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<String, ApiError> {
-        let capacity_map = self.vg_capacity_map()?;
+    /// Choose the pool for a create from a capacity sample already taken
+    /// outside the state lock.
+    ///
+    /// `capacity_map` is a `vgs` sample that the caller took while the state
+    /// lock was released; it is validated against the allocation epoch there
+    /// and again when the reservation is inserted. Selection uses the state
+    /// under the lock, so a device claimed or released during the sample is
+    /// still classified against the current registry.
+    fn pick_pool_vg(
+        &self,
+        state: &LvmState,
+        size_bytes: u64,
+        capacity_map: &BTreeMap<String, VgCapacity>,
+    ) -> Result<PickedPool, ApiError> {
         for entry in state.devices().values() {
             if entry.role != volvisor_types::DeviceRole::NativePool {
                 continue;
             }
             if let Some(capacity) = capacity_map.get(&entry.vg_name) {
                 let demand = extent_rounded(size_bytes, capacity.extent_bytes);
-                if demand.saturating_add(VG_HEADROOM_BYTES) <= capacity.free_bytes {
-                    return Ok(entry.vg_name.clone());
+                // A grow (or another create) that released the state lock
+                // promised these bytes to itself; do not spend them again.
+                let free = capacity
+                    .free_bytes
+                    .saturating_sub(self.reserved_capacity(&entry.vg_name));
+                if demand.saturating_add(VG_HEADROOM_BYTES) <= free {
+                    return Ok(PickedPool {
+                        vg_name: entry.vg_name.clone(),
+                        sampled_free: capacity.free_bytes,
+                        demand,
+                    });
                 }
             }
         }
@@ -1170,7 +2825,7 @@ impl LvmProvider {
             Ok(rows) => Some(rows.into_iter().filter_map(|row| row.vg_name).collect()),
             Err(_) => None,
         };
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let mut changed = false;
 
         changed |= Self::apply_create_intents(&mut state, &present, &lv_sizes)?;
@@ -1198,7 +2853,10 @@ impl LvmProvider {
             }
         }
         if changed {
-            self.persist(&mut state)?;
+            if let Err(error) = self.persist(&mut state) {
+                self.reconcile_failed_save(&mut state);
+                return Err(error);
+            }
         }
         drop(state);
         // Move records (P6-C): classify every record against the
@@ -1492,31 +3150,49 @@ impl LvmProvider {
 
     /// Resume a matching pending create intent.
     ///
-    /// Returns `Some(response)` when the intent-owned LV was verified
-    /// and adopted (or `Err` when that adoption could not be made
-    /// durable). Returns `None` when there is no matching intent or
-    /// the intent's LV is verifiably absent (the intent is cleared in
-    /// memory so a fresh create can proceed). A different payload or
-    /// requested size is a typed idempotency conflict; a present LV
-    /// smaller than the request is never adopted.
+    /// The caller observed `intent` under the provider state lock and then
+    /// dropped the guard: the size check is an `lvs` command and must not
+    /// run under the state lock. Returns `Some(response)` when the
+    /// intent-owned LV was verified and adopted (or `Err` when that
+    /// adoption could not be made durable). Returns `None` when the intent's
+    /// LV is verifiably absent (the intent is cleared in memory so a fresh
+    /// create can proceed). A different payload or requested size is a typed
+    /// idempotency conflict; a present LV smaller than the request is never
+    /// adopted, and a state view that no longer holds the same intent fails
+    /// closed.
     fn resume_create_intent(
         &self,
-        state: &mut LvmState,
         req: &CreateVolumeRequest,
         payload: &str,
+        intent: &CreateIntent,
     ) -> Result<Option<InspectVolumeResponse>, ApiError> {
-        let Some(intent) = state.create_intent(&req.volume_id).cloned() else {
-            return Ok(None);
-        };
         if intent.creation_payload != payload || intent.requested_size_bytes != req.size_bytes {
             return Err(ApiError::idempotency_conflict(&req.volume_id));
         }
-        match self.lv_size(&intent.vg_name, &intent.lv_name)? {
+        // Observe the intent-owned LV without the provider state lock.
+        let observed = self.lv_size(&intent.vg_name, &intent.lv_name)?;
+        let mut state = self.lock_state_stable()?;
+        // The create/delete drive guard excludes another structural mutation
+        // of this volume while the observation ran, so the intent must still
+        // be the one this call observed. Refuse to adopt under a different
+        // authorization (an aligned/reloaded state view is the only way this
+        // can move).
+        if state.create_intent(&req.volume_id) != Some(intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable create intent for volume {} changed while its LV was being \
+                     verified; refusing to adopt a volume under a mismatched intent",
+                    req.volume_id
+                ),
+            ));
+        }
+        match observed {
             Some(observed) if observed >= intent.requested_size_bytes => {
-                let stored = Self::stored_volume_from_create_intent(&intent, observed);
+                let stored = Self::stored_volume_from_create_intent(intent, observed);
                 state.remove_create_intent(&req.volume_id);
                 state.insert_volume(req.volume_id.clone(), stored.clone());
-                if let Err(save_error) = self.persist(state) {
+                if let Err(save_error) = self.persist(&mut state) {
                     // The adoption's save failed. If its rename landed
                     // (the post-rename carve-out), the durable record
                     // already holds the volume: keep the in-memory
@@ -1564,75 +3240,25 @@ impl LvmProvider {
             }
             None => {
                 // The prior attempt never created the LV: clear the
-                // stale intent in memory and create fresh.
+                // stale intent in memory and let the caller create fresh.
                 state.remove_create_intent(&req.volume_id);
                 Ok(None)
             }
         }
     }
 
-    /// Persist the create intent and run the allocating command.
+    /// Run `lvcreate` and verify the observed geometry without the provider
+    /// state lock.
     ///
-    /// Durable-first: the intent is saved before `lvcreate`, so a kill-9
-    /// after the CLI created the LV leaves an intent startup recovery
-    /// can verify and adopt. A failed intent save creates no LV; a
-    /// failed start or size verification leaves/clears the intent
-    /// exactly as the create contract documents. Returns the chosen
-    /// VG/LV names, the block size and the verified effective size.
-    fn create_lv_with_intent(
+    /// The caller writes the durable create intent before this call; it is
+    /// the recovery anchor for the gap. The caller releases the create's
+    /// capacity reservation as soon as this returns.
+    fn run_create_lv(
         &self,
-        state: &mut LvmState,
         req: &CreateVolumeRequest,
-        payload: &str,
-    ) -> Result<(String, String, u32, u64), ApiError> {
-        let vg_name = self.pick_pool_vg(state, req.size_bytes)?;
-        let lv_name = lv_name_for(&req.volume_id);
-        let block_size = req.logical_block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
-        let intent = CreateIntent {
-            vg_name: vg_name.clone(),
-            lv_name: lv_name.clone(),
-            requested_size_bytes: req.size_bytes,
-            project_id: req.project_id.clone(),
-            block_size,
-            creation_payload: payload.to_owned(),
-        };
-        state.insert_create_intent(req.volume_id.clone(), intent.clone());
-        if let Err(save_error) = self.persist(state) {
-            state.remove_create_intent(&req.volume_id);
-            // Classify the failed save in three ways: the rename may
-            // have landed (the post-rename carve-out), it may provably
-            // not have landed, or the re-read may itself fail. Never
-            // report a clean "not saved" (or drop the possibly-durable
-            // intent from memory) when the durable file could not be
-            // read. No LV was created on any path; startup observes no
-            // intent-owned LV and drops the intent.
-            let note = match LvmState::load(&self.state_path) {
-                Ok(durable) if durable.create_intent(&req.volume_id).is_some() => format!(
-                    "the durable state did record the create intent for volume {}, but no LV \
-                     was created; startup recovery observes no intent-owned LV and drops it",
-                    req.volume_id
-                ),
-                Ok(_) => format!(
-                    "the create intent for volume {} could not be made durable, so no LV was \
-                     created",
-                    req.volume_id
-                ),
-                Err(load_error) => {
-                    state.insert_create_intent(req.volume_id.clone(), intent);
-                    format!(
-                        "the create intent for volume {} could not be verified after the \
-                         failed save ({load_error}); treat it as possibly durable — no LV was \
-                         created, and startup recovery observes no intent-owned LV and drops it",
-                        req.volume_id
-                    )
-                }
-            };
-            return Err(ApiError::new(
-                save_error.code,
-                format!("{}; {note}", save_error.detail),
-            ));
-        }
-
+        intent: &CreateIntent,
+    ) -> CreateCommandOutcome {
+        let (vg_name, lv_name) = (intent.vg_name.as_str(), intent.lv_name.as_str());
         let output = match self.runner.run(
             "lvcreate",
             &[
@@ -1640,8 +3266,8 @@ impl LvmProvider {
                 "-L",
                 &format!("{}B", req.size_bytes),
                 "-n",
-                &lv_name,
-                &vg_name,
+                lv_name,
+                vg_name,
             ],
         ) {
             Ok(output) => output,
@@ -1652,7 +3278,7 @@ impl LvmProvider {
                 // reached LVM. Keep the durable intent — never clear it
                 // on an unknown outcome — and let startup recovery
                 // classify the observed LV.
-                return Err(ApiError::new(
+                return CreateCommandOutcome::Unknown(ApiError::new(
                     error.code,
                     format!(
                         "{}; the lvcreate outcome is unknown (the command runner returned an \
@@ -1666,35 +3292,147 @@ impl LvmProvider {
             }
         };
         if !output.success {
-            return Err(self.clear_create_intent_after_failed_start(
-                state,
-                &req.volume_id,
-                command_failed("lvcreate", &output),
-            ));
+            return CreateCommandOutcome::StartFailed(command_failed("lvcreate", &output));
         }
         // Verify against LVM's own report: a successful exit status is
         // not evidence of the requested geometry. Thick LVM rounds the
         // size up to whole physical extents, so anything at or above
         // the request is a success — the effective size is what gets
         // persisted and reported.
-        match self.verify_created_size(&vg_name, &lv_name, req.size_bytes) {
-            Ok(effective) => Ok((vg_name, lv_name, block_size, effective)),
+        match self.verify_created_size(vg_name, lv_name, req.size_bytes) {
+            Ok(effective) => CreateCommandOutcome::Created { effective },
+            Err(error) => CreateCommandOutcome::VerifyFailed(ApiError::new(
+                error.code,
+                format!(
+                    "{}; the durable create intent remains, and startup recovery will \
+                     adopt the LV only if it is present and at least the requested size, \
+                     drop the intent if the LV is absent, and refuse startup if the LV \
+                     is present but smaller",
+                    error.detail
+                ),
+            )),
+        }
+    }
+
+    /// Publish a completed create allocation and release its capacity
+    /// reservation.
+    ///
+    /// `vgs` now reports the real free space, so the in-flight promise can
+    /// be released on every outcome. The allocation epoch is bumped *before*
+    /// the reservation is dropped (the same ordering as grow): a grow that
+    /// sampled before this allocation must either see the bump and re-sample,
+    /// or have observed this reservation in its accounting. Dropping first
+    /// would let a stale sample reserve the freed bytes twice. The state lock
+    /// is taken only for the atomic bump and the leaf-lock removal, never
+    /// across an LVM command.
+    fn publish_created_allocation(&self, reservation: CapacityReservation<'_>) {
+        match self.lock_state_stable() {
+            Ok(_state) => {
+                self.note_capacity_change();
+                drop(reservation);
+            }
             Err(error) => {
-                // The durable intent stays: startup recovery adopts the
-                // LV only if it is present and at least the requested
-                // size, so a partially-created LV cannot leak unowned.
-                Err(ApiError::new(
-                    error.code,
-                    format!(
-                        "{}; the durable create intent remains, and startup recovery will \
-                         adopt the LV only if it is present and at least the requested size, \
-                         drop the intent if the LV is absent, and refuse startup if the LV \
-                         is present but smaller",
-                        error.detail
-                    ),
-                ))
+                // `lock_state_stable` fails only on a poisoned state mutex
+                // or an unreadable alignment load. The allocation has
+                // already happened and `vgs` reports its real free space,
+                // so the epoch must still be bumped and the reservation
+                // released. Log it rather than swallowing the error,
+                // because the invariant "publish under the state lock" did
+                // not hold.
+                tracing::warn!(
+                    error = %error,
+                    "create publish could not take the provider state lock; capacity epoch \
+                     bumped and reservation released without the state guard"
+                );
+                self.note_capacity_change();
+                drop(reservation);
             }
         }
+    }
+
+    /// Clear a create intent after a known-failed start, reacquiring the
+    /// provider state lock only for the state change and its durable save.
+    fn clear_create_intent_drive(&self, volume_id: &VolumeId, error: ApiError) -> ApiError {
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            Err(lock_error) => {
+                let code = error.code;
+                return ApiError::new(
+                    code,
+                    format!(
+                        "{}; the create intent could not be cleared because the provider state \
+                         could not be re-read ({lock_error}); the durable intent remains, and \
+                         startup recovery will adopt the LV only if it is present and at least \
+                         the requested size, drop the intent if the LV is absent, and refuse \
+                         startup if the LV is present but smaller",
+                        error.detail
+                    ),
+                );
+            }
+        };
+        self.clear_create_intent_after_failed_start(&mut state, volume_id, error)
+    }
+
+    /// Commit a verified create under a fresh provider state lock.
+    ///
+    /// The command ran without the lock. Reacquire and revalidate that the
+    /// durable intent is still the one this create was authorized under, then
+    /// insert the record, drop the intent and save once. A failed final save
+    /// runs the existing compensation, whose compensating `lvremove` now runs
+    /// outside the provider state lock (Phase F F2c).
+    fn commit_created_volume(
+        &self,
+        req: &CreateVolumeRequest,
+        intent: &CreateIntent,
+        effective: u64,
+    ) -> Result<InspectVolumeResponse, ApiError> {
+        let mut state = self.lock_state_stable()?;
+        if state.create_intent(&req.volume_id) != Some(intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable create intent for volume {} changed while lvcreate ran; \
+                     refusing to commit a volume under a mismatched intent",
+                    req.volume_id
+                ),
+            ));
+        }
+        let stored = StoredVolume {
+            entry: VolumeEntry {
+                vg_name: intent.vg_name.clone(),
+                lv_name: intent.lv_name.clone(),
+                size_bytes: effective,
+                requested_size_bytes: req.size_bytes,
+                generation: 1,
+                data_epoch: 0,
+                project_id: req.project_id.clone(),
+                block_size: intent.block_size,
+                creation_payload: intent.creation_payload.clone(),
+            },
+            runtime: VolumeRuntime {
+                state: VolumeLifecycle::Ready,
+                attachment: None,
+                retired_attachments: RetiredAttachmentFilter::default(),
+            },
+        };
+        state.insert_volume(req.volume_id.clone(), stored.clone());
+        // The final save commits the volume record and the intent
+        // removal together. Keep the intent so a failed compensating
+        // clear save can put it back in memory when the durable file
+        // may still hold it.
+        let create_intent = state.create_intent(&req.volume_id).cloned();
+        state.remove_create_intent(&req.volume_id);
+        if let Err(save_error) = self.persist(&mut state) {
+            return Err(self.compensate_unpersisted_create(
+                state,
+                &req.volume_id,
+                &intent.vg_name,
+                &intent.lv_name,
+                create_intent,
+                &save_error,
+            ));
+        }
+        Ok(inspect_response(&req.volume_id, &stored))
     }
 
     /// Create with a durable-first create intent.
@@ -1705,11 +3443,13 @@ impl LvmProvider {
     /// when the LV is verifiably absent. A failed start clears the
     /// intent (leaving it durable if that clear fails, for startup
     /// recovery). A failed size verification leaves the durable intent
-    /// so recovery never adopts a wrong geometry. The final save
-    /// commits the volume record and drops the intent together; a
-    /// failed final save runs [`Self::compensate_unpersisted_create`],
-    /// whose carve-out keeps the volume when the durable record already
-    /// landed.
+    /// so recovery never adopts a wrong geometry.
+    ///
+    /// Phase E E2 (#62): once the intent is durable, the provider state lock
+    /// is released for `lvcreate` and its size-verifying `lvs`. The final
+    /// commit reacquires it, and a failed final save runs
+    /// [`Self::compensate_unpersisted_create`], whose carve-out keeps the
+    /// volume when the durable record already landed.
     fn create_volume_inner(
         &self,
         req: &CreateVolumeRequest,
@@ -1724,78 +3464,273 @@ impl LvmProvider {
         check_policies(req)?;
 
         let payload = canonical_create_payload(req)?;
-        let mut state = self.lock_state()?;
-        // A durable pending delete owns this volume id: even an
-        // idempotent create replay must not report a doomed volume as
-        // live. Retry the delete or restart to complete it; a create
-        // of a different volume id is unaffected.
-        self.ensure_no_pending_delete(&state, &req.volume_id)?;
-        // Idempotent replay: same volume_id + same payload returns the
-        // current state; a different payload is a typed conflict. The
-        // comparison uses the *requested* size (stored in
-        // `requested_size_bytes` and embedded in the canonical payload),
-        // never the extent-rounded effective size.
-        if let Some(existing) = state.volume(&req.volume_id) {
-            if existing.entry.creation_payload == payload
-                && existing.entry.requested_size_bytes == req.size_bytes
-            {
-                return Ok(inspect_response(&req.volume_id, existing));
+        // One live structural drive per volume. Create and delete both
+        // release the state lock across external LVM commands, so a
+        // concurrent structural mutation of the same volume is refused
+        // rather than racing the durable intent or spending the same
+        // capacity.
+        let _drive = self.begin_structural_drive(&req.volume_id, StructuralDriveKind::Create)?;
+
+        // Admission and allocation are deliberately separate critical
+        // sections. Admission decides (replay, adopt, or a fresh durable
+        // intent) under the state lock; the allocation and its verification
+        // run without it. A durable intent found at admission needs an `lvs`
+        // look before it can be adopted or cleared, so that look is outside
+        // the lock too.
+        let mut resumed: Option<CreateIntent> = None;
+        // A stale capacity sample costs another `vgs` call. Bound the
+        // optimistic rounds so sustained allocation churn cannot keep one
+        // create looping forever; the caller can retry with a new operation
+        // id. This is a liveness guard, not a capacity answer.
+        let mut attempts = 0usize;
+        let (intent, reservation) = loop {
+            attempts += 1;
+            if attempts > CREATE_ADMISSION_ATTEMPTS {
+                return Err(ApiError::new(
+                    ApiErrorCode::Overloaded,
+                    format!(
+                        "capacity admission for volume {} could not obtain a stable \
+                         free-space sample after {CREATE_ADMISSION_ATTEMPTS} attempts; retry \
+                         the create with a new operation_id",
+                        req.volume_id
+                    ),
+                ));
             }
-            return Err(ApiError::idempotency_conflict(&req.volume_id));
-        }
+            let mut state = self.lock_state_stable()?;
+            // A durable pending delete owns this volume id: even an
+            // idempotent create replay must not report a doomed volume as
+            // live. Retry the delete or restart to complete it; a create
+            // of a different volume id is unaffected.
+            self.ensure_no_pending_delete(&state, &req.volume_id)?;
+            // Idempotent replay: same volume_id + same payload returns the
+            // current state; a different payload is a typed conflict. The
+            // comparison uses the *requested* size (stored in
+            // `requested_size_bytes` and embedded in the canonical payload),
+            // never the extent-rounded effective size.
+            if let Some(existing) = state.volume(&req.volume_id) {
+                if existing.entry.creation_payload == payload
+                    && existing.entry.requested_size_bytes == req.size_bytes
+                {
+                    return Ok(inspect_response(&req.volume_id, existing));
+                }
+                return Err(ApiError::idempotency_conflict(&req.volume_id));
+            }
 
-        // A durable create intent means an earlier attempt reached (or
-        // may have reached) `lvcreate` without committing the volume
-        // record. This call is the retry: a different payload/requested
-        // size is a typed idempotency conflict; a matching intent either
-        // adopts the verified LV or, when the LV is verifiably absent,
-        // clears the intent and proceeds with a fresh create.
-        if let Some(response) = self.resume_create_intent(&mut state, req, &payload)? {
-            return Ok(response);
-        }
+            // A durable create intent means an earlier attempt reached (or
+            // may have reached) `lvcreate` without committing the volume
+            // record. This call is the retry: a different payload/requested
+            // size is a typed idempotency conflict; a matching intent either
+            // adopts the verified LV or, when the LV is verifiably absent,
+            // clears the intent and proceeds with a fresh create.
+            //
+            // Any retry that finds an intent must treat the allocation epoch
+            // as changed, because the earlier attempt may already have spent
+            // space: adoption returns early below, and a refusal would
+            // otherwise leave a grow's pre-attempt sample valid. Bumping on
+            // the absent-LV path too is conservative (one extra sample).
+            if let Some(pending) = state.create_intent(&req.volume_id).cloned() {
+                if resumed.as_ref() == Some(&pending) {
+                    // This call already verified this intent's LV absent; a
+                    // state-alignment reload restored the durable copy. Clear
+                    // it in memory and continue with the fresh allocation.
+                    state.remove_create_intent(&req.volume_id);
+                } else if resumed.is_some() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Internal,
+                        format!(
+                            "the durable create intent for volume {} changed while its LV was \
+                             being verified; refusing to allocate under a different intent",
+                            req.volume_id
+                        ),
+                    ));
+                } else {
+                    self.note_capacity_change();
+                    resumed = Some(pending.clone());
+                    drop(state);
+                    match self.resume_create_intent(req, &payload, &pending)? {
+                        Some(response) => return Ok(response),
+                        // The prior attempt never created the LV; its intent
+                        // is cleared in memory. Re-enter admission to create
+                        // fresh.
+                        None => continue,
+                    }
+                }
+            }
 
-        let (vg_name, lv_name, block_size, effective) =
-            self.create_lv_with_intent(&mut state, req, &payload)?;
+            // Sample pool capacity outside the state lock. `vgs` is an
+            // external CLI call; holding the single provider mutex across it
+            // queued every other volume's mutation behind this create's
+            // probe. The allocation epoch fences a stale sample: a grow or
+            // another create that completes an allocation during the sample
+            // bumps it and this attempt re-samples. Phase F F2b (#62).
+            let epoch = self.capacity_epoch();
+            drop(state);
+            let capacity_map = self.vg_capacity_map()?;
+            if self.capacity_epoch() != epoch {
+                // An allocation completed during the sample; the free
+                // figure may already be stale.
+                continue;
+            }
 
-        let stored = StoredVolume {
-            entry: VolumeEntry {
-                vg_name: vg_name.clone(),
-                lv_name: lv_name.clone(),
-                size_bytes: effective,
-                requested_size_bytes: req.size_bytes,
-                generation: 1,
-                data_epoch: 0,
-                project_id: req.project_id.clone(),
-                block_size,
-                creation_payload: payload,
-            },
-            runtime: VolumeRuntime {
-                state: VolumeLifecycle::Ready,
-                attachment: None,
-                retired_attachment_ids: Vec::new(),
-            },
+            let mut state = self.lock_state_stable()?;
+            // Re-check this volume's admission after the released window.
+            // The structural drive already excludes a second create or
+            // delete of the same id, but a state-alignment reload must not
+            // let a replay or a durable intent slip past this attempt: if one
+            // appeared, re-enter admission so its rules classify it rather
+            // than allocating over it.
+            self.ensure_no_pending_delete(&state, &req.volume_id)?;
+            if state.volume(&req.volume_id).is_some()
+                || state.create_intent(&req.volume_id).is_some()
+            {
+                continue;
+            }
+
+            match self.prepare_create_intent(&mut state, req, &payload, &capacity_map, epoch)? {
+                CreatePrepare::SampleStale => {
+                    // The reservation was released by
+                    // `prepare_create_intent`; a create or completed grow got
+                    // between the sample and the reservation. Re-sample on
+                    // the next loop iteration.
+                }
+                CreatePrepare::Prepared {
+                    intent,
+                    reservation,
+                } => {
+                    break (intent, reservation);
+                }
+            }
         };
-        state.insert_volume(req.volume_id.clone(), stored.clone());
-        // The final save commits the volume record and the intent
-        // removal together. Keep the intent so a failed compensating
-        // clear save can put it back in memory when the durable file
-        // may still hold it.
-        let create_intent = state.create_intent(&req.volume_id).cloned();
-        state.remove_create_intent(&req.volume_id);
-        if let Err(save_error) = self.persist(&mut state) {
-            return Err(self.compensate_unpersisted_create(
-                &mut state,
-                &req.volume_id,
-                &vg_name,
-                &lv_name,
-                create_intent,
-                &save_error,
-            ));
+
+        // The intent is durable; the state lock is now released. `lvcreate`
+        // and the size-verifying `lvs` are the long-running steps of a
+        // create; holding the single provider mutex across them queued every
+        // other volume's mutation behind one allocation.
+        let outcome = self.run_create_lv(req, &intent);
+        // The command returned: `vgs` now reports the real free space, so
+        // the in-flight promise can be released on every outcome.
+        self.publish_created_allocation(reservation);
+        match outcome {
+            CreateCommandOutcome::Created { effective } => {
+                // The final commit is a fresh critical section: other
+                // volumes may have saved state while the command ran.
+                self.commit_created_volume(req, &intent, effective)
+            }
+            CreateCommandOutcome::Unknown(error) => {
+                // Keep the durable intent for recovery; it stays in the
+                // in-memory state, so structural mutations remain fenced.
+                Err(error)
+            }
+            CreateCommandOutcome::StartFailed(error) => {
+                Err(self.clear_create_intent_drive(&req.volume_id, error))
+            }
+            CreateCommandOutcome::VerifyFailed(error) => {
+                // The durable intent stays: recovery adopts only a correct
+                // geometry, and a partially-created LV cannot leak unowned.
+                Err(error)
+            }
         }
-        Ok(inspect_response(&req.volume_id, &stored))
     }
 
-    fn attach_volume_inner(
+    /// Validate the sampled pool capacity, promise the extents, and persist
+    /// a fresh create intent under the provider state lock.
+    ///
+    /// Runs under the provider state lock: the in-flight reservation, the
+    /// intent insertion and its save are atomic with respect to every other
+    /// admission. `capacity_map` was sampled *without* that lock (and without
+    /// a capacity mutex), which is what keeps the `vgs` CLI off both locks;
+    /// `expected_epoch` is the allocation epoch the sample observed. If a
+    /// create or grow completed an allocation in the meantime, this returns
+    /// [`CreatePrepare::SampleStale`] and the caller re-samples. The
+    /// reservation covers the released-lock window up to the `lvcreate`
+    /// answer, so a concurrent grow (or create) cannot spend the same sampled
+    /// free bytes. The intent save is durable-first: no LV exists until it
+    /// succeeds. A failed save returns with the reservation dropped (no LV
+    /// was created).
+    fn prepare_create_intent<'a>(
+        &'a self,
+        state: &mut LvmState,
+        req: &CreateVolumeRequest,
+        payload: &str,
+        capacity_map: &BTreeMap<String, VgCapacity>,
+        expected_epoch: u64,
+    ) -> Result<CreatePrepare<'a>, ApiError> {
+        let picked = self.pick_pool_vg(state, req.size_bytes, capacity_map)?;
+        let reservation =
+            match self.try_reserve_capacity(&picked.vg_name, picked.sampled_free, picked.demand) {
+                Ok(reservation) => reservation,
+                Err((free, already)) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::NoSafeCapacity,
+                        format!(
+                            "no safe capacity: pool {} has {free} bytes free after {already} \
+                             bytes already promised to in-flight allocations, and this create \
+                             needs {} bytes (extent-rounded) plus headroom",
+                            picked.vg_name, picked.demand
+                        ),
+                    ));
+                }
+            };
+        // Reserve first, then check: a reservation inserted before an
+        // allocation completes still covers it, so a bump observed here means
+        // the sample may be stale in the optimistic direction and the caller
+        // must re-read `vgs` before promising anything else.
+        if self.capacity_epoch() != expected_epoch {
+            drop(reservation);
+            return Ok(CreatePrepare::SampleStale);
+        }
+        let intent = CreateIntent {
+            vg_name: picked.vg_name.clone(),
+            lv_name: lv_name_for(&req.volume_id),
+            requested_size_bytes: req.size_bytes,
+            project_id: req.project_id.clone(),
+            block_size: req.logical_block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
+            creation_payload: payload.to_owned(),
+        };
+        state.insert_create_intent(req.volume_id.clone(), intent.clone());
+        if let Err(save_error) = self.persist(state) {
+            state.remove_create_intent(&req.volume_id);
+            // Classify the failed save in three ways: the rename may have
+            // landed (the post-rename carve-out), it may provably not have
+            // landed, or the re-read may itself fail. Never report a clean
+            // "not saved" (or drop the possibly-durable intent from memory)
+            // when the durable file could not be read. No LV was created on
+            // any path; startup observes no intent-owned LV and drops the
+            // intent.
+            let note = match LvmState::load(&self.state_path) {
+                Ok(durable) if durable.create_intent(&req.volume_id).is_some() => format!(
+                    "the durable state did record the create intent for volume {}, but no LV \
+                     was created; startup recovery observes no intent-owned LV and drops it",
+                    req.volume_id
+                ),
+                Ok(_) => format!(
+                    "the create intent for volume {} could not be made durable, so no LV was \
+                     created",
+                    req.volume_id
+                ),
+                Err(load_error) => {
+                    state.insert_create_intent(req.volume_id.clone(), intent.clone());
+                    format!(
+                        "the create intent for volume {} could not be verified after the \
+                         failed save ({load_error}); treat it as possibly durable — no LV was \
+                         created, and startup recovery observes no intent-owned LV and drops \
+                         it",
+                        req.volume_id
+                    )
+                }
+            };
+            return Err(ApiError::new(
+                save_error.code,
+                format!("{}; {note}", save_error.detail),
+            ));
+        }
+        Ok(CreatePrepare::Prepared {
+            intent,
+            reservation,
+        })
+    }
+
+    async fn attach_volume_inner(
         &self,
         volume_id: &VolumeId,
         req: &AttachVolumeRequest,
@@ -1809,114 +3744,184 @@ impl LvmProvider {
             }
         }
         let mode = requested_mode(req.access_mode);
-        let mut state = self.lock_state()?;
-        // A durable pending delete owns this volume's fate: no new
-        // attachment may be granted while it is outstanding.
-        self.ensure_no_pending_delete(&state, volume_id)?;
+        // Everything that touches state lives in this loop: the guard is
+        // dropped before the durability wait, so the provider state lock is
+        // never held across an `await`. Admission first resolves any
+        // outstanding capture: a same-id attach replay must never answer
+        // success from a mutation whose durability is still unproven (the
+        // journal replays that success as terminal), and a failed covering
+        // capture must re-align to the durable file and re-execute.
+        let (response, reservation) = loop {
+            let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    // The covering capture's failure is not this caller's
+                    // failure: re-enter admission, which reloads the
+                    // durable view and re-executes from it.
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
+            }
+            // A durable pending delete owns this volume's fate: no new
+            // attachment may be granted while it is outstanding.
+            self.ensure_no_pending_delete(&state, volume_id)?;
 
-        // Crash-replay idempotency: an attachment id that is already
-        // recorded replays the recorded response (even if the volume
-        // generation has since moved) and never fabricates a second
-        // attachment; the same id with a different payload conflicts.
-        let identity = AttachmentIdentity::from_request(volume_id, req, mode);
-        for (recorded_volume, stored) in state.volumes() {
-            if let Some(record) = stored.runtime.attachment.as_ref() {
-                if record.id == req.attachment_id {
-                    resolve_attachment_replay(recorded_volume, record, &identity)?;
-                    return Ok(attach_response(record, &stored.entry));
+            // Crash-replay idempotency: an attachment id that is already
+            // recorded replays the recorded response (even if the volume
+            // generation has since moved) and never fabricates a second
+            // attachment; the same id with a different payload conflicts.
+            // A replay is read-only, so it is answered even while a grow
+            // is in flight (the grow leaves the volume generation
+            // unchanged until it commits).
+            let identity = AttachmentIdentity::from_request(volume_id, req, mode);
+            for (recorded_volume, stored) in state.volumes() {
+                if let Some(record) = stored.runtime.attachment.as_ref() {
+                    if record.id == req.attachment_id {
+                        resolve_attachment_replay(recorded_volume, record, &identity)?;
+                        return Ok(attach_response(record, &stored.entry));
+                    }
                 }
             }
-        }
 
-        let stored = state
-            .volume_mut(volume_id)
-            .ok_or_else(|| not_found(volume_id))?;
-        ensure_attachment_id_not_retired(
-            stored
-                .runtime
-                .retired_attachment_ids
-                .contains(&req.attachment_id),
-            &req.attachment_id,
-        )?;
-        ensure_expected_generation(req.expected_volume_generation, stored.entry.generation)?;
-        ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
-        match stored.runtime.state {
-            VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
-            other => {
-                return Err(ApiError::new(
-                    ApiErrorCode::InvalidState,
-                    format!("attach requires a Ready volume, volume is {other:?}"),
-                ));
-            }
-        }
+            // A fresh attach bumps the volume generation, which would void
+            // the in-flight grow's recovery anchor: refuse it typed.
+            Self::ensure_no_pending_grow(&state, volume_id)?;
 
-        let record = AttachmentRecord {
-            id: req.attachment_id.clone(),
-            vm_id: req.vm_id.clone(),
-            host_id: req.host_id.clone(),
-            generation: 1,
-            access_mode: mode,
-            vmm_disk_id: req.vmm_disk_id.clone(),
-            state: AttachmentState::Prepared,
-            state_revision: volvisor_types::domain::initial_state_revision(),
-            evidence: None,
-            reporter: None,
-            recorded_at_ms: None,
+            let response = {
+                // Validate against the immutable view first: allocation must
+                // not consume a generation for an attach that is refused.
+                {
+                    let stored = state
+                        .volume(volume_id)
+                        .ok_or_else(|| not_found(volume_id))?;
+                    ensure_expected_generation(
+                        req.expected_volume_generation,
+                        stored.entry.generation,
+                    )?;
+                    ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
+                    match stored.runtime.state {
+                        VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
+                        other => {
+                            return Err(ApiError::new(
+                                ApiErrorCode::InvalidState,
+                                format!("attach requires a Ready volume, volume is {other:?}"),
+                            ));
+                        }
+                    }
+                }
+
+                // The attachment generation is the detach/report fence and is
+                // strictly increasing provider-wide (ADR-0013): it is
+                // allocated from the durable, never-reset allocator, not the
+                // per-volume entry generation and never a constant `1`. A
+                // delayed report or detach from a retired instance therefore
+                // carries an older generation and is refused, even if a
+                // consumer reuses the attachment id across a delete +
+                // same-id recreate.
+                let generation = state.allocate_attachment_generation()?;
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                let record = AttachmentRecord {
+                    id: req.attachment_id.clone(),
+                    vm_id: req.vm_id.clone(),
+                    host_id: req.host_id.clone(),
+                    generation,
+                    access_mode: mode,
+                    vmm_disk_id: req.vmm_disk_id.clone(),
+                    state: AttachmentState::Prepared,
+                    state_revision: volvisor_types::domain::initial_state_revision(),
+                    evidence: None,
+                    reporter: None,
+                    recorded_at_ms: None,
+                };
+                stored.runtime.attachment = Some(record.clone());
+                stored.runtime.state = VolumeLifecycle::Attached;
+                stored.entry.generation += 1;
+                attach_response(&record, &stored.entry)
+            };
+            // Capture and reserve under the state lock; the guard drops at
+            // the end of this block, before the wait. A failure returns
+            // typed and the next admission aligns (the leader failure path
+            // never takes the provider state lock).
+            let reservation = state.capture_and_reserve()?;
+            break (response, reservation);
         };
-        stored.runtime.attachment = Some(record.clone());
-        stored.runtime.state = VolumeLifecycle::Attached;
-        stored.entry.generation += 1;
-        let response = attach_response(&record, &stored.entry);
-        self.persist(&mut state)?;
+        self.writer.commit_async(reservation).await?;
         Ok(response)
     }
 
-    fn detach_volume_inner(
+    async fn detach_volume_inner(
         &self,
         volume_id: &VolumeId,
         attachment_id: &AttachmentId,
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         req.validate()?;
-        let mut state = self.lock_state()?;
-        let stored = state
-            .volume_mut(volume_id)
-            .ok_or_else(|| not_found(volume_id))?;
-        let Some(record) = stored.runtime.attachment.as_ref() else {
-            return Err(ApiError::not_found(format!(
-                "volume {volume_id} has no attachment"
-            )));
-        };
-        if record.id != *attachment_id {
-            return Err(ApiError::not_found(format!(
-                "attachment {attachment_id} is not attached to volume {volume_id}"
-            )));
-        }
-        ensure_expected_attachment_generation(
-            req.expected_attachment_generation,
-            record.generation,
-        )?;
-        // The drain proof (`vm_stopped_or_io_drained_proof`) is a
-        // type-mandatory attestation: authority is never released without
-        // one, though the provider cannot verify the claim itself
-        // (Volume API v2 section 3).
+        // The guard is confined to this loop so it is dropped before the
+        // durability wait. A not-found answer must not be derived from a
+        // detach whose durability is still unproven: a failed covering
+        // capture has to re-align and re-execute, or the journal would
+        // record a terminal absence for an attachment that is still
+        // durable.
+        let (response, reservation) = loop {
+            let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
+            }
+            Self::ensure_no_pending_grow(&state, volume_id)?;
+            let response = {
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                let Some(record) = stored.runtime.attachment.as_ref() else {
+                    return Err(ApiError::not_found(format!(
+                        "volume {volume_id} has no attachment"
+                    )));
+                };
+                if record.id != *attachment_id {
+                    return Err(ApiError::not_found(format!(
+                        "attachment {attachment_id} is not attached to volume {volume_id}"
+                    )));
+                }
+                ensure_expected_attachment_generation(
+                    req.expected_attachment_generation,
+                    record.generation,
+                )?;
+                // The drain proof (`vm_stopped_or_io_drained_proof`) is a
+                // type-mandatory attestation: authority is never released without
+                // one, though the provider cannot verify the claim itself
+                // (Volume API v2 section 3).
 
-        let retired_id = record.id.clone();
-        stored.runtime.attachment = None;
-        if !stored.runtime.retired_attachment_ids.contains(&retired_id) {
-            stored.runtime.retired_attachment_ids.push(retired_id);
-        }
-        if stored.runtime.state == VolumeLifecycle::Attached {
-            stored.runtime.state = VolumeLifecycle::Ready;
-        }
-        stored.entry.generation += 1;
-        stored.entry.data_epoch += 1;
-        let response = inspect_response(volume_id, stored);
-        self.persist(&mut state)?;
+                // The retired id is not tombstoned: the strictly increasing
+                // attachment generation is the fence, so a delayed report for this
+                // instance is `STALE_GENERATION` against any later one. Bounding
+                // per-id state is what keeps a churned volume usable (issue #63).
+                stored.runtime.attachment = None;
+                if stored.runtime.state == VolumeLifecycle::Attached {
+                    stored.runtime.state = VolumeLifecycle::Ready;
+                }
+                stored.entry.generation += 1;
+                stored.entry.data_epoch += 1;
+                inspect_response(volume_id, stored)
+            };
+            let reservation = state.capture_and_reserve()?;
+            break (response, reservation);
+        };
+        self.writer.commit_async(reservation).await?;
         Ok(response)
     }
 
-    fn report_attachment_state_inner(
+    async fn report_attachment_state_inner(
         &self,
         volume_id: &VolumeId,
         req: &ReportAttachmentStateRequest,
@@ -1933,26 +3938,53 @@ impl LvmProvider {
                 req.attachment_id
             )));
         }
-        let mut state = self.lock_state()?;
-        let response = {
-            let stored = state
-                .volume_mut(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            let Some(record) = stored.runtime.attachment.as_mut() else {
-                return Err(ApiError::not_found(format!(
-                    "volume {volume_id} has no attachment"
-                )));
-            };
-            if record.id != req.attachment_id {
-                return Err(ApiError::not_found(format!(
-                    "attachment {} is not attached to volume {volume_id}",
-                    req.attachment_id
-                )));
+        // The guard is confined to this loop so it is dropped before the
+        // durability wait. A not-found or no-op answer must not be derived
+        // from a covering capture that has not proven durable: on failure
+        // the loop re-aligns and re-executes.
+        let (response, reservation) = loop {
+            let mut state = self.lock_state()?;
+            match self.writer.admission_gate() {
+                AdmissionGate::Ready => {}
+                AdmissionGate::Wait(seq) => {
+                    drop(state);
+                    let _ = self.writer.wait_async(seq).await;
+                    continue;
+                }
+                AdmissionGate::Align => continue,
             }
-            apply_attachment_report(record, req, unix_ms_now())?
+            // A report only advances the attachment record's state; it
+            // never moves the volume generation or size, so it cannot
+            // invalidate an in-flight grow's recovery anchor. It stays
+            // admitted (idempotent no-op reports included).
+            let response = {
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
+                let Some(record) = stored.runtime.attachment.as_mut() else {
+                    return Err(ApiError::not_found(format!(
+                        "volume {volume_id} has no attachment"
+                    )));
+                };
+                if record.id != req.attachment_id {
+                    return Err(ApiError::not_found(format!(
+                        "attachment {} is not attached to volume {volume_id}",
+                        req.attachment_id
+                    )));
+                }
+                apply_attachment_report(record, req, unix_ms_now())?
+            };
+            // Preserve the no-op gate: a report that did not advance the
+            // recorded state performs no save (and reserves no sequence).
+            let reservation = if response.applied {
+                Some(state.capture_and_reserve()?)
+            } else {
+                None
+            };
+            break (response, reservation);
         };
-        if response.applied {
-            self.persist(&mut state)?;
+        if let Some(reservation) = reservation {
+            self.writer.commit_async(reservation).await?;
         }
         Ok(response)
     }
@@ -2081,28 +4113,79 @@ impl LvmProvider {
         ApiError::new(save_error.code, format!("{}; {note}", save_error.detail))
     }
 
-    /// Execute a grow that already passed the request/intent checks.
+    /// Validate one grow admission against the current state and derive
+    /// the volume fields the drive needs.
     ///
-    /// Validates capacity (extent-rounded demand plus headroom), then
-    /// persists the grow intent when the resume path did not already
-    /// have one, runs `lvextend`, verifies the effective size from
-    /// `lvs`, and commits the new size/generation with the intent
-    /// removal. Start failures clear the intent (or leave it durable
-    /// when the clear fails); verification/final-save failures leave
-    /// the durable intent for roll-forward. Returns the observed
-    /// effective size.
-    fn execute_grow(
+    /// Runs under the provider state lock. A durable pending delete owns
+    /// the volume's fate (growing would race the delete authorization); a
+    /// move completion bumps the generation and a grow must not straddle
+    /// it (the durable intent would look stale to recovery). Grow-only
+    /// plus alignment is enforced fail-closed (Volume API v2 §4A). The
+    /// caller re-runs this after reacquiring admission around the
+    /// capacity sample, so a record that moved in that window is refused
+    /// or re-derived rather than used stale.
+    fn grow_admission(
+        &self,
+        state: &LvmState,
+        volume_id: &VolumeId,
+        req: &GrowVolumeRequest,
+    ) -> Result<GrowAdmission, ApiError> {
+        self.ensure_no_pending_delete(state, volume_id)?;
+        Self::ensure_no_unsettled_move(state, volume_id)?;
+        let stored = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?;
+        if req.expected_generation != stored.entry.generation {
+            return Err(ApiError::stale_generation(
+                req.expected_generation,
+                stored.entry.generation,
+            ));
+        }
+        match stored.runtime.state {
+            VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded => {}
+            other => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!("grow requires Ready/Attached/Degraded, volume is {other:?}"),
+                ));
+            }
+        }
+        req.validate(stored.entry.size_bytes)?;
+        Ok(GrowAdmission {
+            vg_name: stored.entry.vg_name.clone(),
+            lv_name: stored.entry.lv_name.clone(),
+            current_size: stored.entry.size_bytes,
+            current_generation: stored.entry.generation,
+            has_attachment: stored.runtime.attachment.is_some(),
+        })
+    }
+
+    /// Validate the sampled capacity, reserve it, and make the grow intent
+    /// durable.
+    ///
+    /// Runs under the provider state lock: the in-flight reservation, the
+    /// intent insertion and its save are atomic with respect to every
+    /// other admission. `capacity` was sampled *without* that lock (and
+    /// without a capacity mutex), which is what keeps the `vgs` CLI off
+    /// both locks; `expected_epoch` is the allocation epoch the sample
+    /// observed. If a create or another grow completed an allocation in
+    /// the meantime, this returns [`GrowPrepare::SampleStale`] and the
+    /// caller re-samples. The returned intent is the exact anchor this
+    /// drive later re-validates before committing the observed size; the
+    /// returned reservation covers the released-lock window up to the
+    /// `lvextend` answer.
+    fn prepare_grow(
         &self,
         state: &mut LvmState,
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
         vg_name: &str,
-        lv_name: &str,
+        capacity: VgCapacity,
         current_size: u64,
         current_generation: u64,
         intent_is_durable: bool,
-    ) -> Result<u64, ApiError> {
-        let capacity = self.vg_capacity(vg_name)?;
+        expected_epoch: u64,
+    ) -> Result<GrowPrepare<'_>, ApiError> {
         let delta = req.new_size_bytes - current_size;
         // Thick LVM rounds the grown LV up to whole physical extents,
         // so the space the grow actually consumes is the
@@ -2111,26 +4194,55 @@ impl LvmProvider {
         // the rounding and surface the over-allocation later as a raw
         // INTERNAL instead of the typed NO_SAFE_CAPACITY.
         let demand = extent_rounded(delta, capacity.extent_bytes);
-        if demand.saturating_add(VG_HEADROOM_BYTES) > capacity.free_bytes {
-            return Err(ApiError::new(
-                ApiErrorCode::NoSafeCapacity,
-                format!(
-                    "grow needs {demand} more bytes (extent-rounded from {delta}), {} free \
-                     in {vg_name}",
-                    capacity.free_bytes
-                ),
-            ));
+        let reservation = match self.try_reserve_capacity(vg_name, capacity.free_bytes, demand) {
+            Ok(reservation) => reservation,
+            Err((free, reserved)) => {
+                return Err(ApiError::new(
+                    ApiErrorCode::NoSafeCapacity,
+                    format!(
+                        "grow needs {demand} more bytes (extent-rounded from {delta}), {free} free \
+                         in {vg_name} ({reserved} reserved for in-flight allocations)"
+                    ),
+                ));
+            }
+        };
+        // Reserve first, then check: a reservation inserted before an
+        // allocation completes still covers it, so a bump observed here
+        // means the sample may be stale in the optimistic direction and
+        // the caller must re-read `vgs` before promising anything else.
+        if self.capacity_epoch() != expected_epoch {
+            drop(reservation);
+            return Ok(GrowPrepare::SampleStale);
         }
-        if !intent_is_durable {
-            // Durable-first: persist the intent before `lvextend`, so a
-            // crash between the CLI's success and the volume-record
-            // commit rolls the grow forward on restart.
-            let grow_intent = GrowIntent {
+        let grow_intent = match state.grow_intent(volume_id).cloned() {
+            Some(intent) => intent,
+            // A caller that verified the durable file holds this intent
+            // must find it in memory too. Fabricating one and skipping
+            // the save would run `lvextend` without a durable anchor,
+            // reopening the crash window the durable-first rule closes.
+            None if intent_is_durable => {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} was admitted as resuming a durable grow intent, \
+                         but the in-memory state no longer holds it; refusing to extend \
+                         without a durable anchor"
+                    ),
+                ));
+            }
+            None => GrowIntent {
                 operation_id: req.operation_id.clone(),
                 from_size_bytes: current_size,
                 requested_size_bytes: req.new_size_bytes,
                 expected_generation: current_generation,
-            };
+            },
+        };
+        if !intent_is_durable {
+            // Durable-first: persist the intent before `lvextend`, so a
+            // crash between the CLI's success and the volume-record
+            // commit rolls the grow forward on restart. The already
+            // recorded intent keeps its original authorizing operation
+            // when this call is the payload-identical resume.
             state.insert_grow_intent(volume_id.clone(), grow_intent.clone());
             if let Err(save_error) = self.persist(state) {
                 return Err(self.grow_intent_save_failure(
@@ -2141,70 +4253,131 @@ impl LvmProvider {
                 ));
             }
         }
-        let output = match self.runner.run(
+        Ok(GrowPrepare::Prepared {
+            grow_intent,
+            reservation,
+        })
+    }
+
+    /// Run `lvextend` without the provider state lock.
+    ///
+    /// This is the only long-running step of a grow (~200 ms of LVM CLI
+    /// on the measured host). Holding the state lock across it made every
+    /// other volume's admission queue behind one resize; the caller
+    /// therefore drops the guard before this call and reacquires it only
+    /// after the size has been verified.
+    fn run_lvextend(&self, vg_name: &str, lv_name: &str, new_size_bytes: u64) -> LvextendOutcome {
+        match self.runner.run(
             "lvextend",
             &[
                 "--yes",
                 "-L",
-                &format!("{}B", req.new_size_bytes),
+                &format!("{new_size_bytes}B"),
                 &format!("{vg_name}/{lv_name}"),
             ],
         ) {
-            Ok(output) => output,
-            Err(error) => {
-                // The runner returned an error without an exit status,
-                // so the outcome is unknown: the command may have
-                // reached LVM. Keep the durable grow intent — never
-                // clear it on an unknown outcome — and let startup
-                // recovery classify the observed size.
-                return Err(ApiError::new(
-                    error.code,
+            Ok(output) if output.success => LvextendOutcome::Extended,
+            Ok(output) => LvextendOutcome::StartFailed(command_failed("lvextend", &output)),
+            Err(error) => LvextendOutcome::Unknown(ApiError::new(
+                error.code,
+                format!(
+                    "{}; the lvextend outcome is unknown (the command runner returned an \
+                     error rather than an exit status); the durable grow intent remains, \
+                     and startup recovery will roll the grow forward only if the LV is at \
+                     least the requested size, drop the intent if the LV is still at the \
+                     from-size, and refuse startup on an ambiguous size",
+                    error.detail
+                ),
+            )),
+        }
+    }
+
+    /// Classify a non-zero `lvextend` exit after the state lock was released.
+    ///
+    /// Re-reads the state under a fresh admission and classifies the LV's
+    /// observed size. A lock failure keeps the original command error
+    /// visible and leaves the durable intent for recovery.
+    fn settle_failed_lvextend_drive(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        from_size_bytes: u64,
+        error: ApiError,
+    ) -> ApiError {
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            Err(lock_error) => {
+                let code = lock_error.code;
+                return ApiError::new(
+                    code,
                     format!(
-                        "{}; the lvextend outcome is unknown (the command runner returned an \
-                         error rather than an exit status); the durable grow intent remains, \
-                         and startup recovery will roll the grow forward only if the LV is at \
-                         least the requested size, drop the intent if the LV is still at the \
-                         from-size, and refuse startup on an ambiguous size",
+                        "{}; the grow intent could not be cleared because the provider \
+                         state could not be re-read ({lock_error}); the durable intent \
+                         remains, and a retry or startup will classify the observed size",
                         error.detail
                     ),
-                ));
+                );
             }
         };
-        if !output.success {
-            return Err(self.clear_grow_intent_after_failed_start(
-                state,
-                volume_id,
-                command_failed("lvextend", &output),
-            ));
-        }
-        // Verify the effective size from LVM's own report. Like create,
-        // grow rounds up to whole extents: anything at or above the
-        // requested size is a success, and the effective size is what
-        // gets persisted and reported. A verification failure leaves
-        // the durable grow intent for recovery (never a silent
-        // success).
-        let actual = self.verify_grown_size(vg_name, lv_name, req.new_size_bytes)?;
+        self.settle_failed_lvextend(
+            &mut state,
+            volume_id,
+            vg_name,
+            lv_name,
+            from_size_bytes,
+            error,
+        )
+    }
 
-        let new_generation = {
-            let stored = state
-                .volume_mut(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            stored.entry.size_bytes = actual;
-            stored.entry.generation += 1;
-            stored.entry.generation
-        };
-        state.remove_grow_intent(volume_id);
-        if let Err(save_error) = self.persist(state) {
-            return Err(self.persist_completed_grow(
-                save_error,
-                volume_id,
-                vg_name,
-                lv_name,
-                actual,
-                new_generation,
-            ));
+    /// Classify a non-zero `lvextend` exit against the observed world.
+    ///
+    /// The intent is cleared only when `lvs` proves the LV is still at its
+    /// from-size. A non-zero exit that nevertheless left the LV grown (or
+    /// whose size cannot be re-verified) keeps the durable intent: clearing
+    /// it there would silently drop the recovery anchor and leave the
+    /// recorded size below the real LV.
+    fn settle_failed_lvextend(
+        &self,
+        state: &mut LvmState,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        from_size_bytes: u64,
+        error: ApiError,
+    ) -> ApiError {
+        match self.lv_size(vg_name, lv_name) {
+            Ok(Some(observed)) if observed == from_size_bytes => {
+                self.clear_grow_intent_after_failed_start(state, volume_id, error)
+            }
+            Ok(Some(observed)) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; the lvextend exit status was non-zero but LVM reports {observed} bytes \
+                     for {vg_name}/{lv_name} (from {from_size_bytes}); the durable grow intent \
+                     remains, and a retry or startup classifies the observed size rather than \
+                     assuming the command did nothing",
+                    error.detail
+                ),
+            ),
+            Ok(None) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; lvs no longer reports {vg_name}/{lv_name} after the non-zero lvextend \
+                     exit; the durable grow intent remains for recovery (it never recreates or \
+                     shrinks the LV)",
+                    error.detail
+                ),
+            ),
+            Err(observe_error) => ApiError::new(
+                error.code,
+                format!(
+                    "{}; the LV size could not be re-verified after the non-zero lvextend exit \
+                     ({observe_error}); the durable grow intent remains for recovery",
+                    error.detail
+                ),
+            ),
         }
-        Ok(actual)
     }
 
     /// Verify the post-`lvextend` size from LVM's own report.
@@ -2250,16 +4423,235 @@ impl LvmProvider {
         }
     }
 
+    /// Commit the observed post-`lvextend` size under a fresh admission.
+    ///
+    /// The drive guard and the durable intent excluded every structural
+    /// mutation of this volume while the state lock was released, so the
+    /// anchor and generation must still be exactly what the drive
+    /// recorded; refuse to commit against a changed anchor rather than
+    /// fabricate a record the recovery path cannot explain.
+    fn commit_grown_size(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        grow_intent: &GrowIntent,
+        current_generation: u64,
+        actual: u64,
+    ) -> Result<(), ApiError> {
+        let mut state = self.lock_state_stable()?;
+        if state.grow_intent(volume_id) != Some(grow_intent) {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "the durable grow intent for volume {volume_id} changed while lvextend was \
+                     in flight; refusing to commit a size against an unverified anchor. The LV \
+                     has already been extended to {actual} bytes; the durable intent is left in \
+                     place, but recovery refuses to apply it against a changed anchor, so the \
+                     recorded provisioned size may under-report until an operator reconciles it"
+                ),
+            ));
+        }
+        // Check against the immutable view first so a refusal does not
+        // mark the state guard dirty.
+        let observed_generation = state
+            .volume(volume_id)
+            .ok_or_else(|| not_found(volume_id))?
+            .entry
+            .generation;
+        if observed_generation != current_generation {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "volume {volume_id} generation moved from {current_generation} to \
+                     {observed_generation} while lvextend was in flight; refusing to commit the \
+                     observed size {actual} against a stale grow anchor. The LV has already been \
+                     extended; the durable intent is left in place, but startup recovery drops an \
+                     intent whose recorded generation moved, so the recorded provisioned size may \
+                     under-report until an operator reconciles it"
+                ),
+            ));
+        }
+        let new_generation = {
+            let stored = state
+                .volume_mut(volume_id)
+                .ok_or_else(|| not_found(volume_id))?;
+            stored.entry.size_bytes = actual;
+            stored.entry.generation += 1;
+            stored.entry.generation
+        };
+        state.remove_grow_intent(volume_id);
+        if let Err(save_error) = self.persist(&mut state) {
+            return Err(self.persist_completed_grow(
+                save_error,
+                volume_id,
+                vg_name,
+                lv_name,
+                actual,
+                new_generation,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit one grow drive: sample capacity, reserve it, and make the
+    /// recovery intent durable, with the `vgs` sample outside the provider
+    /// state lock.
+    ///
+    /// The sample is also outside any capacity mutex: concurrent grows
+    /// must not queue behind each other's `vgs` CLI call. A non-evidence
+    /// diagnostic build with a capacity mutex (dirty tree, not a published
+    /// bundle) showed the c128 collapse return when grows were enabled;
+    /// the convoy is the suspected mechanism, and the published residual
+    /// tail remains unattributed. Safety comes from the allocation epoch
+    /// instead — a sample is used only if no create attempt or completed
+    /// `lvextend` changed free space during it, and the reservation is
+    /// inserted before the epoch is re-read so an allocation completing in
+    /// the window is still accounted for.
+    /// A record that moved between the two admissions is re-derived (or
+    /// refused typed), never used stale. A concurrent attach or detach
+    /// that lands in the sample window therefore wins: the grow is
+    /// refused with `STALE_GENERATION` (its CAS token no longer matches)
+    /// instead of making the attach wait behind the grow's CLI. That is
+    /// contract-correct but a client-visible inversion from the
+    /// parent shape, which held the state lock across admission.
+    fn prepare_grow_admission(
+        &self,
+        volume_id: &VolumeId,
+        req: &GrowVolumeRequest,
+    ) -> Result<GrowAdmissionOutcome<'_>, ApiError> {
+        // A stale sample costs another `vgs` call. Bound the optimistic
+        // rounds so a sustained allocation churn cannot keep one grow
+        // looping forever; the caller can retry the request. This is a
+        // liveness guard, not a capacity answer.
+        let mut attempts = 0usize;
+        // The pending-intent check observes the LV with `lvs` and may
+        // finalize a rolled-forward grow. It runs once per drive: while
+        // this drive holds `grow_drives`, no other actor can insert or
+        // remove this volume's grow intent, so re-entering admission for
+        // the capacity revalidation does not need to repeat the world
+        // observation. This check (and the failed-`lvextend` settlement)
+        // still runs its `lvs` under the state lock — a recorded residual,
+        // not a property this change fixes.
+        let mut resume_checked = false;
+        let mut intent_is_durable = false;
+        loop {
+            attempts += 1;
+            if attempts > GROW_ADMISSION_ATTEMPTS {
+                return Err(ApiError::new(
+                    ApiErrorCode::Overloaded,
+                    format!(
+                        "capacity admission for volume {volume_id} could not obtain a stable \
+                         free-space sample after {GROW_ADMISSION_ATTEMPTS} attempts; retry the \
+                         grow with a new operation_id"
+                    ),
+                ));
+            }
+            // Read the admission record under the state lock, then release
+            // it for the capacity sample.
+            let first = {
+                let state = self.lock_state_stable()?;
+                self.grow_admission(&state, volume_id, req)?
+            };
+            let epoch = self.capacity_epoch();
+            let capacity = self.vg_capacity(&first.vg_name)?;
+            if self.capacity_epoch() != epoch {
+                // A create or a completed grow allocated during the
+                // sample; the free figure may already be stale.
+                continue;
+            }
+
+            // Re-enter admission and re-validate against whatever happened
+            // while the state lock was released for the CLI.
+            let mut state = self.lock_state_stable()?;
+            let current = self.grow_admission(&state, volume_id, req)?;
+            if current.vg_name != first.vg_name {
+                // The record moved to another pool; the sample describes
+                // the wrong VG.
+                drop(state);
+                continue;
+            }
+            if !resume_checked {
+                resume_checked = true;
+                match self.resume_pending_grow(
+                    &mut state,
+                    volume_id,
+                    req,
+                    &current.vg_name,
+                    &current.lv_name,
+                    current.current_size,
+                    current.current_generation,
+                )? {
+                    GrowResume::NoIntent => {}
+                    GrowResume::Continue => {
+                        // The in-memory intent may be *possibly* durable: a
+                        // failed intent save whose re-read was unreadable
+                        // reinserted it. Never promote that to an anchor by
+                        // inference — running `lvextend` without a confirmed
+                        // durable intent reopens the crash window the
+                        // durable-first save exists to close. Re-save unless
+                        // the durable file verifiably holds this exact intent;
+                        // an unreadable re-read also takes the safe re-save
+                        // path (and fails closed if that save fails).
+                        intent_is_durable = state.grow_intent(volume_id).is_some_and(|memory| {
+                            LvmState::load(&self.state_path)
+                                .is_ok_and(|durable| durable.grow_intent(volume_id) == Some(memory))
+                        });
+                    }
+                    GrowResume::Finalized(observed) => {
+                        return Ok(GrowAdmissionOutcome::Finalized {
+                            has_attachment: current.has_attachment,
+                            effective_size_bytes: observed,
+                        });
+                    }
+                }
+            }
+            match self.prepare_grow(
+                &mut state,
+                volume_id,
+                req,
+                &current.vg_name,
+                capacity,
+                current.current_size,
+                current.current_generation,
+                intent_is_durable,
+                epoch,
+            )? {
+                GrowPrepare::SampleStale => {
+                    // The reservation was released by `prepare_grow`; a
+                    // create or completed grow got between the sample and
+                    // the reservation. Re-sample.
+                    drop(state);
+                }
+                GrowPrepare::Prepared {
+                    grow_intent,
+                    reservation,
+                } => {
+                    return Ok(GrowAdmissionOutcome::Prepared(PreparedGrow {
+                        grow_intent,
+                        reservation,
+                        vg_name: current.vg_name,
+                        lv_name: current.lv_name,
+                        current_size: current.current_size,
+                        current_generation: current.current_generation,
+                        has_attachment: current.has_attachment,
+                    }));
+                }
+            }
+        }
+    }
+
     /// Grow with a durable-first grow intent.
     ///
     /// Rejected while a delete is pending. A matching pending intent is
     /// a resume: at/above the request finalizes from the observed size,
     /// exactly at the from-size continues to `lvextend`, and anything
     /// else is ambiguous and refused. A fresh grow persists the intent
-    /// before `lvextend`; start/command failures clear it (or leave it
-    /// durable when the clear fails). A failed size verification or a
-    /// failed final save leaves the durable intent to roll the grow
-    /// forward on restart, and the LV is never shrunk as compensation.
+    /// before `lvextend`; a known failed start (proven by `lvs` to have
+    /// left the LV at its from-size) clears it, while an unknown outcome
+    /// leaves it durable. A failed size verification or a failed final
+    /// save leaves the durable intent to roll the grow forward on
+    /// restart, and the LV is never shrunk as compensation.
     fn grow_volume_inner(
         &self,
         volume_id: &VolumeId,
@@ -2269,103 +4661,112 @@ impl LvmProvider {
         if !self.capabilities().contains(Capability::Resize) {
             return Err(unsupported("the resize capability is not advertised"));
         }
-        let mut state = self.lock_state()?;
-        // A durable pending delete owns this volume's fate: growing it
-        // would race a delete authorization (and possibly resurrect a
-        // half-discarded LV).
-        self.ensure_no_pending_delete(&state, volume_id)?;
-        let (vg_name, lv_name, current_size, current_generation, has_attachment) = {
-            let stored = state
-                .volume(volume_id)
-                .ok_or_else(|| not_found(volume_id))?;
-            if req.expected_generation != stored.entry.generation {
-                return Err(ApiError::stale_generation(
-                    req.expected_generation,
-                    stored.entry.generation,
+        // The drive guard (one live grow per volume) is held by the async
+        // wrapper; structural mutations are refused by the durable intent.
+        let prepared = match self.prepare_grow_admission(volume_id, req)? {
+            GrowAdmissionOutcome::Finalized {
+                has_attachment,
+                effective_size_bytes,
+            } => return Ok(grow_response(has_attachment, effective_size_bytes)),
+            GrowAdmissionOutcome::Prepared(prepared) => prepared,
+        };
+        let PreparedGrow {
+            grow_intent,
+            reservation,
+            vg_name,
+            lv_name,
+            current_size,
+            current_generation,
+            has_attachment,
+        } = prepared;
+        // The resize and its verification are the only long-running steps.
+        // The provider state guard was scoped to the revalidation loop and
+        // is already released, so other volumes' writes are not queued
+        // behind this volume's LVM CLI call. The durable intent (written
+        // above) is the recovery anchor for the gap, and the capacity
+        // reservation keeps concurrent admissions honest.
+        let respond =
+            |effective_size_bytes: u64| grow_response(has_attachment, effective_size_bytes);
+        let lvextend = self.run_lvextend(&vg_name, &lv_name, req.new_size_bytes);
+        // The command returned: `vgs` now reports the real free space, so
+        // the in-flight promise can be released on every outcome. Bump the
+        // allocation epoch *before* dropping the reservation: a grow that
+        // sampled before this allocation must either see the bump and
+        // re-sample, or have observed this reservation in its accounting.
+        // Dropping first would let a stale sample reserve the freed bytes
+        // twice.
+        // Publish the completed allocation under the state lock. A create
+        // takes that lock for its `vgs` sample and its `reserved_capacity`
+        // read; a grow's completion otherwise needs no lock. Without this
+        // ordering, a create could sample free space before this
+        // allocation, then read the reservations after they were dropped,
+        // and admit against space that no longer exists. Holding the lock
+        // makes the sample and the reservation accounting atomic with
+        // respect to completed allocations. It is held for an atomic bump
+        // and a leaf-lock removal only, never across an LVM command.
+        match self.lock_state_stable() {
+            Ok(_state) => {
+                self.note_capacity_change();
+                drop(reservation);
+            }
+            Err(error) => {
+                // `lock_state_stable` fails only on a poisoned state mutex
+                // or an unreadable alignment load. The allocation has
+                // already happened and `vgs` reports its real free space,
+                // so the epoch must still be bumped and the reservation
+                // released. Without the state guard this is the documented
+                // degraded path: create admissions that hold the mutex
+                // block rather than observe the drop, and a poisoned mutex
+                // refuses every new admission. Log it rather than
+                // swallowing the error, because the invariant "publish
+                // under the state lock" did not hold.
+                tracing::warn!(
+                    volume_id = %volume_id,
+                    error = %error,
+                    "grow publish could not take the provider state lock; capacity epoch \
+                     bumped and reservation released without the state guard"
+                );
+                self.note_capacity_change();
+                drop(reservation);
+            }
+        }
+        match lvextend {
+            LvextendOutcome::Extended => {}
+            LvextendOutcome::Unknown(error) => {
+                // The command may have reached LVM: keep the durable
+                // intent for recovery. It stays in the in-memory state
+                // (the dropped guard published it), so structural
+                // mutations remain refused until a retry or restart
+                // classifies the observed size.
+                return Err(error);
+            }
+            LvextendOutcome::StartFailed(error) => {
+                // A non-zero exit is a failed start only when LVM proves
+                // the LV did not move; otherwise the durable intent must
+                // survive so recovery classifies the observed size.
+                return Err(self.settle_failed_lvextend_drive(
+                    volume_id,
+                    &vg_name,
+                    &lv_name,
+                    current_size,
+                    error,
                 ));
             }
-            match stored.runtime.state {
-                VolumeLifecycle::Ready | VolumeLifecycle::Attached | VolumeLifecycle::Degraded => {}
-                other => {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidState,
-                        format!("grow requires Ready/Attached/Degraded, volume is {other:?}"),
-                    ));
-                }
-            }
-            // Grow-only plus alignment, fail-closed (Volume API v2 4A).
-            req.validate(stored.entry.size_bytes)?;
-            (
-                stored.entry.vg_name.clone(),
-                stored.entry.lv_name.clone(),
-                stored.entry.size_bytes,
-                stored.entry.generation,
-                stored.runtime.attachment.is_some(),
-            )
-        };
-        let respond = |effective_size_bytes: u64| GrowVolumeResponse {
-            backing_resized: true,
-            // The provider-layer placeholder, honestly labeled: this
-            // layer has no VMM to notify. When the daemon wires the
-            // P6-B grow-notification engine (volvisor-provider's
-            // `grow` module — the LVM daemon path always does), the
-            // API layer composes the real status over this response,
-            // inside the journal's execute closure, so the recorded
-            // outcome carries it and replays byte-compatibly. This
-            // placeholder remains the honest standalone answer (the
-            // conformance kit, provider-direct callers): an attached
-            // frontend still needs a (retried) notification; a
-            // detached volume has nobody to notify. Never `Notified`
-            // from here.
-            guest_notification_status: if has_attachment {
-                GrowGuestNotification::RetryRequired
-            } else {
-                GrowGuestNotification::NotApplicable
-            },
-            effective_size_bytes,
-        };
-
-        // A durable grow intent means an earlier attempt may already
-        // have extended the LV. Roll it forward against the observed
-        // world; never extend again when the request differs.
-        let mut intent_is_durable = false;
-        match self.resume_pending_grow(
-            &mut state,
-            volume_id,
-            req,
-            &vg_name,
-            &lv_name,
-            current_size,
-            current_generation,
-        )? {
-            GrowResume::NoIntent => {}
-            GrowResume::Continue => {
-                // The in-memory intent may be *possibly* durable: a
-                // failed intent save whose re-read was unreadable
-                // reinserted it. Never promote that to an anchor by
-                // inference — running `lvextend` without a confirmed
-                // durable intent reopens the crash window the
-                // durable-first save exists to close. Re-save unless
-                // the durable file verifiably holds this exact intent;
-                // an unreadable re-read also takes the safe re-save
-                // path (and fails closed if that save fails).
-                intent_is_durable = state.grow_intent(volume_id).is_some_and(|memory| {
-                    LvmState::load(&self.state_path)
-                        .is_ok_and(|durable| durable.grow_intent(volume_id) == Some(memory))
-                });
-            }
-            GrowResume::Finalized(observed) => return Ok(respond(observed)),
         }
-
-        let actual = self.execute_grow(
-            &mut state,
+        // Verify the effective size from LVM's own report. Like create,
+        // grow rounds up to whole extents: anything at or above the
+        // requested size is a success, and the effective size is what
+        // gets persisted and reported. A verification failure leaves
+        // the durable grow intent for recovery (never a silent success).
+        let actual = self.verify_grown_size(&vg_name, &lv_name, req.new_size_bytes)?;
+        // Reacquire the state lock only to commit the observed size.
+        self.commit_grown_size(
             volume_id,
-            req,
             &vg_name,
             &lv_name,
-            current_size,
+            &grow_intent,
             current_generation,
-            intent_is_durable,
+            actual,
         )?;
         Ok(respond(actual))
     }
@@ -2419,6 +4820,10 @@ impl LvmProvider {
                 format!("volume {volume_id} must be fully detached before delete"),
             ));
         }
+        // A live grow releases the state lock across `lvextend`; deleting
+        // under it would destroy the LV the resize is operating on and
+        // leave a durable intent that can no longer be classified.
+        Self::ensure_no_pending_grow(state, volume_id)?;
         if let Some(record) = state.move_record(volume_id) {
             if Self::move_blocks_delete(record) {
                 return Err(ApiError::new(
@@ -2566,24 +4971,58 @@ impl LvmProvider {
     /// generation/policy is refused. An absent LV is a loud `INTERNAL`
     /// for a non-Failed volume with no pending intent (never "deleted"
     /// as if erased). The intent is persisted before `blkdiscard`/
-    /// `lvremove`; a failed command clears it when possible (restoring
-    /// it in memory and leaving it durable when the clear fails). The
-    /// final save removes the volume and intent together; its failed
-    /// save keeps the in-memory removal only when the durable file
-    /// already records both removals, otherwise it restores the durable
-    /// shape and reports that a retry/restart completes the delete.
-    /// Foreign LVs are never touched.
+    /// `lvremove`, and the destructive body runs **without** the provider
+    /// state lock (Phase E E1); the durable intent is the fence and the
+    /// recovery anchor while it runs. The final save removes the volume and
+    /// intent together; its failed save keeps the in-memory removal only
+    /// when the durable file already records both removals, otherwise it
+    /// restores the durable shape and reports that a retry/restart
+    /// completes the delete. Foreign LVs are never touched.
     fn delete_volume_inner(
         &self,
         volume_id: &VolumeId,
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
         validate_api_version(&req.api_version)?;
-        let mut state = self.lock_state()?;
-        let (stored_before, pending_intent) =
-            Self::validate_delete_request(&state, volume_id, req)?;
+        // One live structural drive per volume. The destructive body runs
+        // without the provider state lock, so a second delete or create of
+        // the same volume must be refused instead of racing
+        // `blkdiscard`/`lvremove` against the same durable intent.
+        let _drive = self.begin_structural_drive(volume_id, StructuralDriveKind::Delete)?;
+        let (mut stored_before, _) = {
+            let state = self.lock_state_stable()?;
+            Self::validate_delete_request(&state, volume_id, req)?
+        };
         let vg_name = stored_before.entry.vg_name.clone();
         let lv_name = stored_before.entry.lv_name.clone();
+
+        // Observe the LV outside the state lock. `lvs` is an external CLI
+        // call; holding the single provider mutex across it queued every
+        // other volume's mutation behind this check. The structural drive
+        // guard keeps this volume's own create/delete out; the full
+        // revalidation below is the fence against a grow/move that started
+        // in the observation window. Phase F F2a (#62).
+        let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
+
+        let mut state = self.lock_state_stable()?;
+        let (fresh_before, pending_intent) = Self::validate_delete_request(&state, volume_id, req)?;
+        // The observation ran without the lock. Fail closed if the volume
+        // changed under it rather than authorizing a delete from a stale
+        // snapshot; a same-id recreate bumps the generation and is caught
+        // by `validate_delete_request` itself.
+        if fresh_before.entry.generation != stored_before.entry.generation
+            || fresh_before.entry.vg_name != vg_name
+            || fresh_before.entry.lv_name != lv_name
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "volume {volume_id} changed while its LV existence was observed outside \
+                     the state lock; refusing to authorize a delete from a stale snapshot"
+                ),
+            ));
+        }
+        stored_before = fresh_before;
         let volume_state = stored_before.runtime.state;
 
         // A Failed volume whose LV is already absent has nothing to
@@ -2596,7 +5035,6 @@ impl LvmProvider {
         // holding live data — so it fails loudly instead. A pending
         // delete intent is the exception: it authorizes completing the
         // observed absence (the LV may have been removed before a crash).
-        let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
         if !lv_exists && volume_state != VolumeLifecycle::Failed && pending_intent.is_none() {
             return Err(ApiError::new(
                 ApiErrorCode::Internal,
@@ -2622,6 +5060,13 @@ impl LvmProvider {
         )?;
 
         if lv_exists {
+            // Phase E E1 (#62): the intent is durable, so the destructive
+            // body no longer needs the provider state lock. Dropping the
+            // guard publishes the intent; the volume and its fence stay in
+            // the committed state until the final removal, so readers and
+            // structural operations see the same pending-delete truth they
+            // saw before the lock was released.
+            drop(state);
             if let Err(command_error) =
                 self.discard_and_remove_lv(&vg_name, &lv_name, intent.erasure_policy)
             {
@@ -2643,6 +5088,36 @@ impl LvmProvider {
                     ),
                 ));
             }
+            // Reacquire only for the final atomic record removal. Other
+            // volumes' mutations may have saved state while the command
+            // ran; admission alignment resolves any in-flight capture.
+            state = self.lock_state_stable()?;
+            // Fail closed if the volume or its matching authorization
+            // disappeared while the command was in flight. A different
+            // intent must never be removed under this call's authority.
+            let current = state.volume(volume_id).cloned().ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} disappeared from state while its authorized \
+                         delete of {vg_name}/{lv_name} was in flight; the LV was removed, \
+                         but the durable record cannot be cleared safely"
+                    ),
+                )
+            })?;
+            if current.entry.generation != intent.expected_generation
+                || state.delete_intent(volume_id) != Some(&intent)
+            {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "volume {volume_id} changed generation or authorization while its \
+                         delete of {vg_name}/{lv_name} was in flight; refusing to remove a \
+                         record under a mismatched delete intent"
+                    ),
+                ));
+            }
+            stored_before = current;
         }
         state.remove_volume(volume_id);
         state.remove_delete_intent(volume_id);
@@ -2840,37 +5315,51 @@ impl LvmProvider {
     /// queryable by the reconcile pass, which rolls it forward if
     /// the world later proves completion.
     ///
-    /// Parking is the conservative in-memory view: the record is set
-    /// `IN_DOUBT` even if the save below fails, and the caller receives
-    /// the save error rather than a success response. The **durable
-    /// file remains the anchor** in that case — the prior record when
-    /// the rename did not land, or the already-landed `IN_DOUBT` when
-    /// it did — and the daemon never memory-only-completes or
-    /// memory-only-resolves anything; startup reconcile re-parks the
-    /// record from the observed world. A persisted `IN_DOUBT` is
-    /// likewise rolled forward only by a verified completion.
+    /// Parking is applied to the in-memory view before the save. If the
+    /// save fails, [`LvmProvider::reconcile_failed_save`] keeps the parked
+    /// state only when the durable file proves the rename landed; when
+    /// durability cannot be proven the in-memory park is reverted to the
+    /// last committed snapshot. The caller receives the save error either
+    /// way, never a success response. The **durable file remains the
+    /// anchor** — the prior record when the rename did not land, or the
+    /// already-landed `IN_DOUBT` when it did — and the daemon never
+    /// memory-only-completes or memory-only-resolves anything; startup
+    /// reconcile re-parks the record from the observed world. A persisted
+    /// `IN_DOUBT` is likewise rolled forward only by a verified
+    /// completion.
     ///
-    /// **A landed completion is never parked over.** Every caller
-    /// parks on a judgment made *before* this lock — a snapshot of
-    /// the record, or a world observation that may itself have
-    /// failed transiently — so the durable record is re-checked
-    /// under the lock, the same stale-snapshot discipline as
-    /// [`Self::finish_complete`]'s idempotency gate: a stored
-    /// `COMPLETE` record means the completion already landed
-    /// durably (this caller's snapshot predates it, or a concurrent
-    /// finish path won the race — including the case where this
-    /// caller's own verification observe failed transiently), and it
-    /// is answered as-is. Parking over it would resurrect the
-    /// resolved move to `IN_DOUBT`, and the next reconcile pass
-    /// would re-complete it and bump the generation a second time.
+    /// **A terminal record is never parked over.** Every caller parks
+    /// on a judgment made *before* this lock — a snapshot of the
+    /// record, or a world observation that may itself have failed
+    /// transiently — so the durable record is re-checked under the
+    /// lock, the same stale-snapshot discipline as
+    /// [`Self::finish_complete`]'s idempotency gate:
+    ///
+    /// - a stored `COMPLETE` means the completion already landed
+    ///   durably (this caller's snapshot predates it, or a concurrent
+    ///   finish path won the race — including the case where this
+    ///   caller's own verification observe failed transiently); parking
+    ///   over it would resurrect the resolved move to `IN_DOUBT`, and
+    ///   the next reconcile pass would re-complete it and bump the
+    ///   generation a second time;
+    /// - a stored `FAILED` is the reconciliation's settled rollback
+    ///   verdict (the extents verifiably sit on the source with no move
+    ///   active). Parking over it would re-erect the delete fence and
+    ///   destroy the resolution audit detail until the next pass
+    ///   re-resolved it.
+    ///
+    /// Both are answered as-is.
     fn park_in_doubt(
         &self,
         volume_id: &VolumeId,
         detail: String,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         if let Some(stored) = state.move_record(volume_id) {
-            if stored.state == MoveVolumeBackingState::Complete {
+            if matches!(
+                stored.state,
+                MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed
+            ) {
                 return Ok(Self::move_response(&state, volume_id, stored));
             }
         }
@@ -2885,7 +5374,9 @@ impl LvmProvider {
                 .move_record(volume_id)
                 .map(|record| Self::move_response(&state, volume_id, record))
         };
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            self.reconcile_failed_save(&mut state);
+        })?;
         response.ok_or_else(|| not_found(volume_id))
     }
 
@@ -2921,7 +5412,6 @@ impl LvmProvider {
     /// re-read itself fails, the verified completion is kept as
     /// possibly durable (never rolled back, so a later save cannot
     /// regress the generation or erase the anchor).
-    #[allow(clippy::too_many_lines)] // one verified-completion/persist-classification narrative
     fn finish_complete(
         &self,
         volume_id: &VolumeId,
@@ -2929,33 +5419,62 @@ impl LvmProvider {
         lv_name: &str,
         record: &crate::state::MoveRecord,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
+        match self.complete_move_unless_growing(volume_id, vg_name, lv_name, record)? {
+            MoveCompletion::Completed(response) => Ok(response),
+            MoveCompletion::Deferred(error) => Err(error),
+        }
+    }
+
+    /// The verified-completion body, answering `Deferred` (instead of an
+    /// error) when a live grow owns the volume's generation anchor.
+    ///
+    /// Consumer-driven callers ([`Self::finish_complete`]) turn a
+    /// deferral into the typed refusal; the background reconcile pass
+    /// records it and keeps classifying the remaining records instead
+    /// of starving them behind one volume's grow.
+    #[allow(clippy::too_many_lines)] // one verified-completion/persist-classification narrative
+    fn complete_move_unless_growing(
+        &self,
+        volume_id: &VolumeId,
+        vg_name: &str,
+        lv_name: &str,
+        record: &crate::state::MoveRecord,
+    ) -> Result<MoveCompletion, ApiError> {
         let verification = match self.observe_lv(vg_name, lv_name) {
             Ok(Some(verification)) => verification,
             // The LV is verifiably absent (a successful `lvs` with no
             // row): not an unobservable world. The move can never
             // complete and no pvmove can be active, so resolve the
             // record terminally instead of parking it forever.
-            Ok(None) => return self.resolve_absent_move(volume_id, vg_name, lv_name, record),
+            Ok(None) => {
+                return self
+                    .resolve_absent_move(volume_id, vg_name, lv_name, record)
+                    .map(MoveCompletion::Completed);
+            }
             // The completion was observed but cannot be verified:
             // unknown, never a silent success.
             Err(e) => {
-                return self.park_in_doubt(
-                    volume_id,
-                    format!("verification could not observe the LV after the move ended: {e}"),
-                );
+                return self
+                    .park_in_doubt(
+                        volume_id,
+                        format!("verification could not observe the LV after the move ended: {e}"),
+                    )
+                    .map(MoveCompletion::Completed);
             }
         };
         if !verification.relocated_to(&record.source_pv, &record.target_pv) {
-            return self.park_in_doubt(
-                volume_id,
-                format!(
-                    "verification refused: the LV's devices do not verify the relocation \
-                     to {} (observed {:?}); the source PV {} must no longer back the LV",
-                    record.target_pv, verification.devices, record.source_pv
-                ),
-            );
+            return self
+                .park_in_doubt(
+                    volume_id,
+                    format!(
+                        "verification refused: the LV's devices do not verify the relocation \
+                         to {} (observed {:?}); the source PV {} must no longer back the LV",
+                        record.target_pv, verification.devices, record.source_pv
+                    ),
+                )
+                .map(MoveCompletion::Completed);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // The completion snapshot may be stale: this caller verified the
         // world without the lock, and a delete (or a newer move) may
         // have removed/replaced the record in between. Never complete a
@@ -2991,8 +5510,32 @@ impl LvmProvider {
         // is the durable truth, answered as-is — never clobbered,
         // never re-bumped.
         if stored_record.state == MoveVolumeBackingState::Complete {
-            return Ok(Self::move_response(&state, volume_id, &stored_record));
+            return Ok(MoveCompletion::Completed(Self::move_response(
+                &state,
+                volume_id,
+                &stored_record,
+            )));
         }
+        // A live grow holds the volume's durable recovery anchor at the
+        // current generation. A completion bumps that generation without
+        // touching the intent, so a crash before the grow commits would
+        // make the anchor look stale and recovery would drop it while the
+        // LV is already extended. Defer the completion: the next reconcile
+        // tick re-observes the world after the grow commits or clears its
+        // intent. (Unsettled records cannot coexist with a live grow —
+        // grow admission refuses them — so this can only defer a settled,
+        // e.g. previously FAILED, record whose world moved again.)
+        if let Some(error) = Self::pending_grow_error(&state, volume_id) {
+            return Ok(MoveCompletion::Deferred(error));
+        }
+        // A stored `FAILED` is deliberately **not** a barrier on this
+        // path: unlike `park_in_doubt`, this caller holds a fresh world
+        // observation that proves the relocation. A `FAILED` verdict came
+        // from an earlier observation that proved the extents back on the
+        // source; contradictory observations mean the world moved again
+        // between them. The verified relocation is the authority here, so
+        // completing is a roll-forward, not a resurrection of an
+        // unresolved move.
         let previous_record = state.move_record(volume_id).cloned();
         let Some(stored) = state.volume_mut(volume_id) else {
             // The volume was deleted while the move ran. The delete
@@ -3117,7 +5660,9 @@ impl LvmProvider {
                 }
             }
         }
-        response.ok_or_else(|| not_found(volume_id))
+        response
+            .map(MoveCompletion::Completed)
+            .ok_or_else(|| not_found(volume_id))
     }
 
     /// The MoveVolumeBackingOnline drive (contract section 4A,
@@ -3144,8 +5689,13 @@ impl LvmProvider {
         volume_id: &VolumeId,
         req: &MoveVolumeBackingRequest,
     ) -> Result<MoveAdmission, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         self.ensure_no_pending_delete(&state, volume_id)?;
+        // Snapshot fence only: the authoritative re-check runs under the
+        // writer lock in `journal_move_intent` before the record is
+        // inserted, so this early answer cannot race a grow that persists
+        // its intent in the insert→publish gap.
+        Self::ensure_no_pending_grow(&state, volume_id)?;
         let stored = state
             .volume(volume_id)
             .ok_or_else(|| not_found(volume_id))?;
@@ -3219,19 +5769,7 @@ impl LvmProvider {
                         existing_record: Some(record.clone()),
                     })
                 }
-                MoveVolumeBackingState::InDoubt => Err(ApiError::new(
-                    ApiErrorCode::InvalidState,
-                    format!(
-                        "the volume's previous move (to {}) is IN_DOUBT{}; it parks \
-                         until reconciliation proves completion or an operator \
-                         resolves it",
-                        record.target_pv,
-                        record
-                            .detail
-                            .as_deref()
-                            .map_or_else(String::new, |detail| format!(": {detail}"))
-                    ),
-                )),
+                MoveVolumeBackingState::InDoubt => Err(Self::in_doubt_move_error(record)),
                 MoveVolumeBackingState::Failed => {
                     // A resolved failure is terminal for **that
                     // move** only: the reconcile proved the extents
@@ -3255,21 +5793,49 @@ impl LvmProvider {
                 // refuse typed rather than silently superseding a
                 // state the provider cannot even observe.
                 MoveVolumeBackingState::MirrorReady | MoveVolumeBackingState::Pivoted => {
-                    Err(ApiError::new(
-                        ApiErrorCode::Internal,
-                        format!(
-                            "the volume's move record holds {} — a mirror-path state the \
-                             same-VG extent move never writes; the record is foreign to \
-                             this provider's journal, refusing rather than superseding it",
-                            match record.state {
-                                MoveVolumeBackingState::MirrorReady => "MIRROR_READY",
-                                _ => "PIVOTED",
-                            }
-                        ),
-                    ))
+                    Err(Self::foreign_move_error(record))
                 }
             },
         }
+    }
+
+    /// The typed refusal for a parked (`IN_DOUBT`) move record.
+    ///
+    /// Used by both admission and the under-lock journal re-check so a
+    /// record parked between admission's published-snapshot read and the
+    /// writer lock cannot be silently superseded by a fresh drive.
+    fn in_doubt_move_error(record: &crate::state::MoveRecord) -> ApiError {
+        ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "the volume's previous move (to {}) is IN_DOUBT{}; it parks \
+                 until reconciliation proves completion or an operator \
+                 resolves it",
+                record.target_pv,
+                record
+                    .detail
+                    .as_deref()
+                    .map_or_else(String::new, |detail| format!(": {detail}"))
+            ),
+        )
+    }
+
+    /// The typed refusal for a mirror-path move record foreign to this
+    /// same-VG provider (reachable only through hand-edited/imported
+    /// state).
+    fn foreign_move_error(record: &crate::state::MoveRecord) -> ApiError {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!(
+                "the volume's move record holds {} — a mirror-path state the \
+                 same-VG extent move never writes; the record is foreign to \
+                 this provider's journal, refusing rather than superseding it",
+                match record.state {
+                    MoveVolumeBackingState::MirrorReady => "MIRROR_READY",
+                    _ => "PIVOTED",
+                }
+            ),
+        )
     }
 
     /// Phase 2a — qualify the request's named target against the
@@ -3355,7 +5921,7 @@ impl LvmProvider {
         // target's free space (LVM allocates whole extents; the
         // stored effective size is already extent-aligned).
         let lv_size = {
-            let state = self.lock_state()?;
+            let state = self.state_snapshot();
             state
                 .volume(volume_id)
                 .map(|stored| stored.entry.size_bytes)
@@ -3384,27 +5950,13 @@ impl LvmProvider {
         // One pvmove per source PV: LVM attaches a second scoped
         // pvmove to the first and IGNORES its arguments — a second
         // move from the same source would be a silent no-op, so it
-        // is refused typed instead.
-        let same_source = {
-            let state = self.lock_state()?;
-            state.moves().iter().any(|(other, record)| {
-                other != volume_id
-                    && record.source_pv == source
-                    && matches!(
-                        record.state,
-                        MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
-                    )
-            })
-        };
-        if same_source {
-            return Err(ApiError::new(
-                ApiErrorCode::InvalidState,
-                format!(
-                    "another volume is already evacuating source PV {source}; LVM \
-                     attaches a second scoped pvmove to the first and ignores its \
-                     arguments, so one move per source PV at a time"
-                ),
-            ));
+        // is refused typed instead. This is only the pre-CLI check;
+        // `journal_move_intent` re-runs it under the writer lock so a
+        // concurrent admission cannot slip in while this request's
+        // CLI observations are in flight.
+        {
+            let state = self.state_snapshot();
+            ensure_no_other_active_move_on_source(&state, volume_id, &source)?;
         }
         Ok(Some(source))
     }
@@ -3474,13 +6026,16 @@ impl LvmProvider {
         req: &MoveVolumeBackingRequest,
         fallback_source: Option<&str>,
     ) -> Result<(String, crate::state::MoveRecord), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         // Re-validate under the journal lock: admission ran before the
         // CLI observations (target/source/foreign-pvmove queries), and
         // a delete of this volume may have completed in that window.
-        // Inserting an anchor for a deleted (or deleted-and-recreated)
-        // volume would let a later retry redrive pvmove on a volume
-        // that never authorized this move.
+        // Inserting an anchor for a deleted volume would let a later retry
+        // redrive pvmove on a volume that never authorized this move. A
+        // delete-and-recreate is caught only when the recreated volume has
+        // a different generation; a same-id/same-generation ABA recreate is
+        // not distinguishable with the current fence (a per-incarnation
+        // nonce would be needed).
         let Some(stored) = state.volume(volume_id) else {
             return Err(not_found(volume_id));
         };
@@ -3499,6 +6054,7 @@ impl LvmProvider {
                 ),
             ));
         }
+        Self::ensure_no_pending_grow(&state, volume_id)?;
         let mut inserted = false;
         let (source, record) = match state.move_record(volume_id) {
             Some(record)
@@ -3535,6 +6091,13 @@ impl LvmProvider {
                 (record.source_pv.clone(), record.clone())
             }
             _ => {
+                // Admission read a published snapshot before this
+                // request's lock-free CLI observations. If the record was
+                // parked, completed, or replaced by a foreign record in
+                // that window, the `_` arm must not silently supersede it.
+                // Re-check under the writer lock, exactly as admission
+                // would.
+                Self::refuse_superseded_fresh_drive(&state, volume_id, req)?;
                 // A fresh drive always carries a source verified from
                 // the world. Admission may have decided to re-attach and
                 // the record then vanished/settled under a concurrent
@@ -3551,6 +6114,14 @@ impl LvmProvider {
                     ));
                 };
                 let source = source.to_owned();
+                // Re-check the one-move-per-source rule under the writer
+                // lock. Admission's check reads a published snapshot taken
+                // before this request's CLI observations; a concurrent move
+                // that journaled its anchor in that window would otherwise
+                // let two pvmoves start on one source PV, and LVM silently
+                // attaches the second to the first and ignores its
+                // arguments.
+                ensure_no_other_active_move_on_source(&state, volume_id, &source)?;
                 let record = crate::state::MoveRecord {
                     operation_id: req.operation_id.clone(),
                     source_pv: source.clone(),
@@ -3576,6 +6147,72 @@ impl LvmProvider {
             self.ensure_preparing_anchor_durable(&mut state, volume_id, &record)?;
         }
         Ok((source, record))
+    }
+
+    /// Refuse a fresh drive whose live move record changed after admission
+    /// into a state a fresh `PREPARING` record must not supersede.
+    ///
+    /// Admission reads a published snapshot before the caller's lock-free
+    /// CLI observations, so the durable record can move underneath it:
+    ///
+    /// - an `IN_DOUBT` park waits for reconciliation or an operator;
+    /// - `MIRROR_READY`/`PIVOTED` are foreign to this same-VG journal;
+    /// - the exact requested target may have completed (admission would
+    ///   answer idempotently; superseding it would run a no-op pvmove,
+    ///   bump the generation again, and transiently re-erect the delete
+    ///   fence).
+    ///
+    /// `Failed` (a settled rollback) and a different-target `Complete` (a
+    /// new move) remain valid fresh drives.
+    ///
+    /// In a live race the same-target completion also bumps the volume
+    /// generation in the same save, so the generation fence normally
+    /// refuses the stale request first. This branch still matters for
+    /// imported/hand-edited state where a terminal record and an unbumped
+    /// generation coexist, and it mirrors admission's idempotent answer.
+    fn refuse_superseded_fresh_drive(
+        state: &LvmState,
+        volume_id: &VolumeId,
+        req: &MoveVolumeBackingRequest,
+    ) -> Result<(), ApiError> {
+        let Some(stored) = state.move_record(volume_id) else {
+            return Ok(());
+        };
+        match stored.state {
+            MoveVolumeBackingState::InDoubt => Err(Self::in_doubt_move_error(stored)),
+            MoveVolumeBackingState::MirrorReady | MoveVolumeBackingState::Pivoted => {
+                Err(Self::foreign_move_error(stored))
+            }
+            MoveVolumeBackingState::Complete if stored.target_pv == req.target_pool_id => {
+                Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the move for volume {volume_id} to {} completed while this request \
+                         was being admitted; retry to observe the completed record",
+                        stored.target_pv
+                    ),
+                ))
+            }
+            // The call site's outer match consumes active records before
+            // this helper; refuse explicitly rather than relying on that
+            // caller contract, so a future reuse cannot silently supersede
+            // a live move.
+            MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying => {
+                Err(ApiError::new(
+                    ApiErrorCode::InvalidState,
+                    format!(
+                        "the move record for volume {volume_id} is active ({}); re-attach to it \
+                     rather than journaling a fresh drive",
+                        if stored.state == MoveVolumeBackingState::Preparing {
+                            "PREPARING"
+                        } else {
+                            "COPYING"
+                        }
+                    ),
+                ))
+            }
+            MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed => Ok(()),
+        }
     }
 
     /// Ensure a re-attached `Preparing` record has a **durable** anchor
@@ -3825,6 +6462,63 @@ impl LvmProvider {
             .await
     }
 
+    /// Whether a stored move record may still be rolled to `COPYING`.
+    ///
+    /// `COMPLETE` and `FAILED` are terminal facts about this placement:
+    /// regressing either would let the next reconcile pass re-classify
+    /// the move, re-complete it and bump the volume generation a second
+    /// time (or resurrect a resolved failure). `IN_DOUBT` is explicitly
+    /// not terminal — it rolls forward when the world proves completion.
+    fn move_record_may_regress_to_copying(record: &crate::state::MoveRecord) -> bool {
+        !matches!(
+            record.state,
+            MoveVolumeBackingState::Complete | MoveVolumeBackingState::Failed
+        )
+    }
+
+    /// Durably mark a live move `COPYING` only when the stored record
+    /// still matches this pass's snapshot placement and is still
+    /// rollable. Returns whether the stored record is the current live
+    /// move (whether or not a save was needed).
+    ///
+    /// The caller's `lvs` observation happened outside the state lock,
+    /// so a concurrent supervisor may have completed the move in
+    /// between. Writing `COPYING` unconditionally would overwrite the
+    /// landed `COMPLETE`, and the next pass would complete the move
+    /// again and bump the volume generation a second time. A record
+    /// that already says `COPYING` needs no rewrite.
+    fn mark_move_copying_if_current(
+        &self,
+        volume_id: &VolumeId,
+        snapshot: &crate::state::MoveRecord,
+    ) -> Result<bool, ApiError> {
+        let mut state = self.lock_state_stable()?;
+        let Some(stored) = state.move_record(volume_id).cloned() else {
+            return Ok(false);
+        };
+        if stored.source_pv != snapshot.source_pv || stored.target_pv != snapshot.target_pv {
+            return Ok(false);
+        }
+        if !Self::move_record_may_regress_to_copying(&stored) {
+            return Ok(false);
+        }
+        // Already exactly the live classification: the durable anchor is
+        // correct, so do not rewrite it. Besides avoiding write
+        // amplification, an unnecessary save per pass would consume a
+        // crash-injection point intended for the completing save.
+        if stored.state == MoveVolumeBackingState::Copying {
+            return Ok(true);
+        }
+        if let Some(stored) = state.move_record_mut(volume_id) {
+            stored.state = MoveVolumeBackingState::Copying;
+            stored.detail = None;
+        }
+        self.persist(&mut state).inspect_err(|_| {
+            self.reconcile_failed_save(&mut state);
+        })?;
+        Ok(true)
+    }
+
     /// Persist the move's `COPYING` record after `pvmove` started, and
     /// classify a failed save against the durable file.
     ///
@@ -3840,7 +6534,42 @@ impl LvmProvider {
         req: &MoveVolumeBackingRequest,
         record_for_drive: &crate::state::MoveRecord,
     ) -> Result<(), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
+        // The record may have moved on between the pvmove start and this
+        // lock: a concurrent supervisor can complete the same move, or a
+        // delete can drop it. Never regress a terminal record to
+        // `COPYING`; answer the already-completed move instead, and
+        // refuse to clobber a superseded placement.
+        let Some(stored) = state.move_record(volume_id).cloned() else {
+            return Err(not_found(volume_id));
+        };
+        if stored.source_pv != record_for_drive.source_pv
+            || stored.target_pv != record_for_drive.target_pv
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the move record for volume {volume_id} was superseded while the pvmove \
+                     was starting; refusing to overwrite it with this drive's COPYING record"
+                ),
+            ));
+        }
+        if !Self::move_record_may_regress_to_copying(&stored) {
+            if stored.state == MoveVolumeBackingState::Complete {
+                // A concurrent supervisor already completed this exact
+                // move; the supervision below re-verifies the world and
+                // answers the stored record without a second bump.
+                return Ok(());
+            }
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidState,
+                format!(
+                    "the move record for volume {volume_id} already resolved as {:?} while \
+                     the pvmove was starting; refusing to regress it to COPYING",
+                    stored.state
+                ),
+            ));
+        }
         if let Some(record) = state.move_record_mut(volume_id) {
             record.state = MoveVolumeBackingState::Copying;
             record.operation_id = req.operation_id.clone();
@@ -3947,7 +6676,7 @@ impl LvmProvider {
                 )
                 .map(Some);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let preparing = state
             .move_record(volume_id)
             .filter(|record| record.state == MoveVolumeBackingState::Preparing)
@@ -4014,7 +6743,24 @@ impl LvmProvider {
                     // answer the honest state. The record stays
                     // COPYING; the daemon's retry reconcile completes
                     // it, and a fresh operation re-attaches.
-                    let mut state = self.lock_state()?;
+                    //
+                    // Re-check the live record under the lock: another
+                    // actor may have landed `COMPLETE`/`FAILED`/parked
+                    // the move between this pass's observation and the
+                    // lock. Stamping the window detail onto a terminal
+                    // record would misreport a resolved move.
+                    let mut state = self.lock_state_stable()?;
+                    let still_copying = state.move_record(volume_id).is_some_and(|stored| {
+                        stored.state == MoveVolumeBackingState::Copying
+                            && stored.source_pv == record.source_pv
+                            && stored.target_pv == record.target_pv
+                    });
+                    if !still_copying {
+                        return state
+                            .move_record(volume_id)
+                            .map(|stored| Self::move_response(&state, volume_id, stored))
+                            .ok_or_else(|| not_found(volume_id));
+                    }
                     let response = {
                         if let Some(record) = state.move_record_mut(volume_id) {
                             record.detail = Some(
@@ -4027,7 +6773,9 @@ impl LvmProvider {
                             .move_record(volume_id)
                             .map(|record| Self::move_response(&state, volume_id, record))
                     };
-                    self.persist(&mut state)?;
+                    self.persist(&mut state).inspect_err(|_| {
+                        self.reconcile_failed_save(&mut state);
+                    })?;
                     return response.ok_or_else(|| not_found(volume_id));
                 }
                 tokio::time::sleep(self.move_timing.poll_interval).await;
@@ -4058,7 +6806,7 @@ impl LvmProvider {
         report: &mut MoveReconcileReport,
     ) -> Result<Option<(String, String)>, ApiError> {
         let names = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .volume(volume_id)
                 .map(|stored| (stored.entry.vg_name.clone(), stored.entry.lv_name.clone()))
@@ -4066,9 +6814,11 @@ impl LvmProvider {
         if names.is_some() {
             return Ok(names);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         state.remove_move(volume_id);
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            self.reconcile_failed_save(&mut state);
+        })?;
         self.clear_move_observe_failures(volume_id);
         report.dropped.push(volume_id.clone());
         Ok(None)
@@ -4094,7 +6844,7 @@ impl LvmProvider {
     fn reconcile_moves(&self, redrive: bool) -> Result<MoveReconcileReport, ApiError> {
         let mut report = MoveReconcileReport::default();
         let snapshot: Vec<(VolumeId, crate::state::MoveRecord)> = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .moves()
                 .iter()
@@ -4150,16 +6900,16 @@ impl LvmProvider {
             if observation.moving {
                 // The move is alive (whether this daemon started it
                 // or a previous incarnation did): the record must say
-                // so durably.
-                if record.state != MoveVolumeBackingState::Copying {
-                    let mut state = self.lock_state()?;
-                    if let Some(record) = state.move_record_mut(&volume_id) {
-                        record.state = MoveVolumeBackingState::Copying;
-                        record.detail = None;
-                    }
-                    self.persist(&mut state)?;
+                // so durably. The observation may still be stale — the
+                // pass snapshotted before it observed without the lock —
+                // so the live record is re-checked under the lock: a
+                // move that completed (or terminally failed) while this
+                // pass was observing must never be regressed to
+                // `COPYING`. Regressing a `COMPLETE` would let the next
+                // pass re-complete it and bump the generation again.
+                if self.mark_move_copying_if_current(&volume_id, &record)? {
+                    report.marked_copying.push(volume_id);
                 }
-                report.marked_copying.push(volume_id);
                 continue;
             }
             if observation.relocated_to(&record.source_pv, &record.target_pv) {
@@ -4167,8 +6917,15 @@ impl LvmProvider {
                 // for an IN_DOUBT record ("rolls forward under
                 // reconciled authority") — and verified against the
                 // record's own target, never a foreign relocation.
-                self.finish_complete(&volume_id, &vg_name, &lv_name, &record)?;
-                report.completed.push(volume_id);
+                // A live grow defers this one record (its completion
+                // would void the grow's generation anchor); the pass
+                // records the deferral and keeps classifying the rest.
+                match self.complete_move_unless_growing(&volume_id, &vg_name, &lv_name, &record)? {
+                    MoveCompletion::Completed(_) => report.completed.push(volume_id),
+                    MoveCompletion::Deferred(_) => {
+                        report.deferred_while_growing.push(volume_id);
+                    }
+                }
                 continue;
             }
             match record.state {
@@ -4250,7 +7007,7 @@ impl LvmProvider {
         // completed, superseded, or dropped the record since the pass
         // took its snapshot.
         let current = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state.move_record(volume_id).cloned()
         };
         let Some(current) = current else {
@@ -4298,7 +7055,7 @@ impl LvmProvider {
         }
         match self.start_pvmove(vg_name, lv_name, &record.source_pv, &record.target_pv) {
             Ok(()) => {
-                let mut state = self.lock_state()?;
+                let mut state = self.lock_state_stable()?;
                 let still_matches = state.move_record(volume_id).is_some_and(|stored| {
                     stored.state == MoveVolumeBackingState::Preparing
                         && stored.source_pv == record.source_pv
@@ -4313,7 +7070,9 @@ impl LvmProvider {
                     stored.state = MoveVolumeBackingState::Copying;
                     stored.detail = None;
                 }
-                self.persist(&mut state)?;
+                self.persist(&mut state).inspect_err(|_| {
+                    self.reconcile_failed_save(&mut state);
+                })?;
                 report.redriven.push(volume_id.clone());
             }
             Err(_) => report.redrive_failed.push(volume_id.clone()),
@@ -4339,7 +7098,7 @@ impl LvmProvider {
     ) -> Result<(), ApiError> {
         let failures = self.bump_move_observe_failures(volume_id);
         let already_parked = {
-            let state = self.lock_state()?;
+            let state = self.lock_state_stable()?;
             state
                 .move_record(volume_id)
                 .is_some_and(|record| record.state == MoveVolumeBackingState::InDoubt)
@@ -4392,7 +7151,7 @@ impl LvmProvider {
         record: &crate::state::MoveRecord,
         report: &mut MoveReconcileReport,
     ) -> Result<(), ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let resolves = state.move_record(volume_id).is_some_and(|stored| {
             stored.state == MoveVolumeBackingState::InDoubt
                 && stored.source_pv == record.source_pv
@@ -4503,7 +7262,7 @@ impl LvmProvider {
         lv_name: &str,
         record: &crate::state::MoveRecord,
     ) -> Result<MoveVolumeBackingResponse, ApiError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
         let Some(stored) = state.move_record(volume_id).cloned() else {
             return Err(not_found(volume_id));
         };
@@ -4626,11 +7385,18 @@ impl VolumeProvider for LvmProvider {
         &self,
         req: &CreateVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
-        self.create_volume_inner(req)
+        // The create body is synchronous end to end: `vgs`, `lvcreate` and
+        // the size-verifying `lvs` are blocking LVM CLI calls. Running them
+        // inline pins an async worker for their full duration, so at high
+        // in-flight enough concurrent creates can pin every worker and
+        // starve reads, attaches, reports and detaches. `block_in_place`
+        // hands this worker's core to the scheduler for the duration; see
+        // `grow_volume` for the handoff and fallback rationale.
+        run_blocking_body(|| self.create_volume_inner(req))
     }
 
     async fn inspect_volume(&self, id: &VolumeId) -> Result<InspectVolumeResponse, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         state
             .volume(id)
             .map(|stored| inspect_response(id, stored))
@@ -4641,7 +7407,7 @@ impl VolumeProvider for LvmProvider {
         &self,
         project: Option<&ProjectId>,
     ) -> Result<Vec<InspectVolumeResponse>, ApiError> {
-        let state = self.lock_state()?;
+        let state = self.state_snapshot();
         Ok(state
             .volumes()
             .iter()
@@ -4655,7 +7421,7 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &AttachVolumeRequest,
     ) -> Result<AttachVolumeResponse, ApiError> {
-        self.attach_volume_inner(volume_id, req)
+        self.attach_volume_inner(volume_id, req).await
     }
 
     async fn detach_volume(
@@ -4665,6 +7431,7 @@ impl VolumeProvider for LvmProvider {
         req: &DetachVolumeRequest,
     ) -> Result<InspectVolumeResponse, ApiError> {
         self.detach_volume_inner(volume_id, attachment_id, req)
+            .await
     }
 
     async fn report_attachment_state(
@@ -4672,7 +7439,7 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &ReportAttachmentStateRequest,
     ) -> Result<ReportAttachmentStateResponse, ApiError> {
-        self.report_attachment_state_inner(volume_id, req)
+        self.report_attachment_state_inner(volume_id, req).await
     }
 
     async fn grow_volume(
@@ -4680,7 +7447,39 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &GrowVolumeRequest,
     ) -> Result<GrowVolumeResponse, ApiError> {
-        self.grow_volume_inner(volume_id, req)
+        // One live grow drive per volume. A duplicate request is refused
+        // immediately, even before it can observe the durable intent.
+        // Total in-flight grow bodies are bounded by the daemon's request
+        // admission cap; the provider adds no second, lower bound. A
+        // grow-specific bulkhead below that cap was tested in a
+        // non-evidence A/B diagnostic of the parent commit (limit 8 versus
+        // effectively unbounded): the bounded arm added a provider-side
+        // queue without raising the LVM-bound grow completion rate, and
+        // had lower c128 throughput and longer grow latency. The mechanism
+        // beyond that added queue is not attributed.
+        let _drive = self.begin_grow_drive(volume_id)?;
+        // The grow body is synchronous end to end: `vgs`, `lvextend` and
+        // the size-verifying `lvs` are blocking LVM CLI calls. Running
+        // them inline pins an async worker for their full duration, so at
+        // high in-flight enough concurrent grows can pin every worker and
+        // starve reads, attaches, reports and detaches behind them. The
+        // grows-on/off diagnostic (non-evidence) implicated the grow path
+        // in the residual c128 tail but did not attribute the mechanism;
+        // worker pinning is a hypothesis, not a measured cause.
+        // `block_in_place` hands this worker's core to the scheduler for
+        // the duration, so admission keeps running.
+        //
+        // This is a worker handoff, not a move to the blocking pool: the
+        // calling thread still runs the blocking body (blocking mode) and
+        // the runtime may transiently grow its worker set to cover the
+        // handed-off core. That cost is not measured here.
+        //
+        // `block_in_place` panics on a current-thread runtime (test
+        // runtimes, embedded callers) or inside a `LocalSet`, where there
+        // is no other worker to hand off to; `run_blocking_body` falls
+        // back to the inline call there. The daemon uses the multi-thread
+        // runtime, which is the case this protects.
+        run_blocking_body(|| self.grow_volume_inner(volume_id, req))
     }
 
     async fn move_volume_backing(
@@ -4701,13 +7500,89 @@ impl VolumeProvider for LvmProvider {
         volume_id: &VolumeId,
         req: &DeleteVolumeRequest,
     ) -> Result<(), ApiError> {
-        self.delete_volume_inner(volume_id, req)
+        // The delete body is synchronous end to end: the `lvs` check,
+        // `blkdiscard` and `lvremove` are blocking LVM CLI calls. Running
+        // them inline pins an async worker for their full duration, so at
+        // high in-flight enough concurrent deletes can pin every worker and
+        // starve reads, attaches, reports and detaches. `block_in_place`
+        // hands this worker's core to the scheduler for the duration; see
+        // `grow_volume` for the handoff and fallback rationale.
+        run_blocking_body(|| self.delete_volume_inner(volume_id, req))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether the current Tokio runtime reports the multi-thread flavor.
+///
+/// This is only a fast-path predicate. It is **not sufficient** to prove
+/// [`tokio::task::block_in_place`] is legal: a `LocalSet` on a
+/// multi-thread runtime disallows blocking in place even though the
+/// flavor says `MultiThread`, and `block_in_place` then panics. The
+/// actual handoff goes through [`run_blocking_body`], which falls back to
+/// the inline call if the handoff is refused.
+fn on_multi_thread_runtime() -> bool {
+    matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
+/// Run a synchronous blocking body with the current async worker's core
+/// handed off to the scheduler, when the runtime permits it.
+///
+/// `block_in_place` panics (before running the closure) inside a
+/// `LocalSet`, where there is no legal handoff. The panic is caught here and
+/// the body runs inline instead. (A plain current-thread runtime takes the
+/// early return above and never reaches `block_in_place`.) The `ran` flag
+/// distinguishes a refused handoff (body never
+/// started, safe to run it now) from a panic *inside* the body (re-raised
+/// unchanged, never run twice).
+///
+/// The caught refusal still reaches the process-wide panic hook, so an
+/// embedder that calls grow, create or delete on a `LocalSet` sees a "can
+/// call blocking only when running on the multi-threaded runtime" message on
+/// stderr for each call. `volvisord` uses the multi-thread runtime and never
+/// takes this path. The fallback also
+/// runs the synchronous body on the caller's thread, which is the worker
+/// pinning this helper exists to avoid; it is a correctness fallback for
+/// embedders, not a throughput path.
+fn run_blocking_body<F, R>(body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if !on_multi_thread_runtime() {
+        return body();
+    }
+    let mut body = Some(body);
+    let mut ran = false;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| {
+            let Some(body) = body.take() else {
+                unreachable!("the blocking body runs exactly once");
+            };
+            ran = true;
+            body()
+        })
+    }));
+    match result {
+        Ok(value) => value,
+        Err(payload) => {
+            if ran {
+                // The body itself panicked; preserve the original panic.
+                resume_unwind(payload);
+            }
+            // `block_in_place` refused to hand off (LocalSet or another
+            // disallowed context): the caller's body never ran.
+            let Some(body) = body.take() else {
+                unreachable!("a refused handoff leaves the body unexecuted");
+            };
+            body()
+        }
+    }
+}
 
 /// The shared `--reportformat json --units b --nosuffix` LVM arguments.
 fn lvm_json_args() -> &'static [&'static str] {
@@ -4775,6 +7650,40 @@ pub(crate) fn command_failed(program: &str, output: &CommandOutput) -> ApiError 
         ApiErrorCode::Internal,
         format!("{program} failed: {}", output.stderr_excerpt()),
     )
+}
+
+/// Refuse a second active move on one source PV.
+///
+/// Verified LVM behavior: a scoped `pvmove` whose source PV already carries
+/// an active move attaches to it, ignores its arguments and exits 0 — a
+/// silent no-op. Callers run this against the freshest move records they
+/// have: admission against the published snapshot (pre-CLI) and
+/// `journal_move_intent` again under the writer lock (post-CLI), so a
+/// concurrent admission cannot widen the check-then-act window.
+fn ensure_no_other_active_move_on_source(
+    state: &LvmState,
+    volume_id: &VolumeId,
+    source: &str,
+) -> Result<(), ApiError> {
+    let occupied = state.moves().iter().any(|(other, record)| {
+        other != volume_id
+            && record.source_pv == source
+            && matches!(
+                record.state,
+                MoveVolumeBackingState::Preparing | MoveVolumeBackingState::Copying
+            )
+    });
+    if occupied {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidState,
+            format!(
+                "another volume is already evacuating source PV {source}; LVM attaches a \
+                 second scoped pvmove to the first and ignores its arguments, so one move \
+                 per source PV at a time"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// An `UNSUPPORTED_CLASS_OR_POLICY` rejection (fail-closed negotiation).
@@ -4965,6 +7874,30 @@ fn attach_response(record: &AttachmentRecord, entry: &VolumeEntry) -> AttachVolu
     }
 }
 
+/// Build the standalone grow answer.
+///
+/// The provider-layer status is a placeholder, honestly labeled: this
+/// layer has no VMM to notify. When the daemon wires the P6-B
+/// grow-notification engine (volvisor-provider's `grow` module — the LVM
+/// daemon path always does), the API layer composes the real status over
+/// this response, inside the journal's execute closure, so the recorded
+/// outcome carries it and replays byte-compatibly. This placeholder
+/// remains the honest standalone answer (the conformance kit,
+/// provider-direct callers): an attached frontend still needs a
+/// (retried) notification; a detached volume has nobody to notify.
+/// Never `Notified` from here.
+fn grow_response(has_attachment: bool, effective_size_bytes: u64) -> GrowVolumeResponse {
+    GrowVolumeResponse {
+        backing_resized: true,
+        guest_notification_status: if has_attachment {
+            GrowGuestNotification::RetryRequired
+        } else {
+            GrowGuestNotification::NotApplicable
+        },
+        effective_size_bytes,
+    }
+}
+
 impl AttachmentRecordView for AttachmentRecord {
     fn attachment_id(&self) -> &AttachmentId {
         &self.id
@@ -5024,5 +7957,1786 @@ impl AttachmentStateRecord for AttachmentRecord {
         self.evidence = Some(evidence);
         self.reporter = reporter;
         self.recorded_at_ms = Some(recorded_at_ms);
+    }
+}
+
+#[cfg(test)]
+mod read_snapshot_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    pub(super) fn seeded_provider(dir: &tempfile::TempDir) -> (Arc<LvmProvider>, VolumeId) {
+        seeded_provider_with_state_path(dir, dir.path().join("state.json"))
+    }
+
+    fn seeded_provider_with_state_path(
+        dir: &tempfile::TempDir,
+        state_path: std::path::PathBuf,
+    ) -> (Arc<LvmProvider>, VolumeId) {
+        let volume_id = VolumeId::new("vol-snapshot").expect("valid id");
+        let mut state = LvmState::default();
+        state.insert_volume(
+            volume_id.clone(),
+            StoredVolume {
+                entry: VolumeEntry {
+                    vg_name: "vg-1".to_owned(),
+                    lv_name: "vol-vol-snapshot-abcd1234".to_owned(),
+                    size_bytes: 1024,
+                    requested_size_bytes: 1024,
+                    generation: 1,
+                    data_epoch: 0,
+                    project_id: ProjectId::new("tenant-a").expect("valid id"),
+                    block_size: 4096,
+                    creation_payload: "{}".to_owned(),
+                },
+                runtime: VolumeRuntime {
+                    state: VolumeLifecycle::Ready,
+                    attachment: None,
+                    retired_attachments: RetiredAttachmentFilter::default(),
+                },
+            },
+        );
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
+        let provider = LvmProvider {
+            runner: Arc::new(volvisor_provider::FakeRunner::with_queue(Vec::new())),
+            writer,
+            state_path,
+            sysfs_root: dir.path().to_path_buf(),
+            vg_prefix: "vg-volvisor".to_owned(),
+            expected_auth_token: "test-token".to_owned(),
+            store_crash,
+            move_timing: MoveTiming::default(),
+            move_observe_failures: Mutex::new(BTreeMap::new()),
+            grow_drives: Mutex::new(BTreeSet::new()),
+            volume_drives: Mutex::new(BTreeMap::new()),
+            capacity_reservations: Mutex::new(BTreeMap::new()),
+            capacity_epoch: AtomicU64::new(0),
+            state: Mutex::new(state.clone()),
+            read_snapshot,
+        };
+        (Arc::new(provider), volume_id)
+    }
+
+    /// Regression for the Phase C benchmark finding: a schema-v3 state
+    /// file can carry a saturated legacy `retired_attachment_filter`.
+    /// Consulting it (as the Phase A code did) refuses every fresh id as a
+    /// false positive. The generation is the fence, so the attach must
+    /// succeed and the legacy bits must be ignored.
+    #[tokio::test]
+    async fn a_saturated_legacy_retired_filter_does_not_refuse_fresh_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            let runtime = &mut state.volume_mut(&volume_id).expect("volume").runtime;
+            for index in 0..100_000u32 {
+                runtime
+                    .retired_attachments
+                    .insert(&AttachmentId::new(format!("legacy-att-{index}")).expect("valid id"));
+            }
+            assert!(
+                runtime
+                    .retired_attachments
+                    .maybe_contains(&AttachmentId::new("fresh-att").expect("valid id")),
+                "the legacy filter is saturated and would false-positive a fresh id"
+            );
+        }
+        let fresh = AttachmentId::new("fresh-att").expect("valid id");
+        let request = volvisor_types::request::AttachVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-attach-fresh").expect("valid id"),
+            vm_id: "vm-fresh".to_owned(),
+            host_id: volvisor_types::HostId::new("host-fresh").expect("valid id"),
+            attachment_id: fresh.clone(),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let attached = provider
+            .attach_volume(&volume_id, &request)
+            .await
+            .expect("a saturated legacy filter must not refuse a fresh id");
+        assert_eq!(attached.attachment_id, fresh);
+        assert_eq!(attached.attachment_generation, 1);
+    }
+
+    #[test]
+    fn reads_do_not_wait_for_the_writer_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let writer = provider.lock_state().expect("writer guard");
+
+        // A reader in another thread must get the published snapshot
+        // while the writer guard is held (the pre-#62 design took the
+        // same mutex and would block here).
+        let (tx, rx) = mpsc::channel();
+        let reader = Arc::clone(&provider);
+        std::thread::spawn(move || {
+            let count = reader.state_snapshot().volumes().len();
+            let _ = tx.send(count);
+        });
+        let count = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader must not block behind the writer");
+        assert_eq!(count, 1);
+        drop(writer);
+    }
+
+    #[test]
+    fn a_committed_writer_guard_publishes_the_new_read_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.volume_mut(&volume_id).expect("volume").runtime.state = VolumeLifecycle::Degraded;
+        }
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot
+                .volume(&volume_id)
+                .expect("volume in snapshot")
+                .runtime
+                .state,
+            VolumeLifecycle::Degraded,
+            "dropping a mutably-used writer guard publishes the new view"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_publishes_nothing_and_keeps_the_committed_ready_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file where the state directory should be makes every
+        // save fail before the temporary file is even created.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let (provider, volume_id) =
+            seeded_provider_with_state_path(&dir, blocker.join("state.json"));
+
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-failed-save").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-failed-save").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let error = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the durable save must fail");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+
+        // The failed mutation must not be observable as committed: a read
+        // still sees Ready with no attachment, and a same-id retry must
+        // re-execute rather than replay a phantom in-memory success.
+        let snapshot = provider.state_snapshot();
+        let stored = snapshot.volume(&volume_id).expect("volume");
+        assert_eq!(stored.runtime.state, VolumeLifecycle::Ready);
+        assert!(stored.runtime.attachment.is_none());
+        assert_eq!(stored.entry.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn a_poison_refusal_never_resurrects_an_uncommitted_attachment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // Make the seeded volume durable so admission alignment has a
+        // baseline to restore after the poisoned capture is refused.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-poison").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-poison").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider.writer.poison(WRITER_POISON_DETAIL);
+
+        let first = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("a poisoned writer refuses the capture");
+        assert_eq!(first.code, ApiErrorCode::Internal);
+        assert!(first.detail.contains(WRITER_POISON_DETAIL), "{first}");
+        assert!(
+            provider.writer.needs_alignment(),
+            "a poison refusal must require the next admission to align"
+        );
+        assert!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the refused mutation is not published"
+        );
+
+        // A same-id retry must re-execute and fail again. If the refused
+        // mutation were still visible to admission, the idempotency replay
+        // would answer success from memory while the durable file has no
+        // attachment.
+        let retry = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("a retry must never replay a phantom in-memory success");
+        assert_eq!(retry.code, ApiErrorCode::Internal);
+        assert!(retry.detail.contains(WRITER_POISON_DETAIL), "{retry}");
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the durable file never contained the refused attachment"
+        );
+        assert!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the admission view is aligned to the durable file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_after_the_rename_keeps_the_durable_attachment_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // The injected failure lands after the rename: the new state file
+        // IS the durable state even though the save returns an error.
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-post-rename").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-post-rename").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let error = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the directory fsync fails after the rename");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("AfterRenameBeforeDirFsync"),
+            "{error}"
+        );
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_some(),
+            "the rename committed the attachment"
+        );
+        let snapshot = provider.state_snapshot();
+        let stored = snapshot.volume(&volume_id).expect("volume");
+        assert_eq!(
+            stored
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("the read view follows the durable file")
+                .id,
+            request.attachment_id,
+            "a post-rename failure must not revert below the durable state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_async_re_raises_the_armed_kill_payload_in_band() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        provider.store_crash_hooks().arm(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-async-kill").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-async-kill").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let task_provider = Arc::clone(&provider);
+        let joined = tokio::spawn(async move {
+            task_provider
+                .attach_volume_inner(&volume_id, &request)
+                .await
+        })
+        .await;
+        let join_error = joined.expect_err("the armed kill must panic the caller task");
+        assert!(
+            join_error.is_panic(),
+            "the async leader must re-raise the panic, not return a typed error"
+        );
+        let payload = join_error.into_panic();
+        let text = payload
+            .downcast_ref::<String>()
+            .expect("the crash payload is the marked string");
+        assert!(
+            text.starts_with(volvisor_types::crash::CRASH_PANIC_PREFIX),
+            "the campaign rig must still see the in-band crash payload: {text}"
+        );
+        assert!(
+            provider.writer.lock_writer().poisoned.is_some(),
+            "the async leader panic poisons the writer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // The test deliberately holds the per-path write gate across awaits so
+    // the first attach's physical write cannot complete; the gate is a
+    // blocking leaf, not a lock the async code needs on this thread.
+    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::too_many_lines)]
+    async fn a_same_id_attach_replay_waits_for_durability_and_reexecutes_after_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // The seeded memory state must be durable first: a covering
+        // failure aligns the next admission back to this baseline.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-replay-window").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-replay-window").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+
+        // Hold the per-path physical-write gate so the first attach's save
+        // cannot complete until this test releases it, and make that first
+        // write fail before the rename. The re-executed write then
+        // succeeds.
+        let gate = WriterCore::gate_for(&provider.state_path);
+        let held = gate.lock().expect("hold the physical-write gate");
+        let writes_before = provider.writer.physical_writes.load(Ordering::SeqCst);
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+
+        let first_provider = Arc::clone(&provider);
+        let first_request = request.clone();
+        let first_volume = volume_id.clone();
+        let first = tokio::spawn(async move {
+            first_provider
+                .attach_volume_inner(&first_volume, &first_request)
+                .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while provider.writer.physical_writes.load(Ordering::SeqCst) <= writes_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first attach never reached its physical write"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The same-id replay arrives while the first capture is still
+        // unproven. It must not answer success from the uncommitted
+        // in-memory attachment.
+        let second_provider = Arc::clone(&provider);
+        let second_request = request.clone();
+        let second_volume = volume_id.clone();
+        let second = tokio::spawn(async move {
+            second_provider
+                .attach_volume_inner(&second_volume, &second_request)
+                .await
+        });
+
+        // It must park rather than answer, and it must not hold the
+        // provider state lock while it waits. Retry the lock probe so a
+        // brief admission critical section is not a false failure.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                !second.is_finished(),
+                "a same-id replay must wait for the covering capture's watermark"
+            );
+            if provider.state.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replay must not hold the provider state lock while it waits"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .is_none(),
+            "the first attachment is not durable while the write is held"
+        );
+
+        drop(held);
+        let first_result = first.await.expect("first attach task");
+        assert!(
+            first_result.is_err(),
+            "the injected pre-rename failure must reach the first caller"
+        );
+        let second_result = second
+            .await
+            .expect("second attach task")
+            .expect("the replay must re-execute after the failed covering capture");
+        assert_eq!(second_result.attachment_id, request.attachment_id);
+
+        let durable = LvmState::load(&provider.state_path).expect("durable state");
+        assert_eq!(
+            durable
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("the re-executed attach is durable")
+                .id,
+            request.attachment_id,
+            "a replay must never turn a failed save into a durable-lie"
+        );
+        assert_eq!(
+            provider.writer.physical_writes.load(Ordering::SeqCst),
+            writes_before + 2,
+            "one failed write and one successful re-execution"
+        );
+    }
+
+    #[test]
+    fn persisting_a_copying_record_never_regresses_a_landed_completion() {
+        // A concurrent supervisor can complete the move between the
+        // pvmove start and this save. Regressing COMPLETE to COPYING
+        // would let the next reconcile pass complete it again and bump
+        // the volume generation a second time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let source = "/dev/pv-source";
+        let target = "/dev/pv-target";
+        let complete = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-complete").expect("valid id"),
+            source_pv: source.to_owned(),
+            target_pv: target.to_owned(),
+            state: MoveVolumeBackingState::Complete,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), complete);
+            provider.persist(&mut state).expect("seed the completion");
+        }
+
+        let prior = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            source_pv: source.to_owned(),
+            target_pv: target.to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            target_pool_id: target.to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        provider
+            .persist_copying_record(&volume_id, &request, &prior)
+            .expect("an already-complete move is answered, not regressed");
+
+        let snapshot = provider.state_snapshot();
+        let record = snapshot.move_record(&volume_id).expect("move record");
+        assert_eq!(
+            record.state,
+            MoveVolumeBackingState::Complete,
+            "the landed completion must never be regressed to COPYING"
+        );
+        assert_eq!(record.operation_id.as_str(), "op-complete");
+    }
+
+    #[test]
+    fn persisting_a_copying_record_refuses_a_superseded_placement() {
+        // The record was replaced by a newer move (different source or
+        // target) while this drive was starting its pvmove. Clobbering
+        // it would attach this drive's COPYING save to a move it did
+        // not start.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let superseding = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-newer").expect("valid id"),
+            source_pv: "/dev/pv-other-source".to_owned(),
+            target_pv: "/dev/pv-other-target".to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), superseding.clone());
+            provider.persist(&mut state).expect("seed the newer move");
+        }
+
+        let prior = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            source_pv: "/dev/pv-source".to_owned(),
+            target_pv: "/dev/pv-target".to_owned(),
+            state: MoveVolumeBackingState::Preparing,
+            detail: None,
+        };
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-drive").expect("valid id"),
+            target_pool_id: "/dev/pv-target".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .persist_copying_record(&volume_id, &request, &prior)
+            .expect_err("a superseded placement is refused");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+
+        let snapshot = provider.state_snapshot();
+        let record = snapshot.move_record(&volume_id).expect("move record");
+        assert_eq!(record, &superseding, "the newer move is untouched");
+    }
+
+    #[test]
+    fn journaling_a_move_rechecks_the_one_move_per_source_rule_under_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let other_id = VolumeId::new("vol-other").expect("valid id");
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_volume(
+                other_id.clone(),
+                StoredVolume {
+                    entry: VolumeEntry {
+                        vg_name: "vg-1".to_owned(),
+                        lv_name: "vol-vol-other-abcd1234".to_owned(),
+                        size_bytes: 1024,
+                        requested_size_bytes: 1024,
+                        generation: 1,
+                        data_epoch: 0,
+                        project_id: ProjectId::new("tenant-a").expect("valid id"),
+                        block_size: 4096,
+                        creation_payload: "{}".to_owned(),
+                    },
+                    runtime: VolumeRuntime {
+                        state: VolumeLifecycle::Ready,
+                        attachment: None,
+                        retired_attachments: RetiredAttachmentFilter::default(),
+                    },
+                },
+            );
+            // The concurrent admission's anchor: a move on the same source
+            // PV committed by another request.
+            state.insert_move(
+                other_id,
+                crate::state::MoveRecord {
+                    operation_id: volvisor_types::OperationId::new("op-concurrent")
+                        .expect("valid id"),
+                    source_pv: "/dev/sda".to_owned(),
+                    target_pv: "/dev/sdc".to_owned(),
+                    state: MoveVolumeBackingState::Preparing,
+                    detail: None,
+                },
+            );
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-second-move").expect("valid id"),
+            target_pool_id: "/dev/sdb".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("the second move from one source PV must be refused");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error.detail.contains("one move per source PV"),
+            "the refusal names the LVM no-op hazard: {error}"
+        );
+    }
+
+    #[test]
+    fn parking_over_a_resolved_failure_answers_the_settled_record() {
+        // A concurrent reconcile may resolve an IN_DOUBT record FAILED
+        // between this caller's failed observation and its park. The
+        // settled verdict is durable truth: re-parking would resurrect
+        // the move to IN_DOUBT and destroy the resolution detail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let resolved = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-resolved").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::Failed,
+            detail: Some("resolved FAILED by reconciliation".to_owned()),
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), resolved.clone());
+        }
+
+        let response = provider
+            .park_in_doubt(&volume_id, "a late observation failure".to_owned())
+            .expect("a terminal record is answered, not parked over");
+        assert_eq!(response.state, MoveVolumeBackingState::Failed);
+        assert_eq!(response.source_pv, resolved.source_pv);
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&resolved),
+            "the settled FAILED record and its audit detail are untouched"
+        );
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_record_parked_after_admission() {
+        // Admission reads a published snapshot before this request's
+        // lock-free CLI observations. A prior move can park IN_DOUBT in
+        // that window; the fresh drive must not silently supersede the
+        // park (the contract says it waits for reconciliation or an
+        // operator).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let parked = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-parked").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::InDoubt,
+            detail: Some("the pvmove ended without relocating".to_owned()),
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), parked.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdc".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a parked record must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error.detail.contains("IN_DOUBT"),
+            "the refusal names the park contract: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&parked),
+            "the parked record is untouched"
+        );
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_foreign_mirror_record() {
+        // MIRROR_READY/PIVOTED are mirror-path states this same-VG
+        // implementation never writes; a record holding one is foreign
+        // and must be refused, not silently replaced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let foreign = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-foreign").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::MirrorReady,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), foreign.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdc".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a foreign record must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("MIRROR_READY"),
+            "the refusal names the foreign state: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(snapshot.move_record(&volume_id), Some(&foreign));
+    }
+
+    #[test]
+    fn journaling_a_fresh_move_refuses_a_same_target_move_completed_after_admission() {
+        // A concurrent drive can complete the exact move this fresh
+        // request targets between admission's published-snapshot read
+        // and the writer lock. Superseding the landed COMPLETE with a
+        // fresh PREPARING would run a no-op pvmove, bump the generation
+        // again, and transiently re-erect the delete fence. The retry
+        // instead observes admission's idempotent answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let completed = crate::state::MoveRecord {
+            operation_id: volvisor_types::OperationId::new("op-completed").expect("valid id"),
+            source_pv: "/dev/sda".to_owned(),
+            target_pv: "/dev/sdb".to_owned(),
+            state: MoveVolumeBackingState::Complete,
+            detail: None,
+        };
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            state.insert_move(volume_id.clone(), completed.clone());
+        }
+
+        let request = MoveVolumeBackingRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-fresh").expect("valid id"),
+            target_pool_id: "/dev/sdb".to_owned(),
+            expected_generation: 1,
+            max_copy_bytes_per_sec: None,
+        };
+        let error = provider
+            .journal_move_intent(&volume_id, &request, Some("/dev/sda"))
+            .expect_err("a landed same-target completion must not be superseded");
+        assert_eq!(error.code, ApiErrorCode::InvalidState);
+        assert!(
+            error
+                .detail
+                .contains("completed while this request was being admitted"),
+            "the refusal tells the caller to retry the idempotent answer: {error}"
+        );
+        let snapshot = provider.state_snapshot();
+        assert_eq!(
+            snapshot.move_record(&volume_id),
+            Some(&completed),
+            "the landed completion is untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn capture_reservation_order_matches_state_lock_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let provider = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move {
+                let (seq, observed, reservation) = {
+                    let mut state = provider.lock_state().expect("writer guard");
+                    let id = VolumeId::new(format!("vol-order-{index}")).expect("valid id");
+                    state.insert_move(
+                        id,
+                        crate::state::MoveRecord {
+                            operation_id: volvisor_types::OperationId::new(format!(
+                                "op-order-{index}"
+                            ))
+                            .expect("valid id"),
+                            source_pv: format!("/dev/source-{index}"),
+                            target_pv: "/dev/target".to_owned(),
+                            state: MoveVolumeBackingState::Preparing,
+                            detail: None,
+                        },
+                    );
+                    let observed = state.moves().len();
+                    let reservation = state.capture_and_reserve().expect("capture");
+                    (reservation.seq, observed, reservation)
+                };
+                provider
+                    .writer
+                    .commit_async(reservation)
+                    .await
+                    .expect("commit");
+                (seq, observed)
+            }));
+        }
+        let mut observed = Vec::new();
+        for handle in handles {
+            observed.push(handle.await.expect("task"));
+        }
+        observed.sort_by_key(|(seq, _)| *seq);
+        for pair in observed.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "a later sequence must contain every earlier capture: {observed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn needs_alignment_blocks_captures_and_clears_after_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        // Make the seeded state durable so admission has a baseline to
+        // align to after the injected failure.
+        {
+            let mut state = provider.lock_state().expect("writer guard");
+            provider.persist(&mut state).expect("seed durable state");
+        }
+        provider.store_crash_hooks().arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            volvisor_types::crash::StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-align").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-align").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the injected pre-rename failure is not durable");
+        assert!(
+            provider.writer.needs_alignment(),
+            "a hard failure requires admission alignment"
+        );
+
+        // New captures are refused until admission aligns.
+        let mut probe = LvmState::default();
+        let encoded = probe.encode_for_save().expect("encode probe");
+        let rejected = provider
+            .writer
+            .reserve(Arc::from(encoded), Arc::new(probe))
+            .err()
+            .expect("a capture before alignment must be refused");
+        assert!(
+            rejected.detail.contains(NEEDS_ALIGNMENT_DETAIL),
+            "{rejected}"
+        );
+
+        {
+            let state = provider.lock_state().expect("admission aligns");
+            assert!(!provider.writer.needs_alignment());
+            assert!(
+                state.volume(&volume_id).is_some(),
+                "admission loads the durable baseline"
+            );
+            assert!(
+                state
+                    .volume(&volume_id)
+                    .expect("volume")
+                    .runtime
+                    .attachment
+                    .is_none(),
+                "the failed attachment is not resurrected"
+            );
+        }
+
+        // The flag is clear, so the same attach now commits.
+        let attached = provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect("the retry after alignment succeeds");
+        assert_eq!(attached.attachment_id, request.attachment_id);
+        assert_eq!(
+            provider
+                .state_snapshot()
+                .volume(&volume_id)
+                .expect("volume")
+                .runtime
+                .attachment
+                .as_ref()
+                .expect("attachment")
+                .id,
+            request.attachment_id
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_durable_file_fails_admission_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let (provider, volume_id) =
+            seeded_provider_with_state_path(&dir, blocker.join("state.json"));
+        let request = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-unreadable").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-unreadable").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        provider
+            .attach_volume_inner(&volume_id, &request)
+            .await
+            .expect_err("the save fails and the durable file is unreadable");
+        assert!(provider.writer.needs_alignment());
+        let error = provider
+            .lock_state()
+            .err()
+            .expect("admission must fail closed on an unreadable durable file");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains("requires admission alignment"),
+            "{error}"
+        );
+        assert!(
+            provider.writer.needs_alignment(),
+            "an unreadable durable file leaves the flag set for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_readable_different_durable_file_is_adopted_at_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _volume_id) = seeded_provider(&dir);
+        let mut durable = LvmState::default();
+        let foreign = VolumeId::new("vol-adopted").expect("valid id");
+        durable.insert_move(
+            foreign.clone(),
+            crate::state::MoveRecord {
+                operation_id: volvisor_types::OperationId::new("op-adopted").expect("valid id"),
+                source_pv: "/dev/sda".to_owned(),
+                target_pv: "/dev/sdb".to_owned(),
+                state: MoveVolumeBackingState::Preparing,
+                detail: None,
+            },
+        );
+        durable
+            .save(&provider.state_path)
+            .expect("write a different durable state");
+        {
+            provider.writer.lock_writer().needs_alignment = true;
+        }
+        {
+            let state = provider.lock_state().expect("admission adopts durable");
+            assert_eq!(
+                state.move_record(&foreign),
+                durable.move_record(&foreign),
+                "the guard is aligned to the readable durable file"
+            );
+            assert!(
+                !provider.writer.needs_alignment(),
+                "a successful readable alignment clears the flag"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_report_no_op_does_not_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = seeded_provider(&dir);
+        let attach = AttachVolumeRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-report-attach").expect("valid id"),
+            vm_id: "vm-1".to_owned(),
+            host_id: HostId::new("host-1").expect("valid id"),
+            attachment_id: AttachmentId::new("att-report").expect("valid id"),
+            expected_volume_generation: 1,
+            access_mode: volvisor_types::request::AccessModeRequest::SingleWriter,
+            requested_frontend: None,
+            vmm_disk_id: None,
+        };
+        let attached = provider
+            .attach_volume_inner(&volume_id, &attach)
+            .await
+            .expect("attach");
+        let report = ReportAttachmentStateRequest {
+            api_version: "volvisor.volume.v2".to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-report").expect("valid id"),
+            attachment_id: attach.attachment_id.clone(),
+            expected_attachment_generation: attached.attachment_generation,
+            state: AttachmentState::Advertised,
+            evidence: AttachmentEvidence::VmmConfigured,
+            reporter: Some("rig".to_owned()),
+            detail: None,
+        };
+        let first = provider
+            .report_attachment_state_inner(&volume_id, &report)
+            .await
+            .expect("first report");
+        assert!(first.applied, "the first report advances the state");
+        let writes = provider.writer.physical_writes.load(Ordering::SeqCst);
+        let second = provider
+            .report_attachment_state_inner(&volume_id, &report)
+            .await
+            .expect("no-op report");
+        assert!(!second.applied, "the repeated report is a no-op");
+        assert_eq!(
+            provider.writer.physical_writes.load(Ordering::SeqCst),
+            writes,
+            "a no-op report must not perform a physical save"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capacity_epoch_tests {
+    use super::*;
+
+    fn grow_request(new_size_bytes: u64) -> GrowVolumeRequest {
+        GrowVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-epoch-grow").expect("valid id"),
+            new_size_bytes,
+            expected_generation: 1,
+        }
+    }
+
+    fn capacity() -> VgCapacity {
+        VgCapacity {
+            free_bytes: 1 << 30,
+            extent_bytes: 4096,
+        }
+    }
+
+    /// The reservation is recorded before the epoch is re-read, so an
+    /// allocation that completed after the `vgs` sample is still caught.
+    ///
+    /// This isolates the post-reservation check: the sample and the
+    /// reservation insertion happen at the same epoch value, and only the
+    /// counter bump (a completed `lvcreate`/`lvextend`) separates them. If
+    /// the check were removed, this attempt would reserve and persist a
+    /// grow intent against free space that no longer exists.
+    #[tokio::test]
+    async fn a_completed_allocation_invalidates_a_sampled_reservation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, volume_id) = super::read_snapshot_tests::seeded_provider(&dir);
+        let mut state = provider.lock_state().expect("writer guard");
+        let request = grow_request(2048);
+        let sampled_epoch = provider.capacity_epoch();
+
+        // A concurrent `lvcreate` or `lvextend` completed between the
+        // sample and this admission.
+        provider.note_capacity_change();
+
+        let outcome = provider
+            .prepare_grow(
+                &mut state,
+                &volume_id,
+                &request,
+                "vg-1",
+                capacity(),
+                1024,
+                1,
+                false,
+                sampled_epoch,
+            )
+            .expect("prepare the stale grow");
+        assert!(
+            matches!(outcome, GrowPrepare::SampleStale),
+            "a reservation derived from a stale sample must be released"
+        );
+        assert_eq!(
+            provider.reserved_capacity("vg-1"),
+            0,
+            "the stale reservation must not leak"
+        );
+        assert!(
+            state.grow_intent(&volume_id).is_none(),
+            "no durable intent may be written from a stale sample"
+        );
+
+        // The same admission at the current epoch reserves exactly the
+        // extent-rounded demand and becomes durable.
+        let current_epoch = provider.capacity_epoch();
+        let fresh = provider
+            .prepare_grow(
+                &mut state,
+                &volume_id,
+                &request,
+                "vg-1",
+                capacity(),
+                1024,
+                1,
+                false,
+                current_epoch,
+            )
+            .expect("prepare the fresh grow");
+        assert!(
+            matches!(fresh, GrowPrepare::Prepared { .. }),
+            "the current epoch must be accepted"
+        );
+        let GrowPrepare::Prepared {
+            grow_intent: intent,
+            reservation,
+        } = fresh
+        else {
+            return;
+        };
+        assert_eq!(intent.requested_size_bytes, 2048);
+        assert!(state.grow_intent(&volume_id).is_some());
+        assert_eq!(provider.reserved_capacity("vg-1"), 4096);
+        drop(reservation);
+        assert_eq!(
+            provider.reserved_capacity("vg-1"),
+            0,
+            "dropping the reservation returns the promise"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+
+    /// A `vgs` that completes an allocation on every call makes every
+    /// sample stale. The admission must stop after the cap with a typed
+    /// refusal instead of looping forever. The refusal is journaled as
+    /// terminal for that operation id (this test exercises the provider
+    /// layer only; the journal contract is documented on the constant).
+    #[test]
+    fn sustained_epoch_churn_refuses_after_the_attempt_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let volume_id = VolumeId::new("vol-retry").expect("valid id");
+        let mut state = LvmState::default();
+        state.insert_volume(
+            volume_id.clone(),
+            StoredVolume {
+                entry: VolumeEntry {
+                    vg_name: "vg-1".to_owned(),
+                    lv_name: "vol-vol-retry-abcd1234".to_owned(),
+                    size_bytes: 1024,
+                    requested_size_bytes: 1024,
+                    generation: 1,
+                    data_epoch: 0,
+                    project_id: ProjectId::new("tenant-a").expect("valid id"),
+                    block_size: 4096,
+                    creation_payload: "{}".to_owned(),
+                },
+                runtime: VolumeRuntime {
+                    state: VolumeLifecycle::Ready,
+                    attachment: None,
+                    retired_attachments: RetiredAttachmentFilter::default(),
+                },
+            },
+        );
+        let store_crash = Arc::new(StoreCrashHooks::new());
+        let read_snapshot = Arc::new(RwLock::new(Arc::new(state.clone())));
+        let writer = Arc::new(WriterCore::new(
+            &state_path,
+            Arc::clone(&store_crash),
+            Arc::clone(&read_snapshot),
+        ));
+        let provider: Arc<LvmProvider> = Arc::new_cyclic(|weak: &Weak<LvmProvider>| {
+            let weak = weak.clone();
+            let runner = Arc::new(volvisor_provider::FakeRunner::with_closure(
+                move |program, _args| {
+                    if program == "vgs" {
+                        if let Some(provider) = weak.upgrade() {
+                            provider.note_capacity_change();
+                        }
+                        return Some(CommandOutput::success(
+                            r#"{"report":[{"vg":[{"vg_name":"vg-1","vg_free":"1099511627776","vg_size":"1099511627776","vg_extent_size":"4194304"}]}]}"#,
+                        ));
+                    }
+                    None
+                },
+            ));
+            LvmProvider {
+                runner,
+                writer,
+                state_path: state_path.clone(),
+                sysfs_root: dir.path().to_path_buf(),
+                vg_prefix: "vg-volvisor".to_owned(),
+                expected_auth_token: "test-token".to_owned(),
+                store_crash,
+                move_timing: MoveTiming::default(),
+                move_observe_failures: Mutex::new(BTreeMap::new()),
+                grow_drives: Mutex::new(BTreeSet::new()),
+                volume_drives: Mutex::new(BTreeMap::new()),
+                capacity_reservations: Mutex::new(BTreeMap::new()),
+                capacity_epoch: AtomicU64::new(0),
+                state: Mutex::new(state.clone()),
+                read_snapshot,
+            }
+        });
+
+        let request = GrowVolumeRequest {
+            api_version: volvisor_types::API_VERSION.to_owned(),
+            operation_id: volvisor_types::OperationId::new("op-retry").expect("valid id"),
+            new_size_bytes: 2048,
+            expected_generation: 1,
+        };
+        let outcome = provider.prepare_grow_admission(&volume_id, &request);
+        assert!(
+            outcome.is_err(),
+            "continuous churn must exhaust the attempt cap"
+        );
+        let Err(err) = outcome else {
+            return;
+        };
+        assert_eq!(err.code, ApiErrorCode::Overloaded, "{err}");
+        assert!(err.detail.contains("attempts"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod blocking_body_tests {
+    use super::*;
+
+    /// A `LocalSet` on a multi-thread runtime makes `block_in_place`
+    /// refuse the handoff even though the runtime flavor is multi-thread.
+    /// This test proves the fallback runs the body exactly once and does
+    /// not panic; it cannot observe the refusal itself, because the
+    /// refusal reaches `run_blocking_body` as a panic that is caught (the
+    /// default panic hook still prints to stderr). The `ran` flag is what
+    /// distinguishes a refusal from a body panic; the panic test below
+    /// covers the other branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_set_runs_the_body_exactly_once() {
+        let local = tokio::task::LocalSet::new();
+        let runs = AtomicUsize::new(0);
+        let value = local
+            .run_until(async {
+                run_blocking_body(|| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    42
+                })
+            })
+            .await;
+        assert_eq!(value, 42);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A panic inside the blocking body is the body's own; it must be
+    /// re-raised unchanged and must not cause a second execution.
+    #[allow(clippy::panic)] // the body's panic is the property under test
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_panic_is_propagated_and_runs_once() {
+        let runs = AtomicUsize::new(0);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_blocking_body(|| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any("blocking body panic");
+            })
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod durable_writer_tests {
+    use super::*;
+    use volvisor_types::crash::{CRASH_PANIC_PREFIX, StoreSavePoint};
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        hooks: Arc<StoreCrashHooks>,
+        read: Arc<RwLock<Arc<LvmState>>>,
+        core: Arc<WriterCore>,
+    }
+
+    fn core_for(
+        path: &Path,
+        hooks: Arc<StoreCrashHooks>,
+    ) -> (Arc<WriterCore>, Arc<RwLock<Arc<LvmState>>>) {
+        let read = Arc::new(RwLock::new(Arc::new(LvmState::default())));
+        let core = Arc::new(WriterCore::new(path, hooks, Arc::clone(&read)));
+        (core, read)
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let hooks = Arc::new(StoreCrashHooks::new());
+        let (core, read) = core_for(&path, Arc::clone(&hooks));
+        Fixture {
+            _dir: dir,
+            path,
+            hooks,
+            read,
+            core,
+        }
+    }
+
+    fn state_with_moves(count: usize) -> LvmState {
+        let mut state = LvmState::default();
+        for index in 0..count {
+            let id = VolumeId::new(format!("vol-{index}")).expect("valid id");
+            state.insert_move(
+                id,
+                crate::state::MoveRecord {
+                    operation_id: volvisor_types::OperationId::new(format!("op-{index}"))
+                        .expect("valid id"),
+                    source_pv: format!("/dev/source-{index}"),
+                    target_pv: "/dev/target".to_owned(),
+                    state: MoveVolumeBackingState::Preparing,
+                    detail: None,
+                },
+            );
+        }
+        state
+    }
+
+    fn capture(state: &LvmState) -> (Arc<[u8]>, Arc<LvmState>) {
+        let mut state = state.clone();
+        let encoded = state.encode_for_save().expect("encode test state");
+        (Arc::from(encoded), Arc::new(state))
+    }
+
+    fn expect_leader(reservation: Reservation) -> (u64, LeaderToken) {
+        let Reservation { seq, role } = reservation;
+        let token = match role {
+            ReservationRole::Leader(token) => Some(token),
+            ReservationRole::Waiter => None,
+        };
+        (seq, token.expect("the first reservation must lead"))
+    }
+
+    fn reserve(core: &Arc<WriterCore>, state: &LvmState) -> Reservation {
+        let (encoded, snapshot) = capture(state);
+        core.reserve(encoded, snapshot).expect("reserve")
+    }
+
+    #[test]
+    fn writer_gates_are_shared_only_for_the_same_canonical_state_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let other_path = dir.path().join("other.json");
+
+        let first = WriterCore::gate_for(&state_path);
+        let same = WriterCore::gate_for(&state_path);
+        let different = WriterCore::gate_for(&other_path);
+
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "two writers on the same state path must share one gate"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &different),
+            "different state paths must not share a gate"
+        );
+
+        // The canonical parent makes lexically different spellings of
+        // the same file share the gate too.
+        let alias = dir.path().join(".").join("state.json");
+        let aliased = WriterCore::gate_for(&alias);
+        assert!(
+            Arc::ptr_eq(&first, &aliased),
+            "the canonical state-path identity must alias the same gate"
+        );
+    }
+
+    #[test]
+    fn a_dropped_writer_gate_is_not_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+
+        let first = WriterCore::gate_for(&state_path);
+        let old = Arc::downgrade(&first);
+        let same = WriterCore::gate_for(&state_path);
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "two live writers on the same path share one gate"
+        );
+
+        drop(same);
+        drop(first);
+        assert!(
+            old.upgrade().is_none(),
+            "the registry must not keep a strong reference to a dropped writer's gate"
+        );
+
+        let fresh = WriterCore::gate_for(&state_path);
+        assert!(
+            old.upgrade().is_none(),
+            "a fresh writer after every strong reference dropped gets a new gate"
+        );
+        assert!(Arc::strong_count(&fresh) >= 1, "the fresh gate is usable");
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // the test must panic while holding the gate to poison it
+    fn a_poisoned_gate_fails_the_save_and_poisons_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state.json");
+        let other_path = dir.path().join("other.json");
+
+        let (core, _read) = core_for(&state_path, Arc::new(StoreCrashHooks::new()));
+        // Poison this live writer's own gate: dropping every strong
+        // reference would retire the gate (and its poison) instead.
+        let gate = Arc::clone(&core.gate);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = gate
+                .lock()
+                .expect("the gate is unpoisoned before this panic");
+            panic!("poison the writer gate");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the helper thread panicked as intended");
+
+        let reservation = reserve(&core, &state_with_moves(1));
+        let (seq, mut token) = expect_leader(reservation);
+        let error = core
+            .run_leader(seq, &mut token)
+            .expect_err("a poisoned shared gate must fail the save");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(
+            error.detail.contains(GATE_POISON_DETAIL),
+            "the typed INTERNAL error names the poisoned writer gate: {error}"
+        );
+        assert!(
+            core.lock_writer().poisoned.is_some(),
+            "a poisoned gate is a terminal writer poison"
+        );
+
+        let (other, _other_read) = core_for(&other_path, Arc::new(StoreCrashHooks::new()));
+        let reservation = reserve(&other, &state_with_moves(1));
+        let (seq, mut token) = expect_leader(reservation);
+        other
+            .run_leader(seq, &mut token)
+            .expect("a different path's writer is unaffected by the poison");
+        assert!(other_path.exists());
+    }
+
+    #[test]
+    fn leadership_handoff_is_atomic_with_the_empty_pending_check() {
+        let fx = fixture();
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *fx.core
+            .handoff_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            entered_tx.send(()).expect("signal the quiesce decision");
+            release_rx.recv().expect("wait for the reservation attempt");
+        }));
+        let core = Arc::clone(&fx.core);
+        let leader = std::thread::spawn(move || core.run_leader(leader_seq, &mut token));
+        entered_rx
+            .recv()
+            .expect("the leader must reach the quiesce decision");
+
+        // Attempt a reservation while the leader is inside the quiesce
+        // critical section. It blocks on the writer mutex; when it
+        // proceeds, leadership must already be released, so it becomes
+        // the next leader rather than a waiter with no leader.
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let core = Arc::clone(&fx.core);
+        let reserver = std::thread::spawn(move || {
+            attempt_tx.send(()).expect("signal the reservation attempt");
+            reserve(&core, &state_with_moves(2))
+        });
+        attempt_rx.recv().expect("the reserver is about to reserve");
+        release_tx
+            .send(())
+            .expect("release the quiesce critical section");
+
+        leader
+            .join()
+            .expect("leader thread")
+            .expect("the first leader resolves its save");
+        let reservation = reserver.join().expect("reserver thread");
+        let (seq, mut token) = expect_leader(reservation);
+        fx.core
+            .run_leader(seq, &mut token)
+            .expect("the next leader writes the reservation");
+        fx.core.wait_sync(seq).expect("the reservation is durable");
+        assert_eq!(
+            fx.core.physical_writes.load(Ordering::SeqCst),
+            2,
+            "both leaders performed exactly one physical write each"
+        );
+    }
+
+    #[test]
+    fn capture_does_not_publish_until_the_leader_proves_durability() {
+        let fx = fixture();
+        let initial = Arc::clone(&*fx.read.read().expect("read view"));
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            initial,
+            "reserving a capture must not publish it"
+        );
+        assert!(
+            !fx.path.exists(),
+            "no durable file exists before the leader writes"
+        );
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect("the physical write succeeds");
+        assert!(fx.path.exists(), "the leader writes before it publishes");
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            Arc::new(state_with_moves(1)),
+            "publication follows proven durability"
+        );
+    }
+
+    #[test]
+    fn n_pending_captures_coalesce_into_one_physical_write() {
+        let fx = fixture();
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let mut waiters = Vec::new();
+        for count in 2..=8 {
+            let reservation = reserve(&fx.core, &state_with_moves(count));
+            assert!(
+                matches!(&reservation.role, ReservationRole::Waiter),
+                "only the first reservation leads"
+            );
+            waiters.push(reservation.seq);
+        }
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect("the coalesced write succeeds");
+        assert_eq!(
+            fx.core.physical_writes.load(Ordering::SeqCst),
+            1,
+            "all pending captures are covered by one physical write"
+        );
+        for seq in waiters {
+            fx.core
+                .wait_sync(seq)
+                .expect("every covered waiter succeeds");
+        }
+        let durable = LvmState::load(&fx.path).expect("durable state");
+        assert_eq!(
+            durable,
+            state_with_moves(8),
+            "the latest capture is durable"
+        );
+    }
+
+    #[test]
+    fn a_landed_failure_answers_covered_waiters_with_success() {
+        let fx = fixture();
+        fx.hooks.arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterRenameBeforeDirFsync,
+            0,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        fx.core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the leader caller still sees its save error");
+        // The rename landed: seq 2 is durable and its waiter succeeds.
+        fx.core
+            .wait_sync(waiter.seq)
+            .expect("a proven-landed covered waiter succeeds");
+        let durable = LvmState::load(&fx.path).expect("durable state");
+        assert_eq!(
+            durable,
+            state_with_moves(2),
+            "the durable file contains the waiter's mutation"
+        );
+        let published = Arc::clone(&*fx.read.read().expect("read view"));
+        assert_eq!(*published, state_with_moves(2));
+        assert!(!fx.core.lock_writer().needs_alignment);
+    }
+
+    #[test]
+    fn an_unproven_failure_fails_every_waiter_and_publishes_nothing() {
+        let fx = fixture();
+        fx.hooks.arm_save_failure(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterTmpWrite,
+            0,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        let error = fx
+            .core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the pre-rename failure is not durable");
+        assert!(error.detail.contains("AfterTmpWrite"), "{error}");
+        let waiter_error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("an uncovered waiter must fail, never succeed");
+        assert!(
+            waiter_error.detail.contains("AfterTmpWrite"),
+            "{waiter_error}"
+        );
+        assert!(
+            !fx.path.exists(),
+            "a failed pre-rename save publishes no durable state"
+        );
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            Arc::new(LvmState::default()),
+            "a failed capture is never published"
+        );
+        assert!(
+            fx.core.lock_writer().needs_alignment,
+            "the next admission must align to durable"
+        );
+        let (encoded, snapshot) = capture(&state_with_moves(3));
+        let rejected = fx
+            .core
+            .reserve(encoded, snapshot)
+            .err()
+            .expect("new captures are blocked until admission aligns");
+        assert!(
+            rejected.detail.contains(NEEDS_ALIGNMENT_DETAIL),
+            "{rejected}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_durable_file_fails_closed_without_poison() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let path = blocker.join("state.json");
+        let (core, read) = core_for(&path, Arc::new(StoreCrashHooks::new()));
+        let (leader_seq, mut token) = expect_leader(reserve(&core, &state_with_moves(1)));
+        let waiter = reserve(&core, &state_with_moves(2));
+        let error = core
+            .run_leader(leader_seq, &mut token)
+            .expect_err("the physical write and its classification both fail");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        let waiter_error = core
+            .wait_sync(waiter.seq)
+            .expect_err("an unreadable durable file fails every waiter");
+        assert_eq!(waiter_error.code, ApiErrorCode::Internal);
+        {
+            let state = core.lock_writer();
+            assert!(
+                state.poisoned.is_none(),
+                "an unreadable durable file must not poison the writer"
+            );
+            assert!(
+                state.needs_alignment,
+                "an unreadable durable file requires admission alignment"
+            );
+        }
+        assert_eq!(
+            *read.read().expect("read view"),
+            Arc::new(LvmState::default())
+        );
+    }
+
+    #[test]
+    fn a_leader_panic_wakes_every_waiter_and_poisons() {
+        let fx = fixture();
+        fx.hooks.arm(
+            volvisor_types::crash::STORE_LVM_STATE,
+            StoreSavePoint::AfterTmpWrite,
+        );
+        let (leader_seq, mut token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            fx.core.run_leader(leader_seq, &mut token)
+        }))
+        .expect_err("the armed crash seam must panic");
+        let payload = payload
+            .downcast_ref::<String>()
+            .expect("the crash payload is the marked string");
+        assert!(
+            payload.starts_with(CRASH_PANIC_PREFIX),
+            "the campaign rig must still see the in-band crash payload: {payload}"
+        );
+        let error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("a leader panic wakes waiters with a typed failure");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(error.detail.contains("durable writer poisoned"), "{error}");
+        assert!(
+            fx.core.lock_writer().poisoned.is_some(),
+            "a leader panic poisons the writer"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_leader_wakes_every_waiter_and_poisons() {
+        let fx = fixture();
+        let (leader_seq, token) = expect_leader(reserve(&fx.core, &state_with_moves(1)));
+        let waiter = reserve(&fx.core, &state_with_moves(2));
+        assert_eq!(leader_seq, 1);
+        drop(token);
+        let error = fx
+            .core
+            .wait_sync(waiter.seq)
+            .expect_err("an abandoned leader fails its waiters");
+        assert_eq!(error.code, ApiErrorCode::Internal);
+        assert!(fx.core.lock_writer().poisoned.is_some());
+    }
+
+    #[test]
+    fn a_lower_sequence_never_replaces_a_higher_published_snapshot() {
+        let fx = fixture();
+        let higher = Arc::new(state_with_moves(5));
+        let lower = Arc::new(state_with_moves(2));
+        fx.core.publish_if_newer(5, &higher);
+        fx.core.publish_if_newer(3, &lower);
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            higher,
+            "a lower sequence must never regress the published view"
+        );
+        fx.core.publish_if_newer(6, &lower);
+        assert_eq!(
+            *fx.read.read().expect("read view"),
+            lower,
+            "a newer sequence publishes"
+        );
     }
 }

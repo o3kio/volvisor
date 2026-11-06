@@ -3261,6 +3261,132 @@ async fn a_transient_verification_failure_never_parks_over_a_stored_complete() {
     assert_eq!(pvmove_count(&runner), 1);
 }
 
+/// The `COPYING` roll's stale-observation race: the retry reconcile
+/// snapshots a `PREPARING` record and observes a **live mirror**, but
+/// a concurrent re-attach drive completes the move between that
+/// observation and the pass's lock. The live record is `COMPLETE`;
+/// regressing it to `COPYING` would make the next pass re-complete it
+/// and bump the volume generation a second time. The pass must re-check
+/// the live record under the lock and leave a terminal record alone.
+#[tokio::test]
+async fn a_stale_moving_observation_never_regresses_a_landed_completion_to_copying() {
+    let fixture = move_fixture();
+    let volume = "vol-move-stale-copying";
+    fixture
+        .provider
+        .create_volume(&fixture_create_request(volume, 64 * MIB))
+        .await
+        .expect("create");
+
+    // The dead incarnation's durable facts: PREPARING plus a live held
+    // mirror (the crash window between the pvmove start and its
+    // COPYING save). The startup pass runs before the mirror is made
+    // visible, so the record stays PREPARING.
+    seed_move(
+        &fixture.state_path,
+        volume,
+        MOVE_SOURCE_PV,
+        MOVE_TARGET_PV,
+        MoveVolumeBackingState::Preparing,
+    );
+    let pause = PostObservationPause::new();
+    let (provider, runner) = post_observation_provider(&fixture.state_path, &fixture.world, &pause);
+
+    // Now make the mirror live and held, so the reconcile's own
+    // observation classifies it as moving and parks after computing
+    // that answer.
+    {
+        let mut world = fixture.world.lock().expect("world");
+        world.moves.insert(
+            lv_path(volume),
+            common::FakeMove {
+                source: MOVE_SOURCE_PV.to_owned(),
+                target: MOVE_TARGET_PV.to_owned(),
+                percent: 0,
+            },
+        );
+        world.hold_moves = true;
+    }
+
+    let (thread_tx, thread_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let (report_tx, report_rx) = mpsc::channel();
+    let reconcile = {
+        let provider = Arc::clone(&provider);
+        thread::spawn(move || {
+            thread_tx
+                .send(thread::current().id())
+                .expect("send the reconcile thread id");
+            go_rx.recv().expect("receive the go signal");
+            report_tx
+                .send(provider.move_reconcile_pass())
+                .expect("send the pass report");
+        })
+    };
+    pause.arm(thread_rx.recv().expect("the reconcile thread id"));
+    go_tx.send(()).expect("release the reconcile thread");
+    pause.wait_until_paused();
+
+    // The re-attach drive completes the move behind the stale
+    // "moving" observation: release the world, supervise, land, ONE
+    // bump.
+    fixture.world.lock().expect("world").hold_moves = false;
+    let response = tokio::spawn({
+        let provider = Arc::clone(&provider);
+        let volume = volume_id(volume);
+        async move {
+            provider
+                .move_volume_backing(&volume, &move_request("op-drive", MOVE_TARGET_PV, 1))
+                .await
+        }
+    })
+    .await
+    .expect("join the drive")
+    .expect("the drive completes");
+    assert_eq!(response.state, MoveVolumeBackingState::Complete);
+    assert_eq!(response.generation, 2);
+
+    // The reconcile resumes with its stale "moving" answer: the live
+    // COMPLETE record must not be regressed.
+    pause.release();
+    reconcile.join().expect("join the reconcile thread");
+    let report = report_rx
+        .recv()
+        .expect("the pass report")
+        .expect("the pass");
+    assert!(
+        report.marked_copying.is_empty(),
+        "the stale moving observation must not regress the completion: {report:?}"
+    );
+    assert!(
+        report.completed.is_empty(),
+        "the stale pass did not itself complete anything: {report:?}"
+    );
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "the drive's completion bumped exactly once");
+
+    // A later pass sees the stored COMPLETE and completes nothing: no
+    // second generation bump from the clobbered COPYING record.
+    let report = provider.move_reconcile_pass().expect("the next pass");
+    assert_eq!(
+        report.marked_copying,
+        Vec::<volvisor_types::VolumeId>::new()
+    );
+    assert_eq!(report.completed, Vec::<volvisor_types::VolumeId>::new());
+    let (record, generation) = recorded_move(&fixture.state_path, volume);
+    assert_eq!(
+        record.expect("the record").state,
+        MoveVolumeBackingState::Complete
+    );
+    assert_eq!(generation, 2, "no second bump from the stale observation");
+    // The drive's attach is the only pvmove start.
+    assert_eq!(pvmove_count(&runner), 1);
+}
+
 /// A parked `IN_DOUBT` record whose world verifiably shows the
 /// pre-move placement (exactly the record's source PV, no move
 /// active — an out-of-band `pvmove --abort` that completed the
@@ -3773,7 +3899,125 @@ fn gated_provider(
     (provider, runner)
 }
 
-/// The competing-finish choreography: the armed thread's first
+/// The `COPYING`-roll choreography: the armed thread's `lvs` output is
+/// computed from the current world and the thread parks **after** that
+/// computation, before the caller classifies it. A concurrent drive can
+/// then complete the move, leaving the pass holding a stale "moving"
+/// observation against a `COMPLETE` live record.
+#[derive(Clone)]
+struct PostObservationPause {
+    inner: Arc<(Mutex<PostObservationState>, Condvar)>,
+}
+
+struct PostObservationState {
+    /// The thread whose `lvs` observations park (none until armed).
+    thread: Option<thread::ThreadId>,
+    /// The armed thread has computed an observation and parked.
+    paused: bool,
+    /// The test's release signal.
+    released: bool,
+}
+
+impl PostObservationPause {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(PostObservationState {
+                    thread: None,
+                    paused: false,
+                    released: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn arm(&self, thread: thread::ThreadId) {
+        let mut state = self.inner.0.lock().expect("pause state");
+        state.thread = Some(thread);
+        self.inner.1.notify_all();
+    }
+
+    /// Park the armed thread after its `lvs` output was computed.
+    fn pause_after_observation(&self, program: &str) {
+        if program != "lvs" {
+            return;
+        }
+        let mut state = self.inner.0.lock().expect("pause state");
+        if state.thread != Some(thread::current().id()) {
+            return;
+        }
+        state.paused = true;
+        self.inner.1.notify_all();
+        while !state.released {
+            state = self.inner.1.wait(state).expect("pause wait");
+        }
+    }
+
+    fn wait_until_paused(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = self.inner.0.lock().expect("pause state");
+        while !state.paused {
+            assert!(
+                Instant::now() < deadline,
+                "the reconcile thread never reached its parked observation"
+            );
+            let (guard, _) = self
+                .inner
+                .1
+                .wait_timeout(state, Duration::from_millis(50))
+                .expect("pause wait");
+            state = guard;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.inner.0.lock().expect("pause state");
+        state.released = true;
+        self.inner.1.notify_all();
+    }
+}
+
+/// A provider over the fixture's state file and world whose runner
+/// computes each output from the world and then parks the armed
+/// thread's `lvs` calls (after the output exists). The timing is the
+/// fast move shape.
+fn post_observation_provider(
+    state_path: &std::path::Path,
+    world: &Arc<Mutex<common::FakeLvm>>,
+    pause: &PostObservationPause,
+) -> (Arc<LvmProvider>, Arc<FakeRunner>) {
+    let runner = {
+        let world = Arc::clone(world);
+        let pause = pause.clone();
+        Arc::new(FakeRunner::with_closure(move |program, args| {
+            let mut world = world.lock().ok()?;
+            let output = common::script(&mut world, program, args);
+            // Drop the world before parking: the test's drive needs it.
+            drop(world);
+            pause.pause_after_observation(program);
+            output
+        }))
+    };
+    let provider = LvmProvider::new(
+        Arc::clone(&runner) as Arc<dyn volvisor_provider::CommandRunner>,
+        state_path.to_path_buf(),
+        common::leak_tempdir(),
+        common::VG_PREFIX.to_owned(),
+        common::AUTH_TOKEN.to_owned(),
+    )
+    .map(|provider| {
+        Arc::new(
+            provider.with_move_timing(volvisor_lvm::provider::MoveTiming {
+                poll_interval: Duration::from_millis(5),
+                supervision_window: Duration::from_secs(30),
+            }),
+        )
+    })
+    .expect("provider construction");
+    (provider, runner)
+}
+
 /// `lvs` (the pass's own world observation, after its record
 /// snapshot) parks until released — the [`ReconcilePause`] stage —
 /// and its **second** `lvs`, the finishing path's verification

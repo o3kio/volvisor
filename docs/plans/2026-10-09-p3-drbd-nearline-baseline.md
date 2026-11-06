@@ -4,8 +4,8 @@ Date: 2026-10-09
 Status: implementing
 Branch: `feat/p3-drbd-nearline-baseline`
 Normative: [ADR-0007](../adr/0007-drbd9-nearline-replication-provider.md) (Proposed /
-prototype selection), [nearline contract v2](../../../contracts/nearline-replication-v2.md)
-§3, §4, §9A, [Volume API v2](../../../contracts/volume-api-v2.md), AGENTS rules 1–21.
+prototype selection), [nearline contract v2](../../contracts/nearline-replication-v2.md)
+§3, §4, §9A, [Volume API v2](../../contracts/volume-api-v2.md), AGENTS rules 1–21.
 
 ADR-0007 is **Proposed, not accepted**: this phase delivers the *prototype
 baseline* the ADR calls for, with `evidence_status: PrototypeOnly` everywhere

@@ -25,14 +25,16 @@
 
 // Test target (the e2e precedent): invariant assertions may
 // expect/unwrap; the rig's helpers are already bounded.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::time::Duration;
 
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use volvisor_campaign::oracle::{WRITER_ID, WriterHandle, boundary_skew, verify_against};
 use volvisor_campaign::rig::{
-    POLL_BOUND, POLL_STEP, Reply, Rig, campaign_rig, post_prepare, post_transfer,
+    POLL_BOUND, POLL_STEP, Reply, Rig, campaign_rig, post_prepare, post_transfer, witness_view,
 };
 use volvisor_drbd_testkit::{PEER_NODE, PeerTransport, SEED_MINOR, spawn_peer_transport};
 
@@ -220,5 +222,113 @@ async fn the_kill_flag_is_per_launch_not_per_daemon() {
     assert!(
         verdict.prefix_intact(),
         "the source keeps every acknowledged write across both kills: {verdict:?}"
+    );
+}
+
+/// One raw HTTP/1.1 GET (the daemon's liveness route needs no auth).
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect daemon");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read response");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .expect("HTTP status line");
+    (status, response)
+}
+
+/// #49 retained-listener semantics: a stopped witness keeps its port
+/// in listen state (a racing reconnect is accepted and closed, never
+/// refused), and the restart serves the SAME address without a rebind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_witness_keeps_the_port_bound_and_restarts_on_the_same_address() {
+    let mut rig = campaign_rig("vm-retained-witness", "vol-retained-witness").await;
+    let volume = volvisor_types::VolumeId::new(rig.volume.clone()).expect("volume id");
+    let addr = rig.witness.addr;
+
+    // The live witness answers an admin inspect before the outage.
+    let _ = witness_view(&rig.witness, &volume).await;
+
+    rig.witness.stop().await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("a stopped witness keeps the port bound; a reconnect must not be refused");
+    stream
+        .write_all(b"GET /v2/healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write to the reject loop");
+    let mut response = Vec::new();
+    match stream.read_to_end(&mut response).await {
+        // Clean close: the reject loop accepted and closed without serving.
+        Ok(0) => {}
+        // Dropping a socket with unread request bytes resets it; that is
+        // still an observable outage, not a served request.
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("unexpected reject-loop read: {other:?}"),
+    }
+    assert!(
+        response.is_empty(),
+        "the stop-outage answered a request: {}",
+        String::from_utf8_lossy(&response)
+    );
+    drop(stream);
+
+    rig.witness.restart().await;
+    assert_eq!(rig.witness.addr, addr, "the restart never rebinds");
+    let _ = witness_view(&rig.witness, &volume).await;
+}
+
+/// The daemon's retained listener follows the same rule: stop keeps
+/// the socket bound, restart serves the same address, and the
+/// liveness route answers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_daemon_keeps_the_port_bound_and_restarts_on_the_same_address() {
+    let mut rig = campaign_rig("vm-retained-daemon", "vol-retained-daemon").await;
+    let addr = rig.a.addr;
+    assert_eq!(
+        http_get(addr, "/healthz").await.0,
+        200,
+        "live daemon serves"
+    );
+
+    rig.a.stop().await;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("a stopped daemon keeps the port bound; a reconnect must not be refused");
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write to the reject loop");
+    let mut response = Vec::new();
+    match stream.read_to_end(&mut response).await {
+        // Clean close: the reject loop accepted and closed without serving.
+        Ok(0) => {}
+        // Dropping a socket with unread request bytes resets it; that is
+        // still an observable outage, not a served request.
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("unexpected reject-loop read: {other:?}"),
+    }
+    assert!(
+        response.is_empty(),
+        "the stop-outage answered a request: {}",
+        String::from_utf8_lossy(&response)
+    );
+    drop(stream);
+
+    rig.a.restart().await;
+    assert_eq!(rig.a.addr, addr, "the restart never rebinds");
+    assert_eq!(
+        http_get(addr, "/healthz").await.0,
+        200,
+        "the restarted daemon serves the same address"
     );
 }

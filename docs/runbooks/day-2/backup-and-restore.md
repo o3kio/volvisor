@@ -1,10 +1,13 @@
 # Backup and restore — day-2 runbook
 
 **Status: DRILLED.**
-Evidence: [D1 raw log](../../evidence/day2/2026-11-03-devhost/raw/01-backup-restore.log),
-[Report D1](../../evidence/day2/2026-11-03-devhost/REPORT.md#d1--backup-and-restore-of-the-control-plane-state).
-Drilled conflict: source `e551d26`, clean worktree, one host, stopped daemon,
-loop-device LVM. This page is the procedure; the log is the result.
+Evidence: [D1 raw log](../../evidence/day2/2026-11-04-devhost-live/raw/01-backup-restore-v3.log),
+[Report D1](../../evidence/day2/2026-11-04-devhost-live/REPORT.md#d1--backup-drift-restore).
+Drilled at product source `aad1720`, dirty caller worktree, one host, stopped
+daemon, loop-device LVM, with pre-ADR-0012 v3 tombstone-filter assertions. That
+bundle is a historical record; the current harness asserts the attachment
+generation fence instead, so re-run D1 for current-binary evidence. This page
+is the procedure; the linked log is the historical result.
 
 ## Scope and non-goals
 
@@ -41,9 +44,9 @@ longer exists. The consistency step below is mandatory.
 - **RPO:** every control-plane mutation after the stopped backup is lost. D1
   demonstrated this: a volume created after the backup returned 404 after
   restore.
-- **RTO:** 0.194 s from the start of the restore procedure to a healthy API
-  on the lab host, plus the time to reconcile backend LVs and validate the
-  data path. The 0.194 s is not a production SLA.
+- **RTO:** 0.323 s from the start of the restore procedure to a healthy API
+  on the lab host in the 2026-11-04 run, plus the time to reconcile backend
+  LVs and validate the data path. That figure is not a production SLA.
 
 ## Preconditions
 
@@ -125,7 +128,7 @@ sha256sum "$BACKUP/state.tar" | tee "$BACKUP/state.tar.sha256"
 Expected shape (D1 observed):
 
 ```text
-eebc53f97af22a5657c775283259e01cd5197672243d81dab21184ebb89f6700  /var/backups/volvisor/.../state.tar
+80d35e9e31fa299ab856c706ea171cc7b7277042bac4047fbc89cd8430dd204c  /var/backups/volvisor/.../state.tar
 ```
 
 5. If you also need the witness authority, copy its stopped state directory
@@ -202,8 +205,10 @@ curl -fsS --config ~/.volvisor-admin.curl \
 ```
 
 Check at least: volume ids, `state`, `attachments[].state`,
-`attachments[].state_revision`, `attachments[].evidence`, and
-`retired_attachment_ids` (tombstones). D1 expected and observed:
+`attachments[].state_revision`, `attachments[].evidence`,
+`attachments[].attachment_generation`, and the volume generation. The
+`retired_attachment_filter` is legacy decode-only (ADR-0012) and may be absent
+from files written by current binaries. D1 expected and observed:
 
 ```json
 {
@@ -213,8 +218,15 @@ Check at least: volume ids, `state`, `attachments[].state`,
 }
 ```
 
-and the retired id `att-d1-b` still present in the tombstone list. A reattach
-of that retired id must return HTTP 409 `IDEMPOTENCY_CONFLICT`.
+and `vol-d1-b` retains its post-detach volume generation (`3`, the generation
+recorded at the backup). The attachment-id tombstone filter is legacy
+(ADR-0012): new detach writes do not populate it, and the provider does not
+consult it. A legacy v1/v2 state file still imports its old vector at decode.
+The surviving fence is the **strictly increasing per-volume
+`attachment_generation`**: re-attaching `att-d1-b` succeeds as a new instance
+with generation `3`, and a delayed report carrying the retired generation `1`
+returns HTTP 409 `STALE_GENERATION`. That is the behavioral check; do not
+assert the old `IDEMPOTENCY_CONFLICT` on id reuse.
 
 ## C. Backend reconciliation (mandatory)
 
@@ -245,9 +257,10 @@ data restore.
 - the tar digest is recorded;
 - restored file checksums match;
 - the daemon becomes healthy;
-- attachment state/revision/evidence and tombstones match the backup;
+- attachment state/revision/evidence and the volume generation match the backup;
 - post-backup operations are absent (404);
-- retired attachment ids are still refused;
+- a re-attach records a strictly greater generation and a delayed report from
+  the retired generation is `STALE_GENERATION`;
 - every extra LV is reconciled and recorded.
 
 ## If it fails
@@ -265,11 +278,15 @@ data restore.
 
 ## What was drilled
 
-D1 created A/B/C, attached A and B, reported A active, detached B (tombstone),
-stopped the daemon, copied the state directory, drifted by creating C,
-restored, and re-inspected. Evidence:
-[raw/01-backup-restore.log](../../evidence/day2/2026-11-03-devhost/raw/01-backup-restore.log).
-The log contains the exact commands, timestamps, hashes and assertions.
+D1 created A/B/C, attached A and B, reported A active, detached B, stopped the
+daemon, copied the state directory, drifted by creating C, restored, and
+re-inspected. The 2026-11-04 evidence bundle predates ADR-0012 and therefore
+records the retired-id `409 IDEMPOTENCY_CONFLICT` plus the v3 filter count:
+[raw/01-backup-restore-v3.log](../../evidence/day2/2026-11-04-devhost-live/raw/01-backup-restore-v3.log).
+The current harness instead asserts the generation fence (re-attach generation
+`3`, delayed generation `1` → `STALE_GENERATION`). Re-run the drill to produce
+evidence for the current binary; the historical bundle is not evidence for the
+new fence.
 
 **Limits:** single host; control-plane only; no witness quiesce in the drill;
 no VM-disk or LVM-metadata restore; loop-device LVM. A real disaster-recovery

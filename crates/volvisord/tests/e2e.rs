@@ -1,9 +1,10 @@
 //! End-to-end daemon test: config -> journal -> provider -> router -> real
 //! HTTP/1.1 over TCP, using the in-memory fake provider.
 //!
-//! Mutations authenticate with the configured admin bearer token (fail-closed
-//! auth); a tokenless mutation is asserted to be rejected with `401`, and the
-//! privileged admin discovery route is exercised over real HTTP.
+//! Mutations and reads authenticate with the configured admin bearer token
+//! (fail-closed auth); a tokenless mutation is asserted to be rejected with
+//! `401`, and the privileged admin discovery route is exercised over real
+//! HTTP. Only a tokenless daemon leaves reads open.
 //!
 //! There is deliberately no ceph-provider e2e here: constructing
 //! `CephRbdProvider` requires a live external cluster answering its
@@ -104,6 +105,7 @@ fn e2e_config(dir: &tempfile::TempDir) -> volvisord::Config {
         tls: volvisord::config::TlsConfig::default(),
         allow_insecure: false,
         admission: volvisord::config::AdmissionConfig::default(),
+        journal: volvisord::config::JournalConfig::default(),
     }
 }
 
@@ -153,10 +155,17 @@ async fn daemon_end_to_end_fake_provider() {
         "health must be honestly Unknown: {body}"
     );
 
-    // Inspect it (read-only GETs stay open in P0).
+    // Inspect it: any configured credential protects reads, so the same
+    // admin token is required.
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let (status, body) =
-        http_request(&mut stream, "GET", "/v2/volumes/vol-e2e-1", None, None).await;
+    let (status, body) = http_request(
+        &mut stream,
+        "GET",
+        "/v2/volumes/vol-e2e-1",
+        None,
+        Some(E2E_ADMIN_TOKEN),
+    )
+    .await;
     assert_eq!(status, 200, "inspect body: {body}");
     assert!(body.contains("\"volume_id\":\"vol-e2e-1\""), "body: {body}");
 
@@ -243,6 +252,7 @@ async fn daemon_journal_lock_fails_fast_for_second_instance() {
         tls: volvisord::config::TlsConfig::default(),
         allow_insecure: false,
         admission: volvisord::config::AdmissionConfig::default(),
+        journal: volvisord::config::JournalConfig::default(),
     };
     // Hold one state (and thus the journal lock) ...
     let first = volvisord::runtime::build_state(&config).expect("first instance");

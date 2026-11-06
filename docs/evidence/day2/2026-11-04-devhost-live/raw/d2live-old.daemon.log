@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-04T15:11:26.372060Z","level":"INFO","fields":{"message":"volvisord starting (prototype; not production supported)","listen":"127.0.0.1:46691","provider":"Lvm"}}
+{"timestamp":"2026-11-04T15:11:26.455194Z","level":"INFO","fields":{"message":"volvisor API serving","listen":"127.0.0.1:46691","tls":false}}
+{"timestamp":"2026-11-04T15:11:26.639489Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"GET","route":"/v2/volumes/{volume_id}","status":200,"outcome":"success","operation_id":""}}
+{"timestamp":"2026-11-04T15:11:26.657128Z","level":"INFO","fields":{"message":"request","kind":"audit","principal":"admin_token","role":"admin","method":"GET","route":"/v2/volumes/{volume_id}","status":404,"outcome":"failure","operation_id":""}}

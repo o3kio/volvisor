@@ -80,7 +80,7 @@ impl LvmProvider {
     ) -> Result<Pool, ApiError> {
         request.validate()?;
         self.require_token(&request.authorization_token)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
 
         if state.device(device_id).is_some() {
             return Err(ApiError::new(
@@ -176,7 +176,9 @@ impl LvmProvider {
                 owner_generation,
             },
         );
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            self.reconcile_failed_save(&mut state);
+        })?;
 
         Ok(Pool {
             id: pool_id_for(device_id)?,
@@ -216,7 +218,7 @@ impl LvmProvider {
     ) -> Result<(), ApiError> {
         request.validate()?;
         self.require_token(&request.authorization_token)?;
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state_stable()?;
 
         let entry = state
             .device(device_id)
@@ -261,7 +263,9 @@ impl LvmProvider {
         // (that would re-claim a device whose VG no longer exists); the
         // operator gets the exact manual remediation instead.
         state.remove_device(device_id);
-        self.persist(&mut state)?;
+        self.persist(&mut state).inspect_err(|_| {
+            self.reconcile_failed_save(&mut state);
+        })?;
 
         let pvremove = self.runner.run("pvremove", &["--yes", &entry.path])?;
         if !pvremove.success {
@@ -299,13 +303,23 @@ impl LvmProvider {
     /// caller decides what to investigate. Nothing is adopted or destroyed
     /// here. Returns `Err` when `lvs` cannot be queried — an empty report
     /// would dishonestly imply consistency.
+    ///
+    /// The `lvs` observation and the provider-state snapshot are sampled
+    /// non-atomically so the CLI call never holds the writer lock. A
+    /// mutation that lands between the two samples can therefore appear
+    /// transiently as a missing volume or a foreign LV; re-run after the
+    /// writers quiesce before treating a row as evidence of drift.
     pub fn reconcile_report(&self) -> Result<ReconcileReport, ApiError> {
-        let state = self.lock_state()?;
+        // Issue #62: observe the world *before* taking any provider
+        // state view, so `lvs` (a potentially slow CLI call) never holds
+        // the writer lock. The report is derived from the published
+        // committed snapshot.
         let present: Vec<String> = self
             .list_lvs()?
             .into_iter()
             .filter_map(|row| row.vg_slash_lv())
             .collect();
+        let state = self.state_snapshot();
         let our_volumes: Vec<String> = state
             .volumes()
             .values()

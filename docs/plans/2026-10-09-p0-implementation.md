@@ -2,7 +2,7 @@
 
 Status: Active implementation plan (P0 of SPEC-0002 section 12)
 Date: 2026-10-09
-Normative: [Volume API v2](../contracts/volume-api-v2.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [Nearline contract v2](../contracts/nearline-replication-v2.md), [ADR-0003](../adr/0003-tiered-volume-virtualization.md), [AGENTS](../../AGENTS.md)
+Normative: [Volume API v2](../../contracts/volume-api-v2.md), [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md), [Nearline contract v2](../../contracts/nearline-replication-v2.md), [ADR-0003](../adr/0003-tiered-volume-virtualization.md), [AGENTS](../../AGENTS.md)
 
 ## 1. Goal
 

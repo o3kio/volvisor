@@ -1663,7 +1663,9 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "tracing",
  "volvisor-types",
 ]
 
@@ -1677,6 +1679,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tracing",
  "volvisor-provider",
  "volvisor-types",
 ]

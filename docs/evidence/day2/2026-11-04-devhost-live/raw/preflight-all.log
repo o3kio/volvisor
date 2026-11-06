@@ -1,0 +1,52 @@
+# preflight start: 2026-11-04T14:59:06Z
+# invoke: docs/runbooks/day-2/scripts/preflight.sh --check-old-build
+# repo: /root/git/volvisor-phase-a at aad1720 (dirty=yes)
+# runner: uid=0 host=dev
+
+== D2 live old-binary -> new-binary upgrade/rollback ==
+PASS      [d2] git: /usr/bin/git
+PASS      [d2] cargo: /root/.cargo/bin/cargo
+PASS      [d2] jq: /usr/bin/jq
+PASS      [d2] curl: /usr/bin/curl
+PASS      [d2] python3 (free-port helper): /usr/bin/python3
+PASS      [d2] sha256sum: /usr/bin/sha256sum
+PASS      [d2] tar: /usr/bin/tar
+PASS      [d2] losetup: /usr/sbin/losetup
+PASS      [d2] lvm2 vgs: /usr/sbin/vgs
+PASS      [d2] lvm2 pvcreate: /usr/sbin/pvcreate
+PASS      [d2] lvm2 vgcreate: /usr/sbin/vgcreate
+PASS      [d2] lvm2 lvcreate: /usr/sbin/lvcreate
+PASS      [d2] lvm2 lvs: /usr/sbin/lvs
+PASS      [d2] lvm2 vgremove: /usr/sbin/vgremove
+PASS      [d2] lvm2 pvremove: /usr/sbin/pvremove
+PASS      [d2] privilege: uid 0 (loop/LVM lab can run)
+PASS      [d2] repository: /root/git/volvisor-phase-a at aad1720
+PASS      [d2] old commit resolves: 8c2fc1a (8c2fc1a)
+PASS      [d2] old tree has Cargo.toml/Cargo.lock: build inputs present
+PASS      [d2] loop device available: losetup -f returned /dev/loop0
+PASS      [d2] old commit buildable: cargo build -p volvisord succeeded at 8c2fc1a
+
+== D3 storage-side lost-witness fencing ==
+NOT RUN   [d3] DRBD 9 kernel module: not loaded/present (no /sys/module/drbd or /proc/drbd)
+NOT RUN   [d3] drbdadm: command not found: drbdadm
+NOT RUN   [d3] peer host: host is unset
+NOT RUN   [d3] witness service: URL is unset
+NOT RUN   [d3] DRBD resource name: D3_DRBD_RESOURCE is unset
+NOT RUN   [d3] distinct failure domains: D3_LOCAL_FAILURE_DOMAIN/D3_PEER_FAILURE_DOMAIN are unset
+
+== D8 total host loss and re-admission ==
+NOT RUN   [d8] three or more data hosts: D8_HOSTS is unset (expected e.g. a,b,c)
+NOT RUN   [d8] witness service: URL is unset
+NOT RUN   [d8] independent oracle host: host is unset
+NOT RUN   [d8] BMC/power control: D8_BMC_HOST is unset (D8_BMC_TOOL=ipmitool)
+NOT RUN   [d8] storage backend: D8_STORAGE_BACKEND must be drbd or ceph (got: unset)
+NOT RUN   [d8] DRBD 9 kernel module: not loaded/present (no /sys/module/drbd or /proc/drbd)
+
+== summary ==
+D2 live: READY
+D3 storage-side: NOT RUN
+D8: NOT RUN
+checks: 33 selected; 12 missing prerequisite(s); 0 failed check(s)
+VERDICT: NOT RUN (D2 live: READY; D3 storage-side: NOT RUN; D8: NOT RUN)
+A preflight result is not drill evidence. D2 live must still run d2-live.sh; D3/D8 remain NOT RUN without the listed hardware.
+exit=0

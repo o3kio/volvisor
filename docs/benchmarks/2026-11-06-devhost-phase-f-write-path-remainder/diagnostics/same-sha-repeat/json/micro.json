@@ -1,0 +1,261 @@
+{
+  "accepted": {
+    "count": 1224,
+    "max_ms": 277.973,
+    "mean_ms": 29.488,
+    "min_ms": 0.102,
+    "p50_ms": 1.301,
+    "p95_ms": 215.298,
+    "p99_ms": 235.718
+  },
+  "argv": [
+    "/root/git/volvisor-phase-a/scripts/bench/bench.py",
+    "micro",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "33573",
+    "--token-file",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/configs/token",
+    "--out-dir",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z",
+    "--journal",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/lab/journal/journal.log",
+    "--state",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/lab/lvm-state.json",
+    "--repo",
+    "/root/git/volvisor-phase-a",
+    "--binary",
+    "/root/git/volvisor-phase-a/target/release/volvisord",
+    "--config",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/configs/volvisord.toml",
+    "--daemon-log",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/raw/daemon.daemon.log",
+    "--pidfile",
+    "/tmp/opencode/volvisor-bench-phase-f-repeat-20261106T125655Z/records/daemon.pid",
+    "--daemon-pid",
+    "3497239",
+    "--create-delete-iterations",
+    "40",
+    "--cycle-iterations",
+    "150",
+    "--grow-iterations",
+    "30",
+    "--inspect-iterations",
+    "400",
+    "--list-iterations",
+    "100",
+    "--capabilities-iterations",
+    "100"
+  ],
+  "capabilities_iterations": 100,
+  "create_delete_iterations": 40,
+  "cycle_iterations": 150,
+  "error_codes": {},
+  "error_rate": 0.0,
+  "errors": 0,
+  "generated_utc": "2026-11-06T12:57:34Z",
+  "grow_increment_bytes": 8388608,
+  "grow_iterations": 30,
+  "host": "dev",
+  "inspect_iterations": 400,
+  "kernel": "6.8.0-142-generic",
+  "list_iterations": 100,
+  "network_error_kinds": {},
+  "network_errors": 0,
+  "ops": 1224,
+  "overall": {
+    "count": 1224,
+    "max_ms": 277.973,
+    "mean_ms": 29.488,
+    "min_ms": 0.102,
+    "p50_ms": 1.301,
+    "p95_ms": 215.298,
+    "p99_ms": 235.718
+  },
+  "per_op": {
+    "attach": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.808,
+      "mean_ms": 1.436,
+      "min_ms": 1.196,
+      "p50_ms": 1.417,
+      "p95_ms": 1.624,
+      "p99_ms": 1.808
+    },
+    "capabilities": {
+      "count": 100,
+      "errors": 0,
+      "max_ms": 0.184,
+      "mean_ms": 0.116,
+      "min_ms": 0.102,
+      "p50_ms": 0.108,
+      "p95_ms": 0.143,
+      "p99_ms": 0.181
+    },
+    "create": {
+      "count": 72,
+      "errors": 0,
+      "max_ms": 277.973,
+      "mean_ms": 216.645,
+      "min_ms": 194.635,
+      "p50_ms": 215.203,
+      "p95_ms": 235.718,
+      "p99_ms": 277.973
+    },
+    "delete": {
+      "count": 72,
+      "errors": 0,
+      "max_ms": 194.827,
+      "mean_ms": 177.303,
+      "min_ms": 154.11,
+      "p50_ms": 174.623,
+      "p95_ms": 194.684,
+      "p99_ms": 194.827
+    },
+    "detach": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.815,
+      "mean_ms": 1.461,
+      "min_ms": 1.226,
+      "p50_ms": 1.439,
+      "p95_ms": 1.622,
+      "p99_ms": 1.772
+    },
+    "grow": {
+      "count": 30,
+      "errors": 0,
+      "max_ms": 265.85,
+      "mean_ms": 233.514,
+      "min_ms": 214.655,
+      "p50_ms": 234.856,
+      "p95_ms": 255.667,
+      "p99_ms": 265.85
+    },
+    "inspect": {
+      "count": 400,
+      "errors": 0,
+      "max_ms": 0.286,
+      "mean_ms": 0.123,
+      "min_ms": 0.106,
+      "p50_ms": 0.117,
+      "p95_ms": 0.148,
+      "p99_ms": 0.188
+    },
+    "list": {
+      "count": 100,
+      "errors": 0,
+      "max_ms": 0.229,
+      "mean_ms": 0.128,
+      "min_ms": 0.113,
+      "p50_ms": 0.123,
+      "p95_ms": 0.152,
+      "p99_ms": 0.166
+    },
+    "report": {
+      "count": 150,
+      "errors": 0,
+      "max_ms": 1.821,
+      "mean_ms": 1.438,
+      "min_ms": 1.244,
+      "p50_ms": 1.417,
+      "p95_ms": 1.667,
+      "p99_ms": 1.816
+    }
+  },
+  "python": "3.12.3",
+  "read": {
+    "count": 600,
+    "max_ms": 0.286,
+    "mean_ms": 0.123,
+    "min_ms": 0.102,
+    "p50_ms": 0.117,
+    "p95_ms": 0.149,
+    "p99_ms": 0.184
+  },
+  "reads": 600,
+  "scenario": "micro",
+  "setup": {
+    "cycle_create_status": 200,
+    "grow_create_status": 200,
+    "journal": {
+      "bytes_per_mutation": 901.726,
+      "delta_bytes": 562677,
+      "end_bytes": 562677,
+      "mutations": 624,
+      "note": "append-only journal; derived from measured file growth",
+      "start_bytes": 0
+    },
+    "journal_before_cleanup_bytes": 562677,
+    "journal_start_bytes": 0,
+    "state": {
+      "delta_bytes": 1108,
+      "end_bytes": 1378,
+      "note": "whole state file is rewritten and fsynced per mutation; samples are file size after the create at that volume count; not separately timed",
+      "peak_bytes": 20484,
+      "samples": [
+        {
+          "journal_bytes": 507612,
+          "last_create_ms": 235.068,
+          "state_bytes": 1973,
+          "volumes": 1
+        },
+        {
+          "journal_bytes": 515525,
+          "last_create_ms": 215.075,
+          "state_bytes": 6138,
+          "volumes": 8
+        },
+        {
+          "journal_bytes": 542714,
+          "last_create_ms": 215.368,
+          "state_bytes": 20484,
+          "volumes": 32
+        }
+      ],
+      "start_bytes": 270
+    },
+    "state_before_cleanup_bytes": 1378,
+    "state_peak_bytes": 20484,
+    "state_scale": [
+      {
+        "journal_bytes": 507612,
+        "last_create_ms": 235.068,
+        "state_bytes": 1973,
+        "volumes": 1
+      },
+      {
+        "journal_bytes": 515525,
+        "last_create_ms": 215.075,
+        "state_bytes": 6138,
+        "volumes": 8
+      },
+      {
+        "journal_bytes": 542714,
+        "last_create_ms": 215.368,
+        "state_bytes": 20484,
+        "volumes": 32
+      }
+    ],
+    "state_start_bytes": 270
+  },
+  "source_sha": "2edcecd9b3d4c555831e6d4db1337e3dbcff6a15",
+  "status": "OK",
+  "status_counts": {
+    "200": 1224
+  },
+  "volume_size_bytes": 16777216,
+  "worktree_dirty": false,
+  "write": {
+    "count": 624,
+    "max_ms": 277.973,
+    "mean_ms": 57.724,
+    "min_ms": 1.196,
+    "p50_ms": 1.475,
+    "p95_ms": 225.233,
+    "p99_ms": 245.291
+  },
+  "writes": 624
+}

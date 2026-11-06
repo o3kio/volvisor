@@ -73,7 +73,8 @@ const GROW_RETRY_TICK: Duration = Duration::from_secs(5);
 /// Returns [`DaemonError`] when the journal cannot be locked/opened or the
 /// provider cannot be constructed or reconciled.
 pub fn build_state(config: &Config) -> Result<SharedState, DaemonError> {
-    let journal = Journal::open(&config.journal_dir).map_err(journal_err("open journal"))?;
+    let journal = Journal::open_with_retention(&config.journal_dir, config.journal.to_retention())
+        .map_err(journal_err("open journal"))?;
     // The witness probe target is resolved at startup so `/readyz` and the
     // `witness_reachable` gauge can use the same real transport probe the
     // migration driver uses. No witness URL means `not_probed`.
@@ -477,6 +478,14 @@ fn log_move_pass(
                     kind = "move_reconcile",
                     volume_id = %volume_id,
                     "move record unobservable this pass; retried next tick"
+                );
+            }
+            for volume_id in &report.deferred_while_growing {
+                tracing::info!(
+                    kind = "move_reconcile",
+                    volume_id = %volume_id,
+                    "verified move completion deferred while the volume has a grow in \
+                     flight; retried next pass"
                 );
             }
         }
@@ -1018,7 +1027,7 @@ fn journal_err(context: &'static str) -> impl Fn(ApiError) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AdmissionConfig, MigrationConfig, VmmConfig};
+    use crate::config::{AdmissionConfig, JournalConfig, MigrationConfig, VmmConfig};
 
     fn fake_config(listen: &str, admin_token: Option<&str>) -> Config {
         Config {
@@ -1059,6 +1068,7 @@ mod tests {
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
             admission: AdmissionConfig::default(),
+            journal: JournalConfig::default(),
         }
     }
 
@@ -1104,6 +1114,7 @@ mod tests {
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
             admission: AdmissionConfig::default(),
+            journal: JournalConfig::default(),
         }
     }
 
@@ -1259,6 +1270,7 @@ mod tests {
             tls: crate::config::TlsConfig::default(),
             allow_insecure: false,
             admission: AdmissionConfig::default(),
+            journal: JournalConfig::default(),
         }
     }
 

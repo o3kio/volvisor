@@ -12,6 +12,7 @@
 # enforcement. No DRBD 9 module / peered resource exists on this host, so
 # a writer that keeps writing after losing the witness is not exercised.
 # That half stays PARTIAL in the report.
+# shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d3"
@@ -94,10 +95,10 @@ cap "legacy shared token is read-only on the v2 witness (health)"
 api_expect "$ADMIN_CURL" GET "$BASE/healthz" "" 200 "$RUN/records/$TAG-health.txt"
 cap "host-a registers the volume (two hosts, two endpoints)" \
   api_expect "$A_CURL" POST "$BASE/v1/volumes/$VOL/register" "$RUN/records/$TAG-register.json" 200 "$RUN/records/$TAG-register.resp.json"
-cat "$RUN/records/$TAG-register.resp.json" | tee -a "$LOG"
+tee -a "$LOG" < "$RUN/records/$TAG-register.resp.json"
 cap "host-a is granted writer epoch 1" \
   api_expect "$A_CURL" POST "$BASE/v1/volumes/$VOL/grant" "$RUN/records/$TAG-grant-a.json" 200 "$RUN/records/$TAG-grant-a.resp.json"
-cat "$RUN/records/$TAG-grant-a.resp.json" | tee -a "$LOG"
+tee -a "$LOG" < "$RUN/records/$TAG-grant-a.resp.json"
 cap "record the granted epoch/lease for the restart comparison" \
   jq '{epoch,lease_id,lease_ttl_secs}' "$RUN/records/$TAG-grant-a.resp.json"
 GRANT_EPOCH="$(jq -r '.epoch' "$RUN/records/$TAG-grant-a.resp.json")"

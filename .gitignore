@@ -1,4 +1,10 @@
 /target
+# The fuzz workspace has its own target directory (nightly toolchain
+# artifacts); never commit it.
+/fuzz/target/
+# `cargo fuzz` crash/timeout artifacts are triage inputs, not evidence:
+# reproduce, then promote into `fuzz/corpus/` deliberately.
+/fuzz/artifacts/
 # The P5 campaign's evidence bundles (§6) — under target, ignored
 # again explicitly so the artifact location is unmistakable.
 /target/campaign-evidence/
@@ -7,3 +13,9 @@ Cargo.lock.bak
 .env
 __pycache__/
 *.pyc
+
+# Benchmark harness output: per-operation CSV samples and per-second timelines
+# are regenerable, large and not reviewable. Commit the exact JSON aggregates,
+# summary tables and MANIFEST.sha256 instead. Bundles published before this
+# rule keep their already-tracked CSV files.
+docs/benchmarks/**/csv/

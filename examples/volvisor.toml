@@ -103,6 +103,38 @@ witness_host_token = "replace-with-a-generated-host-secret"
 # response).
 witness_renewal_interval_secs = 15
 
+# ------------------------------------------------- journal retention (#64)
+# Bounded retention and compaction. These are the defaults. A retry whose
+# operation was evicted within the tombstone window answers 410
+# OPERATION_EXPIRED instead of re-executing; keep max_tombstones above the
+# longest client retry horizon. max_log_bytes = 0 disables only the byte
+# trigger (the record-count and retention triggers still apply).
+#
+# hard_ceiling_bytes is the fail-closed stop condition above the soft
+# max_log_bytes trigger (ADR-0014): an append that would cross it gets one
+# compaction attempt, then is refused with 503 JOURNAL_FULL if the log is
+# still over. Unset derives twice max_log_bytes; when max_log_bytes = 0
+# disables the trigger, set it explicitly. It must be non-zero and at least
+# max_log_bytes.
+[journal]
+max_retained_operations = 65536
+max_tombstones = 65536
+max_log_records = 500000
+max_log_bytes = 67108864
+hard_ceiling_bytes = 134217728
+
+# --------------------------------------------------- admission control (#45)
+# Read-only routes are bounded by read_timeout_secs; journaled mutations are
+# never aborted by a wall-clock timeout. Per-route overrides go in
+# [admission.route_timeouts]. Rate limiting stays opt-in (0 = disabled).
+[admission]
+read_timeout_secs = 30
+queue_timeout_secs = 5
+max_concurrent_requests = 256
+rate_limit_per_second = 0
+rate_limit_burst = 0
+max_list_limit = 1000
+
 # ------------------------------------------------------- migration and vmm
 # The coordinated VMM/storage handoff (P4b). Inert until
 # enabled = true; enabling requires the drbd provider, a witness, an

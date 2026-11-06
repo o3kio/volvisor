@@ -27,11 +27,16 @@
 //! - every store constructs its own hook instance **empty**, and no
 //!   route, request body, config value or input path can reach it;
 //! - only the constructing test rig — the sole caller of
-//!   [`StoreCrashHooks::arm`] and [`StoreCrashHooks::set_kill_switch`]
-//!   — can change that (the stores expose their instance through
-//!   read-only accessors so a rig can register its kill switch, the
-//!   same discipline as the journal-append hook in
-//!   `volvisor-api`);
+//!   [`StoreCrashHooks::arm`], [`StoreCrashHooks::set_kill_switch`],
+//!   [`StoreCrashHooks::arm_save_failure`] and
+//!   [`StoreCrashHooks::arm_save_failure_until_cleared`] (the latter two
+//!   record a private `SaveFailureArm`) — can change that (the stores
+//!   expose their instance through read-only accessors so a rig can
+//!   register its kill switch or failure arm, the same discipline as the
+//!   journal-append hook in `volvisor-api`). These entry points are
+//!   **rig-only and unreachable from configuration or HTTP**; the
+//!   persistent variant is `pub` because the rigs live in other crates,
+//!   not because it is part of the production surface;
 //! - [`StoreCrashHooks::consult`] is `pub` only because the save
 //!   sites live in other crates; without an armed entry matching
 //!   the exact `(store, point)` pair it does nothing.
@@ -157,9 +162,21 @@ pub struct StoreCrashHooks {
     /// The rig's group-abort action, when registered.
     kill: Mutex<Option<KillSwitch>>,
     /// The rig-only injected **error** arms, keyed by store id: the
-    /// target point and how many matching consults still pass before
-    /// the failure fires (see [`StoreCrashHooks::arm_save_failure`]).
-    failures: Mutex<BTreeMap<&'static str, (StoreSavePoint, usize)>>,
+    /// target point, how many matching consults still pass before the
+    /// failure fires, and whether the arm is one-shot or repeats until
+    /// cleared (see [`StoreCrashHooks::arm_save_failure`] and
+    /// [`StoreCrashHooks::arm_save_failure_until_cleared`]).
+    failures: Mutex<BTreeMap<&'static str, SaveFailureArm>>,
+}
+
+/// One injected save-failure arm: the target boundary, the number of
+/// matching consults that still pass, and whether the arm is consumed
+/// when it fires.
+#[derive(Clone, Copy, Debug)]
+struct SaveFailureArm {
+    point: StoreSavePoint,
+    skip: usize,
+    persistent: bool,
 }
 
 impl std::fmt::Debug for StoreCrashHooks {
@@ -301,28 +318,67 @@ impl StoreCrashHooks {
     /// point for a store whose save does not consult it is inert, so a
     /// rig must not treat a non-firing arm as evidence.
     pub fn arm_save_failure(&self, store: &'static str, point: StoreSavePoint, skip: usize) {
-        self.lock_failures().insert(store, (point, skip));
+        self.lock_failures().insert(
+            store,
+            SaveFailureArm {
+                point,
+                skip,
+                persistent: false,
+            },
+        );
+    }
+
+    /// Arm `store`'s save to return an injected **error** at `point`
+    /// after passing `skip` matching consults, and to keep failing at
+    /// that point until [`StoreCrashHooks::clear`] is called. **Rig
+    /// only**, inert by default (the same trust class as
+    /// [`StoreCrashHooks::arm`]).
+    ///
+    /// This exists for scenarios that need *every* save in a window to
+    /// fail (for example a final save and its compensating clear save),
+    /// not just the next one. The durable artifacts stay exactly as the
+    /// boundary leaves them, exactly like
+    /// [`StoreCrashHooks::arm_save_failure`].
+    pub fn arm_save_failure_until_cleared(
+        &self,
+        store: &'static str,
+        point: StoreSavePoint,
+        skip: usize,
+    ) {
+        self.lock_failures().insert(
+            store,
+            SaveFailureArm {
+                point,
+                skip,
+                persistent: true,
+            },
+        );
     }
 
     /// Consult the injected-failure table at one save boundary of
     /// `store`. Returns `true` exactly when an armed `(store, point)`
-    /// failure fires; that consult consumes the entry.
+    /// failure fires; a one-shot entry is consumed, a persistent entry
+    /// stays armed.
     ///
     /// A consult at a different point (or of an unarmed store) returns
     /// `false` and leaves the arm untouched. Inert unless the
-    /// constructing rig called [`StoreCrashHooks::arm_save_failure`]
-    /// (the module's doc-gated trust class).
+    /// constructing rig called [`StoreCrashHooks::arm_save_failure`] or
+    /// [`StoreCrashHooks::arm_save_failure_until_cleared`] (the
+    /// module's doc-gated trust class).
     pub fn take_save_failure(&self, store: &'static str, point: StoreSavePoint) -> bool {
         let mut failures = self.lock_failures();
-        let Some((armed_point, skip)) = failures.get_mut(store) else {
+        let Some(arm) = failures.get_mut(store) else {
             return false;
         };
-        if *armed_point != point {
+        if arm.point != point {
             return false;
         }
-        if *skip > 0 {
-            *skip -= 1;
+        if arm.skip > 0 {
+            arm.skip -= 1;
             return false;
+        }
+        if arm.persistent {
+            return true;
         }
         failures.remove(store);
         true
@@ -351,7 +407,7 @@ impl StoreCrashHooks {
     }
 
     /// The injected-failure table's lock (same poison recovery).
-    fn lock_failures(&self) -> MutexGuard<'_, BTreeMap<&'static str, (StoreSavePoint, usize)>> {
+    fn lock_failures(&self) -> MutexGuard<'_, BTreeMap<&'static str, SaveFailureArm>> {
         self.failures.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -480,6 +536,22 @@ mod tests {
             !hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRenameBeforeDirFsync),
             "the firing consult consumes the entry"
         );
+    }
+
+    #[test]
+    fn persistent_save_failure_keeps_firing_until_cleared() {
+        let hooks = StoreCrashHooks::new();
+        hooks.arm_save_failure_until_cleared(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite, 1);
+        // The skipped consult passes.
+        assert!(!hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite));
+        // Every following matching consult fires, and the arm survives.
+        for _ in 0..3 {
+            assert!(hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite));
+        }
+        // A mis-pointed consult neither fires nor consumes.
+        assert!(!hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterRename));
+        hooks.clear();
+        assert!(!hooks.take_save_failure(STORE_LVM_STATE, StoreSavePoint::AfterTmpWrite));
     }
 
     #[test]

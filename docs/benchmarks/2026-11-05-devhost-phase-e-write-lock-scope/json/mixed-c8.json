@@ -1,0 +1,213 @@
+{
+  "accepted": {
+    "count": 112718,
+    "max_ms": 1428.878,
+    "mean_ms": 2.1,
+    "min_ms": 0.107,
+    "p50_ms": 0.378,
+    "p95_ms": 7.54,
+    "p99_ms": 11.699
+  },
+  "admission_cap": 256,
+  "argv": [
+    "/root/git/volvisor-phase-a/scripts/bench/bench.py",
+    "mixed",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "35801",
+    "--token-file",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/configs/token",
+    "--out-dir",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105",
+    "--journal",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/lab/journal/journal.log",
+    "--state",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/lab/lvm-state.json",
+    "--repo",
+    "/root/git/volvisor-phase-a",
+    "--binary",
+    "/root/git/volvisor-phase-a/target/release/volvisord",
+    "--config",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/configs/volvisord.toml",
+    "--daemon-log",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/raw/daemon.daemon.log",
+    "--pidfile",
+    "/tmp/opencode/volvisor-bench-phase-e-20261105/records/daemon.pid",
+    "--daemon-pid",
+    "1777064",
+    "--concurrency",
+    "8",
+    "--duration",
+    "30",
+    "--read-ratio",
+    "0.7",
+    "--admission-cap",
+    "256",
+    "--queue-timeout",
+    "5",
+    "--label",
+    "c8"
+  ],
+  "cleanup_failures": [],
+  "concurrency": 8,
+  "duration_seconds": 30.005,
+  "error_codes": {},
+  "error_rate": 0.0,
+  "errors": 0,
+  "generated_utc": "2026-11-05T15:46:45Z",
+  "host": "dev",
+  "kernel": "6.8.0-142-generic",
+  "network_error_kinds": {},
+  "network_errors": 0,
+  "ops": 112718,
+  "overall": {
+    "count": 112718,
+    "max_ms": 1428.878,
+    "mean_ms": 2.1,
+    "min_ms": 0.107,
+    "p50_ms": 0.378,
+    "p95_ms": 7.54,
+    "p99_ms": 11.699
+  },
+  "per_op": {
+    "attach": {
+      "count": 11311,
+      "errors": 0,
+      "max_ms": 38.079,
+      "mean_ms": 5.475,
+      "min_ms": 1.257,
+      "p50_ms": 4.923,
+      "p95_ms": 10.614,
+      "p99_ms": 14.817
+    },
+    "capabilities": {
+      "count": 7843,
+      "errors": 0,
+      "max_ms": 5.884,
+      "mean_ms": 0.338,
+      "min_ms": 0.107,
+      "p50_ms": 0.267,
+      "p95_ms": 0.76,
+      "p99_ms": 1.288
+    },
+    "detach": {
+      "count": 11307,
+      "errors": 0,
+      "max_ms": 40.487,
+      "mean_ms": 5.457,
+      "min_ms": 1.267,
+      "p50_ms": 4.893,
+      "p95_ms": 10.612,
+      "p99_ms": 14.825
+    },
+    "grow": {
+      "count": 32,
+      "errors": 0,
+      "max_ms": 1428.878,
+      "mean_ms": 740.416,
+      "min_ms": 266.636,
+      "p50_ms": 721.297,
+      "p95_ms": 1096.627,
+      "p99_ms": 1428.878
+    },
+    "inspect": {
+      "count": 58998,
+      "errors": 0,
+      "max_ms": 4.817,
+      "mean_ms": 0.349,
+      "min_ms": 0.109,
+      "p50_ms": 0.271,
+      "p95_ms": 0.805,
+      "p99_ms": 1.379
+    },
+    "list": {
+      "count": 11919,
+      "errors": 0,
+      "max_ms": 3.442,
+      "mean_ms": 0.389,
+      "min_ms": 0.154,
+      "p50_ms": 0.298,
+      "p95_ms": 0.863,
+      "p99_ms": 1.464
+    },
+    "report": {
+      "count": 11308,
+      "errors": 0,
+      "max_ms": 37.203,
+      "mean_ms": 5.441,
+      "min_ms": 1.282,
+      "p50_ms": 4.875,
+      "p95_ms": 10.611,
+      "p99_ms": 14.801
+    }
+  },
+  "python": "3.12.3",
+  "queue_timeout_seconds": 5.0,
+  "rate_limit_per_second": 0,
+  "read": {
+    "count": 78760,
+    "max_ms": 5.884,
+    "mean_ms": 0.354,
+    "min_ms": 0.107,
+    "p50_ms": 0.275,
+    "p95_ms": 0.81,
+    "p99_ms": 1.38
+  },
+  "read_ratio_actual": 0.6987,
+  "read_ratio_target": 0.7,
+  "reads": 78760,
+  "resources": {
+    "fds": {
+      "delta": -15.0,
+      "first": 37.0,
+      "last": 22.0,
+      "max": 37.0,
+      "min": 21.0
+    },
+    "fds_per_second": -0.24846,
+    "journal_bytes": {
+      "delta": 30694094.0,
+      "first": 16215867.0,
+      "last": 46909961.0,
+      "max": 46909961.0,
+      "min": 16215867.0
+    },
+    "rss_kib": {
+      "delta": 82428.0,
+      "first": 58204.0,
+      "last": 140632.0,
+      "max": 140632.0,
+      "min": 58204.0
+    },
+    "rss_kib_per_second": 3112.1243,
+    "samples": 29,
+    "state_bytes": {
+      "delta": -1127.0,
+      "first": 7356.0,
+      "last": 6229.0,
+      "max": 7887.0,
+      "min": 5148.0
+    }
+  },
+  "scenario": "mixed-c8",
+  "source_sha": "2c5b0659a68b5ce6b9286c5c1cd1df7a92f8ebb1",
+  "started_utc": "2026-11-05T15:46:14Z",
+  "status": "OK",
+  "status_counts": {
+    "200": 112718
+  },
+  "successful_ops_per_second": 3756.659,
+  "throughput_ops_per_second": 3756.659,
+  "worktree_dirty": false,
+  "write": {
+    "count": 33958,
+    "max_ms": 1428.878,
+    "mean_ms": 6.15,
+    "min_ms": 1.257,
+    "p50_ms": 4.9,
+    "p95_ms": 10.66,
+    "p99_ms": 15.074
+  },
+  "writes": 33958
+}
