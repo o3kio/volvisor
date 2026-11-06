@@ -6,6 +6,7 @@ work that is externally blocked. It does not change any readiness gate and it
 does not turn an accepted ADR into evidence.
 
 Related: [pre-production readiness](../releases/pre-production-readiness.md),
+[production-readiness closure plan](2026-11-06-production-readiness-closure.md),
 [default integration scenarios](../testing/default-integration-scenarios.md),
 [ADR-0013](../adr/0013-durable-attachment-generation-allocator.md),
 [ADR-0014](../adr/0014-journal-bounds-and-exhaustion-contract.md),
@@ -19,7 +20,7 @@ Related: [pre-production readiness](../releases/pre-production-readiness.md),
   with its exact prerequisite recorded. It is never "closed by documentation".
 - No measured JSON/CSV evidence is edited. Repeats and diagnostics are not
   evidence.
-- The default gate remains 54+ exact scenarios, 60 s per test and 300 s for
+- The default gate remains 58+ exact scenarios, 60 s per test and 300 s for
   the warm catalog. Long-running proofs belong to scheduled/evidence lanes.
 
 ## Locally actionable now
@@ -148,6 +149,9 @@ they need real storage and at least two hosts.
 4. Run the default gate, `release-scope.py check`, formatting and CI.
 5. Report the remaining issues with the prerequisites above; do not close
    them without evidence.
+6. Execute the [production-readiness closure plan](2026-11-06-production-readiness-closure.md)
+   for the hardware, release, security, operability and consumer gates; it
+   creates no evidence and changes no verdict until the runs land.
 
 ## Non-claims
 
