@@ -3427,6 +3427,7 @@ mod tests {
                     max_tombstones: 8,
                     max_log_records: 2,
                     max_log_bytes: None,
+                    hard_ceiling_bytes: 64 * 1024 * 1024,
                 },
             )
             .expect("control-plane journal opens");

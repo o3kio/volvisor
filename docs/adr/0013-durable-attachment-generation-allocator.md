@@ -1,13 +1,15 @@
 # ADR-0013 — Make the attachment-generation allocator durable across volume lifetime
 
-Status: Accepted (decision accepted 2026-11-06 by zoorpha; implementation
-pending under [#63](https://github.com/o3kio/volvisor/issues/63))
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; the local allocator
+implementation landed under [#63](https://github.com/o3kio/volvisor/issues/63),
+which remains open for the evidence work)
 Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Revises: [ADR-0012](0012-monotonic-attachment-generation-fence.md) — the
 generation **source**, not the report/detach fence. This revision is
-accepted; ADR-0012's report/detach semantics are unchanged, and the
-implementation remains pending under #63.
+accepted; ADR-0012's report/detach semantics are unchanged. The local
+allocator implementation landed under #63; #63 remains open for the residual
+upgrade window and real-backend evidence.
 Related: [Volume API v2](../../contracts/volume-api-v2.md) §3,
 [ADR-0012](0012-monotonic-attachment-generation-fence.md),
 [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md),
@@ -117,12 +119,18 @@ create.**
 
 ## Implementation status
 
-Not implemented in the Phase F evidence batch. The decision is accepted
-(2026-11-06, zoorpha); implementation remains pending under `#63`. The Phase
-F result records the gap; this ADR records the decision and the required
-migration shape. Until it is implemented, the residual is listed in the
-readiness report and `#63` remains open. Any implementation must add the
-delete + recreate scenario to the default catalog before merge.
+The local allocator implementation landed under `#63` (schema v4): the
+persisted provider-wide `next_attachment_generation` is authoritative, a v3
+file seeds it from `max(entry, attachment) + 1` only when it is absent or `0`,
+every save re-normalizes it, and allocation at `u64::MAX` fails closed. The
+default catalog pins `GF-12` (delete + same-id recreate never reissues a
+retired generation) and `SC-09` (v3 fixture seeds and upgrades to v4).
+
+`#63` remains open: the residual upgrade window — a volume deleted before the
+v4 file was ever written has no durable record of its consumed generations —
+is not represented as fixed, and real-backend/multi-host evidence has not
+been collected. See the readiness report and the
+[remediation plan](../plans/2026-11-06-open-issue-remediation.md).
 
 ## Non-claims
 

@@ -41,8 +41,9 @@ The gate is deliberately fast so it can run on every acceptance:
 - A test that exceeds either bound fails the gate with a typed message.
 
 Indicative warm baseline for the initial 54 scenarios on the development
-host: **9.0 s total, slowest 1.4 s**. Treat that as a measured baseline, not
-a CI SLA.
+host: **9.0 s total, slowest 1.4 s**. The catalog grew to 58 with `GF-12`,
+`SC-09`, `JR-11` and `JR-12`; treat timings as a measured baseline, not a
+CI SLA.
 
 Long-running work is **not admitted** to this catalog: the shortened or
 24-hour soak, the real LVM/Ceph/DRBD suites, campaign Tier R/V, fault
@@ -143,10 +144,11 @@ mutation.
 
 ## GF — attachment generation and fence
 
-These scenarios protect ADR-0012's report/detach fence and the generation
-source to be revised by ADR-0013. The failure mode is a delayed report or
-detach from a retired instance being accepted against a live attachment, or
-a replay fabricating a second attachment.
+These scenarios protect ADR-0012's report/detach fence and ADR-0013's
+provider-wide, durable generation source. The failure mode is a delayed
+report or detach from a retired instance being accepted against a live
+attachment, a replay fabricating a second attachment, or a delete +
+same-id recreate reissuing a generation already retired.
 
 | ID | Invariant | Exact test (`package`, target) |
 |---|---|---|
@@ -161,10 +163,13 @@ a replay fabricating a second attachment.
 | GF-09 | A stale expected generation is refused. | `provider_conformance::attach_stale_generation` (`volvisor-lvm`, `--test conformance`) |
 | GF-10 | Attach replay is idempotent. | `provider_conformance::idempotent_attach` (`volvisor-lvm`, `--test conformance`) |
 | GF-11 | Single-writer attachment admission is preserved. | `provider_conformance::attach_single_writer` (`volvisor-lvm`, `--test conformance`) |
+| GF-12 | A delete + same-id recreate never reissues a retired attachment generation. | `delete_and_same_id_recreate_never_reissues_a_retired_attachment_generation` (`volvisor-lvm`, `--test lvm_tests`) |
 
-ADR-0013's delete + same-id recreate scenario is **not yet implemented**;
-when it lands it is added here as `GF-12`. Until then the residual is
-recorded in the readiness report and `#63` stays open.
+ADR-0013 allocates attachment generations from one durable, provider-wide
+allocator (schema v4) that is never reset by create or delete. The residual
+upgrade window — a volume deleted before the v4 file was written has no
+record of its consumed generations — is recorded in the ADR and the readiness
+report; it is not claimed fixed by `GF-12`.
 
 ## SC — durable schema compatibility
 
@@ -183,6 +188,7 @@ rewriting a future-version file, or starting on an unknown schema.
 | SC-06 | A noncanonical filter with set bits is not treated as empty. | `state::tests::a_noncanonical_filter_with_set_bits_is_never_treated_as_empty` (`volvisor-lvm`, `--lib`) |
 | SC-07 | A future schema version is refused without rewriting the file. | `state::tests::future_schema_version_is_refused_typed_without_rewriting` (`volvisor-lvm`, `--lib`) |
 | SC-08 | A zero schema version is refused typed. | `state::tests::zero_schema_version_is_refused_typed` (`volvisor-lvm`, `--lib`) |
+| SC-09 | The v3 N-1 fixture seeds the v4 attachment allocator and upgrades on write. | `state::tests::v4_n_minus_one_fixture_seeds_the_attachment_allocator_and_upgrades_on_write` (`volvisor-lvm`, `--lib`) |
 
 ## JR — journal retention, replay and idempotency
 
@@ -204,10 +210,18 @@ served request before replay completes, or a lost append acknowledgement.
 | JR-08 | A pinned in-flight operation is never evicted. | `journal::tests::a_pinned_operation_is_never_evicted_while_its_retry_is_executing` (`volvisor-journal`, `--lib`) |
 | JR-09 | A pin interleaved with compaction preserves the outcome across reopen. | `journal::tests::a_pin_interleaved_with_compaction_preserves_the_replacement_outcome_across_reopen` (`volvisor-journal`, `--lib`) |
 | JR-10 | A redriven outcome after window eviction reopens instead of wedging. | `journal::tests::a_redriven_outcome_after_a_replay_window_eviction_reopens_instead_of_wedging` (`volvisor-journal`, `--lib`) |
+| JR-11 | The hard ceiling refuses durable appends and recovers after compaction unblocks. | `journal::tests::the_hard_ceiling_refuses_durable_appends_and_recovers_after_compaction_unblocks` (`volvisor-journal`, `--lib`) |
+| JR-12 | A cannot-fit in-flight set refuses new intents, drains outcomes and recovers. | `journal::tests::a_cannot_fit_in_flight_set_refuses_new_intents_then_recovers_after_draining` (`volvisor-journal`, `--lib`) |
 
-ADR-0014's hard-ceiling refusal (`JOURNAL_FULL`) and its metrics are **not
-yet implemented**; when they land they are added here as `JR-11` and
-`JR-12`. The Phase F report records the current soft-bound residual.
+ADR-0014's hard ceiling is the fail-closed stop condition above the soft byte
+trigger: an append that would cross it gets one compaction attempt and is
+then refused with `JOURNAL_FULL` (HTTP 503) if the log is still over. When
+the irreducible in-flight/pinned set cannot fit one snapshot frame, new
+intents are refused (`cannot_fit`) while outcome appends remain available to
+drain the set; a later successful compaction reopens admission. Neither path
+evicts in-flight intents, terminal records or tombstones to make room.
+`JR-04` remains: a failed compaction alone never fails an already-authorized
+durable append that fits under the ceiling.
 
 ## CF — durable configuration bounds
 
@@ -229,7 +243,12 @@ byte trigger disabled along with the record trigger.
 - It does not prove real-backend behavior, a 24-hour soak, data-path
   durability, multi-host fencing, crash consistency on real media, or
   production capacity.
-- It does not implement ADR-0013's durable allocator or ADR-0014's hard
-  ceiling. ADR-0012/0013/0014/0015/0016 are **Accepted** (2026-11-06,
-  zoorpha); acceptance does not add the scenarios still owed.
-- `#62`, `#63` and `#64` remain open.
+- It implements the local ADR-0013 allocator and ADR-0014 hard-ceiling /
+  cannot-fit paths and pins them as `GF-12`, `SC-09`, `JR-11` and `JR-12`.
+  It does not prove those paths on a real backend, under a 24-hour soak, or
+  across multi-host hardware. ADR-0012/0013/0014/0015/0016 are **Accepted**
+  (2026-11-06, zoorpha); acceptance does not make this catalog production
+  evidence.
+- `#62`, `#63` and `#64` remain open: their remaining acceptance work needs
+  the state-substrate redesign and the evidence lanes described in the
+  [remediation plan](../plans/2026-11-06-open-issue-remediation.md).

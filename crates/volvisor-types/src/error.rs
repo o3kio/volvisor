@@ -85,6 +85,11 @@ pub enum ApiErrorCode {
     /// refused rather than re-executing a possibly-completed mutation
     /// (fail closed; issue #64).
     OperationExpired,
+    /// The journal reached its hard ceiling (or its in-flight intent set can
+    /// no longer fit one snapshot) and compaction could not make progress.
+    /// New durable appends are refused fail-closed; reads and replay remain
+    /// available (ADR-0014 / issue #64). Mapped to the overload/503 surface.
+    JournalFull,
     /// The caller's identity is not permitted to perform this
     /// operation (witness invariant W8: a mutating witness call requires
     /// the host credential bound to the holder it asserts; the legacy
@@ -126,6 +131,7 @@ impl ApiErrorCode {
             Self::InvalidState => "INVALID_STATE",
             Self::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
             Self::OperationExpired => "OPERATION_EXPIRED",
+            Self::JournalFull => "JOURNAL_FULL",
             Self::Forbidden => "FORBIDDEN",
             Self::Internal => "INTERNAL",
         }
@@ -148,7 +154,7 @@ impl ApiErrorCode {
             Self::PayloadTooLarge => 413,
             Self::VmmHandoffUnsupported => 501,
             Self::NoSafeCapacity | Self::ThinMetadataExhausted => 507,
-            Self::CephClusterUnhealthy | Self::Overloaded => 503,
+            Self::CephClusterUnhealthy | Self::Overloaded | Self::JournalFull => 503,
             Self::Internal => 500,
             Self::InsufficientFailureDomains
             | Self::ForeignDeviceState
@@ -249,6 +255,18 @@ impl ApiError {
         )
     }
 
+    /// Convenience constructor for a journal that cannot accept a new
+    /// durable append (hard ceiling reached, or the in-flight intent set no
+    /// longer fits one snapshot; ADR-0014 / issue #64).
+    ///
+    /// Fail-closed: the operation was not journaled, so nothing was executed
+    /// and the caller may retry with the same operation id once the operator
+    /// restores journal capacity. Reads and replay continue.
+    #[must_use]
+    pub fn journal_full(detail: impl Into<String>) -> Self {
+        Self::new(ApiErrorCode::JournalFull, detail)
+    }
+
     /// Convenience constructor for attachment-identity conflicts: the id
     /// is already bound to a different instance payload, or the volume
     /// already consumed it earlier in its lifetime. A report-capable
@@ -340,6 +358,7 @@ impl ApiError {
             "INVALID_STATE" => ApiErrorCode::InvalidState,
             "IDEMPOTENCY_CONFLICT" => ApiErrorCode::IdempotencyConflict,
             "OPERATION_EXPIRED" => ApiErrorCode::OperationExpired,
+            "JOURNAL_FULL" => ApiErrorCode::JournalFull,
             "FORBIDDEN" => ApiErrorCode::Forbidden,
             "INTERNAL" => ApiErrorCode::Internal,
             other => {

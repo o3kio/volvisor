@@ -156,9 +156,10 @@ curl -fsS --config ~/.volvisor-admin.curl \
 jq '.schema_version' /var/lib/volvisor/journal/lvm-state.json
 ```
 
-Expected at this schema: `3`. A v2 build writes `2`; the old `8c2fc1a` build
-in the live drill wrote `2` on its first create. The first successful save is
-what rewrites the file; a mere restart may leave an older file untouched.
+Expected with the current build: `4`. A v3 binary writes `3`, a v2 build
+writes `2`; the old `8c2fc1a` build in the live drill wrote `2` on its first
+create. The first successful save is what rewrites the file; a mere restart
+may leave an older file untouched.
 
 5. Exercise the real workload before considering the upgrade complete. Keep
    the pre-upgrade backup until then.
@@ -169,18 +170,18 @@ Never do this on a live directory. In a lab, a file declaring a newer version
 must be refused and left untouched:
 
 ```sh
-# lab only: copy, set schema_version 4 (one above the current v3), then start
-jq '.schema_version = 4' lvm-state.json > lvm-state.v4.json
-mv lvm-state.v4.json lvm-state.json
+# lab only: copy, set schema_version 5 (one above the current v4), then start
+jq '.schema_version = 5' lvm-state.json > lvm-state.v5.json
+mv lvm-state.v5.json lvm-state.json
 /path/to/volvisord --config /path/to/volvisord.toml
 ```
 
-Expected for the current v3 build:
+Expected for the current v4 build:
 
 ```text
 Error: Config("lvm provider construction failed: INTERNAL: unsupported
 durable-state schema version: lvm state .../lvm-state.json declares
-schema_version 4, but this build supports at most 3; refusing to open it
+schema_version 5, but this build supports at most 4; refusing to open it
 partially (install a matching or newer build, or restore a pre-upgrade
 backup)")
 ```

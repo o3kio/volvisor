@@ -180,7 +180,7 @@ fn a_populated_pre_versioning_state_directory_upgrades_in_place() {
     assert!(
         fs::read_to_string(&lvm_path)
             .expect("read lvm")
-            .contains("\"schema_version\":3")
+            .contains("\"schema_version\":4")
     );
     assert_eq!(LvmState::load(&lvm_path).expect("lvm reload"), lvm);
 

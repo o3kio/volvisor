@@ -1,8 +1,9 @@
 # ADR-0014 — Journal retention bounds are a contract, with fail-closed exhaustion
 
-Status: Accepted (decision accepted 2026-11-06 by zoorpha; hard-ceiling
-implementation pending under
-[#64](https://github.com/o3kio/volvisor/issues/64))
+Status: Accepted (decision accepted 2026-11-06 by zoorpha; the local
+hard-ceiling implementation landed under
+[#64](https://github.com/o3kio/volvisor/issues/64), which remains open for the
+evidence work)
 Decision-accepted: 2026-11-06 by zoorpha
 Date: 2026-11-06
 Related: [ADR-0012](0012-monotonic-attachment-generation-fence.md),
@@ -44,13 +45,13 @@ fail-closed, never a silent drop.**
    evidence that a mutation may have reached storage. Evicting it would
    silently discard a possible side effect. In-flight cardinality must be
    bounded by mutation admission and by the one-frame budget. Today the
-   one-frame budget bounds the snapshot, not admission: an over-budget set
-   makes compaction fail typed, and durable appends continue. **Owed
-   implementation:** if the in-flight set cannot fit, startup or compaction fails
-   closed with a typed error and the daemon refuses new mutating work until
-   an operator resolves it. No best-effort eviction. Until that refusal
-   lands, the current append-tolerates-a-failed-compaction behavior pinned by
-   `JR-04` remains the implemented behavior.
+   one-frame budget bounds the snapshot, not admission. **Implemented
+   (`JR-12`):** if the in-flight set cannot fit, compaction fails closed with
+   a typed error, new mutating work is refused (`cannot_fit`) until the set
+   drains or an operator resolves it, and outcome appends remain available so
+   the outstanding outcomes can drain. No best-effort eviction. `JR-04` still
+   pins that a failed compaction alone never fails an already-authorized
+   append that fits under the ceiling.
 3. **Expiry is a count window, not a TTL.** A retry whose terminal record is
    older than the newest `max_tombstones` evictions is indistinguishable from
    an unknown operation and may execute as a new operation. Consumers must
@@ -104,11 +105,11 @@ substitute for the fail-closed refusal.
 - A persistently failing compaction becomes a visible, bounded outage for
   mutations rather than an unbounded disk leak. Reads and recovery remain
   available.
-- Tests must cover: refusal at the ceiling, recovery after compaction
-  succeeds, no eviction of in-flight intents, the typed error surface, and
-  the cannot-fit refusal of new mutating work. That last test will
-  deliberately change the `JR-04` behavior for the cannot-fit case (a failed
-  compaction alone still must not fail an already-authorized durable append).
+- Tests cover: refusal at the ceiling, recovery after compaction succeeds,
+  no eviction of in-flight intents, the typed error surface, and the
+  cannot-fit refusal of new mutating work. The cannot-fit test preserves
+  `JR-04`: a failed compaction alone still never fails an already-authorized
+  durable append that fits under the ceiling.
 - The existing replay, tombstone, compaction and config tests remain in the
   default scenario catalog.
 - This is a control-plane storage-bound decision. It is not production
@@ -131,13 +132,25 @@ substitute for the fail-closed refusal.
 ## Implementation status
 
 The terminal bounds, tombstone ring, replay eviction, compaction backoff and
-config wiring are implemented and covered by the default scenarios. The
-hard-ceiling refusal (`JOURNAL_FULL`), the cannot-fit refusal that stops new
-mutating work when in-flight intents cannot be snapshotted, and the
-in-flight/hard-ceiling metrics are the remaining implementation of this ADR
-and are tracked under `#64`. Until they land, a persistent compaction failure
-can still grow the log and an over-budget in-flight set fails compaction
-rather than admission; the Phase F report records those residuals.
+config wiring are implemented and covered by the default scenarios. The local
+hard-ceiling implementation also landed under `#64`: `hard_ceiling_bytes` is
+configurable (default twice the byte trigger; explicit non-zero required when
+the trigger is disabled; at least the trigger), a durable append that would
+cross it gets one forced compaction attempt and is then refused with the typed
+`JOURNAL_FULL` (HTTP 503) without evicting in-flight intents, terminal records
+or tombstones. A cannot-fit in-flight/pinned set closes **new-intent**
+admission (`cannot_fit`) while outcome appends remain available to drain it,
+and a later successful compaction reopens admission. `/metrics` exposes the
+in-flight/hard-ceiling gauges, `journal_compaction_attempts_total`,
+`journal_cannot_fit` and `journal_refusals_total{reason}`. The default catalog
+pins `JR-11` (ceiling refusal and recovery) and `JR-12` (cannot-fit admission
+and drain); `JR-04` still covers "a failed compaction alone never fails an
+already-authorized append that fits under the ceiling".
+
+`#64` remains open: no real-backend, crash-consistency-on-real-media or
+24-hour soak evidence has been collected, and the Phase F report records those
+residuals. See the readiness report and the
+[remediation plan](../plans/2026-11-06-open-issue-remediation.md).
 
 ## Non-claims
 

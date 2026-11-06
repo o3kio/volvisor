@@ -242,26 +242,55 @@ impl AppState {
     /// a closed journal rather than a fabricated record count.
     pub(crate) fn journal_snapshot(&self) -> JournalSnapshot {
         match self.journal.lock() {
-            Ok(journal) => JournalSnapshot {
-                records: Some(journal.record_count()),
-                log_bytes: std::fs::metadata(journal.log_path())
-                    .ok()
-                    .map(|metadata| metadata.len()),
-                compactions: Some(journal.compactions()),
-                compaction_failures: Some(journal.compaction_failures()),
-                retained_operations: Some(
-                    u64::try_from(journal.retained_operations()).unwrap_or(u64::MAX),
-                ),
-                tombstones: Some(u64::try_from(journal.tombstone_count()).unwrap_or(u64::MAX)),
-                open: true,
-            },
+            Ok(journal) => {
+                let retention = journal.retention();
+                JournalSnapshot {
+                    records: Some(journal.record_count()),
+                    log_bytes: std::fs::metadata(journal.log_path())
+                        .ok()
+                        .map(|metadata| metadata.len()),
+                    compactions: Some(journal.compactions()),
+                    compaction_failures: Some(journal.compaction_failures()),
+                    // The ADR-0014 bound must be visible even when the trigger
+                    // is disabled: 0 is the documented "off" spelling.
+                    max_log_bytes: Some(retention.max_log_bytes.unwrap_or(0)),
+                    hard_ceiling_bytes: Some(retention.hard_ceiling_bytes),
+                    compaction_attempts: Some(journal.compaction_attempts()),
+                    retained_operations: Some(
+                        u64::try_from(journal.retained_operations()).unwrap_or(u64::MAX),
+                    ),
+                    in_flight_operations: Some(
+                        u64::try_from(journal.in_flight_operations()).unwrap_or(u64::MAX),
+                    ),
+                    terminal_operations: Some(
+                        u64::try_from(journal.terminal_operations()).unwrap_or(u64::MAX),
+                    ),
+                    tombstones: Some(u64::try_from(journal.tombstone_count()).unwrap_or(u64::MAX)),
+                    tombstone_capacity: Some(
+                        u64::try_from(retention.max_tombstones).unwrap_or(u64::MAX),
+                    ),
+                    ceiling_refusals: Some(journal.ceiling_refusals()),
+                    cannot_fit_refusals: Some(journal.cannot_fit_refusals()),
+                    cannot_fit: Some(journal.cannot_fit()),
+                    open: true,
+                }
+            }
             Err(_) => JournalSnapshot {
                 records: None,
                 log_bytes: None,
                 compactions: None,
                 compaction_failures: None,
+                max_log_bytes: None,
+                hard_ceiling_bytes: None,
+                compaction_attempts: None,
                 retained_operations: None,
+                in_flight_operations: None,
+                terminal_operations: None,
                 tombstones: None,
+                tombstone_capacity: None,
+                ceiling_refusals: None,
+                cannot_fit_refusals: None,
+                cannot_fit: None,
                 open: false,
             },
         }

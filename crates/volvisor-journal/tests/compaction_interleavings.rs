@@ -31,6 +31,7 @@ fn two_terminal_retention() -> JournalRetention {
         max_tombstones: 128,
         max_log_records: 1_000_000,
         max_log_bytes: None,
+        hard_ceiling_bytes: 64 * 1024 * 1024,
     }
 }
 

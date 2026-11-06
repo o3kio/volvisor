@@ -2429,6 +2429,108 @@ async fn reattaching_a_consumed_id_fences_the_retired_instance_by_generation() {
 }
 
 #[tokio::test]
+async fn delete_and_same_id_recreate_never_reissues_a_retired_attachment_generation() {
+    // ADR-0013 / issue #63: the generation allocator is provider-wide and
+    // survives delete + same-id recreate. A delayed report from the prior
+    // volume incarnation must not match the new instance even when the
+    // consumer reuses both the volume id and the attachment id.
+    let fixture = fixture();
+    let created = fixture
+        .provider
+        .create_volume(&fixture_create_request("recreate-vol", GIB))
+        .await
+        .expect("create");
+    let first = fixture
+        .provider
+        .attach_volume(
+            &created.volume_id,
+            &fixture_attach_request("recreate-vol", "recreate-att", 1),
+        )
+        .await
+        .expect("attach the first incarnation");
+    let detached = fixture
+        .provider
+        .detach_volume(
+            &created.volume_id,
+            &first.attachment_id,
+            &fixture_detach_request("recreate-att", first.attachment_generation),
+        )
+        .await
+        .expect("detach the first incarnation");
+    fixture
+        .provider
+        .delete_volume(
+            &created.volume_id,
+            &fixture_delete_request("recreate-vol", detached.generation),
+        )
+        .await
+        .expect("delete the first incarnation");
+
+    // Recreate the same durable volume id and reuse the same attachment id.
+    let recreated = fixture
+        .provider
+        .create_volume(&fixture_create_request("recreate-vol", GIB))
+        .await
+        .expect("recreate");
+    let second = fixture
+        .provider
+        .attach_volume(
+            &recreated.volume_id,
+            &fixture_attach_request("recreate-vol", "recreate-att", recreated.generation),
+        )
+        .await
+        .expect("attach the recreated volume");
+    assert!(
+        second.attachment_generation > first.attachment_generation,
+        "the allocator must not reset on delete: first={} second={}",
+        first.attachment_generation,
+        second.attachment_generation
+    );
+
+    // A delayed report from the first incarnation carries the old
+    // generation: it is refused, never attributed to the new instance.
+    let delayed = fixture_report_request(
+        "recreate-att",
+        first.attachment_generation,
+        AttachmentState::Active,
+        AttachmentEvidence::GuestConfirmed,
+    );
+    let err = fixture
+        .provider
+        .report_attachment_state(&recreated.volume_id, &delayed)
+        .await
+        .expect_err("a report from the deleted incarnation");
+    assert_eq!(err.code, ApiErrorCode::StaleGeneration);
+
+    // The fence and the allocator are durable across a restart.
+    let restarted = common::provider_from(&fixture.state_path, &fixture.world);
+    let err = restarted
+        .report_attachment_state(&recreated.volume_id, &delayed)
+        .await
+        .expect_err("the retired generation after restart");
+    assert_eq!(err.code, ApiErrorCode::StaleGeneration);
+    let after_restart = restarted
+        .detach_volume(
+            &recreated.volume_id,
+            &second.attachment_id,
+            &fixture_detach_request("recreate-att", second.attachment_generation),
+        )
+        .await
+        .expect("detach the recreated instance");
+    let third = restarted
+        .attach_volume(
+            &recreated.volume_id,
+            &fixture_attach_request("recreate-vol", "recreate-att-2", after_restart.generation),
+        )
+        .await
+        .expect("a fresh attachment id after restart");
+    assert!(
+        third.attachment_generation > second.attachment_generation,
+        "the persisted allocator continues above the recreated instance"
+    );
+}
+
+#[tokio::test]
 async fn report_state_survives_a_provider_restart_and_never_moves_the_generation() {
     let fixture = fixture();
     let created = fixture

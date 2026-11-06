@@ -3791,34 +3791,45 @@ impl LvmProvider {
             Self::ensure_no_pending_grow(&state, volume_id)?;
 
             let response = {
-                let stored = state
-                    .volume_mut(volume_id)
-                    .ok_or_else(|| not_found(volume_id))?;
-                ensure_expected_generation(
-                    req.expected_volume_generation,
-                    stored.entry.generation,
-                )?;
-                ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
-                match stored.runtime.state {
-                    VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
-                    other => {
-                        return Err(ApiError::new(
-                            ApiErrorCode::InvalidState,
-                            format!("attach requires a Ready volume, volume is {other:?}"),
-                        ));
+                // Validate against the immutable view first: allocation must
+                // not consume a generation for an attach that is refused.
+                {
+                    let stored = state
+                        .volume(volume_id)
+                        .ok_or_else(|| not_found(volume_id))?;
+                    ensure_expected_generation(
+                        req.expected_volume_generation,
+                        stored.entry.generation,
+                    )?;
+                    ensure_no_active_attachment(stored.runtime.attachment.is_some(), volume_id)?;
+                    match stored.runtime.state {
+                        VolumeLifecycle::Ready | VolumeLifecycle::Degraded => {}
+                        other => {
+                            return Err(ApiError::new(
+                                ApiErrorCode::InvalidState,
+                                format!("attach requires a Ready volume, volume is {other:?}"),
+                            ));
+                        }
                     }
                 }
 
                 // The attachment generation is the detach/report fence and is
-                // strictly increasing per volume: it is the volume generation this
-                // attach consumed, never a constant `1`. A delayed report or detach
-                // from a retired instance therefore carries an older generation and
-                // is refused, even if a consumer reuses the attachment id.
+                // strictly increasing provider-wide (ADR-0013): it is
+                // allocated from the durable, never-reset allocator, not the
+                // per-volume entry generation and never a constant `1`. A
+                // delayed report or detach from a retired instance therefore
+                // carries an older generation and is refused, even if a
+                // consumer reuses the attachment id across a delete +
+                // same-id recreate.
+                let generation = state.allocate_attachment_generation()?;
+                let stored = state
+                    .volume_mut(volume_id)
+                    .ok_or_else(|| not_found(volume_id))?;
                 let record = AttachmentRecord {
                     id: req.attachment_id.clone(),
                     vm_id: req.vm_id.clone(),
                     host_id: req.host_id.clone(),
-                    generation: stored.entry.generation,
+                    generation,
                     access_mode: mode,
                     vmm_disk_id: req.vmm_disk_id.clone(),
                     state: AttachmentState::Prepared,

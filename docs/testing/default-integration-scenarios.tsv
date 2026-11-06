@@ -44,6 +44,7 @@ GF-08	generation	volvisor-provider	--lib	semantics::tests::attach_replay_is_iden
 GF-09	generation	volvisor-lvm	--test conformance	provider_conformance::attach_stale_generation	A stale expected generation is refused.
 GF-10	generation	volvisor-lvm	--test conformance	provider_conformance::idempotent_attach	Attach replay is idempotent.
 GF-11	generation	volvisor-lvm	--test conformance	provider_conformance::attach_single_writer	Single-writer attachment admission is preserved.
+GF-12	generation	volvisor-lvm	--test lvm_tests	delete_and_same_id_recreate_never_reissues_a_retired_attachment_generation	A delete + same-id recreate never reissues a retired attachment generation.
 SC-01	schema	volvisor-lvm	--lib	state::tests::v3_n_minus_one_fixture_imports_legacy_ids_and_upgrades_to_v3	The v3 N-1 fixture imports legacy ids and upgrades without loss.
 SC-02	schema	volvisor-lvm	--lib	state::tests::tombstone_fixture_preserves_retired_attachment_ids	The legacy tombstone fixture decodes without loss.
 SC-03	schema	volvisor-lvm	--lib	state::tests::retired_attachment_filter_has_no_false_negatives_and_is_bounded	The retired-id filter has no false negatives and is bounded.
@@ -52,6 +53,7 @@ SC-05	schema	volvisor-lvm	--lib	state::tests::a_legacy_vector_is_merged_into_an_
 SC-06	schema	volvisor-lvm	--lib	state::tests::a_noncanonical_filter_with_set_bits_is_never_treated_as_empty	A noncanonical filter with set bits is not treated as empty.
 SC-07	schema	volvisor-lvm	--lib	state::tests::future_schema_version_is_refused_typed_without_rewriting	A future schema version is refused without rewriting the file.
 SC-08	schema	volvisor-lvm	--lib	state::tests::zero_schema_version_is_refused_typed	A zero schema version is refused typed.
+SC-09	schema	volvisor-lvm	--lib	state::tests::v4_n_minus_one_fixture_seeds_the_attachment_allocator_and_upgrades_on_write	The v3 N-1 fixture seeds the v4 attachment allocator and upgrades on write.
 JR-01	journal	volvisor-journal	--lib	journal::tests::compaction_bounds_the_log_and_expires_evicted_operations	Compaction bounds the log and expires evicted operations.
 JR-02	journal	volvisor-journal	--lib	journal::tests::the_tombstone_window_is_bounded_and_its_overflow_is_the_documented_contract	The tombstone window is bounded and overflow has the documented answer.
 JR-03	journal	volvisor-journal	--lib	journal::tests::bounded_replay_evicts_and_compacts_before_serving	Replay evicts and compacts before serving.
@@ -62,6 +64,8 @@ JR-07	journal	volvisor-journal	--lib	journal::tests::a_post_snapshot_record_for_
 JR-08	journal	volvisor-journal	--lib	journal::tests::a_pinned_operation_is_never_evicted_while_its_retry_is_executing	A pinned in-flight operation is never evicted.
 JR-09	journal	volvisor-journal	--lib	journal::tests::a_pin_interleaved_with_compaction_preserves_the_replacement_outcome_across_reopen	A pin interleaved with compaction preserves the outcome across reopen.
 JR-10	journal	volvisor-journal	--lib	journal::tests::a_redriven_outcome_after_a_replay_window_eviction_reopens_instead_of_wedging	A redriven outcome after window eviction reopens instead of wedging.
+JR-11	journal	volvisor-journal	--lib	journal::tests::the_hard_ceiling_refuses_durable_appends_and_recovers_after_compaction_unblocks	The hard ceiling refuses durable appends and recovers after compaction unblocks.
+JR-12	journal	volvisor-journal	--lib	journal::tests::a_cannot_fit_in_flight_set_refuses_new_intents_then_recovers_after_draining	A cannot-fit in-flight set refuses new intents, drains outcomes and recovers.
 CF-01	config	volvisord	--lib	config::tests::journal_retention_defaults_are_bounded_and_mapped	Journal retention defaults are bounded and mapped to the runtime.
 CF-02	config	volvisord	--lib	config::tests::journal_retention_is_parsed_and_zero_bytes_disables_only_the_byte_trigger	Retention parses and zero bytes disables only the byte trigger.
 CF-03	config	volvisord	--lib	config::tests::journal_retention_rejects_zero_bounds_and_unknown_keys	Invalid retention bounds and unknown keys are refused.

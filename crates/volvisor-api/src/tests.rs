@@ -6898,6 +6898,7 @@ async fn an_expired_operation_answers_410_and_is_never_re_executed() {
             max_tombstones: 8,
             max_log_records: 1_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: 64 * 1024 * 1024,
         },
     )
     .expect("journal open");

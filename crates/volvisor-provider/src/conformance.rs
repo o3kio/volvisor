@@ -384,8 +384,8 @@ pub async fn check_attach_single_writer(provider: &dyn VolumeProvider) -> Result
         .await
         .map_err(|e| format!("first attach: {e}"))?;
     require(
-        first.attachment_generation == 1,
-        "a fresh attachment starts at generation 1",
+        first.attachment_generation >= 1,
+        "a fresh attachment records a positive, opaque attachment generation",
     )?;
     require(
         first.volume_generation == 2,
@@ -921,6 +921,15 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         attached.state == AttachmentState::Prepared,
         "attach must report the provider-recorded prepared state",
     )?;
+    // ADR-0013: the attachment generation is an opaque, provider-scoped
+    // value. It is not necessarily 1 on a shared provider instance; the
+    // contract is that it is positive, stable across reports, and strictly
+    // increasing across attachment incarnations.
+    let generation = attached.attachment_generation;
+    require(
+        generation >= 1,
+        "the attachment generation must be positive",
+    )?;
 
     let inspected = provider
         .inspect_volume(&create.volume_id)
@@ -936,8 +945,8 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         "a fresh attachment must project prepared at revision 1",
     )?;
     require(
-        view.attachment_generation == 1,
-        "the initial attachment generation must be 1",
+        view.attachment_generation == generation,
+        "inspect must project the generation the attach recorded",
     )?;
     require(
         view.evidence.is_none() && view.reporter.is_none(),
@@ -950,7 +959,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Advertised,
                 AttachmentEvidence::VmmConfigured,
             ),
@@ -963,7 +972,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         "advertised must project revision 2",
     )?;
     require(
-        advertised.attachment_generation == 1,
+        advertised.attachment_generation == generation,
         "a report must never advance attachment_generation",
     )?;
     require(
@@ -978,7 +987,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1002,7 +1011,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1034,7 +1043,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             && observed.evidence == Some(AttachmentEvidence::GuestConfirmed)
             && observed.reporter.as_deref() == Some("conformance-vmm")
             && observed.recorded_at_ms == active.recorded_at_ms
-            && observed.attachment_generation == 1,
+            && observed.attachment_generation == generation,
         "inspect must project the applied evidence verbatim at the unchanged generation",
     )?;
 
@@ -1044,7 +1053,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Advertised,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1062,7 +1071,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                2,
+                generation.wrapping_add(1),
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1078,22 +1087,22 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
         Ok(_) => return Err("a stale report generation must not succeed".to_owned()),
     }
 
-    // Detach still fences on generation 1 (reports never moved it), and a
+    // Detach still fences on the generation reports never moved, and a
     // report against the detached instance is NOT_FOUND for a new operation.
     provider
         .detach_volume(
             &create.volume_id,
             &attach.attachment_id,
-            &fixture_detach_request(attachment_id, 1),
+            &fixture_detach_request(attachment_id, generation),
         )
         .await
-        .map_err(|e| format!("detach at the unchanged generation 1: {e}"))?;
+        .map_err(|e| format!("detach at the unchanged generation: {e}"))?;
     match provider
         .report_attachment_state(
             &create.volume_id,
             &fixture_report_request(
                 attachment_id,
-                1,
+                generation,
                 AttachmentState::Active,
                 AttachmentEvidence::GuestConfirmed,
             ),
@@ -1112,7 +1121,7 @@ pub async fn check_attachment_state_report(provider: &dyn VolumeProvider) -> Res
     // A re-attach records a strictly greater generation. A delayed report
     // from the retired instance must never label the new one, even when the
     // consumer reuses the attachment id: its old generation is stale.
-    let retired_generation = attached.attachment_generation;
+    let retired_generation = generation;
     let after_detach = provider
         .inspect_volume(&create.volume_id)
         .await

@@ -552,7 +552,7 @@ a running system or any existing durable file.
   default suite before merge.
 - **Default scenario catalog.** `docs/testing/default-integration-scenarios.md`
   is the normative catalog and `docs/testing/default-integration-scenarios.tsv`
-  is its machine-readable list: 54 exact tests across write-path lock scope
+  is its machine-readable list: 58 exact tests across write-path lock scope
   (WP), fail-closed create/delete and idempotency (FC), attachment
   generation/fence (GF), schema decode (SC), journal retention/replay (JR)
   and durable configuration bounds (CF). `scripts/test-default-scenarios.sh`
@@ -564,9 +564,9 @@ a running system or any existing durable file.
   bound fails the gate. Soaks, real-backend suites, campaign tiers and fault
   campaigns are not admitted to this catalog. The `check` CI job runs it
   after `cargo test --workspace --locked`; `test-harness` adds `bash -n` and
-  `shellcheck` coverage. The gate reports **54 passed in 9.0 s warm**
-  (slowest 1.4 s) in this batch; that timing is a measured baseline, not a
-  CI SLA.
+  `shellcheck` coverage. The Phase F batch reported **54 passed in 9.0 s
+  warm** (slowest 1.4 s); the ADR-0013/0014 addendum records the current
+  58-scenario catalog. Timings are a measured baseline, not a CI SLA.
 - **New scenarios still owed by the ADRs.** ADR-0013's delete + same-id
   recreate fence (`GF-12`) and ADR-0014's hard-ceiling refusal (`JR-11`,
   `JR-12`) are not yet implemented and therefore not in the catalog. ADR-0014
@@ -581,6 +581,46 @@ a running system or any existing durable file.
   production-support, SLA, zero-RPO, durability, capacity, hardware,
   multi-host, release or 24-hour-soak claim, and no push, tag, pull request
   or issue-state change is part of the evidence record.
+
+## Post-report addendum (2026-11-06) — ADR-0013/0014 local implementation
+
+This addendum supersedes the “New scenarios still owed” bullet in the Phase F
+addendum above. The local decision work for `#63` and `#64` is now
+implemented and pinned; **no readiness gate changes and neither issue
+closes**.
+
+- **ADR-0013 / `#63` — durable attachment-generation allocator (landed
+  locally).** LVM state is schema v4 with a persisted provider-wide
+  `next_attachment_generation` and per-volume high-water marks. A v3 file
+  seeds the allocator from `max(entry, attachment) + 1` only when the field is
+  absent/zero; every save re-normalizes it; allocation at `u64::MAX` fails
+  closed; create/delete never reset it. Default scenarios `GF-12` (delete +
+  same-id recreate never reissues a retired generation) and `SC-09` (v3
+  fixture seeds and upgrades to v4) are in the catalog. **Residual:** a volume
+  deleted *before* the v4 file was written has no durable record of its
+  consumed generations, and no real-backend/multi-host evidence has been
+  collected. `#63` stays open.
+- **ADR-0014 / `#64` — journal hard ceiling and cannot-fit refusal (landed
+  locally).** `hard_ceiling_bytes` is configurable (default `2 *
+  max_log_bytes`; explicit non-zero when the byte trigger is disabled; at
+  least the trigger). A durable append that would cross it gets one forced
+  compaction attempt and is then refused with typed `JOURNAL_FULL` (HTTP 503)
+  without evicting in-flight intents, terminal records or tombstones. A
+  cannot-fit in-flight/pinned set closes **new-intent** admission while outcome
+  appends drain it; a later successful compaction reopens admission. The new
+  journal gauges/counters are on `/metrics`, and outcomes classify
+  `journal_full` distinctly from append I/O failure. Default scenarios `JR-11`
+  and `JR-12` are in the catalog; `JR-04` still pins “a failed compaction alone
+  never fails an already-authorized append that fits under the ceiling”.
+  **Residual:** no real-backend crash-consistency or 24-hour soak evidence.
+  `#64` stays open.
+- **Catalog.** The default gate now has **58 exact scenarios** and still
+  enforces 60 s per test / 300 s warm total. The measured baseline in this
+  batch is 58 passed; timings are a measured baseline, not a CI SLA.
+- **No gate change.** `#62`, `#63` and `#64` remain **open**. Gates 1/2/5
+  remain **NOT MET**, gates 3/4 **PARTIAL**, overall **NOT PRE-PRODUCTION
+  READY**. This batch creates no production-support, SLA, zero-RPO, capacity,
+  hardware, multi-host, release or soak claim.
 
 ## Gate verdicts
 

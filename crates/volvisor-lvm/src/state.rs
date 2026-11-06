@@ -87,15 +87,25 @@ use volvisor_types::{
 /// durable `pending_creates`/`pending_grows`/`pending_deletes` intent
 /// maps introduced for issue #70. Version 3 replaces the unbounded
 /// `retired_attachment_ids` vector with the fixed-size
-/// [`RetiredAttachmentFilter`] introduced for issue #63. Because each
-/// is an additive serialized-shape change, the version is bumped per
-/// the [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
+/// [`RetiredAttachmentFilter`] introduced for issue #63. Version 4 adds
+/// the durable `next_attachment_generation` allocator required by
+/// [ADR-0013](../../../docs/adr/0013-durable-attachment-generation-allocator.md):
+/// attachment generations are allocated from one provider-wide,
+/// never-reset counter, so a delete + same-id recreate cannot reuse a
+/// generation. Because each is an additive serialized-shape change, the
+/// version is bumped per the
+/// [durable-state schema compatibility policy](../../../docs/schema-compatibility.md):
 /// older files still load (the intent maps default empty; the legacy
-/// retired-id vector is imported into the filter) and are upgraded on
-/// the first successful save, while an older binary refuses a newer
-/// file with the typed unsupported-version error instead of failing on
-/// an unknown field.
-pub const LVM_STATE_SCHEMA_VERSION: u32 = 3;
+/// retired-id vector is imported into the filter; the allocator is
+/// seeded from the persisted generations) and are upgraded on the first
+/// successful save, while an older binary refuses a newer file with the
+/// typed unsupported-version error instead of failing on an unknown
+/// field.
+pub const LVM_STATE_SCHEMA_VERSION: u32 = 4;
+
+/// Sentinel meaning "the attachment-generation allocator has not been
+/// seeded yet". A valid allocated generation is never zero.
+pub const NEXT_ATTACHMENT_GENERATION_UNSEEDED: u64 = 0;
 
 /// Number of bits in one volume's retired-attachment tombstone filter.
 ///
@@ -622,11 +632,9 @@ pub struct DeleteIntent {
 }
 
 /// The whole durable provider state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LvmState {
     /// Durable schema version; absent in pre-versioning files (baseline 1).
-    #[serde(default = "volvisor_types::baseline_schema_version")]
     schema_version: u32,
     volumes: BTreeMap<VolumeId, StoredVolume>,
     devices: BTreeMap<DeviceId, DeviceEntry>,
@@ -650,6 +658,55 @@ pub struct LvmState {
     /// a state with no pending delete serializes without the map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_deletes: BTreeMap<VolumeId, DeleteIntent>,
+    /// Provider-wide allocator for attachment generations (ADR-0013,
+    /// schema v4). Never reset by create or delete. Zero is the
+    /// "unseeded" sentinel accepted only from older files; decode seeds
+    /// it from the persisted generations. It is always serialized so a
+    /// restart reads the durable value instead of re-deriving it.
+    #[serde(default)]
+    next_attachment_generation: u64,
+}
+
+/// Wire shape for [`LvmState`]; identical fields plus the schema-v4
+/// allocator, which older files omit.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LvmStateWire {
+    #[serde(default = "volvisor_types::baseline_schema_version")]
+    schema_version: u32,
+    volumes: BTreeMap<VolumeId, StoredVolume>,
+    devices: BTreeMap<DeviceId, DeviceEntry>,
+    #[serde(default)]
+    moves: BTreeMap<VolumeId, MoveRecord>,
+    #[serde(default)]
+    pending_creates: BTreeMap<VolumeId, CreateIntent>,
+    #[serde(default)]
+    pending_grows: BTreeMap<VolumeId, GrowIntent>,
+    #[serde(default)]
+    pending_deletes: BTreeMap<VolumeId, DeleteIntent>,
+    #[serde(default)]
+    next_attachment_generation: u64,
+}
+
+impl<'de> Deserialize<'de> for LvmState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LvmStateWire::deserialize(deserializer)?;
+        let mut state = Self {
+            schema_version: wire.schema_version,
+            volumes: wire.volumes,
+            devices: wire.devices,
+            moves: wire.moves,
+            pending_creates: wire.pending_creates,
+            pending_grows: wire.pending_grows,
+            pending_deletes: wire.pending_deletes,
+            next_attachment_generation: wire.next_attachment_generation,
+        };
+        state.seed_attachment_generation();
+        Ok(state)
+    }
 }
 
 impl Default for LvmState {
@@ -662,11 +719,80 @@ impl Default for LvmState {
             pending_creates: BTreeMap::new(),
             pending_grows: BTreeMap::new(),
             pending_deletes: BTreeMap::new(),
+            // A fresh provider starts its global allocator at 1. It is
+            // not derived from a volume entry generation: a fresh state
+            // has no history to protect.
+            next_attachment_generation: 1,
         }
     }
 }
 
 impl LvmState {
+    /// Seed the schema-v4 attachment-generation allocator from durable
+    /// records.
+    ///
+    /// A schema-v1/v2/v3 file has no allocator, and a v4 file may carry
+    /// the zero sentinel. Seeding takes
+    /// `max(volume entry generations, attachment generations) + 1`, so
+    /// an upgrade cannot reissue a generation that is still recoverable
+    /// from a live volume or attachment record. A persisted non-zero
+    /// allocator is authoritative; it is only raised to stay above a
+    /// persisted attachment generation (defence against a hand-edited or
+    /// downgraded file), never inflated by the volume-entry counter on
+    /// every restart.
+    fn seed_attachment_generation(&mut self) {
+        let highest_attachment = self
+            .volumes
+            .values()
+            .filter_map(|stored| {
+                stored
+                    .runtime
+                    .attachment
+                    .as_ref()
+                    .map(|attachment| attachment.generation)
+            })
+            .max()
+            .unwrap_or(0);
+        if self.next_attachment_generation == NEXT_ATTACHMENT_GENERATION_UNSEEDED {
+            let highest_entry = self
+                .volumes
+                .values()
+                .map(|stored| stored.entry.generation)
+                .max()
+                .unwrap_or(0);
+            self.next_attachment_generation = highest_entry
+                .max(highest_attachment)
+                .saturating_add(1)
+                .max(1);
+        } else {
+            self.next_attachment_generation = self
+                .next_attachment_generation
+                .max(highest_attachment.saturating_add(1));
+        }
+    }
+
+    /// Allocate the next provider-wide attachment generation (ADR-0013).
+    ///
+    /// The value is opaque to consumers: it is strictly increasing for
+    /// every later attachment on a volume **and** across delete + same-id
+    /// recreate. At `u64::MAX` the allocator fails closed rather than
+    /// wrapping; this is a recorded bound, not a realistic path.
+    pub(crate) fn allocate_attachment_generation(&mut self) -> Result<u64, ApiError> {
+        if self.next_attachment_generation == NEXT_ATTACHMENT_GENERATION_UNSEEDED {
+            self.seed_attachment_generation();
+        }
+        if self.next_attachment_generation == u64::MAX {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "attachment-generation allocator is exhausted at u64::MAX; refusing to wrap \
+                 and reissue a retired generation",
+            ));
+        }
+        let generation = self.next_attachment_generation;
+        self.next_attachment_generation = self.next_attachment_generation.saturating_add(1);
+        Ok(generation)
+    }
+
     /// Load the state from `path`.
     ///
     /// A missing file is an empty state (first start). A corrupt file, an
@@ -749,6 +875,12 @@ impl LvmState {
         // writes the current version so an upgrade becomes durable on the
         // first mutation (or the startup reconcile's first save).
         self.schema_version = LVM_STATE_SCHEMA_VERSION;
+        // Enforce the ADR-0013 invariant before persisting: the allocator
+        // must remain above every attachment generation that is still
+        // durably recoverable. A state assembled without the allocator (a
+        // migration, a test fixture, a hand-restored file) is normalized
+        // here, never reset. A non-zero allocator is otherwise unchanged.
+        self.seed_attachment_generation();
         // Issue #62: the state file is internal, whole-file rewritten and
         // fsynced on every mutation. Compact JSON roughly halves the bytes
         // written and fsynced versus pretty-printing, without changing the
@@ -1415,7 +1547,7 @@ mod tests {
         state.save(&path).expect("save");
         let text = fs::read_to_string(&path).expect("read state");
         assert!(
-            text.contains("\"schema_version\":3"),
+            text.contains("\"schema_version\":4"),
             "the current schema version is stamped: {text}"
         );
         assert!(
@@ -2351,6 +2483,64 @@ mod tests {
     }
 
     const V3_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v3-n1.json");
+    const V4_N1_FIXTURE: &str = include_str!("../../../tests/fixtures/schema/lvm-state-v4-n1.json");
+
+    #[test]
+    fn v4_n_minus_one_fixture_seeds_the_attachment_allocator_and_upgrades_on_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = write_fixture(&dir, "lvm-state-v4-n1.json", V4_N1_FIXTURE);
+        let mut state = LvmState::load(&source).expect("v3 state loads in v4");
+        // Entry generation 7 and attachment generation 5: the allocator
+        // seeds above both, so an upgrade cannot reissue generation 5.
+        assert_eq!(state.next_attachment_generation, 8);
+
+        let target = dir.path().join("upgraded-v4.json");
+        state.save(&target).expect("upgrade-on-write");
+        let text = fs::read_to_string(&target).expect("read upgraded");
+        assert!(
+            text.contains("\"schema_version\":4"),
+            "the first save stamps schema v4: {text}"
+        );
+        assert!(
+            text.contains("\"next_attachment_generation\":8"),
+            "the seeded allocator is persisted: {text}"
+        );
+        let reloaded = LvmState::load(&target).expect("reload");
+        assert_eq!(
+            reloaded.next_attachment_generation, 8,
+            "a persisted allocator is authoritative and is not inflated per restart"
+        );
+        assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn attachment_generation_allocator_is_monotonic_and_fails_closed_at_max() {
+        let mut state = LvmState::default();
+        assert_eq!(state.next_attachment_generation, 1);
+        assert_eq!(
+            state
+                .allocate_attachment_generation()
+                .expect("first generation"),
+            1
+        );
+        assert_eq!(
+            state
+                .allocate_attachment_generation()
+                .expect("second generation"),
+            2
+        );
+        state.next_attachment_generation = u64::MAX;
+        let err = state
+            .allocate_attachment_generation()
+            .expect_err("the allocator must not wrap");
+        assert_eq!(err.code, ApiErrorCode::Internal);
+        assert!(err.detail.contains("u64::MAX"), "{err}");
+        assert_eq!(
+            state.next_attachment_generation,
+            u64::MAX,
+            "a refused allocation never advances past the bound"
+        );
+    }
 
     #[test]
     fn v3_n_minus_one_fixture_imports_legacy_ids_and_upgrades_to_v3() {
@@ -2378,7 +2568,7 @@ mod tests {
         state.save(&target).expect("upgrade-on-write");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\":3"),
+            text.contains("\"schema_version\":4"),
             "the first save stamps schema v3: {text}"
         );
         assert!(
@@ -2436,7 +2626,7 @@ mod tests {
         state.save(&target).expect("upgrade-on-write");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\":3"),
+            text.contains("\"schema_version\":4"),
             "the first save stamps schema v3: {text}"
         );
         assert!(
@@ -2461,7 +2651,7 @@ mod tests {
         state.save(&target).expect("save");
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
-            text.contains("\"schema_version\":3"),
+            text.contains("\"schema_version\":4"),
             "upgrade-on-write stamps the current schema version: {text}"
         );
         assert_eq!(
@@ -2476,14 +2666,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let future = N1_FIXTURE.replacen(
             '{',
-            "{\n  \"schema_version\": 4,\n  \"future_field\": true,",
+            "{\n  \"schema_version\": 5,\n  \"future_field\": true,",
             1,
         );
         let path = write_fixture(&dir, "future.json", &future);
         let err = LvmState::load(&path).expect_err("future version must be refused");
         assert_eq!(err.code, ApiErrorCode::Internal);
         assert!(err.is_unsupported_schema_version(), "{err}");
-        assert!(err.detail.contains("schema_version 4"), "{err}");
+        assert!(err.detail.contains("schema_version 5"), "{err}");
         assert_eq!(
             fs::read_to_string(&path).expect("read refused file"),
             future,

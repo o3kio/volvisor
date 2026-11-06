@@ -487,6 +487,11 @@ where
                     // failure: the journal is healthy and refused to
                     // re-execute a possibly-completed operation.
                     state.metrics.record_operation(op_kind, "expired");
+                } else if error.code == ApiErrorCode::JournalFull {
+                    // Bounded admission (ADR-0014) is not an I/O failure:
+                    // the journal is healthy but refuses new durable work at
+                    // its hard ceiling or cannot-fit admission point.
+                    state.metrics.record_operation(op_kind, "journal_full");
                 } else {
                     state
                         .metrics
@@ -826,6 +831,23 @@ fn note_outcome_append_failure(
             detail,
             "the outcome was refused because bounded retention had already \
              evicted the operation; this is not a journal I/O failure"
+        );
+        return;
+    }
+    if journal_error.code == ApiErrorCode::JournalFull {
+        // The mutation landed but its outcome could not be journaled because
+        // bounded admission refused the record (ADR-0014). The journal is
+        // healthy; the operation is in doubt until an operator restores
+        // capacity. This is not an I/O failure and must not inflate the
+        // append-failure counter's I/O meaning.
+        state.metrics.record_operation(op_kind, "journal_full");
+        tracing::error!(
+            kind = op_kind,
+            operation_id = %operation_id,
+            error = %journal_error,
+            detail,
+            "the outcome was refused at the journal hard ceiling; the mutation \
+             landed but its outcome is not durable (in doubt until capacity is restored)"
         );
         return;
     }

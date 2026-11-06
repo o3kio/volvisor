@@ -143,6 +143,7 @@ operation rate so compaction stays rare and its pause stays bounded.
 | `journal.max_tombstones` | integer | `65536` | Upper bound on newest evicted-operation fingerprints kept by the tombstone ring (1..=10000000). A zero ring would silently re-execute retries, so zero is refused. The effective ring is capped by the one-frame limit. |
 | `journal.max_log_records` | integer | `500000` | Compact after this many valid records in the current log (2..=100000000). A successful compaction requires meaningful new growth (at least 64 records) before this trigger can fire again, so a tiny value cannot rewrite the snapshot on every append. |
 | `journal.max_log_bytes` | integer (bytes) | 67108864 (64 MiB) | Compact after the log reaches this size; `0` disables the byte trigger (the record-count and retention triggers still apply). After a successful compaction the trigger requires at least 1 MiB of new growth. |
+| `journal.hard_ceiling_bytes` | integer (bytes) or unset | `2 × max_log_bytes` (128 MiB with defaults) | Fail-closed stop condition above the soft byte trigger (ADR-0014). An append that would cross it first attempts one compaction; if the log is still over, nothing is written and the request answers `503 JOURNAL_FULL`. Must be non-zero and at least `max_log_bytes` when that trigger is enabled; when `max_log_bytes = 0` disables the trigger it must be set explicitly (the derivation from zero is refused). |
 
 **One-frame limit.** A snapshot is written as a single journal frame, whose
 payload is capped at 8 MiB. If the configured retention would produce a
@@ -152,8 +153,22 @@ fail closed) and then shortens the tombstone ring until the snapshot fits.
 The effective retention can therefore be below the configured upper bounds;
 this keeps compaction making progress instead of failing forever. If
 in-flight or pinned operations alone exceed one frame, compaction fails
-closed, `/metrics` shows `journal_compaction_failures_total` increasing, and
-the next append retries.
+closed and new intents are refused with `503 JOURNAL_FULL` (`cannot_fit`)
+while outcome appends remain available so the outstanding outcomes can drain;
+`/metrics` shows `journal_cannot_fit 1` and a rising
+`journal_refusals_total{reason="cannot_fit"}`. A later successful compaction
+clears the state and reopens admission.
+
+**Hard ceiling.** `max_log_bytes` is a compaction trigger, not a bound: a
+persistently failing compaction (or a snapshot whose own size exceeds the
+trigger) can leave the log above it. `hard_ceiling_bytes` is the stop
+condition. Before writing a record, the journal checks whether the append
+would cross the ceiling and, if so, forces one compaction attempt. If the log
+is still over, the record is not written and the request answers
+`503 JOURNAL_FULL`; reads and replay continue. The refusal never evicts
+in-flight intents, terminal operations or tombstones to make room, so the
+retention contract is not weakened to satisfy the ceiling. Recovery is
+automatic once compaction can progress again.
 
 ```toml
 [journal]
@@ -161,15 +176,18 @@ max_retained_operations = 65536
 max_tombstones = 65536
 max_log_records = 500000
 max_log_bytes = 67108864
+hard_ceiling_bytes = 134217728
 ```
 
 A retry whose operation was evicted **within** the tombstone window answers
 `410 OPERATION_EXPIRED` (metric `operations_total{outcome="expired"}`)
 instead of re-executing a possibly-completed mutation. An operation evicted
 before the ring's window is indistinguishable from a new one, so keep
-`max_tombstones` above the longest client retry horizon. The witness registry
-folds the full record history and refuses a compacted journal; it must not
-share `journal_dir` with a control-plane journal. See
+`max_tombstones` above the longest client retry horizon. A bounded admission
+refusal answers `503 JOURNAL_FULL` (metric
+`operations_total{outcome="journal_full"}`); it is not a journal I/O failure.
+The witness registry folds the full record history and refuses a compacted
+journal; it must not share `journal_dir` with a control-plane journal. See
 [schema compatibility](schema-compatibility.md).
 
 ### TLS and transport fields

@@ -194,6 +194,13 @@ pub struct JournalConfig {
     /// trigger (the record-count and retention triggers still apply).
     #[serde(default = "default_journal_max_log_bytes")]
     pub max_log_bytes: u64,
+    /// Hard ceiling above which new durable appends are refused with
+    /// `JOURNAL_FULL` (ADR-0014). Unset derives `2 * max_log_bytes`; when
+    /// `max_log_bytes = 0` disables the byte trigger this must be set
+    /// explicitly. Must be non-zero and at least `max_log_bytes` when that
+    /// trigger is enabled.
+    #[serde(default)]
+    pub hard_ceiling_bytes: Option<u64>,
 }
 
 impl Default for JournalConfig {
@@ -203,11 +210,21 @@ impl Default for JournalConfig {
             max_tombstones: default_journal_max_tombstones(),
             max_log_records: default_journal_max_log_records(),
             max_log_bytes: default_journal_max_log_bytes(),
+            hard_ceiling_bytes: None,
         }
     }
 }
 
 impl JournalConfig {
+    /// The effective hard ceiling: the explicit value, or twice the byte
+    /// trigger. A disabled trigger (`max_log_bytes = 0`) with no explicit
+    /// ceiling yields `0`, which validation refuses.
+    #[must_use]
+    fn effective_hard_ceiling_bytes(&self) -> u64 {
+        self.hard_ceiling_bytes
+            .unwrap_or_else(|| self.max_log_bytes.saturating_mul(2))
+    }
+
     /// Convert the daemon knob table to the journal crate's retention policy.
     /// Range validation runs separately in `Config::validate`.
     #[must_use]
@@ -219,6 +236,7 @@ impl JournalConfig {
             // `0` is the documented "disable the byte trigger" spelling; the
             // journal crate's `None` carries the same meaning.
             max_log_bytes: (self.max_log_bytes != 0).then_some(self.max_log_bytes),
+            hard_ceiling_bytes: self.effective_hard_ceiling_bytes(),
         }
     }
 }
@@ -1397,6 +1415,30 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if journal
+            .hard_ceiling_bytes
+            .is_some_and(|value| value > (1 << 40))
+        {
+            return Err(DaemonError::Config(
+                "journal.hard_ceiling_bytes must not exceed 1099511627776 (1 TiB)".to_owned(),
+            ));
+        }
+        let ceiling = journal.effective_hard_ceiling_bytes();
+        if ceiling == 0 {
+            return Err(DaemonError::Config(
+                "journal.hard_ceiling_bytes must be set explicitly (non-zero) when \
+                 max_log_bytes = 0 disables the byte trigger; it is the fail-closed stop \
+                 condition (ADR-0014)"
+                    .to_owned(),
+            ));
+        }
+        if journal.max_log_bytes != 0 && ceiling < journal.max_log_bytes {
+            return Err(DaemonError::Config(
+                "journal.hard_ceiling_bytes must be at least journal.max_log_bytes \
+                 (the ceiling is above the compaction trigger)"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -1816,13 +1858,18 @@ device_claim_token = \"scoped-destructive-auth\"
             "absent [journal] preserves the journal crate defaults"
         );
         assert!(retention.max_log_bytes.is_some());
+        assert_eq!(
+            retention.hard_ceiling_bytes,
+            2 * retention.max_log_bytes.expect("byte trigger"),
+            "an unset hard ceiling derives twice the byte trigger"
+        );
     }
 
     #[test]
     fn journal_retention_is_parsed_and_zero_bytes_disables_only_the_byte_trigger() {
         let raw = format!(
             "{}\n[journal]\nmax_retained_operations = 128\nmax_tombstones = 256\n\
-             max_log_records = 10000\nmax_log_bytes = 0\n",
+             max_log_records = 10000\nmax_log_bytes = 0\nhard_ceiling_bytes = 268435456\n",
             minimal_toml()
         );
         let cfg: Config = toml::from_str(&raw).expect("parse");
@@ -1835,6 +1882,10 @@ device_claim_token = \"scoped-destructive-auth\"
             retention.max_log_bytes, None,
             "0 is the documented disable spelling, not a zero threshold"
         );
+        assert_eq!(
+            retention.hard_ceiling_bytes, 268_435_456,
+            "the hard ceiling remains an explicit stop condition"
+        );
 
         let raw = format!(
             "{}\n[journal]\nmax_retained_operations = 1\nmax_tombstones = 1\n\
@@ -1843,6 +1894,51 @@ device_claim_token = \"scoped-destructive-auth\"
         );
         let cfg: Config = toml::from_str(&raw).expect("parse");
         assert_eq!(cfg.journal.to_retention().max_log_bytes, Some(1_048_576));
+        assert_eq!(
+            cfg.journal.to_retention().hard_ceiling_bytes,
+            2_097_152,
+            "the derived ceiling tracks a configured trigger"
+        );
+    }
+
+    #[test]
+    fn journal_hard_ceiling_requires_a_nonzero_value_above_the_trigger() {
+        // A disabled byte trigger with no explicit ceiling is refused: the
+        // ADR-0014 stop condition cannot be derived from zero.
+        let raw = format!("{}\n[journal]\nmax_log_bytes = 0\n", minimal_toml());
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg
+            .validate()
+            .expect_err("a disabled trigger needs an explicit ceiling");
+        assert!(
+            error.to_string().contains("hard_ceiling_bytes"),
+            "the error names the missing ceiling: {error}"
+        );
+
+        // An explicit zero is also refused.
+        let raw = format!(
+            "{}\n[journal]\nmax_log_bytes = 0\nhard_ceiling_bytes = 0\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        assert!(
+            cfg.validate().is_err(),
+            "a zero ceiling is not a stop condition"
+        );
+
+        // The ceiling must sit at or above the trigger.
+        let raw = format!(
+            "{}\n[journal]\nmax_log_bytes = 1048576\nhard_ceiling_bytes = 524288\n",
+            minimal_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let error = cfg
+            .validate()
+            .expect_err("a ceiling below the trigger is invalid");
+        assert!(
+            error.to_string().contains("hard_ceiling_bytes"),
+            "the error names the ceiling: {error}"
+        );
     }
 
     #[test]

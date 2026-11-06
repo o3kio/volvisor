@@ -87,17 +87,29 @@ as a fabricated zero.
 | `journal_compactions_total` | counter | — | Successful compactions since the daemon opened the journal. |
 | `journal_compaction_failures_total` | counter | — | Failed compaction attempts since open. A sustained increase means the log is not being bounded; alert on any increase and inspect the daemon log for the `journal compaction failed` warning (the detail is also available as `Journal::last_compaction_error`). A failure counted after the snapshot rename already succeeded means only the directory fsync is pending: the in-process log is bounded, the fsync is retried and cleared by the next append, and the counter still records that the rename's crash durability is not yet proven. |
 | `journal_retained_operations` | gauge | — | Terminal plus in-flight operations currently retained in the idempotency registry. |
+| `journal_in_flight_operations` | gauge | — | In-flight intents (no outcome yet). These are recovery state and are never evicted. |
+| `journal_terminal_operations` | gauge | — | Terminal operations currently tracked in terminal order. |
 | `journal_tombstones` | gauge | — | Exact evicted-operation fingerprints currently in the tombstone ring. |
+| `journal_tombstone_capacity` | gauge | — | Configured tombstone ring bound. |
+| `journal_max_log_bytes` | gauge | — | Configured compaction byte trigger; `0` means the byte trigger is disabled. |
+| `journal_hard_ceiling_bytes` | gauge | — | Configured hard ceiling above which durable appends are refused (ADR-0014). |
+| `journal_compaction_attempts_total` | counter | — | Compaction attempts since open (successes plus failures). |
+| `journal_cannot_fit` | gauge | — | `1` while new-intent admission is closed because the in-flight/pinned set cannot fit one snapshot frame; `0` otherwise. |
+| `journal_refusals_total` | counter | `reason` | Durable appends refused by bounded admission, by reason (`ceiling` or `cannot_fit`). |
 | `reconcile_age_seconds` | gauge | `scope` | Seconds since the last completed reconcile pass, or since the `grow`/`move` task started if no pass has completed: `startup`, `grow`, or `move`. |
 | `witness_reachable` | gauge | — | `1`/`0` from the last witness transport probe. Absent without a configured probe target (and before the first probe). |
 
 `operations_total.outcome` is one of `success`, `failure`, `replayed`,
-`in_doubt`, `conflict`, `resolved`, `re_drive`, `expired`. `resolved` is a
+`in_doubt`, `conflict`, `resolved`, `re_drive`, `expired`, `journal_full`.
+`resolved` is a
 terminal recovery outcome: a retry proved by inspection that the act had
 landed, so the operation returns the recorded result without a second
 provider call. `expired` is a terminal fail-closed refusal: the operation's
 journal entry was evicted by bounded retention, so it is never re-executed
-(`OPERATION_EXPIRED`, HTTP 410). `re_drive` is not terminal: a retry proved
+(`OPERATION_EXPIRED`, HTTP 410). `journal_full` is a bounded-admission
+refusal (`JOURNAL_FULL`, HTTP 503): the journal is healthy but refuses a new
+durable record at its hard ceiling or cannot-fit admission point. It is not
+counted in `journal_append_failures_total`. `re_drive` is not terminal: a retry proved
 the act had **not** landed and is re-executing, so the same operation later
 records its `success`/`failure`.
 Operation kinds are the
@@ -147,7 +159,8 @@ The label space is fixed by code and configuration, never by consumer data:
 - `code` is the exact HTTP status produced by the daemon, a bounded set for
   this API; the latency `class` is one of `1xx`, `2xx`, `3xx`, `4xx`, `5xx`.
 - `kind` and `outcome` are compile-time constants; `stage` is `intent` or
-  `outcome`; `scope` is `startup`, `grow` or `move`.
+  `outcome`; `scope` is `startup`, `grow` or `move`; the journal refusal
+  `reason` is `ceiling` or `cannot_fit`.
 - No label contains a principal, role, bearer token, URL, request body,
   error string or free-form detail.
 

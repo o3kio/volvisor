@@ -45,6 +45,13 @@ pub const DEFAULT_MAX_LOG_RECORDS: u64 = 500_000;
 /// Default byte threshold that triggers compaction (64 MiB).
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default hard ceiling above which new durable appends are refused (ADR-0014).
+///
+/// This is twice the default byte trigger. The trigger is a soft target; the
+/// ceiling is the bound that stops a persistently failing compaction from
+/// growing the log without limit.
+pub const DEFAULT_HARD_CEILING_BYTES: u64 = 2 * DEFAULT_MAX_LOG_BYTES;
+
 /// Minimum number of new records after a successful compaction before the
 /// record trigger may fire again.
 ///
@@ -90,6 +97,16 @@ const MAX_COMPACTION_RETRY_SHIFT: u32 = 6;
 /// indistinguishable from an unknown operation and will be executed again.
 /// Operators must therefore keep the window (in operations) larger than the
 /// longest client retry horizon; see `docs/schema-compatibility.md`.
+///
+/// # Hard ceiling (ADR-0014)
+///
+/// `max_log_bytes` is a compaction *trigger*, not a hard bound: a persistently
+/// failing compaction (or a snapshot whose own size is above the trigger) can
+/// leave the log above it. `hard_ceiling_bytes` is the stop condition. An
+/// append that would cross it first attempts one compaction; if the log is
+/// still over, the append is refused with a typed `JOURNAL_FULL` (HTTP 503)
+/// and nothing is written. The daemon never evicts in-flight intents, terminal
+/// records or tombstones to get under the ceiling. Reads and replay continue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalRetention {
     /// Terminal operations retained in the registry/snapshot. In-flight
@@ -102,6 +119,10 @@ pub struct JournalRetention {
     /// Compact after the log reaches this many bytes, or `None` to disable
     /// the byte trigger.
     pub max_log_bytes: Option<u64>,
+    /// Hard ceiling in bytes: an append that would exceed it after one
+    /// compaction attempt is refused with `JOURNAL_FULL`. Must be non-zero
+    /// and, when the byte trigger is enabled, at least the trigger.
+    pub hard_ceiling_bytes: u64,
 }
 
 impl Default for JournalRetention {
@@ -111,6 +132,7 @@ impl Default for JournalRetention {
             max_tombstones: DEFAULT_MAX_TOMBSTONES,
             max_log_records: DEFAULT_MAX_LOG_RECORDS,
             max_log_bytes: Some(DEFAULT_MAX_LOG_BYTES),
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         }
     }
 }
@@ -145,6 +167,25 @@ impl JournalRetention {
                 ApiErrorCode::Internal,
                 "journal retention max_log_bytes must be at least 1 when set",
             ));
+        }
+        if self.hard_ceiling_bytes == 0 {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                "journal retention hard_ceiling_bytes must be set explicitly (non-zero) \
+                 when the byte trigger is disabled; it is the fail-closed stop condition",
+            ));
+        }
+        if let Some(trigger) = self.max_log_bytes {
+            if self.hard_ceiling_bytes < trigger {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    format!(
+                        "journal retention hard_ceiling_bytes ({}) must be at least \
+                         max_log_bytes ({trigger})",
+                        self.hard_ceiling_bytes
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -294,6 +335,17 @@ pub struct Journal {
     /// (an interrupted request leaves a durable in-flight or terminal
     /// record, which retention treats normally).
     pinned_operations: HashMap<OperationId, usize>,
+    /// Set when the irreducible in-flight/pinned set cannot fit one snapshot
+    /// frame. New intents are then refused fail-closed (ADR-0014); outcome
+    /// appends remain available so the in-flight set can drain, and a later
+    /// successful compaction clears the flag.
+    cannot_fit: bool,
+    /// Durable appends refused because the log would cross
+    /// `hard_ceiling_bytes` (diagnostic; ADR-0014).
+    ceiling_refusals: u64,
+    /// New intents refused because the in-flight set cannot fit one frame
+    /// (diagnostic; ADR-0014).
+    cannot_fit_refusals: u64,
     /// Test-fault injection (feature `test-faults`): appends fail once this
     /// countdown reaches zero. `u64::MAX` (default) never fires.
     #[cfg(feature = "test-faults")]
@@ -488,6 +540,9 @@ impl Journal {
             last_compaction_bytes: 0,
             dir_sync_pending: false,
             pinned_operations: HashMap::new(),
+            cannot_fit: false,
+            ceiling_refusals: 0,
+            cannot_fit_refusals: 0,
             #[cfg(feature = "test-faults")]
             fail_after_remaining: AtomicU64::new(u64::MAX),
             #[cfg(feature = "test-faults")]
@@ -678,6 +733,25 @@ impl Journal {
         if self.is_tombstoned(&operation_id) {
             return Err(ApiError::operation_expired(&operation_id));
         }
+        // ADR-0014 cannot-fit admission: when the irreducible in-flight set
+        // cannot be snapshotted, a new intent would only deepen the problem.
+        // Refuse new mutating work here while outcome appends (which drain
+        // the in-flight set) remain available.
+        if self.cannot_fit {
+            self.cannot_fit_refusals = self.cannot_fit_refusals.saturating_add(1);
+            tracing::error!(
+                cannot_fit_refusals = self.cannot_fit_refusals,
+                in_flight = self.in_flight_operations(),
+                "journal admission is closed: the in-flight intent set cannot fit one \
+                 snapshot frame; new mutating work is refused until an operator resolves \
+                 the retention set or the outstanding outcomes drain"
+            );
+            return Err(ApiError::journal_full(
+                "journal admission is closed: the in-flight intent set cannot fit one \
+                 snapshot frame; new mutating work is refused until the outstanding \
+                 outcomes drain or an operator resolves the retention set",
+            ));
+        }
 
         self.append(JournalRecord::Intent(Intent {
             operation_id: operation_id.clone(),
@@ -805,6 +879,47 @@ impl Journal {
         self.operations.len()
     }
 
+    /// Number of in-flight intents (no outcome yet). These are recovery
+    /// state and are never evicted; ADR-0014 bounds them by admission.
+    #[must_use]
+    pub fn in_flight_operations(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|state| state.outcome.is_none())
+            .count()
+    }
+
+    /// Number of terminal operations currently tracked in terminal order.
+    #[must_use]
+    pub fn terminal_operations(&self) -> usize {
+        self.terminal_order.len()
+    }
+
+    /// Whether new intents are currently refused because the in-flight set
+    /// cannot fit one snapshot frame (ADR-0014).
+    #[must_use]
+    pub fn cannot_fit(&self) -> bool {
+        self.cannot_fit
+    }
+
+    /// Durable appends refused at the hard ceiling since this journal opened.
+    #[must_use]
+    pub fn ceiling_refusals(&self) -> u64 {
+        self.ceiling_refusals
+    }
+
+    /// New intents refused because the in-flight set cannot fit one frame.
+    #[must_use]
+    pub fn cannot_fit_refusals(&self) -> u64 {
+        self.cannot_fit_refusals
+    }
+
+    /// Compaction attempts since this journal opened (successes + failures).
+    #[must_use]
+    pub fn compaction_attempts(&self) -> u64 {
+        self.compactions.saturating_add(self.compaction_failures)
+    }
+
     /// Number of exact tombstone fingerprints currently retained.
     #[must_use]
     pub fn tombstone_count(&self) -> usize {
@@ -926,8 +1041,17 @@ impl Journal {
     /// snapshot.
     fn compact(&mut self) -> Result<(), ApiError> {
         let (plan, payload) = match self.plan_compaction_within_frame_budget() {
-            Ok(plan) => plan,
-            Err(err) => return Err(self.record_compaction_failure(err.detail)),
+            Ok(plan) => {
+                // The irreducible set fits one frame; admission can reopen
+                // even if the write below fails for an unrelated reason.
+                self.cannot_fit = false;
+                plan
+            }
+            Err(PlanError::CannotFit(detail)) => {
+                self.cannot_fit = true;
+                return Err(self.record_compaction_failure(detail));
+            }
+            Err(PlanError::Other(err)) => return Err(self.record_compaction_failure(err.detail)),
         };
         // A compacted log always restarts its frame sequence at 1.
         let encoded = match frame::encode(1, &payload) {
@@ -1070,14 +1194,14 @@ impl Journal {
     /// intents and pinned operations are irreducible; when they alone exceed
     /// the frame budget the planner fails closed rather than writing a
     /// snapshot that can never be framed.
-    fn plan_compaction_within_frame_budget(&self) -> Result<(CompactionPlan, Vec<u8>), ApiError> {
+    fn plan_compaction_within_frame_budget(&self) -> Result<(CompactionPlan, Vec<u8>), PlanError> {
         let mut keep_operations = self.retention.max_retained_operations;
         let mut keep_tombstones = self.retention.max_tombstones;
         // Each successful iteration evicts at least one operation or trims at
         // least one tombstone; the ceiling is defensive only.
         for _ in 0..64 {
             let plan = self.plan_compaction(keep_operations, keep_tombstones);
-            let payload = encode_snapshot(&plan.snapshot)?;
+            let payload = encode_snapshot(&plan.snapshot).map_err(PlanError::Other)?;
             if payload.len() <= frame::MAX_PAYLOAD_LEN {
                 return Ok((plan, payload));
             }
@@ -1110,18 +1234,15 @@ impl Journal {
                 continue;
             }
             if plan.tombstones.is_empty() {
-                return Err(ApiError::new(
-                    ApiErrorCode::Internal,
-                    format!(
-                        "journal compaction snapshot cannot fit the {} byte frame limit: \
-                         {} in-flight/pinned operations and {} tombstones remain after \
-                         evicting every evictable terminal operation; refusing to write \
-                         a snapshot that can never be framed",
-                        frame::MAX_PAYLOAD_LEN,
-                        plan.snapshot.operations.len(),
-                        plan.tombstones.len()
-                    ),
-                ));
+                return Err(PlanError::CannotFit(format!(
+                    "journal compaction snapshot cannot fit the {} byte frame limit: \
+                     {} in-flight/pinned operations and {} tombstones remain after \
+                     evicting every evictable terminal operation; refusing to write \
+                     a snapshot that can never be framed",
+                    frame::MAX_PAYLOAD_LEN,
+                    plan.snapshot.operations.len(),
+                    plan.tombstones.len()
+                )));
             }
             // The irreducible entries still leave tombstone bytes over the
             // budget. Trim the oldest fingerprints; the retention window is
@@ -1138,10 +1259,10 @@ impl Journal {
             let trim = trim.max(1).min(plan.tombstones.len());
             keep_tombstones = plan.tombstones.len().saturating_sub(trim);
         }
-        Err(ApiError::new(
+        Err(PlanError::Other(ApiError::new(
             ApiErrorCode::Internal,
             "journal compaction did not converge within the frame payload budget",
-        ))
+        )))
     }
 
     /// Compute the snapshot and the retained in-memory state without
@@ -1234,6 +1355,43 @@ impl Journal {
         }
     }
 
+    /// Ensure a `frame_len`-byte append would stay at or below the hard
+    /// ceiling, attempting one compaction first (ADR-0014).
+    ///
+    /// Compaction is forced here even when [`Journal::should_compact`]'s
+    /// failure backoff would otherwise wait: crossing the ceiling is a stop
+    /// condition, not a soft trigger. Nothing is evicted beyond the normal
+    /// compaction contract to make room; if the log is still over after the
+    /// attempt, the append is refused with `JOURNAL_FULL`.
+    fn ensure_within_ceiling(&mut self, frame_len: u64) -> Result<(), ApiError> {
+        let ceiling = self.retention.hard_ceiling_bytes;
+        if self.log_bytes.saturating_add(frame_len) <= ceiling {
+            return Ok(());
+        }
+        let _ = self.compact();
+        if self.log_bytes.saturating_add(frame_len) <= ceiling {
+            return Ok(());
+        }
+        self.ceiling_refusals = self.ceiling_refusals.saturating_add(1);
+        tracing::error!(
+            log_bytes = self.log_bytes,
+            frame_len,
+            hard_ceiling_bytes = ceiling,
+            ceiling_refusals = self.ceiling_refusals,
+            cannot_fit = self.cannot_fit,
+            "journal hard ceiling reached; refusing the durable append with JOURNAL_FULL. \
+             Reads and replay continue; no in-flight intent, terminal record or tombstone \
+             was evicted to make room"
+        );
+        Err(ApiError::journal_full(format!(
+            "journal hard ceiling of {ceiling} bytes reached (log {} bytes, next record \
+             {frame_len} bytes) and compaction could not make progress; refusing the \
+             durable append. Reads and replay continue; no in-flight intent, terminal \
+             record or tombstone was evicted",
+            self.log_bytes
+        )))
+    }
+
     /// Serialize, frame, write and fsync one record. Acknowledged only
     /// after the data reaches stable storage.
     fn append(&mut self, record: JournalRecord) -> Result<(), ApiError> {
@@ -1280,6 +1438,14 @@ impl Journal {
                 format!("failed to serialize journal record: {err}"),
             )
         })?;
+        // ADR-0014 hard ceiling: a record that would cross the ceiling gets
+        // one compaction attempt. The frame is encoded twice because a
+        // successful compaction restarts the sequence at 1 (payload size is
+        // unchanged, so the first encoding is a valid size probe).
+        if self.compaction_enabled {
+            let frame_len = frame::encode(self.next_sequence, &payload)?.len() as u64;
+            self.ensure_within_ceiling(frame_len)?;
+        }
         let frame = frame::encode(self.next_sequence, &payload)?;
         let frame_len = frame.len() as u64;
         let start_bytes = self.log_bytes;
@@ -1385,6 +1551,17 @@ struct CompactionPlan {
     terminal_order: VecDeque<OperationId>,
     tombstones: TombstoneRing,
     evicted: u64,
+}
+
+/// Why a compaction plan could not be encoded.
+///
+/// The distinction matters for admission: `CannotFit` means the irreducible
+/// (in-flight/pinned) set alone exceeds one frame, which closes new-intent
+/// admission until it drains; `Other` is an ordinary failure (serialization
+/// or a non-converging planner) that must not change admission.
+enum PlanError {
+    CannotFit(String),
+    Other(ApiError),
 }
 
 /// Stable 64-bit fingerprint of an operation id (first eight SHA-256 bytes,
@@ -2302,6 +2479,7 @@ mod tests {
             max_tombstones: 8,
             max_log_records: 1_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         }
     }
 
@@ -2424,6 +2602,7 @@ mod tests {
                 max_tombstones: 2,
                 max_log_records: 1_000,
                 max_log_bytes: None,
+                hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
             },
         )
         .expect("open");
@@ -2531,6 +2710,7 @@ mod tests {
             max_tombstones: 8,
             max_log_records: 1_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         };
         let mut journal = Journal::open_with_retention(dir.path(), retention).expect("open");
         for (index, id) in ids.iter().enumerate() {
@@ -2614,6 +2794,7 @@ mod tests {
             max_tombstones: 8,
             max_log_records: 1_000_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         };
         let journal =
             Journal::open_with_retention(dir.path(), retention).expect("snapshot reopens");
@@ -3122,6 +3303,7 @@ mod tests {
             max_tombstones: 16,
             max_log_records: 1_000_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         };
         let target = op_id("op-replay-redrive");
         {
@@ -3230,13 +3412,23 @@ mod tests {
     }
 
     #[test]
-    fn irreducible_in_flight_operations_fail_closed_without_poisoning_the_log() {
+    fn a_cannot_fit_in_flight_set_refuses_new_intents_then_recovers_after_draining() {
         // In-flight intents are never evicted. If they alone exceed the
         // one-frame durability unit, compaction must fail closed before any
-        // file I/O: the already-fsynced log stays intact, is not poisoned,
-        // and later appends keep succeeding.
+        // file I/O and new intents must be refused (ADR-0014 cannot-fit
+        // admission). The already-fsynced log stays intact and is not
+        // poisoned; outcome appends remain available so the set can drain.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut journal = Journal::open(dir.path()).expect("open");
+        let durable = op_id("op-durable-inflight");
+        journal
+            .append_intent(
+                durable.clone(),
+                [9; 32],
+                "create_volume",
+                serde_json::json!({}),
+            )
+            .expect("durable in-flight intent");
         // Populate the in-memory registry directly: this test is about the
         // frame planner, not fsync throughput. Each entry serializes to
         // roughly 60 bytes, so this is comfortably over 8 MiB.
@@ -3250,6 +3442,7 @@ mod tests {
                 },
             );
         }
+        let in_flight_before = journal.in_flight_operations();
 
         let error = journal
             .compact()
@@ -3265,16 +3458,169 @@ mod tests {
         );
         assert_eq!(journal.compactions(), 0);
         assert!(journal.last_compaction_error().is_some());
+        assert!(journal.cannot_fit());
+        assert_eq!(
+            journal.in_flight_operations(),
+            in_flight_before,
+            "a cannot-fit refusal must not evict any in-flight intent"
+        );
 
-        // The durable log was untouched and the journal is not poisoned:
-        // appends continue.
-        let id = op_id("op-after-frame-failure");
+        // New mutating work is refused with the typed fail-closed code...
+        let refused = journal
+            .append_intent(
+                op_id("op-after-frame-failure"),
+                [7; 32],
+                "create_volume",
+                serde_json::json!({}),
+            )
+            .expect_err("cannot-fit admission refuses a new intent");
+        assert_eq!(refused.code, ApiErrorCode::JournalFull);
+        assert_eq!(refused.http_status(), 503);
+        assert_eq!(journal.cannot_fit_refusals(), 1);
+        // ...while a replay of the known in-flight operation is still
+        // answered without a new append.
+        assert!(matches!(
+            journal
+                .append_intent(
+                    durable.clone(),
+                    [9; 32],
+                    "create_volume",
+                    serde_json::json!({}),
+                )
+                .expect("known-op replay stays available"),
+            IntentAppend::AlreadyInFlight
+        ));
+        // ...and its outcome can still be journaled, draining the set.
         journal
-            .append_intent(id.clone(), [7; 32], "create_volume", serde_json::json!({}))
-            .expect("a failed compaction must not fail later appends");
+            .append_outcome(durable.clone(), true, serde_json::json!({"ok": true}))
+            .expect("outcome appends drain the in-flight set despite cannot-fit");
+        assert!(journal.cannot_fit(), "one drained entry is not a recovery");
+
+        // Once enough outcomes have drained (simulated here by dropping the
+        // synthetic entries), compaction fits, admission reopens and the
+        // durable log is intact.
+        journal
+            .operations
+            .retain(|id, _| id == &durable || id.as_str().starts_with("op-inflight-0000"));
+        journal.compact().expect("compaction now fits one frame");
+        assert!(!journal.cannot_fit());
+        let admitted = op_id("op-after-frame-failure");
+        journal
+            .append_intent(
+                admitted.clone(),
+                [7; 32],
+                "create_volume",
+                serde_json::json!({}),
+            )
+            .expect("admission reopens after the set drains");
         drop(journal);
         let reopened = Journal::open(dir.path()).expect("the log reopens");
-        assert!(reopened.lookup(&id).is_some());
+        assert!(reopened.lookup(&durable).is_some());
+        assert!(reopened.lookup(&admitted).is_some());
+    }
+
+    #[test]
+    fn the_hard_ceiling_refuses_durable_appends_and_recovers_after_compaction_unblocks()
+    -> Result<(), String> {
+        // ADR-0014: a persistently failing compaction must not grow the log
+        // without limit. Once the log would cross the hard ceiling, the
+        // append is refused with JOURNAL_FULL; reads and replay continue,
+        // and the journal recovers as soon as compaction can run again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let retention = JournalRetention {
+            max_retained_operations: 1,
+            max_tombstones: 8,
+            max_log_records: 1_000_000,
+            max_log_bytes: None,
+            hard_ceiling_bytes: 4_096,
+        };
+        let mut journal = Journal::open_with_retention(dir.path(), retention).expect("open");
+        // Block the fixed compaction target so the log cannot be rewritten.
+        std::fs::create_dir(dir.path().join("journal.log.compact")).expect("block compaction");
+
+        let mut refusal = None;
+        let mut last_terminal: Option<(OperationId, u64)> = None;
+        for index in 0..10_000 {
+            let id = op_id(&format!("op-ceiling-{index:04}"));
+            match journal.append_intent(
+                id.clone(),
+                [u8::try_from(index % 251).expect("small"); 32],
+                "create_volume",
+                serde_json::json!({}),
+            ) {
+                Ok(IntentAppend::New) => {}
+                Ok(other) => {
+                    return Err(format!("unexpected replay during fill: {other:?}"));
+                }
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+            match journal.append_outcome(id.clone(), true, serde_json::json!({"n": index})) {
+                Ok(()) => last_terminal = Some((id, index)),
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let refusal = refusal.expect("the hard ceiling must be reached");
+        assert_eq!(
+            refusal.code,
+            ApiErrorCode::JournalFull,
+            "the ceiling refusal is typed: {refusal}"
+        );
+        assert_eq!(refusal.http_status(), 503);
+        assert!(
+            journal.ceiling_refusals() >= 1,
+            "the refusal is counted for /metrics"
+        );
+        assert!(
+            journal.compaction_failures() >= 1,
+            "the ceiling was reached because compaction could not progress"
+        );
+        assert!(
+            journal.log_bytes() <= retention.hard_ceiling_bytes,
+            "no append is written past the ceiling: {} > {}",
+            journal.log_bytes(),
+            retention.hard_ceiling_bytes
+        );
+
+        // Reads and replay continue: the last acknowledged terminal outcome
+        // is still served, and its retry replays instead of failing.
+        let (last, last_index) =
+            last_terminal.expect("a terminal operation succeeded before the ceiling");
+        assert_eq!(
+            journal
+                .lookup(&last)
+                .expect("retained before the ceiling")
+                .outcome
+                .expect("outcome")
+                .response,
+            serde_json::json!({"n": last_index}),
+        );
+
+        // Unblocking the compaction target recovers the journal: the next
+        // append first compacts below the ceiling and is then accepted.
+        std::fs::remove_dir(dir.path().join("journal.log.compact")).expect("unblock");
+        journal
+            .append_intent(
+                op_id("op-after-ceiling"),
+                [1; 32],
+                "create_volume",
+                serde_json::json!({}),
+            )
+            .expect("append after the ceiling recovers once compaction runs");
+        assert!(
+            journal.compactions() >= 1,
+            "recovery is a real compaction, not a raised ceiling"
+        );
+        assert!(
+            journal.log_bytes() <= retention.hard_ceiling_bytes,
+            "the recovered log is under the ceiling"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3290,6 +3636,7 @@ mod tests {
             max_tombstones: 1_024,
             max_log_records: 100_000_000,
             max_log_bytes: None,
+            hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
         };
         let mut journal = Journal::open_with_retention(dir.path(), retention).expect("open");
         let ids: Vec<OperationId> = (0..128)
@@ -3364,6 +3711,7 @@ mod tests {
                 max_tombstones: 10_000,
                 max_log_records: 2,
                 max_log_bytes: None,
+                hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
             },
         )
         .expect("open");
@@ -3396,6 +3744,7 @@ mod tests {
                 max_tombstones: 10_000,
                 max_log_records: 1_000_000,
                 max_log_bytes: Some(1),
+                hard_ceiling_bytes: DEFAULT_HARD_CEILING_BYTES,
             },
         )
         .expect("open");

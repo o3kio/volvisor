@@ -17,7 +17,7 @@ file is never allowed (AGENTS rule 8's fail-closed reading).
 | Store | File(s) | Version carrier | Current version |
 |---|---|---|---|
 | Intent journal | `<journal_dir>/journal.log` (binary frames) | `record_version` inside each frame payload | `RECORD_VERSION = 2` |
-| LVM provider state | `lvm_state_path`, default `<journal_dir>/lvm-state.json` | `schema_version` | `LVM_STATE_SCHEMA_VERSION = 3` |
+| LVM provider state | `lvm_state_path`, default `<journal_dir>/lvm-state.json` | `schema_version` | `LVM_STATE_SCHEMA_VERSION = 4` |
 | Ceph provider state | `ceph_state_path`, default `<journal_dir>/ceph-state.json` | `schema_version` | `CEPH_STATE_SCHEMA_VERSION = 1` |
 | DRBD provider state | `drbd_state_path`, default `<journal_dir>/drbd-state.json` | `schema_version` | `DRBD_STATE_SCHEMA_VERSION = 1` |
 | Migration records | `<journal_dir>/migrations/<migration_id>.json` | `schema_version` | `MIGRATION_RECORD_SCHEMA_VERSION = 1` |
@@ -117,6 +117,26 @@ per-id state. The field stays decodable (and is re-serialized if a legacy file
 had one) but is never populated by the current attach/detach path; a legacy
 v1/v2 vector is still imported at decode. The v3 shape is unchanged.
 
+ADR-0013 is schema v4: the LVM state gains one field,
+`next_attachment_generation` (the durable provider-wide allocator).
+`lvm-state-v4-n1.json` is the last released v3 shape. A v3 file loads with the
+allocator unseeded (`0`); on decode the allocator is seeded to
+`max(persisted volume entry generations, persisted attachment generations) + 1`
+only when the field is absent or `0`, and the first successful save writes v4
+with the field always serialized. A non-zero
+persisted allocator is authoritative and is never reset by create, delete or
+recreate, so an attachment generation retired on a volume is never reissued.
+A fresh `LvmState::default()` starts at `1`. Every save re-normalizes the
+allocator through the same seeding rule, so a state assembled without it (a
+migration, a hand-restored file, a test fixture) is raised to the invariant
+before it is persisted rather than silently persisted unseeded. An allocator at
+`u64::MAX` fails closed: allocation returns a typed `INTERNAL` refusal instead
+of wrapping. An older binary refuses a v4 file with the typed
+unsupported-version error. The residual upgrade window — a volume deleted
+before the v4 file was ever written has no durable record of its consumed
+generations — is recorded in ADR-0013 and the readiness report; it is not
+represented as fixed.
+
 Issue [#64](https://github.com/o3kio/volvisor/issues/64) is journal
 `record_version` 2. Version 2 adds the `snapshot` record emitted by bounded
 retention/compaction; version-1 records still replay unchanged and the first
@@ -139,15 +159,34 @@ their fingerprints as tombstones) and then shortens the tombstone ring as
 needed. The effective
 retention can therefore be lower than configured, but compaction always makes
 progress. In-flight intents and pinned operations are never evicted; if they
-alone exceed one frame, compaction fails closed (the failure **count** is
-exposed on `/metrics`; the detail is in the daemon log and
-`Journal::last_compaction_error`). A failed compaction is retried after bounded
+alone exceed one frame, compaction fails closed and new intents are refused
+(`cannot_fit`) while outcome appends drain the set; the failure **count** is
+exposed on `/metrics`, the detail is in the daemon log and
+`Journal::last_compaction_error`. A failed compaction is retried after bounded
 new growth — immediately after one record for the first failure, then with an
 exponential backoff capped at 64 records or 64 MiB of new log — so a
 persistently failing target is not re-serialized on every append. The witness registry
 folds the complete record history and therefore opts out of compaction: it
 refuses a compacted journal with a typed error rather than deriving authority
-state from a truncated prefix. `journal-v2-n1.log` is a version-1 log from
+state from a truncated prefix. ADR-0014 adds the fail-closed exhaustion
+contract on top of these bounds. `max_log_bytes` is a compaction **trigger**,
+not a hard bound; `hard_ceiling_bytes` (default twice the byte trigger, and
+required explicitly non-zero when the byte trigger is disabled) is the stop
+condition. An append that would cross the ceiling first gets one forced
+compaction attempt; if the log is still over, nothing is written and the append
+is refused with the typed `JOURNAL_FULL` (HTTP 503). Reads and replay continue.
+The refusal never evicts in-flight intents, terminal operations or tombstones
+to make room. When the irreducible in-flight/pinned set alone cannot fit one
+snapshot frame, compaction fails closed, new intents are refused
+(`cannot_fit`), and outcome appends remain available so the outstanding
+outcomes can drain; a later successful compaction clears the flag and reopens
+admission. `/metrics` exposes `journal_hard_ceiling_bytes`,
+`journal_in_flight_operations`, `journal_terminal_operations`,
+`journal_tombstone_capacity`, `journal_compaction_attempts_total`,
+`journal_cannot_fit` and `journal_refusals_total{reason}` alongside the
+existing journal gauges. The witness journal (`open_with_records`) disables
+compaction and therefore does not enforce the hard ceiling; its registry still
+refuses a compacted log. `journal-v2-n1.log` is a version-1 log from
 before the `http_status` field was added (byte-identical to
 `journal-v1-n1.log`); it exercises the oldest v1 replay era, while the
 version-independent `Outcome` decoder covers the later v1 shape that carried
@@ -220,6 +259,7 @@ current struct.
 | `tests/fixtures/schema/lvm-state-v1-tombstones.json` | LVM | `c00bc3e` (tombstones, before version field) | `retired_attachment_ids` preserved |
 | `tests/fixtures/schema/lvm-state-v2-n1.json` | LVM v1 (N-1 for v2) | last released v1 shape, written by the pre-#70 binary at `ee739bc` from the `a8c0254` fixture | v1 attachment state/revision/evidence, move record, and empty intent maps; upgrade-on-write stamps the current version (covered by the `volvisor-lvm` unit test and the daemon-store test `a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write`) |
 | `tests/fixtures/schema/lvm-state-v3-n1.json` | LVM v2 (N-1 for v3) | last released v2 shape: the `c00bc3e` tombstone fixture stamped `schema_version: 2` | legacy `retired_attachment_ids` import into the v3 filter; upgrade-on-write stamps v3 and never writes the vector again (covered by the `volvisor-lvm` unit test and the daemon-store test `a_v2_stamped_n_minus_one_lvm_state_imports_tombstones_and_upgrades_on_write`) |
+| `tests/fixtures/schema/lvm-state-v4-n1.json` | LVM v3 (N-1 for v4) | last released v3 shape with an attached volume (entry generation 7, attachment generation 5) | the allocator seeds from the persisted entry/attachment generations when absent/zero, the first save writes v4 with the allocator, and no retired generation is reissued (`state::tests::v4_n_minus_one_fixture_seeds_the_attachment_allocator_and_upgrades_on_write`) |
 | `tests/fixtures/schema/ceph-state-v1-n1.json` | Ceph N-1 | `ab9cedd` (before `vmm_disk_id`) | attachment mapping, absent disk id is `None` |
 | `tests/fixtures/schema/drbd-state-v1-n1.json` | DRBD N-1 | `f686531` (before `vmm_disk_id`) | authority block, migration-cut marker, counters |
 | `tests/fixtures/schema/drbd-state-v1-n2.json` | DRBD N-2 | `97e6841` (initial P3 format) | defaulted authority/fence/migration/disk id |

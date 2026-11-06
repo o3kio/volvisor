@@ -84,9 +84,9 @@ mod journal;
 mod record;
 
 pub use journal::{
-    DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_LOG_RECORDS, DEFAULT_MAX_RETAINED_OPERATIONS,
-    DEFAULT_MAX_TOMBSTONES, IntentAppend, JOURNAL_LOCK_FILE, JOURNAL_LOG_FILE, Journal,
-    JournalRetention, RecordedOutcome, RegistryEntry,
+    DEFAULT_HARD_CEILING_BYTES, DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_LOG_RECORDS,
+    DEFAULT_MAX_RETAINED_OPERATIONS, DEFAULT_MAX_TOMBSTONES, IntentAppend, JOURNAL_LOCK_FILE,
+    JOURNAL_LOG_FILE, Journal, JournalRetention, RecordedOutcome, RegistryEntry,
 };
 pub use record::{
     Checkpoint, Intent, JournalRecord, LEGACY_RECORD_VERSION_N1, Outcome, RECORD_VERSION, Snapshot,
