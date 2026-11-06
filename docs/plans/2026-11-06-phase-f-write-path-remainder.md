@@ -1,9 +1,12 @@
 # Phase F — the #62 write-path remainder, with #63/#64 verification
 
 Status: normative for this workstream (the plan of record; implementation
-commits cite it)
+commits cite it). F1/F2 are implemented and F3 measured at
+`2edcecd9b3d4c555831e6d4db1337e3dbcff6a15`; the evidence bundle is
+`docs/benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/`.
 Date: 2026-11-06
-Branch: `phase-a-scaling`, HEAD `8d4579a`
+Branch: `phase-a-scaling`; plan baseline HEAD `8d4579a`, implementation and
+measured HEAD `2edcecd`
 Builds on: [Phase E plan](2026-11-05-phase-e-write-path-lock-scope.md),
 [Phase D plan](2026-11-04-phase-d-control-plane-hardening.md),
 [pre-production readiness report](../releases/pre-production-readiness.md),
@@ -261,3 +264,20 @@ This slice adds **evidence, not a new retention design**.
 `#62`, `#63` and `#64` stay open until explicitly instructed. All gate
 verdicts are unchanged: gates 1, 2 and 5 **NOT MET**; gates 3 and 4
 **PARTIAL**; overall **NOT PRE-PRODUCTION READY**.
+
+## Completion note
+
+F1, F2a, F2b, F2c and F3 are complete at
+`2edcecd9b3d4c555831e6d4db1337e3dbcff6a15` on `phase-a-scaling`. The
+measured evidence bundle is
+[2026-11-06-devhost-phase-f-write-path-remainder](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md):
+a clean-tree 1/8/32/128 sweep and a **shortened 25-minute soak**, not the
+24-hour soak. It is a single-host development-lab control-plane measurement
+and supports no production, data-path, SLA, durability, capacity or
+throughput claim. `#62`, `#63` and `#64` remain **open** (their code is
+present and tested; the issues are not closed), ADR-0012 remains
+`Proposed`, and no gate verdict changes: gates 1/2/5 **NOT MET**, gates 3/4
+**PARTIAL**, overall **NOT PRE-PRODUCTION READY**. The plan's earlier
+"No push, tag, PR…" line was the pre-authorization constraint; the branch
+was later pushed as WIP under explicit authorization, and that push is not
+evidence for this batch.

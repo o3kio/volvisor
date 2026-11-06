@@ -373,6 +373,129 @@ remain **PARTIAL**, and the overall status remains **NOT PRE-PRODUCTION
 READY**. No tag, GitHub release, push or pull request is created by this
 workstream.
 
+## Post-report addendum (2026-11-06) — Phase F write-path remainder and #63/#64 verification
+
+This addendum records the Phase F batch delivered on `phase-a-scaling`
+after the Phase E work recorded in the Phase D addendum. It follows the
+[Phase F plan](../plans/2026-11-06-phase-f-write-path-remainder.md).
+**It changes no gate verdict below.** It is a single-host development-lab
+control-plane measurement with a shortened 25-minute soak, not the 24-hour
+soak; it is not production, data-path, SLA, durability or capacity
+evidence.
+
+- **Exact source and build.** `2edcecd9b3d4c555831e6d4db1337e3dbcff6a15`
+  (`volvisord 2edcecd`), clean worktree (`worktree_dirty: no`), release
+  binary SHA256
+  `a09ec03d8157a527b17c3a7111cee62522cc711ab6b42b93d6b697ddff2c2e7a`,
+  built with `CARGO_BUILD_JOBS=4 cargo build --release --locked -p
+  volvisord` (exit 0). Measured window 2026-11-06T12:20:58Z ..
+  2026-11-06T12:52:21Z on one dev host (16 vCPU AMD EPYC 9554P, 31.3 GiB
+  RAM, kernel `6.8.0-142-generic`, loop-backed LVM, every client and the
+  daemon on `127.0.0.1`; no Ceph, DRBD, `fio` or second host).
+- **Implementation.** F1 proves the move drive's **existing** lock scope
+  (it is not a new narrowing). F2a delete validates under the lock, runs
+  `lvs` outside it, fully revalidates generation/VG/LV/lifecycle/pending-
+  grow/unsettled-move, then persists the intent. F2b create samples `vgs`
+  outside the lock under the allocation-epoch protocol, bounded by
+  `CREATE_ADMISSION_ATTEMPTS = 32`, with a post-reserve epoch re-check and
+  `SampleStale` retry. F2c failed-create compensation classifies the
+  durable file under the lock, reverts uncommitted memory, drops the guard
+  for `lvremove`, then reacquires to roll back/clear the intent. Accepted
+  residuals: the failure-only durable re-read in `persist_copying_record`
+  stays under the lock; startup `apply_delete_intents` runs the delete CLI
+  under the startup lock; move's CLI calls remain inline on async workers.
+- **Test evidence.** `cargo fmt --all --check` exit 0; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` exit 0; `cargo test
+  --workspace` exit 0 with 78 `test result:` lines, **1,378 passed, 0
+  failed, 3 ignored** (65 test binaries + 13 doc-test binaries). All seven
+  Phase F gate tests pass individually:
+  `move_releases_the_state_lock_across_lvs_observation`,
+  `move_releases_the_state_lock_across_pvmove_start`,
+  `delete_releases_the_state_lock_across_lvs_existence_check`,
+  `delete_refuses_a_volume_that_changed_during_the_lvs_check`,
+  `create_releases_the_state_lock_across_vgs_pool_sample`,
+  `a_create_re_samples_when_the_allocation_epoch_moves` and
+  `create_compensation_releases_the_state_lock_across_lvremove`. All ten
+  #63 tests and the listed #64 retention/compaction/tombstone/config tests
+  pass. F1/F2 negative controls were reproduced during implementation
+  before commit; the F3 run only re-confirms the committed gate tests
+  pass, so it is not crash injection.
+- **Bundle.** [Phase F write-path remainder bundle](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md).
+  Both source manifests verified; the published measured `json/` and
+  `csv/` are byte-identical to the source run (`diff -rq` exit 0).
+- **Micro (descriptive only).** create p50 **195.561 → 205.42 ms
+  (+5.04%)**, p95 **215.488 → 225.682 (+4.73%)**; delete p50 **154.685 →
+  174.612 ms (+12.88%)**, p95 **174.961 → 185.304 (+5.91%)**. The same-SHA
+  non-evidence repeat measured create p50/p95 215.203/235.718 ms and
+  delete 174.623/194.684 ms. No A/B at `7204a53` was run in this batch, so
+  this is **not attributed** to Phase F and is neither a regression nor a
+  gain.
+- **Sweep (not attributed).** c1 **1,837.885 → 1,826.312 ops/s (−0.63%)**,
+  c8 **3,824.485 → 3,743.924 (−2.11%)**, c32 **2,436.350 → 2,311.046
+  (−5.14%)**, c128 **462.899 → 419.873 (−9.29%)**. Measured p95
+  1.451/7.401/45.273/138.175 ms; p99 1.56/11.478/93.864/**11,800.496** ms.
+  c128 completed 18,233 ops in **43.425 s** against a nominal 30 s tier
+  (non-evidence repeat 42.676 s, p99 12,523.519 ms). The timed sweep has no
+  create/delete/move and Phase F only touches those paths, so no delta is
+  **attributed**; no throughput or zero-regression claim.
+- **Soak (not attributed).** 1,500.003 s, 4 workers, **7,040,538 ops**,
+  **4,693.683 ops/s** (success 4,693.645), error rate **8e-06** (58
+  `NETWORK_ERROR`: 55 `ConnectionRefusedError`, 3 `RemoteDisconnected`, at
+  the planned restart), p50/p95/p99 **0.304/2.864/3.606 ms**, actual read
+  ratio **0.7999** vs target 0.6. Prior `7204a53`: 7,112,020 ops at
+  4,741.343 ops/s (−1.005% derived). The soak contains no create/delete;
+  the difference is **not attributed**.
+- **Resources and restart.** RSS first/last **75,716 → 2,668,132 KiB**,
+  high-water **2,762,300 KiB** (prior 2,842,396 KiB, −2.82% derived); fds
+  21 → 18, max 25; journal first/last **17,801,776 → 25,563,609 B**, delta
+  7,761,833 B, high-water **75,497,904 B** (prior 75,497,758 B); state
+  **3,413 → 2,977 B**, high-water 4,083 B. The journal high-water is
+  consistent with the documented post-compaction growth floor above the
+  64 MiB trigger, not a new unbounded-log finding and not a hard-cap claim;
+  the exact peak composition is not separately instrumented. Restart: pre-soak
+  0.102–0.103 s (3 rounds), mid-soak **0.425 s with 4/4 volumes and none
+  missing**, post-soak 0.366/0.364 s with 0 volumes after cleanup; all
+  `OK`. Daemon log 0 `ERROR` and 1,553 `WARN`, all the known
+  grow-notification retry for attachments without a `vmm_disk_id`.
+- **#63 findings (not fixes).** Schema v3 at
+  `crates/volvisor-lvm/src/state.rs:98`; the 8 KiB-bit filter at `:107` is
+  decode-only; the legacy vector is imported at `:416-439` but never written
+  or consulted. The fence is the strictly increasing per-volume attachment
+  generation (`crates/volvisor-lvm/src/provider.rs:3812-3816`, `:3821`,
+  `:3832`, `:3894-3898`; `crates/volvisor-provider/src/semantics.rs:232-235`
+  refuses `STALE_GENERATION`). Residuals:
+  per-volume-lifetime generation-1 reset across delete + same-id recreate
+  (`provider.rs:3406`, `:5111`), so a delayed report could match generation
+  1 if the same `attachment_id` is reused and no test covers it; the legacy
+  wire vector is unbounded at decode; a non-empty legacy filter is
+  preserved on save (up to 1 KiB/volume) though never consulted.
+  ADR-0012 remains **Proposed**.
+- **#64 findings (not fixes).** Retention/compaction/tombstone code is
+  present and tested
+  (`crates/volvisor-journal/src/journal.rs:37,40,43,46,56,64,74,1412-1417,
+  1448-1481,1029-1062,853-869,1073-1124,1743-1753`; config wiring
+  `crates/volvisord/src/config.rs:178-223,1374-1401`,
+  `crates/volvisord/src/runtime.rs:76`,
+  `examples/volvisor.toml:112-116`). Residuals: in-flight intents are never
+  evicted; "expiry" is a count window, not a TTL; a persistent compaction
+  failure backs off but leaves the log unbounded (metric only); the
+  terminal registry may reach 2x `max_retained_operations` between
+  compactions and the one-frame planner can reduce effective retention, so
+  configured bounds are soft; a 64-bit fingerprint collision can answer
+  `OPERATION_EXPIRED`; and the observed journal high-water above the
+  trigger is consistent with the documented post-compaction growth floor,
+  not a hard cap.
+- **Non-evidence repeat.** A same-SHA `--skip-soak` repeat exists at
+  `diagnostics/same-sha-repeat/` and is explicitly **NON-EVIDENCE**. It
+  was not used to select, replace or support the measured sample and
+  supports no performance claim.
+- **No gate change.** `#62`, `#63` and `#64` stay **open**; ADR-0012 stays
+  `Proposed`; gates 1/2/5 remain **NOT MET**, gates 3/4 **PARTIAL**, and
+  the overall status remains **NOT PRE-PRODUCTION READY**. The evidence
+  record includes no push, tag, pull request or issue-state change; the
+  branch itself was pushed earlier as WIP under explicit authorization, and
+  that push is not evidence.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |
@@ -450,6 +573,7 @@ READY**.
 | [Per-VG grow capacity-sample coalescing, 2026-11-05](../benchmarks/2026-11-05-devhost-grow-sample-coalescing/REPORT.md) | `75beea3` (code-identical to `a07203e`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after per-VG single-flight `vgs`; c128 throughput 655.326 → 508.225 ops/s (−22.45 %), grow p50 8,338.505 → 11,335.103 ms while p95 19,633.371 → 12,396.977 ms, soak −4.48 %; measured regression, reverted locally at `59f64cc` | Data path, real backends, 24 h soak, production capacity/SLA, a throughput or envelope improvement, an adopted change |
 | [Phase E create/delete lock scope, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-write-lock-scope/REPORT.md) | `2c5b065` (E1 `8cfa4c2`, E2 `2c5b065`), clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after releasing the state lock across `lvcreate`/`lvremove`; deterministic create/delete gate tests; c8/c32/c128 −2.35/−5.10/−6.77 %, soak −7.12 %; sweep and soak contain no create/delete, so no delta is attributed to E1/E2 | Data path, real backends, 24 h soak, production capacity/SLA, a Phase E gain, a zero-regression result, concurrent create/delete load |
 | [Phase E create/delete worker handoff, 2026-11-05](../benchmarks/2026-11-05-devhost-phase-e-worker-handoff/REPORT.md) | `7204a53`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and 25-min soak after routing create/delete bodies through `run_blocking_body`; create p50/p95 flat in both same-SHA samples, delete flat in the measured sample but +6.34 %/+5.90 % in an explicitly non-evidence repeat; gate tests for cross-kind refusal and reservation release with negative controls; c128 −24.24 % measured but not attributed (timed load has no create/delete; non-evidence A/B spans 427.5–626.0 ops/s across four runs of both arms, A 439.5–626.0 and B 427.5–432.8) | Data path, real backends, 24 h soak, production capacity/SLA, a handoff gain, a zero-regression result, concurrent create/delete load, a resolved delete overhead |
+| [Phase F write-path remainder, 2026-11-06](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md) | `2edcecd`, clean worktree | One host, loop-backed LVM, loopback HTTP | Clean-tree 1/8/32/128 sweep and shortened 25-min soak at the Phase F SHA; deterministic lock-scope gate tests for move/delete/create/failed-create compensation; #63 schema-v3/decode-only filter + generation-fence tests and #64 retention/compaction/tombstone/config tests pass (code present, issues not closed); c1/c8/c32/c128 −0.63/−2.11/−5.14/−9.29 % and soak −1.005 % measured but **not attributed** because the timed load has no create/delete/move (c128 p99 11,800.496 ms and 43.425 s duration recorded); RSS high-water 2,762,300 KiB and journal high-water 75,497,904 B recorded | Data path, real backends, 24 h soak, production capacity/SLA, a Phase F throughput or zero-regression result, that #62/#63/#64 are fixed, ADR-0012 acceptance |
 | CI real-LVM gate | `575acfc` | GitHub-hosted runner, loop device | `native-local` suite: 6/6 integration tests, unit suites, clippy/fmt | Real NVMe, Ceph, DRBD, multi-host |
 
 The benchmark bundle records 1/8/32/128 in-flight throughput of
