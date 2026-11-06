@@ -161,9 +161,11 @@ these and the invalid-input behavior.
 
 - **Observed flake rate: none published.** There is no in-repo history of
   nightly `campaign-flake` artifacts to compute one from.
-- **14-consecutive-night criterion: NOT MET.** Existing workflows collect
-  samples but no nightly history exists in the repository, and the workflow
-  summary reports only the current run.
+- **14-consecutive-night criterion: NOT MET.** The fuzz and campaign-flake
+  workflows are not on the default branch, so scheduled runs currently
+  collect nothing; no nightly history exists in the repository, and the
+  workflow summary reports only the current run. The 14-night clock starts
+  only after those workflows reach the default branch.
 - The calculator exists so that, once enough historical artifacts are
   downloaded, the rate and criterion can be computed reproducibly and
   reviewed instead of asserted.

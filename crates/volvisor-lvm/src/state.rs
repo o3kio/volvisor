@@ -2569,7 +2569,7 @@ mod tests {
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
             text.contains("\"schema_version\":4"),
-            "the first save stamps schema v3: {text}"
+            "the first save stamps schema v4: {text}"
         );
         assert!(
             !text.contains("retired_attachment_ids"),
@@ -2627,7 +2627,7 @@ mod tests {
         let text = fs::read_to_string(&target).expect("read upgraded");
         assert!(
             text.contains("\"schema_version\":4"),
-            "the first save stamps schema v3: {text}"
+            "the first save stamps schema v4: {text}"
         );
         assert!(
             !text.contains("pending_creates")

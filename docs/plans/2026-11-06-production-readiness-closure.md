@@ -222,7 +222,10 @@ W0 design (#62 ADR, #45 amendment, #50 docs, #49 nightly clock)
 | M6 exit review | M2–M5 | #36 gate-to-evidence report; no unmet gate waived; final verdict recorded. |
 
 W4 and W5 can overlap W2 once the hosts exist. W6 cannot start before M3.
-#49's 14-night clock should start at M0 because it cannot be compressed.
+#49's 14-night clock cannot be compressed, but it can start only after the
+campaign-flake workflow is on the default branch. The workflow is currently
+branch-only, so PR #73 must merge first; it cannot start at M0 as a local
+action.
 #43's 24 h soak belongs to W2 and may be repeated at the release candidate if
 the release changes the measured path.
 
@@ -293,7 +296,9 @@ Every closing bundle must satisfy [the evidence standards](../evidence/README.md
 2. Publish the rig request: three physical hosts + fourth-domain witness,
    BMC/power control, NVMe, Ceph test pool/keyring, DRBD peer, three cell
    hosts with VFIO, and the two self-hosted runner labels.
-3. Start the #49 nightly clock and the #50 documentation slice now.
+3. #50's structural documentation slice is already delivered on this branch;
+   #49's nightly clock starts only after the campaign-flake workflow reaches
+   the default branch (PR #73 must merge first).
 4. Run both preflights as soon as the rig exists; fix every failure before
    scheduling any campaign scenario.
 5. Only then start W2, W3 and the 24 h soak, in that order.

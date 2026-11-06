@@ -49,7 +49,7 @@ The controls above do **not** protect against:
   intentionally full control;
 - denial of service, resource exhaustion, traffic analysis or metadata
   leakage at the network layer. Application-level admission control
-  ([admission control](admission-control.md)) bounds per-principal request
+  ([admission control](../admission-control.md)) bounds per-principal request
   rate, in-flight concurrency and body size, but it is not a network-level
   DDoS defense;
 - a misconfigured external TLS terminator that forwards plaintext to an
@@ -315,6 +315,6 @@ them.
 - [ ] The audit sink is protected and retained.
 - [ ] `[admission]` limits and timeouts are sized to provider capacity;
       `429`/`503` responses are monitored and clients honour `Retry-After`
-      ([admission control](admission-control.md)).
+      ([admission control](../admission-control.md)).
 - [ ] `--check-config` passes for every daemon, then a real TLS startup and
       request are exercised before production traffic.

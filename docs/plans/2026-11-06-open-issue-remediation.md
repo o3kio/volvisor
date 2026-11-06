@@ -25,7 +25,7 @@ Related: [pre-production readiness](../releases/pre-production-readiness.md),
 
 ## Locally actionable now
 
-### #63 — durable attachment-generation allocator (ADR-0013)
+### #63 — retired-attachment-id accumulation and the durable attachment-generation allocator (ADR-0013)
 
 **Status: local implementation landed; issue stays open for evidence and the
 upgrade-window residual.**
@@ -45,8 +45,11 @@ Implemented ADR-0013:
   retired generation);
 - updated schema, configuration and ADR wording.
 
-Residual: a volume deleted *before* the upgrade has no record in a v3 file,
-so its consumed generations are unrecoverable. The ADR records that window.
+The original unbounded retired-id vector was replaced by the bounded schema-v3
+filter, so the accumulation risk is bounded; ADR-0013 addresses the remaining
+generation-reuse window. Residual: a volume deleted *before* the upgrade has no
+record in a v3 file, so its consumed generations are unrecoverable. The ADR
+records that window.
 Real-backend/multi-host evidence is still required. The [upgrade
 runbook](../runbooks/day-2/upgrade-and-rollback.md) now carries the pre-upgrade
 operator control (drain, hash/schema baseline, no volume-id reuse across the
@@ -79,6 +82,11 @@ Implemented the remaining ADR-0014 decision:
 `JR-04` remains: a failed compaction alone still never fails an
 already-authorized durable append that fits under the ceiling.
 
+Residual: no real-backend crash-consistency or 24-hour soak evidence. The
+[Phase F write-path remainder report](../benchmarks/2026-11-06-devhost-phase-f-write-path-remainder/REPORT.md)
+also records an RSS high-water of 2,762,300 KiB (about 2.76 GB). `#64` stays
+open.
+
 ### #45 — admission control, timeouts, pagination (remaining slice)
 
 The admission caps, read timeouts, body limits and list pagination are
@@ -94,16 +102,20 @@ act); it is **not accepted and not implemented**.
 ### #49 — parser fuzzing and interleaving tests (remaining slice)
 
 The fuzz corpus, compaction interleaving and nightly machinery are present.
-The outstanding acceptance criterion is a **14-night flake-rate record**;
-that is a scheduled-lane measurement, not a unit-test change. The local work
-is to keep the corpus/interleaving suite green and to wire the flake report
-format if it is missing.
+The 14-night flake-rate record is blocked until the campaign-flake workflow is
+on the default branch; the workflow is currently branch-only, so PR #73 must
+merge first. Ceph and DRBD state-decoder fuzz targets now exist with
+deterministic corpus regression tests; named detach/report, lease/cut and
+witness/resume interleavings remain local test work. No flake rate is
+published, and `#49` stays open until the scheduled record exists.
 
 ### #50 — knowledge concentration (local documentation slice)
 
-`ARCHITECTURE.md`, `CODEOWNERS`, a contributor guide and a review checklist
-can be written locally. The two-maintainer release/restore sign-off depends
-on #46/#47 and cannot be manufactured by documentation.
+The structural slice is already delivered on this branch: `ARCHITECTURE.md`,
+`.github/CODEOWNERS`, the `CONTRIBUTING.md` review checklist and
+`docs/bus-factor.md` exist. The remaining gaps are organizational — named
+per-area owners and the two-maintainer release/restore sign-off — and depend
+on #46/#47; they cannot be manufactured by documentation.
 
 ### #62 — control-plane write serialization (partial)
 

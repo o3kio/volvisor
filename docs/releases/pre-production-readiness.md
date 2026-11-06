@@ -508,6 +508,11 @@ It is a documentation, CI and test-enforcement batch: it changes no
 provider, journal or daemon behavior, so it does not alter the semantics of
 a running system or any existing durable file.
 
+The later [ADR-0013/0014 local implementation](#post-report-addendum-2026-11-06--adr-001314-local-implementation)
+addendum records the implementation at `3fa984a` and supersedes the
+"implementation pending" / "not implemented" statements in this section;
+gate verdicts and issue states are unchanged.
+
 - **Decision acceptance.** ADR-0012, ADR-0013, ADR-0014, ADR-0015 and
   ADR-0016 are **Accepted** (2026-11-06, zoorpha). Acceptance covers the
   decisions only: ADR-0013's durable allocator, ADR-0014's hard ceiling and

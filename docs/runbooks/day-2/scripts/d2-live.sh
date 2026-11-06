@@ -3,8 +3,9 @@
 #
 # This is deliberately not a simulation of a version bump. It builds the
 # product at OLD_COMMIT (default 8c2fc1a, LVM_STATE_SCHEMA_VERSION = 2) in a
-# disposable git worktree and builds the current NEW_COMMIT (v3) in a clean
-# worktree when the caller's worktree is dirty. It then runs the two binaries
+# disposable git worktree and builds NEW_COMMIT (default aad1720, the recorded
+# v3 build) in a clean worktree when the caller is dirty or not at NEW_COMMIT.
+# It then runs the two binaries
 # against the same loop-backed LVM lab:
 #
 #   1. OLD starts on the lab-seeded schema-v1 state file and writes the
@@ -21,16 +22,20 @@
 #
 # LIMITS: one physical host, loop-device LVM, debug builds, no real tenant
 # data path. This is single-host lab evidence, not a rolling multi-host
-# upgrade or a production release claim. d2.sh remains the same-binary v3
+# upgrade or a production release claim. d2.sh is the same-binary v4
 # schema-policy drill.
 #
-# Env overrides: OLD_COMMIT, NEW_COMMIT (default HEAD), REPO, BIN, RUN.
+# This is the historical v2->v3 reproduction at the recorded commits, not a
+# drill of the current v4 build.
+#
+# Env overrides: OLD_COMMIT, NEW_COMMIT (default aad1720, the recorded v3
+# build; NEW_COMMIT may override it), REPO, BIN, RUN.
 # shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
 
 TAG="d2live"
 OLD_COMMIT="${OLD_COMMIT:-8c2fc1a}"
-NEW_COMMIT="${NEW_COMMIT:-$(git -C "$REPO" rev-parse HEAD)}"
+NEW_COMMIT="${NEW_COMMIT:-aad1720}"
 OLD_SHORT="$(git -C "$REPO" rev-parse --short=7 "$OLD_COMMIT" 2>/dev/null || true)"
 NEW_SHORT="$(git -C "$REPO" rev-parse --short=7 "$NEW_COMMIT" 2>/dev/null || true)"
 OLD_WT=""
@@ -91,8 +96,17 @@ cap "build the old binary from the old worktree" \
   --manifest-path "$OLD_WT/Cargo.toml" --locked -p volvisord
 [[ -x "$OLD_BIN" ]] || { printf 'old binary missing: %s\n' "$OLD_BIN" | tee -a "$LOG"; exit 1; }
 
-if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
-  say "caller worktree is dirty; build NEW from a clean worktree at $NEW_COMMIT"
+CALLER_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+CALLER_DIRTY="$(git -C "$REPO" status --porcelain)"
+if [[ -z "$CALLER_DIRTY" ]] && [[ "$CALLER_HEAD" == "$(git -C "$REPO" rev-parse "$NEW_COMMIT")" ]]; then
+  say "caller worktree is clean at NEW_COMMIT; use the existing new build under BIN"
+  NEW_BIN="$BIN/volvisord"
+else
+  if [[ -n "$CALLER_DIRTY" ]]; then
+    say "caller worktree is dirty; build NEW from a clean worktree at $NEW_COMMIT"
+  else
+    say "caller worktree is clean but not at NEW_COMMIT; build NEW from a clean worktree at $NEW_COMMIT"
+  fi
   NEW_WT="$RUN/src-new-$NEW_SHORT"
   cap "create a clean worktree at new commit $NEW_COMMIT" \
     git -C "$REPO" worktree add --detach "$NEW_WT" "$NEW_COMMIT"
@@ -100,9 +114,6 @@ if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
     env CARGO_TARGET_DIR="$NEW_TARGET" cargo build \
     --manifest-path "$NEW_WT/Cargo.toml" --locked -p volvisord
   NEW_BIN="$NEW_TARGET/debug/volvisord"
-else
-  say "caller worktree is clean; use the existing new build under BIN"
-  NEW_BIN="$BIN/volvisord"
 fi
 [[ -x "$NEW_BIN" ]] || { printf 'new binary missing: %s\n' "$NEW_BIN" | tee -a "$LOG"; exit 1; }
 

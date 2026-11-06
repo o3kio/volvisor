@@ -141,7 +141,9 @@ Run one drill only:
 sudo RUN=/tmp/opencode/volvisor-day2-d4 \
   bash docs/runbooks/day-2/scripts/d4.sh
 
-# Real old (8c2fc1a, schema 2) -> new (HEAD, schema 3) -> restore drill.
+# Historical v2 -> v3 reproduction: real old (8c2fc1a, schema 2) -> recorded
+# v3 build (aad1720, schema 3) -> restore drill. The cross-binary v3 -> v4
+# upgrade still needs a separate refreshed drill.
 sudo RUN=/tmp/opencode/volvisor-d2live-$(date -u +%Y%m%dT%H%M%SZ) \
   bash docs/runbooks/day-2/scripts/d2-live.sh
 

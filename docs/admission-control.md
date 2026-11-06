@@ -44,7 +44,11 @@ What a client should do instead:
 **Explicitly not implemented:** a resumable operation handle / async job
 surface. Issue #45's long-operation checkbox that asks for such a handle
 stays unchecked; this document records the synchronous model instead of
-claiming a capability the daemon does not have.
+claiming a capability the daemon does not have. A
+[Proposed, not-accepted, not-normative contract amendment](../contracts/volume-api-v2-amendment-1-long-operations.md)
+records a future opt-in observation handle and per-route mutation response
+budgets; the capability is not implemented and the synchronous model above
+remains current.
 
 ## Read-route timeout
 

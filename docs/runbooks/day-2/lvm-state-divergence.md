@@ -73,12 +73,15 @@ A 5xx alone never proves "nothing happened". Startup reconciliation is the
 authority: it re-reads the durable intents and classifies them against `lvs`.
 
 The intent maps (`pending_creates`, `pending_grows`, `pending_deletes`) are
-defaulted and omitted when empty. Adding them is a durable-shape change, so
-`LVM_STATE_SCHEMA_VERSION` is **2**: v1 files load with empty maps and are
-upgraded by the first successful save, while an older binary refuses a v2
+defaulted and omitted when empty. Adding them was a durable-shape change that
+introduced `LVM_STATE_SCHEMA_VERSION` **2**: v1 files load with empty maps and
+are upgraded by the first successful save, while an older binary refuses a v2
 file with the typed unsupported-version error instead of failing on an
-unknown field. A state with a pending intent is therefore a supported v2
-file; see the
+unknown field. The current LVM schema is **4**: v3 replaced the unbounded
+retired-id vector with the fixed-size retired-id filter, and v4 added the
+attachment-generation allocator. A state file with a pending intent was
+therefore a supported v2 file; current files are v4, and an older binary
+refuses a v4 file the same way. See the
 [durable-state schema compatibility policy](../../schema-compatibility.md).
 The v1-stamped N-1 fixture is `tests/fixtures/schema/lvm-state-v2-n1.json`,
 loaded by the `volvisor-lvm` unit test and the daemon-store test

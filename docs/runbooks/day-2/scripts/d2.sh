@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# D2: same-binary schema policy drill (current binary, current v3 schema).
+# D2: same-binary schema policy drill (current binary, current v4 schema).
 #   - run the repository's populated-directory compatibility test;
-#   - live upgrade-on-write from a pre-versioning state file to v3;
-#   - live refusal of a newer schema without rewriting the file.
+#   - live upgrade-on-write from a pre-versioning state file to v4;
+#   - live refusal of a newer schema (v5) without rewriting the file.
 # This is NOT a live old-binary -> new-binary upgrade and NOT a rollback
 # drill. Those are performed by d2-live.sh with a real v2 binary built from
-# OLD_COMMIT and the current v3 build. See upgrade-and-rollback.md and the
+# OLD_COMMIT and the current v4 build. See upgrade-and-rollback.md and the
 # evidence bundles.
 # shellcheck disable=SC1091 # resolved from the script directory at runtime
 source "$(dirname "$0")/lib.sh"
@@ -41,7 +41,7 @@ D2_BIN_SHA="$(sha256sum "$D2_BIN" | cut -d' ' -f1)"
   printf 'caller_worktree_dirty=%s\n' "$([[ -n "$(git -C "$REPO" status --porcelain)" ]] && echo yes || echo no)"
   printf 'source_sha=%s\n' "$(git -C "$REPO" rev-parse HEAD)"
 } >"$RUN/records/$TAG-binaries.txt"
-cap "record the v3 drill binary identity (version, sha256, dirty flag)" cat "$RUN/records/$TAG-binaries.txt"
+cap "record the v4 drill binary identity (version, sha256, dirty flag)" cat "$RUN/records/$TAG-binaries.txt"
 
 STATE="$RUN/lab-$TAG/journal/lvm-state.json"
 JOURNAL="$RUN/lab-$TAG/journal"
@@ -95,23 +95,23 @@ api_expect "$CURL" POST "$BASE/v2/volumes" "$RUN/records/$TAG-create-new.json" 2
 stop_or_exit "$TAG-daemon"
 assert_no_writer "$JOURNAL" "stopped state has no writer before reading the upgraded file"
 
-cap "after the first successful write the file carries schema_version 3" jq '.schema_version' "$STATE"
+cap "after the first successful write the file carries schema_version 4" jq '.schema_version' "$STATE"
 cap "the attachment state/revision survived the upgrade-on-write" jq '.volumes["vol-upgrade-n1"].runtime.attachment | {state,state_revision,evidence}' "$STATE"
-cap "the v2 tombstone vector was imported into the legacy v3 filter (decode only)" jq '.volumes["vol-upgrade-tombstone"].runtime | {legacy_vector: (.retired_attachment_ids // "absent"), filter_inserted: .retired_attachment_filter.inserted}' "$STATE"
-assert_eq "$(jq -r '.schema_version' "$STATE")" "3" "upgraded schema_version"
+cap "the pre-versioning tombstone vector was imported into the legacy v3 filter (decode only)" jq '.volumes["vol-upgrade-tombstone"].runtime | {legacy_vector: (.retired_attachment_ids // "absent"), filter_inserted: .retired_attachment_filter.inserted}' "$STATE"
+assert_eq "$(jq -r '.schema_version' "$STATE")" "4" "upgraded schema_version"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state' "$STATE")" "active" "upgraded attachment state"
 assert_eq "$(jq -r '.volumes["vol-upgrade-n1"].runtime.attachment.state_revision' "$STATE")" "3" "upgraded attachment state_revision"
 assert_eq "$(jq -r '.volumes["vol-upgrade-tombstone"].runtime.retired_attachment_ids // "absent"' "$STATE")" "absent" "legacy tombstone vector is not rewritten"
-assert_eq "$(jq -r '.volumes["vol-upgrade-tombstone"].runtime.retired_attachment_filter.inserted' "$STATE")" "2" "tombstones imported into the v3 filter"
+assert_eq "$(jq -r '.volumes["vol-upgrade-tombstone"].runtime.retired_attachment_filter.inserted' "$STATE")" "2" "tombstones imported into the legacy v3 filter"
 
-say "live refusal of a newer schema: construct a hand-edited synthetic v4 copy and start the daemon"
+say "live refusal of a newer schema: construct a hand-edited synthetic v5 copy and start the daemon"
 cp "$STATE" "$RUN/records/$TAG-state-supported.json"
 # This copy is deliberately hand-edited test data, not a file any Volvisor
 # version wrote. Record the construction command and the resulting digest.
-printf '$ jq %q %q > %q\n' '.schema_version = 4' \
-  "$RUN/records/$TAG-state-supported.json" "$RUN/records/$TAG-state-v4.json" | tee -a "$LOG"
-jq '.schema_version = 4' "$RUN/records/$TAG-state-supported.json" >"$RUN/records/$TAG-state-v4.json"
-cp "$RUN/records/$TAG-state-v4.json" "$STATE"
+printf '$ jq %q %q > %q\n' '.schema_version = 5' \
+  "$RUN/records/$TAG-state-supported.json" "$RUN/records/$TAG-state-v5.json" | tee -a "$LOG"
+jq '.schema_version = 5' "$RUN/records/$TAG-state-supported.json" >"$RUN/records/$TAG-state-v5.json"
+cp "$RUN/records/$TAG-state-v5.json" "$STATE"
 cap "future schema file checksum before startup" sha256sum "$STATE"
 # The harness runs without `set -e`, so capture the expected refusal status
 # explicitly instead of toggling a shell option that was never enabled.
@@ -121,8 +121,8 @@ printf 'future-schema startup exit=%s\n' "$FUTURE_RC" | tee -a "$LOG"
 cap "future-schema daemon stderr" cat "$RUN/raw/$TAG-future.daemon.log"
 assert_eq "$FUTURE_RC" "1" "future schema startup exit status"
 assert_contains "$(cat "$RUN/raw/$TAG-future.daemon.log")" "unsupported durable-state schema version" "typed future-schema refusal"
-assert_contains "$(cat "$RUN/raw/$TAG-future.daemon.log")" "supports at most 3" "future-schema refusal names the v3 ceiling"
-assert_eq "$(sha256sum "$STATE" | cut -d' ' -f1)" "$(sha256sum "$RUN/records/$TAG-state-v4.json" | cut -d' ' -f1)" "future schema file untouched"
+assert_contains "$(cat "$RUN/raw/$TAG-future.daemon.log")" "supports at most 4" "future-schema refusal names the v4 ceiling"
+assert_eq "$(sha256sum "$STATE" | cut -d' ' -f1)" "$(sha256sum "$RUN/records/$TAG-state-v5.json" | cut -d' ' -f1)" "future schema file untouched"
 
 say "restore the supported schema and prove the same binary starts"
 cp "$RUN/records/$TAG-state-supported.json" "$STATE"

@@ -11,10 +11,11 @@ drilled.**
   with the typed unsupported-version error; restoring the whole stopped v2
   backup let the old binary serve the original volume again, and the
   post-backup volume was absent.
-- **DRILLED separately:** the `aad1720` binary's same-binary v3 policy drill
-  (pre-versioning → v3 upgrade-on-write, v4 refusal) is [`d2.sh`](scripts/d2.sh).
-  `d2.sh` asserts a v3 ceiling and needs a v4 refresh before it can be re-run
-  against the current v4 build.
+- **DRILLED separately (2026-11-04):** the `aad1720` binary's same-binary v3
+  policy drill (pre-versioning → v3 upgrade-on-write, v4 refusal) is
+  [`d2.sh`](scripts/d2.sh). The script has since been refreshed for the current
+  v4 build (pre-versioning → v4, synthetic-v5 refusal); no curated v4 evidence
+  bundle exists yet.
 - **NOT RUN:** a rolling multi-host upgrade, packaged/systemd upgrade and
   downgrade scriptlets, live Ceph/DRBD/migration/peer store upgrades, a
   data-plane workload during the swap, and the v3→v4 drain/allocator steps
@@ -302,9 +303,17 @@ There is no in-place downgrade. The supported procedure is:
 5. Verify attachments (state/revision/evidence and generation) and any legacy
    tombstone filter, then resume workloads.
 
-Lab-equivalent commands (from `d2-live.sh`, after stopping the new daemon):
+Lab-equivalent commands (from `d2-live.sh`, after stopping the new daemon).
+The drill defines `RUN` and `JOURNAL`; the guard below refuses a journal path
+outside `RUN`, and this must never be run on a live state directory:
 
 ```sh
+: "${RUN:?set RUN to the drill run directory}"
+: "${JOURNAL:?set JOURNAL to the drill journal directory}"
+[[ "$JOURNAL" == "$RUN/"* ]] || {
+  printf 'refusing to remove journal path outside RUN: %s\n' "$JOURNAL" >&2
+  exit 1
+}
 rm -rf "$JOURNAL"
 mkdir -p "$JOURNAL"
 tar -C "$JOURNAL" -xf "$RUN/records/d2live-pre-upgrade-state.tar"

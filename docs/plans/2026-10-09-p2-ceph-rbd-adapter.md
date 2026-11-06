@@ -5,7 +5,7 @@ Status: implementing
 Branch: `feat/p2-ceph-rbd-adapter`
 Normative: [ADR-0005](../adr/0005-ceph-rbd-and-managed-osds.md) Phase A,
 [SPEC-0002](../specs/SPEC-0002-volvisor-volume-virtualization.md) §12 P2 slice,
-[Volume API v2](../../../contracts/volume-api-v2.md), AGENTS rules 1–21.
+[Volume API v2](../../contracts/volume-api-v2.md), AGENTS rules 1–21.
 
 ## 1. Scope
 
