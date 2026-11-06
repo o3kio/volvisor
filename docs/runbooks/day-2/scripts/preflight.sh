@@ -96,7 +96,7 @@ printf '# repo: %s at %s (dirty=%s)\n' "$REPO" \
   "$([[ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]] && echo yes || echo no)"
 printf '# runner: uid=%s host=%s\n' "$(id -u)" "$(uname -n)"
 
-# shellcheck disable=SC2317 # invoked indirectly through `trap ... EXIT`
+# shellcheck disable=SC2317,SC2329 # invoked indirectly through `trap ... EXIT`
 cleanup() {
   if [[ -n "$BUILD_WT" && -d "$BUILD_WT" ]]; then
     git -C "$REPO" worktree remove --force "$BUILD_WT" >/dev/null 2>&1 || true
