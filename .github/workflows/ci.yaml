@@ -33,6 +33,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      # Pin the durable-semantics scenarios by exact test name. A renamed,
+      # removed or #[ignore]d test fails here even though the workspace run
+      # may still be green.
+      - name: Run the default durable-semantics scenarios
+        run: scripts/test-default-scenarios.sh
       - run: cargo doc --locked --no-deps --document-private-items
       # The fuzz workspace is excluded from the main workspace, so the
       # commands above do not compile it. Keep the harness itself gated on
@@ -52,10 +57,12 @@ jobs:
       - name: Validate the real-backend shell scripts
         run: |
           bash -n scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
+            scripts/test-default-scenarios.sh \
             scripts/lib/real-backends-common.sh \
             scripts/bench/lib.sh scripts/bench/run-all.sh scripts/bench/publish.sh
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck -x scripts/test-lvm.sh scripts/test-ceph.sh scripts/test-drbd.sh \
+            scripts/test-default-scenarios.sh \
             scripts/lib/real-backends-common.sh \
             scripts/bench/lib.sh scripts/bench/run-all.sh scripts/bench/publish.sh
       - name: Validate the day-2 drill scripts

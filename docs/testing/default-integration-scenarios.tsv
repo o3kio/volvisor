@@ -1,0 +1,64 @@
+# Default integration scenario catalog — machine-readable index.
+#
+# Columns are tab-separated:
+#   scenario_id  group  package  target  exact_test_name  invariant
+#
+# `target` is passed verbatim to cargo after `-p <package>` (for example
+# `--lib` or `--test lvm_tests`). `exact_test_name` is matched with
+# `cargo test ... -- --exact`. See default-integration-scenarios.md for the
+# normative description and scripts/test-default-scenarios.sh for the runner.
+scenario_id	group	package	target	exact_test_name	invariant
+WP-01	write-path	volvisor-lvm	--test lvm_tests	create_releases_the_state_lock_across_lvcreate	Create persists its intent, then runs lvcreate without the state lock.
+WP-02	write-path	volvisor-lvm	--test lvm_tests	create_releases_the_state_lock_across_vgs_pool_sample	Create samples vgs outside the lock or by a bounded epoch retry.
+WP-03	write-path	volvisor-lvm	--test lvm_tests	a_create_re_samples_when_the_allocation_epoch_moves	A capacity sample is retried or refused when the allocation epoch moves.
+WP-04	write-path	volvisor-lvm	--test lvm_tests	create_compensation_releases_the_state_lock_across_lvremove	Failed-create compensation runs lvremove without the state lock.
+WP-05	write-path	volvisor-lvm	--test lvm_tests	delete_releases_the_state_lock_across_lvs_existence_check	Delete runs its lvs existence check outside the lock.
+WP-06	write-path	volvisor-lvm	--test lvm_tests	delete_releases_the_state_lock_across_lvremove	Delete runs lvremove without the state lock.
+WP-07	write-path	volvisor-lvm	--test lvm_tests	delete_refuses_a_volume_that_changed_during_the_lvs_check	Delete refuses to act when the volume changed during the unlocked check.
+WP-08	write-path	volvisor-lvm	--test lvm_tests	move_releases_the_state_lock_across_lvs_observation	Move's lvs observation does not hold the state lock.
+WP-09	write-path	volvisor-lvm	--test lvm_tests	move_releases_the_state_lock_across_pvmove_start	Move's pvmove start does not hold the state lock.
+WP-10	write-path	volvisor-lvm	--test lvm_tests	grow_releases_the_state_lock_across_lvextend	Grow's lvextend does not hold the state lock.
+WP-11	write-path	volvisor-lvm	--test lvm_tests	grow_samples_capacity_without_holding_the_state_lock	Grow samples capacity outside the lock under the epoch protocol.
+FC-01	fail-closed	volvisor-lvm	--test lvm_tests	create_save_failure_rolls_back_lv_and_memory_and_converges_across_restart	A failed create save rolls back and converges on restart.
+FC-02	fail-closed	volvisor-lvm	--test lvm_tests	create_save_failure_with_a_failing_lvremove_surfaces_the_orphan	A failed compensating lvremove surfaces the orphan instead of claiming success.
+FC-03	fail-closed	volvisor-lvm	--test lvm_tests	create_save_failure_after_rename_is_honored_not_compensated	A create whose rename landed is honored, not compensated away.
+FC-04	fail-closed	volvisor-lvm	--test lvm_tests	create_save_failure_with_an_unreadable_durable_file_still_compensates	An unreadable durable file still fails closed and compensates.
+FC-05	fail-closed	volvisor-lvm	--test lvm_tests	a_create_compensation_clear_failure_keeps_the_intent_in_memory	A failed compensation clear keeps the intent for recovery.
+FC-06	fail-closed	volvisor-lvm	--test lvm_tests	create_intent_adopts_a_verified_lv_left_by_a_kill_window	A retry adopts only a verified LV left by a kill window.
+FC-07	fail-closed	volvisor-lvm	--test lvm_tests	delete_command_failure_keeps_the_pending_authorization_and_fences_new_authority	A failed delete keeps its durable authorization and fences new authority.
+FC-08	fail-closed	volvisor-lvm	--test lvm_tests	delete_intent_with_a_stale_generation_is_dropped_without_deleting	A stale delete intent is dropped without deleting the volume.
+FC-09	fail-closed	volvisor-lvm	--test lvm_tests	delete_final_save_failure_is_completed_at_startup	A failed delete completion is finished at startup.
+FC-10	fail-closed	volvisor-lvm	--test lvm_tests	delete_intent_save_failure_leaves_the_volume_untouched	A failed delete-intent save leaves the volume untouched.
+FC-11	fail-closed	volvisor-lvm	--test conformance	provider_conformance::idempotent_create	Create replay is idempotent and payload-exact.
+GF-01	generation	volvisor-lvm	--test lvm_tests	reattaching_a_consumed_id_fences_the_retired_instance_by_generation	A consumed attachment id cannot be reattached under a stale generation.
+GF-02	generation	volvisor-lvm	--test lvm_tests	report_state_survives_a_provider_restart_and_never_moves_the_generation	Restart preserves attachment state and never moves the generation.
+GF-03	generation	volvisor-lvm	--test lvm_tests	attach_replay_survives_a_provider_restart	Attachment replay survives a provider restart.
+GF-04	generation	volvisor-lvm	--test lvm_tests	attach_replay_conflicts_on_a_different_vmm_disk_id	Attachment replay with a different disk id is a typed conflict.
+GF-05	generation	volvisor-lvm	--test lvm_tests	attach_replay_never_fabricates_a_second_attachment	Attachment replay never fabricates a second attachment.
+GF-06	generation	volvisor-provider	--lib	semantics::tests::generation_fences_are_typed_and_separate	Generation fences are distinct typed refusals.
+GF-07	generation	volvisor-provider	--lib	semantics::tests::reports_advance_monotonically_without_moving_the_generation	Reports advance monotonically without changing the generation.
+GF-08	generation	volvisor-provider	--lib	semantics::tests::attach_replay_is_identity_exact	Attachment replay is identity-exact.
+GF-09	generation	volvisor-lvm	--test conformance	provider_conformance::attach_stale_generation	A stale expected generation is refused.
+GF-10	generation	volvisor-lvm	--test conformance	provider_conformance::idempotent_attach	Attach replay is idempotent.
+GF-11	generation	volvisor-lvm	--test conformance	provider_conformance::attach_single_writer	Single-writer attachment admission is preserved.
+SC-01	schema	volvisor-lvm	--lib	state::tests::v3_n_minus_one_fixture_imports_legacy_ids_and_upgrades_to_v3	The v3 N-1 fixture imports legacy ids and upgrades without loss.
+SC-02	schema	volvisor-lvm	--lib	state::tests::tombstone_fixture_preserves_retired_attachment_ids	The legacy tombstone fixture decodes without loss.
+SC-03	schema	volvisor-lvm	--lib	state::tests::retired_attachment_filter_has_no_false_negatives_and_is_bounded	The retired-id filter has no false negatives and is bounded.
+SC-04	schema	volvisor-lvm	--lib	state::tests::malformed_retired_attachment_filter_is_rejected	A malformed filter is refused typed.
+SC-05	schema	volvisor-lvm	--lib	state::tests::a_legacy_vector_is_merged_into_an_existing_filter_without_false_negatives	A legacy vector merges into an existing filter without loss.
+SC-06	schema	volvisor-lvm	--lib	state::tests::a_noncanonical_filter_with_set_bits_is_never_treated_as_empty	A noncanonical filter with set bits is not treated as empty.
+SC-07	schema	volvisor-lvm	--lib	state::tests::future_schema_version_is_refused_typed_without_rewriting	A future schema version is refused without rewriting the file.
+SC-08	schema	volvisor-lvm	--lib	state::tests::zero_schema_version_is_refused_typed	A zero schema version is refused typed.
+JR-01	journal	volvisor-journal	--lib	journal::tests::compaction_bounds_the_log_and_expires_evicted_operations	Compaction bounds the log and expires evicted operations.
+JR-02	journal	volvisor-journal	--lib	journal::tests::the_tombstone_window_is_bounded_and_its_overflow_is_the_documented_contract	The tombstone window is bounded and overflow has the documented answer.
+JR-03	journal	volvisor-journal	--lib	journal::tests::bounded_replay_evicts_and_compacts_before_serving	Replay evicts and compacts before serving.
+JR-04	journal	volvisor-journal	--lib	journal::tests::a_failed_compaction_never_fails_the_durable_append_and_is_retried	A failed compaction never fails a durable append and is retried.
+JR-05	journal	volvisor-journal	--lib	journal::tests::a_persistently_failing_compaction_backs_off_and_recovers_after_growth	A persistent compaction failure backs off and recovers after growth.
+JR-06	journal	volvisor-journal	--lib	journal::tests::compaction_evicts_to_fit_one_frame_instead_of_failing_forever	Compaction evicts to fit one frame instead of failing forever.
+JR-07	journal	volvisor-journal	--lib	journal::tests::a_post_snapshot_record_for_a_snapshot_tombstone_is_still_refused	A post-snapshot record for a snapshot tombstone is still refused.
+JR-08	journal	volvisor-journal	--lib	journal::tests::a_pinned_operation_is_never_evicted_while_its_retry_is_executing	A pinned in-flight operation is never evicted.
+JR-09	journal	volvisor-journal	--lib	journal::tests::a_pin_interleaved_with_compaction_preserves_the_replacement_outcome_across_reopen	A pin interleaved with compaction preserves the outcome across reopen.
+JR-10	journal	volvisor-journal	--lib	journal::tests::a_redriven_outcome_after_a_replay_window_eviction_reopens_instead_of_wedging	A redriven outcome after window eviction reopens instead of wedging.
+CF-01	config	volvisord	--lib	config::tests::journal_retention_defaults_are_bounded_and_mapped	Journal retention defaults are bounded and mapped to the runtime.
+CF-02	config	volvisord	--lib	config::tests::journal_retention_is_parsed_and_zero_bytes_disables_only_the_byte_trigger	Retention parses and zero bytes disables only the byte trigger.
+CF-03	config	volvisord	--lib	config::tests::journal_retention_rejects_zero_bounds_and_unknown_keys	Invalid retention bounds and unknown keys are refused.

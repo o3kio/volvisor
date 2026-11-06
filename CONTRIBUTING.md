@@ -80,6 +80,7 @@ every tier has been run.
 | Tier / suite | What runs | Command | Hardware / prerequisites |
 |---|---|---|---|
 | Workspace unit + integration | All default tests: API, journal, providers over fakes/testkits, handoff, witness, TLS, daemon e2e, campaign Tier S and skipped Tier R/V gate records | `cargo test --workspace --locked` | None beyond a normal Linux build host |
+| Default durable-semantics scenarios | Exact-name pinned provider write-path, create/delete compensation, attachment-generation, schema-decode, journal-retention and config regression tests. A renamed, removed or ignored test fails the gate | `scripts/test-default-scenarios.sh` (add `--list-only` to check presence only) | None; CI runs the full form in the `check` job |
 | Provider conformance | Each provider's `tests/conformance.rs` over the shared kit | Included in `cargo test --workspace --locked` | None |
 | Property/state-machine | `proptest` state-machine suite for provider semantics | `cargo test -p volvisor-provider --test state_machine` | None |
 | Journal replay/faults | Replay, torn-tail and injected append failures | `cargo test -p volvisor-journal`; fault injection is feature-gated (`--features test-faults`, test-only) | None |
@@ -97,6 +98,24 @@ when its rig is missing, and writes JUnit/log evidence under
 `target/real-backends/<suite>/`. A skipped suite is not a pass. See
 [docs/testing/real-backends.md](docs/testing/real-backends.md) for the full
 rig contract, runner labels, secrets/variables and triage.
+
+### Durable-semantics changes
+
+A change that alters durable meaning — an on-disk schema or record version,
+generation/epoch/fence/allocator semantics, journal retention or replay,
+crash recovery or compensation, the lock invariant in
+[ADR-0015](docs/adr/0015-write-path-critical-section-invariant.md), or a
+configuration bound and its failure behavior — must follow
+[ADR-0016](docs/adr/0016-semantic-change-and-default-scenario-gate.md). It
+needs an ADR or ADR amendment, a compatibility/migration statement, a
+fail-closed refusal path, a scenario in
+[docs/testing/default-integration-scenarios.md](docs/testing/default-integration-scenarios.md),
+rollback/replay evidence, and a green default suite.
+
+Do not reinterpret existing durable state in place. If old and new binaries
+would read any existing byte differently, bump the schema version and add the
+N-1 fixture before writing the new shape
+([schema compatibility](docs/schema-compatibility.md)).
 
 ### Fake vs privileged suites
 
@@ -186,6 +205,12 @@ Before requesting review:
 - [ ] New or changed durable state follows
       [docs/schema-compatibility.md](docs/schema-compatibility.md), including a
       version decision and an N-1 fixture when the shape changes.
+- [ ] A durable-semantics change (schema, generation/fence, journal retention
+      or replay, recovery/compensation, the ADR-0015 lock invariant, or a
+      durable config bound) cites an ADR, states the migration/rollback shape,
+      and adds or updates a scenario in
+      [docs/testing/default-integration-scenarios.md](docs/testing/default-integration-scenarios.md).
+      `scripts/test-default-scenarios.sh` passes.
 - [ ] No secret material (tokens, keys, keyrings, shared secrets) is logged,
       journaled or committed. Journal payload redaction still covers new
       credential fields.
@@ -195,9 +220,10 @@ Before requesting review:
       SLA, zero-RPO or multi-host claim is made beyond recorded evidence
       (AGENTS rule 12).
 - [ ] New links in Markdown resolve, and ADR statuses are respected.
-- [ ] `cargo fmt`, clippy with `-D warnings`, workspace tests and docs pass.
-      Add the relevant real-backend or campaign command/result if the change
-      touches those surfaces, or state that it was not run and why.
+- [ ] `cargo fmt`, clippy with `-D warnings`, workspace tests, the default
+      durable-semantics scenarios and docs pass. Add the relevant real-backend
+      or campaign command/result if the change touches those surfaces, or state
+      that it was not run and why.
 - [ ] The PR is focused, names the issue it closes/advances, and includes the
       exact commands used.
 

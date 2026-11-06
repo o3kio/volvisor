@@ -496,6 +496,75 @@ evidence.
   branch itself was pushed earlier as WIP under explicit authorization, and
   that push is not evidence.
 
+## Post-report addendum (2026-11-06) — durable-semantics decisions and the default scenario gate
+
+This addendum records the architecture decisions and the enforceable
+regression gate created from the Phase F findings. It follows the
+[Phase F addendum](#post-report-addendum-2026-11-06--phase-f-write-path-remainder-and-6364-verification).
+**It changes no gate verdict below, accepts no ADR, and closes no issue.**
+It is a documentation, CI and test-enforcement batch: it changes no
+provider, journal or daemon behavior, so it does not alter the semantics of
+a running system or any existing durable file.
+
+- **ADR-0013 — durable attachment-generation allocator (Proposed).**
+  Records the `#63` finding that the generation fence is per volume lifetime:
+  `create_volume` writes generation `1` and delete removes the record, so a
+  delete + same-id recreate restarts at `1`. The decision is one durable
+  monotonic `next_attachment_generation: u64` in LVM state (schema v4), never
+  reset, seeded from the maximum persisted volume/attachment generation on v3
+  decode, failing closed at `u64::MAX`. The one residual the v3 file cannot
+  close is a volume deleted before the upgrade: its consumed generations are
+  gone, so a delayed report from that pre-upgrade incarnation can still match
+  during the upgrade window. **Not implemented.**
+- **ADR-0014 — journal bounds and exhaustion contract (Proposed).** Records
+  that terminal retention is bounded and in-flight intents are never evicted,
+  but expiry is a count window, configured values are soft targets, and a
+  persistent compaction failure can still grow the log. The decision adds a
+  hard ceiling above the byte trigger with a typed `JOURNAL_FULL`/503 refusal
+  while reads and replay continue, plus refusal metrics; it also proposes
+  refusing new mutating work when in-flight intents cannot be snapshotted.
+  **The hard ceiling, the cannot-fit mutation refusal and their metrics are
+  not implemented.**
+- **ADR-0015 — write-path critical-section invariant (Proposed).** Records
+  the Phase E/F invariant: the provider state lock may span validation,
+  reservation, durable save and commit, but never an external `lvcreate`,
+  `lvremove`, `lvs`, `vgs`, `pvs`, `pvmove` or `lvextend` on a request path.
+  The durable intent plus revalidation is the cross-command fence. The
+  failure-only durable re-read that classifies a failed save, the
+  single-threaded startup recovery lock, and move's inline CLI worker
+  handoff remain accepted exceptions/residuals. This proves the existing
+  lock scope; it is not a new narrowing.
+- **ADR-0016 — semantic-change and default-scenario gate (Proposed).**
+  Requires any durable-semantics change to carry an ADR or amendment, a
+  compatibility/migration and rollback statement, a fail-closed refusal path,
+  an exact-name default scenario, rollback/replay evidence and a green
+  default suite before merge.
+- **Default scenario catalog.** `docs/testing/default-integration-scenarios.md`
+  is the normative catalog and `docs/testing/default-integration-scenarios.tsv`
+  is its machine-readable list: 54 exact tests across write-path lock scope
+  (WP), fail-closed create/delete and idempotency (FC), attachment
+  generation/fence (GF), schema decode (SC), journal retention/replay (JR)
+  and durable configuration bounds (CF). `scripts/test-default-scenarios.sh`
+  caches `cargo test -- --list`, asserts each exact test exists and is
+  documented, then runs it with `--exact --test-threads=1` and requires
+  exactly one passing and zero ignored tests. The `check` CI job runs it
+  after `cargo test --workspace --locked`; `test-harness` adds `bash -n` and
+  `shellcheck` coverage. The gate reports **54 passed** in this batch.
+- **New scenarios still owed by the ADRs.** ADR-0013's delete + same-id
+  recreate fence (`GF-12`) and ADR-0014's hard-ceiling refusal (`JR-11`,
+  `JR-12`) are not yet implemented and therefore not in the catalog. ADR-0014
+  also owes a cannot-fit refusal scenario (amending `JR-04`, which pins the
+  current append-never-fails behavior for a failed compaction). They must be
+  added with their implementations before those ADRs can be considered met.
+- **No gate change and no acceptance.** ADR-0012, ADR-0013, ADR-0014,
+  ADR-0015 and ADR-0016 remain **Proposed**; accepting them needs an
+  accepting authority and date. `#62`, `#63` and `#64` remain **open**.
+  Gates 1/2/5 remain **NOT MET**, gates 3/4 **PARTIAL**, and the overall
+  status remains **NOT PRE-PRODUCTION READY**. This batch creates no
+  production-support, SLA, zero-RPO, durability, capacity, hardware,
+  multi-host, release or 24-hour-soak claim, and no push, tag, pull request
+  or issue-state change is part of the evidence record.
+
 ## Gate verdicts
 
 | # | Gate | Verdict | What is missing |
