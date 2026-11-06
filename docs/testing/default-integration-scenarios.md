@@ -30,15 +30,38 @@ data-path benchmark, a real-backend qualification, a 24-hour soak, or a
 multi-host/hardware result. A green catalog says the control-plane
 regression semantics below still hold on the test host.
 
+## Acceptance time budget
+
+The gate is deliberately fast so it can run on every acceptance:
+
+- **60 s for any single scenario** (`--per-test-timeout`, default `60`).
+- **300 s for the whole warm execution** (`--budget`, default `300`).
+  Compilation and test-binary listing happen before the timer starts and are
+  outside the budget, so a cold build does not consume it.
+- A test that exceeds either bound fails the gate with a typed message.
+
+Indicative warm baseline for the initial 54 scenarios on the development
+host: **9.0 s total, slowest 1.4 s**. Treat that as a measured baseline, not
+a CI SLA.
+
+Long-running work is **not admitted** to this catalog: the shortened or
+24-hour soak, the real LVM/Ceph/DRBD suites, campaign Tier R/V, fault
+campaigns, fuzzing and evidence benchmarks stay in their scheduled or
+evidence lanes. If a semantic needs a long run to prove, add a fast
+deterministic scenario for acceptance and record the long proof separately.
+
 ## How to run
 
 ```sh
-# Run every catalogued test, exactly, one at a time.
+# Run every catalogued test, exactly, under the default 60 s/300 s budget.
 scripts/test-default-scenarios.sh
 
 # Fast check: verify each test still exists and each scenario is documented,
 # without executing it.
 scripts/test-default-scenarios.sh --list-only
+
+# Tighten the budget for a constrained acceptance host.
+scripts/test-default-scenarios.sh --per-test-timeout 30 --budget 120
 ```
 
 The runner reads
@@ -60,6 +83,11 @@ before merge (see ADR-0016). The change set must include:
 3. the fail-closed refusal path;
 4. a new row in the TSV and a row in this document with the exact test name;
 5. rollback/replay evidence or an explicit recorded gap.
+
+The scenario must fit the acceptance budget (60 s for that test, 300 s for
+the whole warm catalog). A test that needs a long run, a real backend, root
+or a soak is not a default scenario; pair a fast deterministic scenario with
+a separately recorded long proof.
 
 Removing, renaming or ignoring a catalogued test is a semantic change, not
 test cleanup. It requires the same review as the behavior it protects.

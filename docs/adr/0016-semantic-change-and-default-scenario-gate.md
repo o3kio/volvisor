@@ -69,7 +69,11 @@ Such a change must include all of the following in the same change set:
 4. **A default scenario.** At least one exact test in the
    [default integration scenario catalog](../testing/default-integration-scenarios.md)
    proves the new semantics and its refusal path. The scenario is added to
-   the catalog and passes through `scripts/test-default-scenarios.sh`.
+   the catalog and passes through `scripts/test-default-scenarios.sh`. It
+   must fit the fast acceptance budget enforced by that runner: **60 s for
+   the test and 300 s for the whole warm catalog execution**. A test that
+   needs a long run, real hardware or a soak is not a default scenario; pair
+   a fast deterministic scenario with a separately recorded long proof.
 5. **Rollback and replay evidence.** State how an operator returns to the
    previous binary (state restore plus matching binary, per the compatibility
    policy) and what replay does with a durable intent written by the new
@@ -103,8 +107,9 @@ best-effort behavior.
 - `docs/testing/default-integration-scenarios.md` is the normative catalog.
   `docs/testing/default-integration-scenarios.tsv` is its machine-readable
   test list. `scripts/test-default-scenarios.sh` verifies that every exact
-  test exists, runs it with `--exact`, and fails if it is missing, ignored or
-  not passing.
+  test exists, runs it with `--exact`, enforces a 60 s per-test timeout and a
+  300 s total warm execution budget, and fails if a test is missing, ignored,
+  not passing or over budget. Compilation is outside the budget.
 - The `check` job in `.github/workflows/ci.yaml` runs the script on every
   change, after the workspace test suite.
 - `CONTRIBUTING.md` and `AGENTS.md` state the rule; the pull-request
@@ -117,7 +122,8 @@ best-effort behavior.
 
 - Durable-semantics changes are slightly slower to land, by design.
 - The catalog becomes a maintained surface. A stale test fails CI instead of
-  silently disappearing.
+  silently disappearing, and a test that grows past the acceptance budget
+  fails instead of making every change wait for a soak.
 - The catalog is control-plane evidence, not a production-support claim. A
   green default suite does not qualify a real backend, a 24-hour soak or a
   multi-host deployment.

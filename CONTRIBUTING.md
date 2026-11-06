@@ -80,7 +80,7 @@ every tier has been run.
 | Tier / suite | What runs | Command | Hardware / prerequisites |
 |---|---|---|---|
 | Workspace unit + integration | All default tests: API, journal, providers over fakes/testkits, handoff, witness, TLS, daemon e2e, campaign Tier S and skipped Tier R/V gate records | `cargo test --workspace --locked` | None beyond a normal Linux build host |
-| Default durable-semantics scenarios | Exact-name pinned provider write-path, create/delete compensation, attachment-generation, schema-decode, journal-retention and config regression tests. A renamed, removed or ignored test fails the gate | `scripts/test-default-scenarios.sh` (add `--list-only` to check presence only) | None; CI runs the full form in the `check` job |
+| Default durable-semantics scenarios | Exact-name pinned provider write-path, create/delete compensation, attachment-generation, schema-decode, journal-retention and config regression tests. A renamed, removed, ignored or over-budget test fails the gate. Time-bounded to 60 s per test and 300 s total warm execution | `scripts/test-default-scenarios.sh` (add `--list-only` to check presence only) | None; CI runs the full form in the `check` job |
 | Provider conformance | Each provider's `tests/conformance.rs` over the shared kit | Included in `cargo test --workspace --locked` | None |
 | Property/state-machine | `proptest` state-machine suite for provider semantics | `cargo test -p volvisor-provider --test state_machine` | None |
 | Journal replay/faults | Replay, torn-tail and injected append failures | `cargo test -p volvisor-journal`; fault injection is feature-gated (`--features test-faults`, test-only) | None |
@@ -110,7 +110,10 @@ configuration bound and its failure behavior — must follow
 needs an ADR or ADR amendment, a compatibility/migration statement, a
 fail-closed refusal path, a scenario in
 [docs/testing/default-integration-scenarios.md](docs/testing/default-integration-scenarios.md),
-rollback/replay evidence, and a green default suite.
+rollback/replay evidence, and a green default suite. The default scenario must
+fit the acceptance budget: 60 s for that test and 300 s for the whole warm
+catalog. Long-running proof belongs in its own scheduled or evidence lane, not
+in the acceptance gate.
 
 Do not reinterpret existing durable state in place. If old and new binaries
 would read any existing byte differently, bump the schema version and add the

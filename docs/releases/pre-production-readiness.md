@@ -547,9 +547,15 @@ a running system or any existing durable file.
   and durable configuration bounds (CF). `scripts/test-default-scenarios.sh`
   caches `cargo test -- --list`, asserts each exact test exists and is
   documented, then runs it with `--exact --test-threads=1` and requires
-  exactly one passing and zero ignored tests. The `check` CI job runs it
+  exactly one passing and zero ignored tests. It is time-bounded so acceptance
+  stays fast: **60 s per test and 300 s total warm execution** (compilation
+  and test-binary listing are outside the budget), and a test over either
+  bound fails the gate. Soaks, real-backend suites, campaign tiers and fault
+  campaigns are not admitted to this catalog. The `check` CI job runs it
   after `cargo test --workspace --locked`; `test-harness` adds `bash -n` and
-  `shellcheck` coverage. The gate reports **54 passed** in this batch.
+  `shellcheck` coverage. The gate reports **54 passed in 9.0 s warm**
+  (slowest 1.4 s) in this batch; that timing is a measured baseline, not a
+  CI SLA.
 - **New scenarios still owed by the ADRs.** ADR-0013's delete + same-id
   recreate fence (`GF-12`) and ADR-0014's hard-ceiling refusal (`JR-11`,
   `JR-12`) are not yet implemented and therefore not in the catalog. ADR-0014

@@ -7,6 +7,9 @@
 # `--lib` or `--test lvm_tests`). `exact_test_name` is matched with
 # `cargo test ... -- --exact`. See default-integration-scenarios.md for the
 # normative description and scripts/test-default-scenarios.sh for the runner.
+#
+# Acceptance budget: every row must finish within 60 s warm, and the whole
+# catalog within 300 s warm. Long-running tests are not admitted here.
 scenario_id	group	package	target	exact_test_name	invariant
 WP-01	write-path	volvisor-lvm	--test lvm_tests	create_releases_the_state_lock_across_lvcreate	Create persists its intent, then runs lvcreate without the state lock.
 WP-02	write-path	volvisor-lvm	--test lvm_tests	create_releases_the_state_lock_across_vgs_pool_sample	Create samples vgs outside the lock or by a bounded epoch retry.
