@@ -184,6 +184,14 @@ pub(crate) const VG_HEADROOM_BYTES: u64 = 4 << 20;
 /// retry must use a new operation id.
 const GROW_ADMISSION_ATTEMPTS: usize = 32;
 
+/// Maximum optimistic capacity-sample rounds for one create admission.
+///
+/// Same liveness guard as [`GROW_ADMISSION_ATTEMPTS`]: each stale round
+/// costs another `vgs` call, so sustained allocation churn must not keep one
+/// create looping forever. Exhaustion returns an `OVERLOADED` refusal and the
+/// client retries with a new operation id.
+const CREATE_ADMISSION_ATTEMPTS: usize = 32;
+
 /// Physical extent size assumed when `vgs` does not report one (LVM's
 /// own default; bigger arrays legitimately use bigger extents).
 const DEFAULT_EXTENT_BYTES: u64 = 4 << 20;
@@ -208,6 +216,18 @@ struct VgCapacity {
 enum GrowPrepare<'a> {
     Prepared {
         grow_intent: GrowIntent,
+        reservation: CapacityReservation<'a>,
+    },
+    SampleStale,
+}
+
+/// The outcome of one create-preparation attempt under the state lock.
+///
+/// `SampleStale` means an allocation completed after the `vgs` sample was
+/// taken; the reservation has been released and the caller must re-sample.
+enum CreatePrepare<'a> {
+    Prepared {
+        intent: CreateIntent,
         reservation: CapacityReservation<'a>,
     },
     SampleStale,
@@ -1779,6 +1799,29 @@ impl LvmProvider {
         }
     }
 
+    /// Lock the writer state without the admission-alignment load.
+    ///
+    /// The failed-create compensation has already classified the durable
+    /// file explicitly; when that file is unreadable it leaves
+    /// `needs_alignment` set, so [`Self::lock_state_stable`] refuses to hand
+    /// back a view. The compensation still needs to attempt its clear save
+    /// and classify that attempt's outcome (the existing fail-closed
+    /// direction), so this raw guard bypasses only the alignment load. A
+    /// poisoned mutex still fails here.
+    fn lock_state_compensation(&self) -> Result<StateGuard<'_>, ApiError> {
+        let guard = self.state.lock().map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "LVM provider state lock poisoned by a previous failure",
+            )
+        })?;
+        Ok(StateGuard {
+            guard,
+            writer: &self.writer,
+            dirty: false,
+        })
+    }
+
     /// The committed read view (issue #62).
     ///
     /// Clones the published `Arc` under a short read lock; the caller
@@ -1990,9 +2033,10 @@ impl LvmProvider {
     /// failed), the volume is never erased from memory while its LV
     /// remains: the durable record is restored and the volume is served.
     /// Neither failure ever masks the original save error.
+    #[allow(clippy::too_many_lines)] // one compensation/durable-classification narrative
     fn compensate_unpersisted_create(
         &self,
-        state: &mut StateGuard<'_>,
+        mut state: StateGuard<'_>,
         volume_id: &VolumeId,
         vg_name: &str,
         lv_name: &str,
@@ -2011,13 +2055,49 @@ impl LvmProvider {
         // inside `persist`): adopt a landed save, otherwise revert, and
         // leave the flag set when the durable file is unreadable.
         if self.writer.needs_alignment() {
-            self.reconcile_failed_save(state);
+            self.reconcile_failed_save(&mut state);
         }
+        // Roll the uncommitted in-memory edit (volume inserted, intent
+        // removed) back to the last published durable view before the guard
+        // is released: a failed save must never become visible as a phantom
+        // volume when the guard drops. The intent is removed from memory
+        // only after the compensating removal below, then cleared durably.
+        state.revert();
 
+        // The compensating `lvremove` is an external CLI call, so run it
+        // without the provider state lock; the durable-file classification
+        // above stays under the lock, and the in-memory rollback plus clear
+        // save below reacquire it. Phase F F2c (#62).
+        drop(state);
         let removed = self
             .runner
             .run("lvremove", &["--yes", &format!("{vg_name}/{lv_name}")])
             .is_ok_and(|output| output.success);
+        let mut state = match self.lock_state_stable() {
+            Ok(state) => state,
+            // The durable-file classification above already ran. When that
+            // file is unreadable, alignment cannot load it and
+            // `lock_state_stable` refuses; fall back to the raw guard so the
+            // clear save is still attempted and its failure is classified
+            // by the existing re-read (never a silent success). A poisoned
+            // mutex fails here too and is reported below.
+            Err(_align_error) => match self.lock_state_compensation() {
+                Ok(state) => state,
+                Err(lock_error) => {
+                    // The removal already ran (or its outcome is unknown) and
+                    // the create intent could not be cleared. Never mask the
+                    // original save error: report both and leave the durable
+                    // intent for recovery to classify.
+                    return Self::compensation_relock_error(
+                        save_error,
+                        vg_name,
+                        lv_name,
+                        removed,
+                        &lock_error,
+                    );
+                }
+            },
+        };
         state.remove_volume(volume_id);
         // Reconciliation may have restored the durable intent; the clear
         // save below is what removes it durably.
@@ -2040,7 +2120,7 @@ impl LvmProvider {
         // outlives the compensation. Classify the clear's own failure:
         // the rename may have landed, in which case the durable intent
         // is gone and the compensation is complete.
-        if let Err(clear_error) = self.persist(state) {
+        if let Err(clear_error) = self.persist(&mut state) {
             // If the durable file may still hold the create intent, put
             // it back in memory: a later successful save from this
             // provider must not erase an authorization startup
@@ -2135,6 +2215,36 @@ impl LvmProvider {
             let cleanup_note = format!(" (cleanup save failed: {clear_error})");
             detail.push_str(&cleanup_note);
         }
+        ApiError::new(save_error.code, detail)
+    }
+
+    /// Report a compensation whose durable-file classification completed but
+    /// whose state lock could not be reacquired after the compensating
+    /// `lvremove`.
+    ///
+    /// The original save error is never masked: its code and detail lead, and
+    /// the removal outcome plus the re-lock failure are appended so recovery
+    /// can classify the durable intent.
+    fn compensation_relock_error(
+        save_error: &ApiError,
+        vg_name: &str,
+        lv_name: &str,
+        removed: bool,
+        lock_error: &ApiError,
+    ) -> ApiError {
+        let mut detail = save_error.detail.clone();
+        detail.push_str("; the compensating lvremove ");
+        detail.push_str(if removed {
+            "removed the LV"
+        } else {
+            "could not remove the LV"
+        });
+        detail.push_str(
+            ", but the provider state lock could not be reacquired to clear the create intent (",
+        );
+        detail.push_str(&lock_error.to_string());
+        detail.push_str("): ");
+        Self::push_create_recovery_note(&mut detail, vg_name, lv_name, removed);
         ApiError::new(save_error.code, detail)
     }
 
@@ -2617,8 +2727,20 @@ impl LvmProvider {
     /// Pick the first claimed native-pool volume group with enough free
     /// space for the **extent-rounded** demand (headroom included);
     /// `NO_SAFE_CAPACITY` when none qualifies.
-    fn pick_pool_vg(&self, state: &LvmState, size_bytes: u64) -> Result<PickedPool, ApiError> {
-        let capacity_map = self.vg_capacity_map()?;
+    /// Choose the pool for a create from a capacity sample already taken
+    /// outside the state lock.
+    ///
+    /// `capacity_map` is a `vgs` sample that the caller took while the state
+    /// lock was released; it is validated against the allocation epoch there
+    /// and again when the reservation is inserted. Selection uses the state
+    /// under the lock, so a device claimed or released during the sample is
+    /// still classified against the current registry.
+    fn pick_pool_vg(
+        &self,
+        state: &LvmState,
+        size_bytes: u64,
+        capacity_map: &BTreeMap<String, VgCapacity>,
+    ) -> Result<PickedPool, ApiError> {
         for entry in state.devices().values() {
             if entry.role != volvisor_types::DeviceRole::NativePool {
                 continue;
@@ -3256,8 +3378,8 @@ impl LvmProvider {
     /// The command ran without the lock. Reacquire and revalidate that the
     /// durable intent is still the one this create was authorized under, then
     /// insert the record, drop the intent and save once. A failed final save
-    /// runs the existing compensation (whose `lvremove` is an accepted E3
-    /// residual: it still runs in this reacquired critical section).
+    /// runs the existing compensation, whose compensating `lvremove` now runs
+    /// outside the provider state lock (Phase F F2c).
     fn commit_created_volume(
         &self,
         req: &CreateVolumeRequest,
@@ -3302,7 +3424,7 @@ impl LvmProvider {
         state.remove_create_intent(&req.volume_id);
         if let Err(save_error) = self.persist(&mut state) {
             return Err(self.compensate_unpersisted_create(
-                &mut state,
+                state,
                 &req.volume_id,
                 &intent.vg_name,
                 &intent.lv_name,
@@ -3356,7 +3478,24 @@ impl LvmProvider {
         // look before it can be adopted or cleared, so that look is outside
         // the lock too.
         let mut resumed: Option<CreateIntent> = None;
+        // A stale capacity sample costs another `vgs` call. Bound the
+        // optimistic rounds so sustained allocation churn cannot keep one
+        // create looping forever; the caller can retry with a new operation
+        // id. This is a liveness guard, not a capacity answer.
+        let mut attempts = 0usize;
         let (intent, reservation) = loop {
+            attempts += 1;
+            if attempts > CREATE_ADMISSION_ATTEMPTS {
+                return Err(ApiError::new(
+                    ApiErrorCode::Overloaded,
+                    format!(
+                        "capacity admission for volume {} could not obtain a stable \
+                         free-space sample after {CREATE_ADMISSION_ATTEMPTS} attempts; retry \
+                         the create with a new operation_id",
+                        req.volume_id
+                    ),
+                ));
+            }
             let mut state = self.lock_state_stable()?;
             // A durable pending delete owns this volume id: even an
             // idempotent create replay must not report a doomed volume as
@@ -3418,7 +3557,49 @@ impl LvmProvider {
                 }
             }
 
-            break self.prepare_create_intent(&mut state, req, &payload)?;
+            // Sample pool capacity outside the state lock. `vgs` is an
+            // external CLI call; holding the single provider mutex across it
+            // queued every other volume's mutation behind this create's
+            // probe. The allocation epoch fences a stale sample: a grow or
+            // another create that completes an allocation during the sample
+            // bumps it and this attempt re-samples. Phase F F2b (#62).
+            let epoch = self.capacity_epoch();
+            drop(state);
+            let capacity_map = self.vg_capacity_map()?;
+            if self.capacity_epoch() != epoch {
+                // An allocation completed during the sample; the free
+                // figure may already be stale.
+                continue;
+            }
+
+            let mut state = self.lock_state_stable()?;
+            // Re-check this volume's admission after the released window.
+            // The structural drive already excludes a second create or
+            // delete of the same id, but a state-alignment reload must not
+            // let a replay or a durable intent slip past this attempt: if one
+            // appeared, re-enter admission so its rules classify it rather
+            // than allocating over it.
+            self.ensure_no_pending_delete(&state, &req.volume_id)?;
+            if state.volume(&req.volume_id).is_some()
+                || state.create_intent(&req.volume_id).is_some()
+            {
+                continue;
+            }
+
+            match self.prepare_create_intent(&mut state, req, &payload, &capacity_map, epoch)? {
+                CreatePrepare::SampleStale => {
+                    // The reservation was released by
+                    // `prepare_create_intent`; a create or completed grow got
+                    // between the sample and the reservation. Re-sample on
+                    // the next loop iteration.
+                }
+                CreatePrepare::Prepared {
+                    intent,
+                    reservation,
+                } => {
+                    break (intent, reservation);
+                }
+            }
         };
 
         // The intent is durable; the state lock is now released. `lvcreate`
@@ -3451,10 +3632,17 @@ impl LvmProvider {
         }
     }
 
-    /// Sample the pool, promise the extents, and persist a fresh create
-    /// intent under the provider state lock.
+    /// Validate the sampled pool capacity, promise the extents, and persist
+    /// a fresh create intent under the provider state lock.
     ///
-    /// The reservation covers the released-lock window up to the `lvcreate`
+    /// Runs under the provider state lock: the in-flight reservation, the
+    /// intent insertion and its save are atomic with respect to every other
+    /// admission. `capacity_map` was sampled *without* that lock (and without
+    /// a capacity mutex), which is what keeps the `vgs` CLI off both locks;
+    /// `expected_epoch` is the allocation epoch the sample observed. If a
+    /// create or grow completed an allocation in the meantime, this returns
+    /// [`CreatePrepare::SampleStale`] and the caller re-samples. The
+    /// reservation covers the released-lock window up to the `lvcreate`
     /// answer, so a concurrent grow (or create) cannot spend the same sampled
     /// free bytes. The intent save is durable-first: no LV exists until it
     /// succeeds. A failed save returns with the reservation dropped (no LV
@@ -3464,8 +3652,10 @@ impl LvmProvider {
         state: &mut LvmState,
         req: &CreateVolumeRequest,
         payload: &str,
-    ) -> Result<(CreateIntent, CapacityReservation<'a>), ApiError> {
-        let picked = self.pick_pool_vg(state, req.size_bytes)?;
+        capacity_map: &BTreeMap<String, VgCapacity>,
+        expected_epoch: u64,
+    ) -> Result<CreatePrepare<'a>, ApiError> {
+        let picked = self.pick_pool_vg(state, req.size_bytes, capacity_map)?;
         let reservation =
             match self.try_reserve_capacity(&picked.vg_name, picked.sampled_free, picked.demand) {
                 Ok(reservation) => reservation,
@@ -3481,6 +3671,14 @@ impl LvmProvider {
                     ));
                 }
             };
+        // Reserve first, then check: a reservation inserted before an
+        // allocation completes still covers it, so a bump observed here means
+        // the sample may be stale in the optimistic direction and the caller
+        // must re-read `vgs` before promising anything else.
+        if self.capacity_epoch() != expected_epoch {
+            drop(reservation);
+            return Ok(CreatePrepare::SampleStale);
+        }
         let intent = CreateIntent {
             vg_name: picked.vg_name.clone(),
             lv_name: lv_name_for(&req.volume_id),
@@ -3526,7 +3724,10 @@ impl LvmProvider {
                 format!("{}; {note}", save_error.detail),
             ));
         }
-        Ok((intent, reservation))
+        Ok(CreatePrepare::Prepared {
+            intent,
+            reservation,
+        })
     }
 
     async fn attach_volume_inner(
@@ -4777,11 +4978,40 @@ impl LvmProvider {
         // the same volume must be refused instead of racing
         // `blkdiscard`/`lvremove` against the same durable intent.
         let _drive = self.begin_structural_drive(volume_id, StructuralDriveKind::Delete)?;
-        let mut state = self.lock_state_stable()?;
-        let (mut stored_before, pending_intent) =
-            Self::validate_delete_request(&state, volume_id, req)?;
+        let (mut stored_before, _) = {
+            let state = self.lock_state_stable()?;
+            Self::validate_delete_request(&state, volume_id, req)?
+        };
         let vg_name = stored_before.entry.vg_name.clone();
         let lv_name = stored_before.entry.lv_name.clone();
+
+        // Observe the LV outside the state lock. `lvs` is an external CLI
+        // call; holding the single provider mutex across it queued every
+        // other volume's mutation behind this check. The structural drive
+        // guard keeps this volume's own create/delete out; the full
+        // revalidation below is the fence against a grow/move that started
+        // in the observation window. Phase F F2a (#62).
+        let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
+
+        let mut state = self.lock_state_stable()?;
+        let (fresh_before, pending_intent) = Self::validate_delete_request(&state, volume_id, req)?;
+        // The observation ran without the lock. Fail closed if the volume
+        // changed under it rather than authorizing a delete from a stale
+        // snapshot; a same-id recreate bumps the generation and is caught
+        // by `validate_delete_request` itself.
+        if fresh_before.entry.generation != stored_before.entry.generation
+            || fresh_before.entry.vg_name != vg_name
+            || fresh_before.entry.lv_name != lv_name
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Internal,
+                format!(
+                    "volume {volume_id} changed while its LV existence was observed outside \
+                     the state lock; refusing to authorize a delete from a stale snapshot"
+                ),
+            ));
+        }
+        stored_before = fresh_before;
         let volume_state = stored_before.runtime.state;
 
         // A Failed volume whose LV is already absent has nothing to
@@ -4794,7 +5024,6 @@ impl LvmProvider {
         // holding live data — so it fails loudly instead. A pending
         // delete intent is the exception: it authorizes completing the
         // observed absence (the LV may have been removed before a crash).
-        let lv_exists = self.lv_size(&vg_name, &lv_name)?.is_some();
         if !lv_exists && volume_state != VolumeLifecycle::Failed && pending_intent.is_none() {
             return Err(ApiError::new(
                 ApiErrorCode::Internal,
