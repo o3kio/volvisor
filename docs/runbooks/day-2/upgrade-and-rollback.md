@@ -6,16 +6,20 @@ drilled.**
 
 - **DRILLED:** a real old binary built at `8c2fc1a` (LVM state schema 2,
   journal record version 1) upgraded a v2 state directory to schema 3 with
-  the current binary at `aad1720` (journal record version 2). The original
+  the then-current binary at `aad1720` (journal record version 2). The original
   volume survived; the old binary refused the v3 state and the v2 journal
   with the typed unsupported-version error; restoring the whole stopped v2
   backup let the old binary serve the original volume again, and the
   post-backup volume was absent.
-- **DRILLED separately:** the current binary's same-binary v3 policy drill
+- **DRILLED separately:** the `aad1720` binary's same-binary v3 policy drill
   (pre-versioning → v3 upgrade-on-write, v4 refusal) is [`d2.sh`](scripts/d2.sh).
+  `d2.sh` asserts a v3 ceiling and needs a v4 refresh before it can be re-run
+  against the current v4 build.
 - **NOT RUN:** a rolling multi-host upgrade, packaged/systemd upgrade and
-  downgrade scriptlets, live Ceph/DRBD/migration/peer store upgrades, and a
-  data-plane workload during the swap. There is still no release tag.
+  downgrade scriptlets, live Ceph/DRBD/migration/peer store upgrades, a
+  data-plane workload during the swap, and the v3→v4 drain/allocator steps
+  themselves (the drilled cross-binary upgrade was v2→v3 at `aad1720`). There
+  is still no release tag.
 
 Evidence:
 [2026-11-04 live cross-binary report](../../evidence/day2/2026-11-04-devhost-live/REPORT.md),
@@ -86,15 +90,15 @@ and `a_v1_stamped_n_minus_one_lvm_state_upgrades_on_write`.
 For the repeatable lab drill, use the harness instead of hand-building:
 
 ```sh
-sudo RUN=/tmp/opencode/volvisor-d2live-$(date -u +%Y%m%dT%H%M%SZ) \
+sudo env RUN=/tmp/opencode/volvisor-d2live-$(date -u +%Y%m%dT%H%M%SZ) \
   bash docs/runbooks/day-2/scripts/d2-live.sh
 ```
 
 It builds the old binary at `OLD_COMMIT` (default `8c2fc1a`) in a disposable
 worktree, builds the current commit in a clean worktree when the caller's
 worktree is dirty, and removes both worktrees afterwards. A preflight report
-is available with `scripts/preflight.sh --only d2` (add `--check-old-build`
-to build the old commit during preflight).
+is available with `bash docs/runbooks/day-2/scripts/preflight.sh --only d2` (add
+`--check-old-build` to build the old commit during preflight).
 
 ## A. Pre-upgrade inspection
 
@@ -113,15 +117,17 @@ jq '.schema_version // "pre-versioning (baseline 1)"' /var/lib/volvisor/journal/
 Expected: a missing field means baseline 1. A value **greater than** the new
 binary's supported version is a stop: the new binary will refuse it, and you
 must install a build that supports it. A value of 0 is invalid. The current
-LVM ceiling is **3**; journal `record_version` is **2**.
+LVM ceiling is **4**; journal `record_version` is **2**.
 
 Record the pre-upgrade hashes:
 
 ```sh
-sha256sum /var/lib/volvisor/journal/* 2>/dev/null
+find /var/lib/volvisor/journal -maxdepth 1 -type f -print0 \
+  | sort -z | xargs -0 -r sha256sum
 ```
 
-Expected: one line per file. Keep this with the backup.
+Expected: one line per **file**; `migrations/` and `peer-preparations/` are
+directories and are deliberately not hashed here. Keep this with the backup.
 
 ## B. Upgrade
 
@@ -129,7 +135,47 @@ Expected: one line per file. Keep this with the backup.
    Back up the **whole directory**, not one store file.
 2. Install the new binary. Do not start it against the live directory until
    the backup is verified.
-3. Start it and check health and the typed startup result.
+3. **Drain attachments and record the ADR-0013 pre-upgrade baseline.** If the
+   old daemon is still serving attachments, drain before you stop it in A: for
+   a v3 directory, detach every attachment cleanly and confirm there is no
+   in-flight attach, detach or report. If it is already stopped, keep
+   attachments down. In either case, hold them down through the first v4
+   write, and record the baseline while the daemon is stopped and before you
+   start the new binary. If a consumer reattaches after step 4, detach it and
+   wait before mutating.
+
+```sh
+STATE_DIR=/var/lib/volvisor/journal
+RUN="${HOME}/volvisor-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+umask 077
+mkdir -p "$RUN"
+
+# Every state file and the journal, plus the schema version being upgraded.
+find "$STATE_DIR" -maxdepth 1 -type f -print0 \
+  | sort -z | xargs -0 -r sha256sum | tee "$RUN/pre-upgrade.sha256"
+jq '.schema_version' "$STATE_DIR/lvm-state.json" \
+  | tee "$RUN/pre-upgrade-schema-version.txt"
+
+# The v3 file cannot enumerate volumes deleted before this upgrade. Record the
+# id-reuse risk next to the backup; add any known pre-upgrade deleted ids.
+cat > "$RUN/pre-upgrade-deleted-id-risk.txt" <<'EOF'
+ADR-0013 residual: volumes deleted before the first v4 write have no durable
+record of consumed generations. Do not reuse their volume_id across the
+v3 -> v4 boundary. Known pre-upgrade deleted ids (best effort):
+EOF
+${EDITOR:-vi} "$RUN/pre-upgrade-deleted-id-risk.txt"
+```
+
+   Do not reuse a volume id that was deleted before the upgrade across the
+   v3→v4 boundary. The new allocator is authoritative only for incarnations
+   created after the v4 file exists; it cannot recover generations consumed by
+   a pre-upgrade deleted incarnation. If a consumer reuses ids, treat the
+   pre-upgrade deleted set as unrecoverable and record that risk. Do not mark
+   the residual closed.
+
+4. Start it and check health and the typed startup result. Do not reattach
+   workloads yet. The `127.0.0.1:8080` URLs below are illustrative: use the
+   configured `listen` address, which has no built-in default.
 
 ```sh
 systemctl start volvisord.service
@@ -140,7 +186,7 @@ systemctl status volvisord.service --no-pager
 Expected: `{"status":"ok"}` and an active unit. A typed startup refusal is a
 stop; read the detail, do not patch the file.
 
-4. Prove loading alone does not rewrite the file, then prove upgrade-on-write
+5. Prove loading alone does not rewrite the file, then prove upgrade-on-write
    with a harmless mutation.
 
 ```sh
@@ -161,7 +207,45 @@ writes `2`; the old `8c2fc1a` build in the live drill wrote `2` on its first
 create. The first successful save is what rewrites the file; a mere restart
 may leave an older file untouched.
 
-5. Exercise the real workload before considering the upgrade complete. Keep
+6. **Verify the allocator after the first v4 save.** The first successful save
+   is what writes v4; check it before reattaching workloads.
+
+```sh
+STATE=/var/lib/volvisor/journal/lvm-state.json
+
+# Readable evidence: no expected number is hard-coded.
+jq '{schema_version,
+     next_attachment_generation,
+     max_entry_generation: ([.volumes[].entry.generation] | max // 0),
+     max_attachment_generation: ([.volumes[] | .runtime.attachment?.generation? // empty] | max // 0)}' "$STATE"
+
+# Fail closed unless the allocator is present and strictly above every
+# persisted *attachment* generation. Entry generations are deliberately not
+# part of this invariant after the one-time v3->v4 seed: attach, detach and
+# grow bump entry.generation while only attach advances the allocator.
+jq -e '
+  (.next_attachment_generation // 0) as $n
+  | ([.volumes[] | .runtime.attachment?.generation? // empty] | max // 0) as $a
+  | ($n != 0) and ($n > $a)
+' "$STATE"
+```
+
+Expected: the second command exits `0`, and `next_attachment_generation` is
+non-zero and greater than `max_attachment_generation`. **Entry generations may
+legitimately equal or exceed the allocator after the one-time seed** (detach
+and grow advance the entry generation without allocating an attachment
+generation), so do not treat that as a failure. A missing or zero allocator, or
+any persisted attachment generation at or above it, is a stop. Do not expect
+`1`, a fixed seed, or a contiguous sequence: the value is seeded from the
+persisted maximum at migration and is opaque afterwards.
+
+> **Operator control, not a fix.** This step narrows and records the ADR-0013
+> upgrade-window residual; it does not close it. The residual is a volume
+> deleted before the v4 file ever existed, whose consumed generations cannot
+> be recovered from the v3 file. Real-backend and multi-host evidence is still
+> required. Do not record this run as closure.
+
+7. Exercise the real workload before considering the upgrade complete. Keep
    the pre-upgrade backup until then.
 
 ## C. Future-version refusal (safety check, not a rollback)
@@ -170,10 +254,15 @@ Never do this on a live directory. In a lab, a file declaring a newer version
 must be refused and left untouched:
 
 ```sh
-# lab only: copy, set schema_version 5 (one above the current v4), then start
-jq '.schema_version = 5' lvm-state.json > lvm-state.v5.json
-mv lvm-state.v5.json lvm-state.json
-/path/to/volvisord --config /path/to/volvisord.toml
+# lab only: copy the whole state directory to scratch, raise the COPY's
+# schema_version to 5 (one above the current v4), and point a test config at
+# the scratch directory.
+SCRATCH="$(mktemp -d)"
+cp -a /var/lib/volvisor/journal/. "$SCRATCH"/
+jq '.schema_version = 5' "$SCRATCH/lvm-state.json" > "$SCRATCH/lvm-state.v5.json"
+mv "$SCRATCH/lvm-state.v5.json" "$SCRATCH/lvm-state.json"
+# test config must point its state/journal paths at $SCRATCH
+/path/to/volvisord --config /path/to/volvisord-scratch.toml
 ```
 
 Expected for the current v4 build:
@@ -234,10 +323,15 @@ run the old binary against the newer directory: exit 1 with the typed
 
 - The compatibility test passes at the new commit.
 - Pre-upgrade versions are recorded and no store is newer than the new binary.
+- For an ADR-0013 v3→v4 upgrade: attachments stayed detached through the first
+  v4 write, pre-upgrade hashes and `schema_version` were recorded, the
+  id-reuse risk was recorded, and the post-write allocator check passed. This
+  is an operator control, not closure of the residual.
 - A stopped whole-directory backup exists and verifies.
 - The old binary serves the original volume on the v2 state.
-- The new binary opens that state without rewriting it on load, then a write
-  stamps v3 without losing the original volume.
+- The `aad1720` new binary opens that state without rewriting it on load, then
+  a write stamps v3 without losing the original volume (the current v4 build
+  stamps v4 instead).
 - A v3 state and a v2 journal are refused typed by the old binary and left
   byte-identical.
 - A rollback restores the pre-upgrade directory, the old binary opens it and
@@ -288,6 +382,7 @@ Observed in the passing run (`ASSERT SUMMARY: 0 failures`):
 
 **NOT RUN:** a rolling multi-host upgrade, package/systemd scriptlets, Ceph/
 DRBD/migration/peer store live upgrades, a real data workload during the swap,
-and a released artifact. **Limits:** one host, one kernel, debug builds,
-loop-device LVM, LVM store only. This is not production support or a
-zero-downtime claim.
+the v3→v4 drain/allocator steps themselves (the drilled cross-binary upgrade
+was v2→v3 at `aad1720`), and a released artifact. **Limits:** one host, one
+kernel, debug builds, loop-device LVM, LVM store only. This is not production
+support or a zero-downtime claim.
