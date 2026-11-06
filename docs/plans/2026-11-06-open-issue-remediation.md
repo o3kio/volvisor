@@ -47,7 +47,11 @@ Implemented ADR-0013:
 
 Residual: a volume deleted *before* the upgrade has no record in a v3 file,
 so its consumed generations are unrecoverable. The ADR records that window.
-Real-backend/multi-host evidence is still required.
+Real-backend/multi-host evidence is still required. The [upgrade
+runbook](../runbooks/day-2/upgrade-and-rollback.md) now carries the pre-upgrade
+operator control (drain, hash/schema baseline, no volume-id reuse across the
+v3→v4 boundary, post-save allocator verification). The control narrows and
+records the residual; it does not close it.
 
 ### #64 — journal hard ceiling and cannot-fit refusal (ADR-0014)
 
@@ -82,7 +86,10 @@ implemented. The remaining locally-actionable gap is the explicit **resumable
 long-operation handle** and **distinct per-route mutation timeouts**, neither
 of which exists. Both are durable-semantics/surface additions and require an
 accepted contract amendment before implementation; they are recorded here,
-not silently added.
+not silently added. A [Proposed amendment](../../contracts/volume-api-v2-amendment-1-long-operations.md)
+now records the design (opt-in `Prefer: respond-async`, journal-derived
+observation handle, per-route response budgets that never abort a journaled
+act); it is **not accepted and not implemented**.
 
 ### #49 — parser fuzzing and interleaving tests (remaining slice)
 
@@ -105,7 +112,10 @@ saves, but the durable state is still one whole-file rewrite/fsync and the
 control plane still serializes on one provider-state lock. A truthful fix
 needs a state-substrate redesign (per-record or segmented durable state with
 a single-writer commit protocol) and an ADR/amendment. Not a small patch;
-kept open.
+kept open. A [Proposed ADR](../adr/0017-append-only-provider-state-log.md)
+now records the design (v5 snapshot plus append-only record log with group
+commit); it is **not accepted and not implemented**, and implementation stays
+blocked on the owner decisions in that ADR.
 
 ## Partially local, evidence still missing
 
