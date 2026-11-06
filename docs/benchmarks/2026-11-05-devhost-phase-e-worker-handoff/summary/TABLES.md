@@ -1,9 +1,9 @@
 # Benchmark tables
 
 Generated from the raw JSON records by `scripts/bench/summarize.py`.
-Percentiles are nearest-rank over every recorded request; the CSV
-`*-ops.csv` files are a deterministic latency sample (first 5,000 per
-operation).
+Percentiles are nearest-rank over every recorded request; the per-operation
+`*-ops.csv` samples (first 5,000 per operation) are not committed, and these
+tables are derived from the exact JSON aggregates.
 
 ## Micro (concurrency 1)
 

@@ -52,7 +52,7 @@ under crash. Correctness evidence is the test suite and conformance checks at
 | Mixed sweep | 1 / 8 / 32 / 128 in-flight, 70 % read-ratio target, 30 s per tier | 0 errors; throughput falls above 8 in-flight | [mixed-c1](json/mixed-c1.json), [c8](json/mixed-c8.json), [c32](json/mixed-c32.json), [c128](json/mixed-c128.json) |
 | Admission cap probe | 128 in-flight, cap 32, 1 s queue timeout, 15 s (diagnostic) | queued, no `503`; see §6 | [mixed-cap32-c128.json](json/mixed-cap32-c128.json) |
 | Rate-limit shedding probe | 64 in-flight, 50 req/s burst 50, 15 s (diagnostic) | 952 × `429 RATE_LIMITED`; 51.255 accepted ops/s | [mixed-rate50-c64.json](json/mixed-rate50-c64.json) |
-| Shortened soak | 25 min, 4 workers, continuous attach/report/detach/grow, restart at 12 min, per-second resource samples | completed; state bounded, journal bounded, RSS high-water filed | [soak.json](json/soak.json), [soak-timeline.csv](csv/soak-timeline.csv) |
+| Shortened soak | 25 min, 4 workers, continuous attach/report/detach/grow, restart at 12 min, per-second resource samples | completed; state bounded, journal bounded, RSS high-water filed | [soak.json](json/soak.json) (per-second timeline not committed) |
 | Restart replay | 3 pre-soak restarts, 1 mid-soak restart, 2 post-soak restarts | healthy in 0.102 s – 0.391 s; mid-soak replay listed 4/4 volumes | [restart-pre-soak.json](json/restart-pre-soak.json), [restart-post-soak.json](json/restart-post-soak.json) |
 
 Every acknowledged mutation used the daemon's real journal append + fsync
@@ -320,8 +320,10 @@ by serialization.
 | [summary/state-scale.csv](summary/state-scale.csv) | state size versus live volumes |
 | [summary/restart.csv](summary/restart.csv) | restart replay rows |
 | [json/](json/) | exact aggregate JSON per scenario |
-| [csv/](csv/) | per-second timelines and deterministic per-op samples |
 | [raw/00-orchestration.log](raw/00-orchestration.log) | unmodified orchestration trace |
 | [raw/daemon.daemon.log.gz](raw/daemon.daemon.log.gz) | gzip daemon log (2.4 GiB raw) |
 | [records/](records/) | lab loop/VG identity and pre/post VG listings |
 | [configs/](configs/) | sanitized benchmark configs (tokens replaced) |
+
+The per-operation CSV samples and per-second timelines are not committed; the
+JSON aggregates and summary tables retain the measured values.

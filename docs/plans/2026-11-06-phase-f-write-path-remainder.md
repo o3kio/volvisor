@@ -236,7 +236,8 @@ This slice adds **evidence, not a new retention design**.
 **Acceptance.**
 
 - The bundle is published only if the tree is clean, the binary digest
-  matches the source, and every measured JSON/CSV is copied unmodified.
+  matches the source, and every measured JSON aggregate is copied unmodified
+  (per-operation CSV samples are not committed).
 - The report distinguishes "code present" from "issue closed" and does not
   claim a throughput gain.
 

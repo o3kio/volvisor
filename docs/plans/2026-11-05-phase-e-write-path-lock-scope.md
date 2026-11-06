@@ -158,8 +158,9 @@ sudo scripts/bench/run-all.sh \
 
 Compare against the `4290b84` capacity-domain bundle, which is the current
 measured envelope after the option C revert. Publish the bundle only if the
-tree is clean, the binary digest matches the source, and every measured
-JSON/CSV is copied unmodified. State the result honestly: a regression, a
+tree is clean, the binary digest matches the source, and every measured JSON
+aggregate is copied unmodified (per-operation CSV samples are not committed).
+State the result honestly: a regression, a
 neutral result, or a gain. Do not claim a throughput gain from a micro
 create/delete change; the mixed sweep has no create/delete, so a gain there
 would be host/run drift, not this phase.

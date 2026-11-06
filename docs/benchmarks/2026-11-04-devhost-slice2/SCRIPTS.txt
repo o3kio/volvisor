@@ -54,7 +54,9 @@ Post-run tools
 --------------
 scripts/bench/publish.sh copied the run directory into this bundle, redacted
 the run token in configs/, and gzip-compressed the oversized daemon log
-(2.15 GiB raw) with `gzip -9 -n`. It does not alter any measured JSON or CSV.
+(2.15 GiB raw) with `gzip -9 -n`. It does not alter any measured JSON or
+summary CSV. The per-operation CSV samples are not committed; the JSON
+aggregates and summary tables retain the measured values.
 
 scripts/bench/compare.py generated comparison/comparison.md and
 comparison/comparison.csv from this bundle and the

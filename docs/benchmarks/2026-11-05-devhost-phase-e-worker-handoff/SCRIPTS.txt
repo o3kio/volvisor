@@ -80,12 +80,14 @@ clean measured run. See each directory's README before reading it.
 
 Post-run tools
 --------------
-scripts/bench/publish.sh copied the run's measured records (raw/csv/json/
-summary and the named records files) into this bundle, redacted the run token
-in configs/, and gzip-compressed the oversized daemon log
+scripts/bench/publish.sh copied the run's measured records (raw/json/summary
+and the named records files) into this bundle, redacted the run token in
+configs/, and gzip-compressed the oversized daemon log
 (2,393,781,369 bytes = 2.39 GB / 2.23 GiB raw) with `gzip -9 -n` to
-62,953,722 bytes = 62.95 MB / 60.04 MiB. It does not alter any measured JSON
-or CSV.
+62,953,722 bytes = 62.95 MB / 60.04 MiB. The per-operation CSV samples were
+generated but are not committed; the JSON aggregates and summary tables
+retain the measured values. Publication does not alter any measured JSON or
+summary CSV.
 
 scripts/bench/compare.py generated comparison/comparison.md and
 comparison/comparison.csv from this bundle and the 2026-11-05-devhost-

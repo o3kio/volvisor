@@ -21,10 +21,15 @@ This directory holds benchmark methodology and published evidence bundles.
 - A benchmark is not a durability or production-support proof (AGENTS
   rule 12). Bundles state their exact source SHA, worktree dirtiness,
   host, kernel, build profile, and what was **not** run.
-- Raw JSON/CSV records and a `MANIFEST.sha256` are committed with every
-  bundle; authored summaries must not alter measured files.
-- Percentiles are nearest-rank over every recorded request; any sampled
-  CSV is labeled as a sample, not the percentile source.
+- Exact JSON aggregates, the derived summary tables and a `MANIFEST.sha256`
+  are committed with every bundle; authored summaries must not alter
+  measured files.
+- Per-operation CSV samples and per-second timelines are regenerable and
+  are not committed for new bundles (`docs/benchmarks/**/csv/` is ignored in
+  `.gitignore`). Bundles published before that rule keep their tracked CSV
+  files. Percentiles are nearest-rank over every recorded request; the JSON
+  aggregates are exact, and any retained CSV sample is not the percentile
+  source.
 
 The committed harness for the 2026-11-03 bundle is
 [`scripts/bench/`](../../scripts/bench/).

@@ -110,16 +110,16 @@ MANIFEST.sha256      SHA256 over every other file in the bundle
 comparison/          compare.py output against the 2026-11-03 bundle
 configs/             sanitized benchmark configs (tokens replaced)
 json/                exact aggregates and per-scenario metadata
-csv/                 per-second timelines and deterministic per-op samples
 raw/                 orchestration log and gzip daemon log
 records/             lab loop/VG identity and pre/post VG listings
 summary/             generated CSV tables and TABLES.md
 ```
 
-Percentiles are nearest-rank over every recorded request. The `*-ops.csv`
-files are a deterministic prefix sample (first 5,000 requests per operation);
-the JSON aggregates are exact. The run token was replaced with `<redacted>`
-in `configs/`; the bundle has no bearer or claim token.
+Percentiles are nearest-rank over every recorded request. The per-operation
+`*-ops.csv` samples (first 5,000 requests per operation) and per-second
+timelines are not committed; the JSON aggregates are exact. The run token was
+replaced with `<redacted>` in `configs/`; the bundle has no bearer or claim
+token.
 
 ## Reproduction
 

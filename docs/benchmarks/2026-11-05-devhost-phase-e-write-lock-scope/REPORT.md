@@ -298,10 +298,11 @@ queue improved; a capacity, SLA, durability or data-path claim; or the
 ## Appendix: files
 
 `ENVIRONMENT.txt`, `MANIFEST.sha256`, `README.md`, `REPORT.md`,
-`SCRIPTS.txt`, `configs/`, `comparison/`, `csv/`, `json/`, `raw/`,
-`records/`, `summary/`. The measured JSON/CSV are copied unmodified; the only
-post-run transformation is the token redaction in `configs/` and the
-`gzip -9 -n` compression of the oversized raw daemon log. Verify with:
+`SCRIPTS.txt`, `configs/`, `comparison/`, `json/`, `raw/`,
+`records/`, `summary/`. The measured JSON is copied unmodified; per-operation
+CSV samples and timelines are not committed. The only post-run transformation
+is the token redaction in `configs/` and the `gzip -9 -n` compression of the
+oversized raw daemon log. Verify with:
 
 ```
 sha256sum -c MANIFEST.sha256

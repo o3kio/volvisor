@@ -13,3 +13,9 @@ Cargo.lock.bak
 .env
 __pycache__/
 *.pyc
+
+# Benchmark harness output: per-operation CSV samples and per-second timelines
+# are regenerable, large and not reviewable. Commit the exact JSON aggregates,
+# summary tables and MANIFEST.sha256 instead. Bundles published before this
+# rule keep their already-tracked CSV files.
+docs/benchmarks/**/csv/

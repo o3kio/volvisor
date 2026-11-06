@@ -195,8 +195,9 @@ comparison.
 ### 6.2 Grow completion timing
 
 All 433 candidate grows and all 438 comparator grows are present in the
-recorded `mixed-c128-ops.csv` (the per-operation CSV cap is 5,000). Relative
-to the first recorded request:
+recorded per-operation data behind the copied JSON aggregates (the
+per-operation CSV cap is 5,000; those CSV samples are not committed).
+Relative to the first recorded request:
 
 - candidate: grow starts span 0.022–29.347 s; completions span 0.618–40.791 s;
   305 grow completions fall in the first 30 s.
@@ -379,10 +380,11 @@ not used as evidence.
 ## Appendix: files
 
 `ENVIRONMENT.txt`, `MANIFEST.sha256`, `README.md`, `REPORT.md`,
-`SCRIPTS.txt`, `configs/`, `csv/`, `json/`, `raw/`, `records/`, `summary/`,
-`comparison/`. The measured JSON/CSV are copied unmodified; the only
-post-run transformation is the token redaction in `configs/` and the
-`gzip -9 -n` compression of the oversized raw daemon log. Verify with:
+`SCRIPTS.txt`, `configs/`, `json/`, `raw/`, `records/`, `summary/`,
+`comparison/`. The measured JSON is copied unmodified; per-operation CSV
+samples and timelines are not committed. The only post-run transformation is
+the token redaction in `configs/` and the `gzip -9 -n` compression of the
+oversized raw daemon log. Verify with:
 
 ```
 sha256sum -c MANIFEST.sha256

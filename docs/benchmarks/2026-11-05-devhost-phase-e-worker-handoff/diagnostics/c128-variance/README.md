@@ -5,7 +5,7 @@ diagnostic executed *after* the measured run, solely to test whether the
 measured c128 throughput drop (`610.988 → 462.899` ops/s) can be attributed
 to the measured change. It was not used to select, replace or support any
 claim, and no number here is a measured result for `7204a53`. The measured
-evidence is the bundle root's `json/`, `csv/`, `summary/`, `records/`,
+evidence is the bundle root's `json/`, `summary/`, `records/`,
 `raw/`, `ENVIRONMENT.txt` and `comparison/`.
 
 ## Design

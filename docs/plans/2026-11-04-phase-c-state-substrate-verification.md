@@ -155,7 +155,8 @@ changes. No post-fix run exists.
 
 - a clean-tree run of `scripts/bench/run-all.sh` on the Phase C commit
   (release build, 1/8/32/128 sweep, 25-minute shortened soak with restart);
-- a published bundle under `docs/benchmarks/` with the raw JSON/CSV,
+- a published bundle under `docs/benchmarks/` with the exact raw JSON
+  aggregates (per-operation CSV samples are regenerable and not committed),
   `MANIFEST.sha256`, a generated before/after comparison and an
   operator-authored `REPORT.md` recording the exact SHAs, commands, numbers
   and limits;

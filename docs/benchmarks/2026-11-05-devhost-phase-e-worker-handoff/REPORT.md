@@ -362,8 +362,9 @@ It does **not** support:
 - `json/` — ten aggregate records (`micro`, `mixed-c1/c8/c32/c128`,
   `mixed-cap32-c128`, `mixed-rate50-c64`, `restart-pre-soak`,
   `restart-post-soak`, `soak`).
-- `csv/` — per-operation samples (each operation capped at the harness's
-  sample limit) and per-second timelines.
+- `csv/` — **not committed**: per-operation samples (each operation capped
+  at the harness's sample limit) and per-second timelines; the `json/`
+  aggregates and `summary/` tables retain the measured values.
 - `summary/` — harness tables.
 - `records/` — lab VG/loop identity and post-run VG state.
 - `raw/` — orchestration log and the gzip-compressed daemon log.

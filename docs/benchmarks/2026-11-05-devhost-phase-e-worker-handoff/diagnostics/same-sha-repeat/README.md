@@ -4,7 +4,7 @@
 the measured source, executed 42 seconds after the published run ended, with
 `--skip-soak`. It was not used to select, replace or support the published
 sample, and no number here is the measured result for `7204a53`. The measured
-evidence is the bundle root's `json/`, `csv/`, `summary/`, `records/`,
+evidence is the bundle root's `json/`, `summary/`, `records/`,
 `raw/`, `ENVIRONMENT.txt` and `comparison/`. This repeat is disclosed because
 the published report must not imply that no same-SHA repeat exists, and
 because its micro delete numbers qualify the published sample's "flat"
