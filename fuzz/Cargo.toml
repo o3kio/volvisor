@@ -17,9 +17,25 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 tempfile = "3"
+volvisor-ceph = { path = "../crates/volvisor-ceph" }
+volvisor-drbd = { path = "../crates/volvisor-drbd" }
 volvisor-journal = { path = "../crates/volvisor-journal" }
 volvisor-lvm = { path = "../crates/volvisor-lvm" }
 volvisor-types = { path = "../crates/volvisor-types" }
+
+[[bin]]
+name = "ceph_state"
+path = "fuzz_targets/ceph_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drbd_state"
+path = "fuzz_targets/drbd_state.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "journal_frame"

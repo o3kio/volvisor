@@ -42,6 +42,8 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          - ceph_state
+          - drbd_state
           - journal_frame
           - journal_record
           - lvm_state

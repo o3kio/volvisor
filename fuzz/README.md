@@ -12,6 +12,8 @@ nightly) never enters the main workspace lockfile, and
 | `journal_frame` | Raw journal bytes | The frame-chain walker and the production streaming `read_frame` chain agree frame-for-frame; neither panics or loops, both stop at a torn/corrupt boundary, and neither consumes past the input. |
 | `journal_record` | One frame payload (JSON record envelope) | The same version probe and strict `Envelope` decode replay uses: supported versions decode, unknown fields and unsupported versions are refused. |
 | `lvm_state` | One LVM state file | Both direct serde decode and the production `LvmState::load` path terminate without panic; a newer schema is a typed refusal. |
+| `ceph_state` | One Ceph provider state file | Both direct serde decode and the production `CephState::load` path terminate without panic; a newer schema is a typed refusal. |
+| `drbd_state` | One DRBD provider state file | Both direct serde decode and the production `DrbdState::load` path terminate without panic; a newer schema is a typed refusal. |
 | `request_validation` | One public request envelope | Parsing, `validate()` and `request_hash()` never panic or loop on arbitrary bytes. |
 
 ## Seed corpus
@@ -23,10 +25,10 @@ schema and the N-1 fixtures. File names are the regression contract:
 - `invalid-*` inputs must be refused without panicking.
 
 The corpus is also exercised deterministically on every change by the
-`fuzz_corpus` integration tests in `volvisor-journal`, `volvisor-lvm`
-and `volvisor-types`, so the committed seeds do not depend on the
-nightly workflow running. When a serialized shape changes, update the
-seeds and the N-1 fixture together; see
+`fuzz_corpus` integration tests in `volvisor-journal`, `volvisor-lvm`,
+`volvisor-ceph`, `volvisor-drbd` and `volvisor-types`, so the committed
+seeds do not depend on the nightly workflow running. When a serialized
+shape changes, update the seeds and the N-1 fixture together; see
 [`docs/schema-compatibility.md`](../docs/schema-compatibility.md).
 
 ### Corpus hygiene
@@ -52,6 +54,8 @@ does not commit it back.
 
 ```sh
 cd fuzz
+cargo +nightly fuzz run ceph_state
+cargo +nightly fuzz run drbd_state
 cargo +nightly fuzz run journal_frame
 cargo +nightly fuzz run journal_record
 cargo +nightly fuzz run lvm_state
