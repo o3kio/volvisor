@@ -501,7 +501,7 @@ fn assert_lv_exists(pool: &LoopPool, vg_name: &str, lv_name: &str) -> Result<(),
 }
 
 #[tokio::test]
-async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart()
+async fn lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart()
 -> Result<(), ApiError> {
     if !lvm_tests_enabled() {
         eprintln!(
@@ -555,8 +555,10 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
 
     fill_tmpfs(&statefs.join("fill"))?;
 
-    // The state save hits real ENOSPC after `lvcreate` already ran: the
-    // provider must compensate the LV and never expose a phantom volume.
+    // Phase F persists the create intent before `lvcreate`. At this
+    // intent-first boundary the real ENOSPC fails the durable intent save,
+    // so no LV is ever created. The post-`lvcreate` save-failure
+    // compensation is covered by the deterministic FC-01/FC-03 tests.
     let err = provider
         .create_volume(&fixture_create_request("itest-enospc", VOLUME_BYTES))
         .await
@@ -565,20 +567,23 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     // The detail proves this is the save failure, not an lvcreate failure
     // (the string is coupled to state.rs's save-error format by design).
     assert!(
-        err.detail.contains("state.json"),
-        "the save failure names the state file: {err}"
+        err.detail.contains("failed to write")
+            && err.detail.contains(&statefs.display().to_string()),
+        "the save failure names the provider state filesystem: {err}"
     );
 
     let inspected = provider
         .inspect_volume(&id)
         .await
-        .expect_err("the failed create must not be visible");
+        .expect_err("the refused create must not be visible");
     assert_eq!(inspected.code, ApiErrorCode::NotFound);
     let listed = provider.list_volumes(None).await.expect("list volumes");
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0].volume_id, unrelated_id);
 
-    // The compensating `lvremove` really ran: no orphan LV remains.
+    // No LV was created, so there is no orphan for the compensating
+    // `lvremove` to remove; this asserts the intent-first fail-closed
+    // outcome instead of the old post-`lvcreate` rollback.
     let lvs = pool.runner.run(
         "lvs",
         &["--reportformat", "json", "--units", "b", "--nosuffix"],
@@ -586,7 +591,7 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     assert!(lvs.success, "lvs query: {}", lvs.stderr_excerpt());
     assert!(
         !lvs.stdout.contains(&failed_lv_name),
-        "the compensating lvremove removed the failed LV {failed_lv_name}: {}",
+        "no LV named {failed_lv_name} was created: {}",
         lvs.stdout
     );
 
@@ -597,7 +602,7 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     let after = fs::read(&state_path).map_err(|e| internal(format!("read state: {e}")))?;
     assert_eq!(after, snapshot, "the claim record is unchanged");
 
-    // A restart converges: the rolled-back create never reappears and
+    // A restart converges: the refused create never reappears and
     // no orphan is reported as foreign.
     let restarted = LvmProvider::new(
         Arc::clone(&pool.runner),
@@ -609,7 +614,7 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     let inspected = restarted
         .inspect_volume(&id)
         .await
-        .expect_err("the rolled-back create must not reappear");
+        .expect_err("the refused create must not reappear");
     assert_eq!(inspected.code, ApiErrorCode::NotFound);
     let report = restarted.reconcile_report()?;
     assert!(report.missing_volumes.is_empty(), "{report:?}");
@@ -619,7 +624,7 @@ async fn lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart
     let created = restarted
         .create_volume(&fixture_create_request("itest-enospc", VOLUME_BYTES))
         .await
-        .expect("retry after compensation");
+        .expect("retry after the refused create");
     assert_eq!(created.volume_id, id);
     assert_eq!(created.state, VolumeLifecycle::Ready);
     assert_lv_exists(&pool, "volvisorit-enospc", &lv_name_for(&id))?;

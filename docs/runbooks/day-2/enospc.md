@@ -37,8 +37,10 @@ procedure and the create-specific tails.
 Historical evidence (pre-fix D5):
 [D5 raw log](../../evidence/day2/2026-11-03-devhost/raw/05-enospc.log),
 [Report D5](../../evidence/day2/2026-11-03-devhost/REPORT.md#d5--enospc-on-journal-and-provider-state-writes).
-Post-fix coverage: `lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
-in `crates/volvisor-lvm/tests/integration_lvm.rs`.
+Post-fix coverage: `lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart`
+in `crates/volvisor-lvm/tests/integration_lvm.rs` (real ENOSPC on the
+durable create intent before `lvcreate`; post-`lvcreate` save-failure
+compensation is covered by the deterministic FC tests).
 
 ## Scope and non-goals
 
@@ -461,11 +463,12 @@ harness `940722e`:**
   [post-fix report](../../evidence/day2/2026-11-03-d5-redrill/REPORT.md).
 
 The post-fix state path is also exercised by
-`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
-in the real-LVM suite (256 KiB tmpfs, real ENOSPC, real `lvremove`, restart
-and retry), plus deterministic tests for the cleanup-failure, carve-out and
-unreadable-reread branches. Those are code-level regression tests, not a
-full re-run of every branch.
+`lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart`
+in the real-LVM suite (256 KiB tmpfs, real ENOSPC on the durable create
+intent before `lvcreate`, restart and retry); post-`lvcreate` rollback is
+covered by deterministic injected-save tests, including the cleanup-failure,
+carve-out and unreadable-reread branches. Those are code-level regression
+tests, not a full re-run of every branch.
 
 **Limits:** filesystem ENOSPC only (not inode/thin-pool/metadata); fake
 provider for the journal; loop LVM for state; single host; no concurrent

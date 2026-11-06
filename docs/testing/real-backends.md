@@ -38,7 +38,9 @@ Local LVM evidence for this branch (2026-11-03, dev host): `./scripts/test-lvm.s
 exited 0 with `124` tests passing, including all seven real-loop-device
 integration tests (`test result: ok. 7 passed; 0 failed`), among them the
 #58 ENOSPC regression
-(`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`);
+(`lvm_create_state_save_enospc_rolls_back_lv_and_converges_across_restart`
+at that SHA; after Phase F made the create intent durable before `lvcreate`
+the test is `lvm_create_intent_save_enospc_fails_closed_and_converges_across_restart`);
 the run's evidence is a local artifact under the configured
 `VOLVISOR_TEST_OUTPUT_DIR` and is not committed. The earlier 2026-11-02 run
 recorded `110` passing tests and six integration tests before that regression
